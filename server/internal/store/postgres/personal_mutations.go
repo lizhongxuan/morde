@@ -79,6 +79,16 @@ func applyPersonalMutationInTx(ctx context.Context, tx pgx.Tx, principal identit
 	} else if found {
 		return replay, nil
 	}
+	candidateID, sourceMemoryID, allBoundRules := personalRuleRevocationTarget(mutation)
+	if candidateID != "" || sourceMemoryID != "" || allBoundRules {
+		if err := lockSchedulePersonalRuleOwner(ctx, tx, mutation.OwnerID); err != nil {
+			return personal.MutationReceipt{}, err
+		}
+	}
+	revokedSchedules, err := lockSchedulesForPersonalRuleRevocation(ctx, tx, mutation.OwnerID, mutation)
+	if err != nil {
+		return personal.MutationReceipt{}, err
+	}
 	if _, err := lockAccountChangeCounter(ctx, tx, instanceID, mutation.OwnerID); err != nil {
 		return personal.MutationReceipt{}, err
 	}
@@ -124,6 +134,11 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND object_type=$3 AND object
 			return personal.MutationReceipt{}, err
 		}
 	}
+	if mutation.ObjectType == personal.ObjectTypeSkillCandidate && !mutation.Delete {
+		if err := validatePersonalSkillCandidateMutationInTx(ctx, tx, instanceID, mutation, objectExists, previousBody); err != nil {
+			return personal.MutationReceipt{}, err
+		}
+	}
 	if mutation.Delete && mutation.ObjectType == personal.ObjectTypeMemory {
 		var previousMemory struct {
 			Content string `json:"content"`
@@ -141,6 +156,9 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND object_type=$3 AND object
 		}
 	}
 	if err := validatePersonalAttachmentReferenceInTx(ctx, tx, instanceID, mutation.OwnerID, mutation, allowedNewAttachmentID); err != nil {
+		return personal.MutationReceipt{}, err
+	}
+	if err := revokePersonalRuleSchedulesInTx(ctx, tx, mutation.OwnerID, revokedSchedules, mutation); err != nil {
 		return personal.MutationReceipt{}, err
 	}
 	previousAttachmentBytes, err := personalAttachmentUsageBytesInTx(ctx, tx, instanceID, mutation.OwnerID)
@@ -218,11 +236,15 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND object_type=$3 AND object
 			return personal.MutationReceipt{}, err
 		}
 	}
-	if mutation.ObjectType == personal.ObjectTypeSkillSetting && mutation.ObjectID == "builtin_memory" && !mutation.Delete {
-		var setting struct {
-			Enabled bool `json:"enabled"`
+	if mutation.ObjectType == personal.ObjectTypeSkillSetting && mutation.ObjectID == "builtin_memory" {
+		memoryDisabled := mutation.Delete
+		if !mutation.Delete {
+			var setting struct {
+				Enabled bool `json:"enabled"`
+			}
+			memoryDisabled = json.Unmarshal(mutation.Body, &setting) == nil && !setting.Enabled
 		}
-		if json.Unmarshal(mutation.Body, &setting) == nil && !setting.Enabled {
+		if memoryDisabled {
 			if err := invalidateAllPersonalConversationSummariesInTx(ctx, tx, mutation.OwnerID); err != nil {
 				return personal.MutationReceipt{}, err
 			}
@@ -274,16 +296,43 @@ func validatePersonalRuleCandidateMutationInTx(ctx context.Context, tx pgx.Tx, i
 			personal.ValidateObjectBody(personal.ObjectTypeRuleCandidate, mutation.ObjectID, previousBody) != nil {
 			return domain.NewError(domain.CodeInternal, "stored personal rule candidate is invalid")
 		}
-		if previous.Status != personal.RuleCandidatePending {
+		if previous.Status == personal.RuleCandidateActive {
 			return domain.NewError(domain.CodeConflict, "an active rule must be removed and proposed again before it can change")
 		}
-		if next.Status == personal.RuleCandidateActive &&
-			(next.Scope != previous.Scope || next.SourceMemoryID != previous.SourceMemoryID ||
-				next.SourceMemoryRevision != previous.SourceMemoryRevision) {
-			return domain.NewError(domain.CodeConflict, "review the unchanged candidate before activating it")
+		unchanged := next.Scope == previous.Scope && next.SourceMemoryID == previous.SourceMemoryID &&
+			next.SourceMemoryRevision == previous.SourceMemoryRevision
+		switch previous.Status {
+		case personal.RuleCandidatePending:
+			if next.Status == personal.RuleCandidateActive {
+				return domain.NewError(domain.CodeForbidden, "a rule candidate must pass source validation before explicit activation")
+			}
+			if next.Status != personal.RuleCandidatePending && next.Status != personal.RuleCandidateValidated {
+				return domain.NewError(domain.CodeForbidden, "a rule candidate cannot skip source validation")
+			}
+			if next.Status == personal.RuleCandidateValidated && !unchanged {
+				return domain.NewError(domain.CodeConflict, "validate the unchanged rule candidate")
+			}
+		case personal.RuleCandidateValidated:
+			if !unchanged {
+				return domain.NewError(domain.CodeConflict, "a validated rule cannot change before activation; delete and propose it again")
+			}
+			if next.Status != personal.RuleCandidateValidated && next.Status != personal.RuleCandidateActive {
+				return domain.NewError(domain.CodeForbidden, "a validated rule can only be explicitly activated")
+			}
+		default:
+			return domain.NewError(domain.CodeConflict, "personal rule candidate state is invalid")
 		}
 	}
 
+	var sourceBody []byte
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(body::text,'') FROM personal_objects
+WHERE service_instance_id=$1::uuid AND owner_id=$2 AND object_type=$3 AND object_id=$4 FOR SHARE`,
+		instanceID, mutation.OwnerID, personal.ObjectTypeMemory, next.SourceMemoryID).Scan(&sourceBody); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.NewError(domain.CodeConflict, "the source memory is no longer available; create a new rule candidate")
+		}
+		return fmt.Errorf("read personal rule candidate source memory: %w", err)
+	}
 	var sourceRevision int64
 	var sourceDeleted bool
 	err := tx.QueryRow(ctx, `SELECT revision,is_deleted FROM account_object_versions
@@ -295,17 +344,62 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND object_type=$3 AND object
 	if err != nil {
 		return fmt.Errorf("check personal rule candidate source revision: %w", err)
 	}
-	var sourceBody []byte
-	if err := tx.QueryRow(ctx, `SELECT body::text FROM personal_objects
-WHERE service_instance_id=$1::uuid AND owner_id=$2 AND object_type=$3 AND object_id=$4 FOR SHARE`,
-		instanceID, mutation.OwnerID, personal.ObjectTypeMemory, next.SourceMemoryID).Scan(&sourceBody); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.NewError(domain.CodeConflict, "the source memory is no longer available; create a new rule candidate")
-		}
-		return fmt.Errorf("read personal rule candidate source memory: %w", err)
-	}
 	if personal.ValidateObjectBody(personal.ObjectTypeMemory, next.SourceMemoryID, sourceBody) != nil {
 		return domain.NewError(domain.CodeInternal, "stored rule candidate source memory is invalid")
+	}
+	return nil
+}
+
+func validatePersonalSkillCandidateMutationInTx(ctx context.Context, tx pgx.Tx, instanceID string,
+	mutation personal.Mutation, objectExists bool, previousBody []byte) error {
+	var next personal.SkillCandidateBody
+	if err := json.Unmarshal(mutation.Body, &next); err != nil ||
+		personal.ValidateObjectBody(personal.ObjectTypeSkillCandidate, mutation.ObjectID, mutation.Body) != nil {
+		return domain.NewError(domain.CodeInvalidArgument, "personal skill candidate is invalid")
+	}
+	if !objectExists {
+		if next.Status != personal.SkillCandidatePending {
+			return domain.NewError(domain.CodeForbidden, "a skill candidate must pass validation and explicit approval before activation")
+		}
+		var count int
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM account_object_versions
+WHERE service_instance_id=$1::uuid AND owner_id=$2 AND object_type=$3 AND NOT is_deleted`,
+			instanceID, mutation.OwnerID, personal.ObjectTypeSkillCandidate).Scan(&count); err != nil {
+			return fmt.Errorf("count personal skill candidates: %w", err)
+		}
+		if count >= personal.MaxSkillCandidateCount {
+			return domain.NewError(domain.CodeQuotaExceeded, "personal skill candidate limit is reached")
+		}
+		return nil
+	}
+
+	var previous personal.SkillCandidateBody
+	if err := json.Unmarshal(previousBody, &previous); err != nil ||
+		personal.ValidateObjectBody(personal.ObjectTypeSkillCandidate, mutation.ObjectID, previousBody) != nil {
+		return domain.NewError(domain.CodeInternal, "stored personal skill candidate is invalid")
+	}
+	if previous.Status == personal.SkillCandidateActive {
+		return domain.NewError(domain.CodeConflict, "an active skill must be revoked and proposed again before it can change")
+	}
+	contentChanged := next.Scope != previous.Scope || next.Name != previous.Name ||
+		next.Description != previous.Description || next.Content != previous.Content
+	switch previous.Status {
+	case personal.SkillCandidatePending:
+		if contentChanged && next.Status != personal.SkillCandidatePending {
+			return domain.NewError(domain.CodeConflict, "validate the current unchanged skill candidate")
+		}
+		if next.Status != personal.SkillCandidatePending && next.Status != personal.SkillCandidateValidated {
+			return domain.NewError(domain.CodeForbidden, "a skill candidate cannot skip validation")
+		}
+	case personal.SkillCandidateValidated:
+		if contentChanged {
+			return domain.NewError(domain.CodeConflict, "a validated skill cannot change before activation; delete and propose it again")
+		}
+		if next.Status != personal.SkillCandidateValidated && next.Status != personal.SkillCandidateActive {
+			return domain.NewError(domain.CodeForbidden, "a validated skill can only be explicitly activated")
+		}
+	default:
+		return domain.NewError(domain.CodeConflict, "personal skill candidate state is invalid")
 	}
 	return nil
 }

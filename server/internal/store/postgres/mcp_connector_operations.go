@@ -176,6 +176,17 @@ func (s *Store) MarkMCPConnectorOperationDispatched(ctx context.Context, value a
 		if err := ensureNoPendingTaskWorkspacePublish(ctx, tx, value.TaskID); err != nil {
 			return err
 		}
+		if stored.Status == task.OperationDispatched {
+			bound, err := admitMCPConnectorOperationTaskPlanStepInTx(ctx, tx, stored, value.PlanRevision, value.PlanStepID)
+			if err != nil {
+				return err
+			}
+			if !bound {
+				return domain.NewError(domain.CodeConflict, "MCP connector operation is no longer prepared")
+			}
+			result = stored
+			return nil
+		}
 		if stored.Status != task.OperationPrepared {
 			return domain.NewError(domain.CodeConflict, "MCP connector operation is no longer prepared")
 		}
@@ -196,6 +207,9 @@ func (s *Store) MarkMCPConnectorOperationDispatched(ctx context.Context, value a
 			inputPending = true
 			return nil
 		}
+		if _, err := admitMCPConnectorOperationTaskPlanStepInTx(ctx, tx, stored, value.PlanRevision, value.PlanStepID); err != nil {
+			return err
+		}
 		if err := tx.QueryRow(ctx, `UPDATE task_mcp_connector_operations SET status='dispatched', updated_at=clock_timestamp()
 WHERE id=$1 AND task_id=$2 AND owner_id=$3 AND COALESCE(connector_id, 'builtin:' || builtin_service)=$4 AND operation_key=$5 AND status='prepared' RETURNING updated_at`,
 			stored.ID, stored.TaskID, stored.OwnerID, stored.ConnectorID, stored.Key).Scan(&stored.UpdatedAt); err != nil {
@@ -212,6 +226,92 @@ WHERE id=$1 AND task_id=$2 AND owner_id=$3 AND COALESCE(connector_id, 'builtin:'
 		return result, app.NewTaskInputPendingError(supersedingMessages)
 	}
 	return result, err
+}
+
+// admitMCPConnectorOperationTaskPlanStepInTx gates MCP dispatch using the
+// durable plan, Task, TaskStep, dependency settlement, and operation rows.
+// Plan selectors are caller input; they only choose which persisted step to
+// bind the already prepared operation to.
+func admitMCPConnectorOperationTaskPlanStepInTx(ctx context.Context, tx pgx.Tx, operation app.MCPConnectorOperation,
+	planRevision int64, planStepID string) (bool, error) {
+	if (planRevision == 0) != (planStepID == "") {
+		return false, domain.InvalidArgument("task_plan_step", "task plan step metadata is incomplete")
+	}
+	row, err := sqlcgen.New(tx).GetTask(ctx, sqlcgen.GetTaskParams{ID: operation.TaskID, OwnerID: operation.OwnerID})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, missingTaskError()
+	}
+	if err != nil {
+		return false, fmt.Errorf("read Task for MCP plan admission: %w", err)
+	}
+	current := rowTaskDomain(row)
+	var desiredRevision int64
+	if err := tx.QueryRow(ctx, `SELECT desired_revision FROM tasks WHERE id=$1 AND owner_id=$2`, operation.TaskID, operation.OwnerID).
+		Scan(&desiredRevision); err != nil {
+		return false, fmt.Errorf("read MCP Task desired revision: %w", err)
+	}
+	current.DesiredRevision = &desiredRevision
+	plan, err := latestTaskPlan(ctx, tx, current.ID, *current.CurrentRevision)
+	if err != nil {
+		return false, err
+	}
+	if plan == nil {
+		if planRevision != 0 || planStepID != "" {
+			return false, taskPlanStepBindingConflict(planStepReadinessPlanMissing)
+		}
+		return false, nil
+	}
+	if planRevision < 1 || planStepID == "" {
+		return false, taskPlanStepBindingConflict(planStepReadinessStepMissing)
+	}
+	if planRevision != plan.Revision {
+		return false, taskPlanStepBindingConflict(planStepReadinessPlanRevisionStale)
+	}
+	if operation.TaskRevision == nil || *operation.TaskRevision != *current.CurrentRevision || operation.TaskID != current.ID ||
+		operation.OwnerID != current.OwnerID || operation.CallID == "" || operation.ToolName == "" || len(operation.RequestHash) != 32 {
+		return false, taskPlanStepBindingConflict(planStepReadinessEvidenceMissing)
+	}
+	toolCall := app.TaskToolCallProgress{AgentSessionID: current.AgentSessionID,
+		AuthorizationVersion: current.Authorization.Version, TaskRevision: *operation.TaskRevision,
+		CallKey: operation.CallID, ToolName: operation.ToolName, RequestDigest: append([]byte(nil), operation.RequestHash...)}
+	if !validPlanStepToolCall(current, planRevision, planStepID, toolCall) {
+		return false, taskPlanStepBindingConflict(planStepReadinessEvidenceMissing)
+	}
+	fence, blocked, err := taskPlanStepBindingFenceInTx(ctx, tx, current, planRevision, planStepID,
+		toolCall.AuthorizationVersion, true)
+	if err != nil {
+		return false, err
+	}
+	if blocked != "" {
+		return false, taskPlanStepBindingConflict(blocked)
+	}
+	binding := taskPlanStepExecutionBinding{kind: planStepExecutionMCP, executionID: operation.ID,
+		agentSessionID: toolCall.AgentSessionID, callID: toolCall.CallKey, toolName: toolCall.ToolName,
+		connectorID: operation.ConnectorID, requestDigest: toolCall.RequestDigest,
+		authorizationVersion: toolCall.AuthorizationVersion}
+	if err := verifyTaskPlanStepExecutionSource(ctx, tx, fence, &binding); err != nil {
+		return false, err
+	}
+	if operation.Status == task.OperationPrepared {
+		ready, reason, err := taskPlanStepDependenciesReadyInTx(ctx, tx, fence, planStepID)
+		if err != nil {
+			return false, err
+		}
+		if !ready {
+			return false, taskPlanStepBindingConflict(reason)
+		}
+		if err := persistTaskPlanStepExecutionBindingInTx(ctx, tx, fence, planStepID, binding); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	if operation.Status == task.OperationDispatched {
+		if err := requireExistingTaskPlanStepOperationBindingInTx(ctx, tx, fence, planStepID, binding); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	return false, domain.NewError(domain.CodeConflict, "MCP connector operation is no longer dispatchable")
 }
 
 func requireMCPConnectorTaskWorkspaceSnapshot(ctx context.Context, tx pgx.Tx, value app.MCPConnectorOperation) error {

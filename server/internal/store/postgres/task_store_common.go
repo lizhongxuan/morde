@@ -160,7 +160,8 @@ func validateMessage(value conversation.Message) error {
 func validateTask(value task.Task) error {
 	validInitialStatus := value.Status == task.StatusQueued && value.WaitingReason == "" && value.CurrentStep == ""
 	validInitialClarification := value.Status == task.StatusWaitingUser && value.WaitingReason == "clarification_required" &&
-		value.FileDeliveryIntent == task.FileDeliveryUnclear && domain.ValidStepID(value.CurrentStep)
+		(value.FileDeliveryIntent == task.FileDeliveryUnclear || value.FileDeliveryIntent == task.FileDeliveryNone) &&
+		domain.ValidStepID(value.CurrentStep)
 	if !domain.ValidTaskID(value.ID) || !domain.ValidUserID(value.OwnerID) ||
 		!domain.ValidConversationID(value.ConversationID) || (value.HostID != "" && !domain.ValidHostID(value.HostID)) ||
 		value.ModelID == "" || strings.TrimSpace(value.Objective) == "" || (!validInitialStatus && !validInitialClarification) ||
@@ -201,8 +202,8 @@ func normalizeNewTask(value task.Task) task.Task {
 	if value.QueuePriority == "" {
 		value.QueuePriority = task.QueuePriorityNormal
 	}
-	if !value.FileDeliveryIntent.Valid() {
-		value.FileDeliveryIntent = app.ClassifyFileDeliveryIntent(value.Objective, value.WorkspaceID != "")
+	if value.FileDeliveryIntent == "" {
+		value.FileDeliveryIntent = task.FileDeliveryNone
 	}
 	if value.WorkspaceCheckpointRevision == nil && value.InputRevision != nil {
 		checkpoint := *value.InputRevision

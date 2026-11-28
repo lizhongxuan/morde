@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"strconv"
@@ -28,6 +29,7 @@ type TaskService interface {
 	CommitConversationMessageUpload(context.Context, identity.Principal, string, string, string, string, string) (conversation.Message, error)
 	AssociateConversationMessageAttachment(context.Context, identity.Principal, string, string, string, string, string) error
 	RetryConversationMessageProcessing(context.Context, identity.Principal, string, string, string, string, string) error
+	GetConversationMessageRetryEligibility(context.Context, identity.Principal, string, string, string, string) (app.ConversationMessageRetryEligibility, error)
 	List(context.Context, identity.Principal, app.TaskListRequest) (app.TaskPage, error)
 	ListConversationActiveTasks(context.Context, identity.Principal, string, string, app.PageRequest) (app.TaskPage, error)
 	ListConversationTasks(context.Context, identity.Principal, string, string, app.ConversationTaskView, app.PageRequest) (app.TaskPage, error)
@@ -35,12 +37,16 @@ type TaskService interface {
 	RequestAction(context.Context, identity.Principal, string, task.Action, task.Status, string) (app.TaskActionResult, error)
 	RetryBatchItem(context.Context, identity.Principal, string, string, string) error
 	RespondToPendingRequest(context.Context, identity.Principal, string, string, int64, task.PendingDecision, string) error
-	AnswerClarificationRequest(context.Context, identity.Principal, string, string, int64, string, string) error
+	AnswerClarificationRequest(context.Context, identity.Principal, string, string, int64, string, task.FileDeliveryIntent, string) error
 	ListEvents(context.Context, identity.Principal, string, int64, int32) (app.TaskEventPage, error)
 }
 
 type TaskApprovalQueryService interface {
 	ListTaskApprovals(context.Context, identity.Principal, string, app.PageRequest) (app.TaskApprovalPage, error)
+}
+
+type TaskRequirementConfirmationService interface {
+	ConfirmTaskRequirementManifest(context.Context, identity.Principal, string, app.TaskRequirementManifestConfirmationInput) (app.TaskRequirementManifestConfirmation, error)
 }
 
 type TaskFileFetchQueryService interface {
@@ -53,6 +59,10 @@ type TaskStepDetailService interface {
 
 type TaskStepRetryService interface {
 	RetryStep(context.Context, identity.Principal, string, string, int64, int64, string) (app.TaskStepRetryResult, error)
+}
+
+type TaskModelRecoveryRetryService interface {
+	RetryTaskModelRecovery(context.Context, identity.Principal, string, int64, int64, string) (app.TaskDetails, error)
 }
 
 type TaskRevisionFencedActionService interface {
@@ -113,6 +123,12 @@ type taskApprovalSnapshotResponse struct {
 	RespondedAt             *time.Time                      `json:"responded_at"`
 	CreatedAt               time.Time                       `json:"created_at"`
 	MediaPreviewOperationID string                          `json:"media_preview_operation_id,omitempty"`
+	// E05 evidence fields; cost pointers are null when unknown, never 0.
+	EvidencePointer      string `json:"evidence_pointer,omitempty"`
+	ThisCostMicros       *int64 `json:"this_cost_micros"`
+	TotalCostMicros      *int64 `json:"total_cost_micros"`
+	TriggerRule          string `json:"trigger_rule,omitempty"`
+	RejectionConsequence string `json:"rejection_consequence,omitempty"`
 }
 
 type taskSummaryResponse struct {
@@ -131,6 +147,7 @@ type taskSummaryResponse struct {
 	ModelID                     string                    `json:"model_id"`
 	Objective                   string                    `json:"objective"`
 	Status                      task.Status               `json:"status"`
+	WaitingReason               *string                   `json:"waiting_reason"`
 	QueuePriority               task.QueuePriority        `json:"queue_priority"`
 	CurrentStep                 *string                   `json:"current_step"`
 	StepCount                   int64                     `json:"step_count"`
@@ -175,24 +192,33 @@ type taskValidationResponse struct {
 
 type taskResponse struct {
 	taskSummaryResponse
-	EventSequence          int64                             `json:"event_sequence"`
-	Result                 *string                           `json:"result"`
-	ValidationDetail       *app.TaskValidationEvidenceRecord `json:"validation_detail,omitempty"`
-	CurrentRevisionStarted *bool                             `json:"current_revision_started,omitempty"`
-	ResultMessagePending   bool                              `json:"result_message_pending,omitempty"`
-	ResultMessagePublished bool                              `json:"result_message_published,omitempty"`
-	WaitingReason          *string                           `json:"waiting_reason"`
-	Steps                  []taskStepResponse                `json:"steps"`
-	Agents                 []taskAgentResponse               `json:"agents,omitempty"`
-	BatchItems             []taskBatchItemResponse           `json:"batch_items"`
-	Artifacts              []taskArtifactResponse            `json:"artifacts"`
-	PendingRequest         *taskPendingRequestResponse       `json:"pending_request"`
-	ClarificationRequest   *taskClarificationRequestResponse `json:"clarification_request"`
-	StopRequest            *taskStopRequestResponse          `json:"stop_request"`
-	AssistantMessage       *taskAssistantMessageResponse     `json:"assistant_message"`
-	FinishedAt             *time.Time                        `json:"finished_at"`
-	Plan                   *task.Plan                        `json:"plan,omitempty"`
-	Billing                *taskBillingResponse              `json:"billing,omitempty"`
+	EventSequence                   int64                                  `json:"event_sequence"`
+	Attention                       *app.TaskAttention                     `json:"attention"`
+	Result                          *string                                `json:"result"`
+	ValidationDetail                *app.TaskValidationEvidenceRecord      `json:"validation_detail,omitempty"`
+	CurrentRevisionStarted          *bool                                  `json:"current_revision_started,omitempty"`
+	ResultMessagePending            bool                                   `json:"result_message_pending,omitempty"`
+	ResultMessagePublished          bool                                   `json:"result_message_published,omitempty"`
+	WaitingReason                   *string                                `json:"waiting_reason"`
+	Steps                           []taskStepResponse                     `json:"steps"`
+	Agents                          []taskAgentResponse                    `json:"agents,omitempty"`
+	BatchItems                      []taskBatchItemResponse                `json:"batch_items"`
+	Artifacts                       []taskArtifactResponse                 `json:"artifacts"`
+	PendingRequest                  *taskPendingRequestResponse            `json:"pending_request"`
+	ClarificationRequest            *taskClarificationRequestResponse      `json:"clarification_request"`
+	StopRequest                     *taskStopRequestResponse               `json:"stop_request"`
+	AssistantMessage                *taskAssistantMessageResponse          `json:"assistant_message"`
+	FinishedAt                      *time.Time                             `json:"finished_at"`
+	Plan                            *task.Plan                             `json:"plan,omitempty"`
+	PlanEventSequence               *int64                                 `json:"plan_event_sequence,omitempty"`
+	RequirementManifestConfirmation *taskRequirementManifestStatusResponse `json:"requirement_manifest_confirmation,omitempty"`
+	Billing                         *taskBillingResponse                   `json:"billing,omitempty"`
+}
+
+type taskRequirementManifestStatusResponse struct {
+	ManifestDigest               string     `json:"manifest_digest"`
+	RequirementsCompleteAttested bool       `json:"requirements_complete_attested"`
+	AttestedAt                   *time.Time `json:"attested_at,omitempty"`
 }
 
 type taskFileFetchResponse struct {
@@ -275,6 +301,13 @@ type taskPendingRequestResponse struct {
 	Disclosures             taskApprovalDisclosuresResponse `json:"disclosures"`
 	ExpiresAt               *time.Time                      `json:"expires_at"`
 	MediaPreviewOperationID string                          `json:"media_preview_operation_id,omitempty"`
+	// E05 evidence fields. EvidencePointer is "step:<step-id>"; cost
+	// pointers are null when no trusted source exists (unknown, never 0).
+	EvidencePointer      string `json:"evidence_pointer,omitempty"`
+	ThisCostMicros       *int64 `json:"this_cost_micros"`
+	TotalCostMicros      *int64 `json:"total_cost_micros"`
+	TriggerRule          string `json:"trigger_rule,omitempty"`
+	RejectionConsequence string `json:"rejection_consequence,omitempty"`
 }
 
 type taskApprovalDisclosureResponse struct {
@@ -383,6 +416,7 @@ type taskClarificationRequestResponse struct {
 	ID       string `json:"id"`
 	Version  int64  `json:"version"`
 	Question string `json:"question"`
+	CallID   string `json:"call_id"`
 }
 
 func validTaskText(value string, maxRunes int) bool {
@@ -408,6 +442,26 @@ func pendingRequestResponseStatus(pending *task.PendingRequest) string {
 		return "expired"
 	}
 	return ""
+}
+
+func validTaskApprovalEvidenceFields(pending *task.PendingRequest) bool {
+	if pending.EvidencePointer != "" {
+		stepID, ok := strings.CutPrefix(pending.EvidencePointer, "step:")
+		if !ok || !domain.ValidStepID(stepID) {
+			return false
+		}
+	}
+	if !task.ValidApprovalTriggerRule(pending.TriggerRule) {
+		return false
+	}
+	if pending.RejectionConsequence != "" && !validTaskText(pending.RejectionConsequence, 512) {
+		return false
+	}
+	if (pending.ThisCostMicros != nil && *pending.ThisCostMicros < 0) ||
+		(pending.TotalCostMicros != nil && *pending.TotalCostMicros < 0) {
+		return false
+	}
+	return true
 }
 
 func validTaskAgentID(value string) bool {
@@ -511,15 +565,16 @@ type taskArtifactResponse struct {
 }
 
 type submitTaskRequest struct {
-	HostID          string             `json:"host_id"`
-	WorkspaceID     string             `json:"workspace_id"`
-	InputRevision   *int64             `json:"input_revision"`
-	MCPConnectorIDs []string           `json:"mcp_connector_ids"`
-	ApplicationID   string             `json:"application_id"`
-	ModelID         string             `json:"model_id"`
-	Objective       string             `json:"objective"`
-	Budget          *taskBudgetRequest `json:"budget"`
-	BatchItems      []batchItemRequest `json:"batch_items"`
+	HostID             string             `json:"host_id"`
+	WorkspaceID        string             `json:"workspace_id"`
+	InputRevision      *int64             `json:"input_revision"`
+	MCPConnectorIDs    []string           `json:"mcp_connector_ids"`
+	ApplicationID      string             `json:"application_id"`
+	ModelID            string             `json:"model_id"`
+	Objective          string             `json:"objective"`
+	FileDeliveryIntent json.RawMessage    `json:"file_delivery_intent"`
+	Budget             *taskBudgetRequest `json:"budget"`
+	BatchItems         []batchItemRequest `json:"batch_items"`
 }
 
 type taskBudgetRequest struct {
@@ -529,8 +584,9 @@ type taskBudgetRequest struct {
 }
 
 type batchItemRequest struct {
-	Key   string `json:"key"`
-	Input string `json:"input"`
+	Key                string          `json:"key"`
+	Input              string          `json:"input"`
+	FileDeliveryIntent json.RawMessage `json:"file_delivery_intent"`
 }
 
 type taskActionRequest struct {
@@ -555,9 +611,25 @@ func parseOptionalTaskActionRevision(raw json.RawMessage) (*int64, bool) {
 }
 
 type taskInputRequest struct {
-	ClarificationID      string `json:"clarification_id"`
-	ClarificationVersion int64  `json:"clarification_version"`
-	Answer               string `json:"answer"`
+	ClarificationID      string          `json:"clarification_id"`
+	ClarificationVersion int64           `json:"clarification_version"`
+	Answer               string          `json:"answer"`
+	FileDeliveryIntent   json.RawMessage `json:"file_delivery_intent"`
+}
+
+func parseFileDeliveryIntentRequest(raw json.RawMessage, allowUnclear bool) (task.FileDeliveryIntent, bool) {
+	if raw == nil {
+		return "", true
+	}
+	var value string
+	if json.Unmarshal(raw, &value) != nil {
+		return "", false
+	}
+	intent := task.FileDeliveryIntent(value)
+	if !intent.Valid() || !allowUnclear && intent == task.FileDeliveryUnclear {
+		return "", false
+	}
+	return intent, true
 }
 
 type taskApprovalResponseRequest struct {
@@ -568,6 +640,24 @@ type taskApprovalResponseRequest struct {
 type taskStepRetryRequest struct {
 	ExpectedTaskRevision int64 `json:"expected_task_revision"`
 	ExpectedAttempt      int64 `json:"expected_attempt"`
+}
+
+type taskRequirementManifestConfirmationRequest struct {
+	TaskRevision                 int64 `json:"expected_task_revision"`
+	PlanRevision                 int64 `json:"expected_plan_revision"`
+	PlanEventSequence            int64 `json:"expected_plan_event_sequence"`
+	RequirementsCompleteAttested bool  `json:"requirements_complete_attested"`
+}
+
+type taskRequirementManifestConfirmationResponse struct {
+	TaskID                       string     `json:"task_id"`
+	TaskRevision                 int64      `json:"task_revision"`
+	PlanRevision                 int64      `json:"plan_revision"`
+	PlanEventSequence            int64      `json:"plan_event_sequence"`
+	ManifestDigest               string     `json:"manifest_digest"`
+	RequirementsCompleteAttested bool       `json:"requirements_complete_attested"`
+	AttestedAt                   *time.Time `json:"attested_at,omitempty"`
+	ConfirmedAt                  time.Time  `json:"confirmed_at"`
 }
 
 func (h *api) registerTasks(group *gin.RouterGroup, service TaskService) {
@@ -581,11 +671,17 @@ func (h *api) registerTasks(group *gin.RouterGroup, service TaskService) {
 	group.POST("/tasks", h.submitTask(service))
 	group.DELETE("/tasks/:id/mcp-connectors/:connector_id", h.revokeTaskMCPConnectorGrant(service))
 	group.GET("/tasks/:id", h.getTask(service))
+	if confirmationService, ok := service.(TaskRequirementConfirmationService); ok {
+		group.POST("/tasks/:id/requirement-manifest/confirm", h.confirmTaskRequirementManifest(confirmationService))
+	}
 	if detailService, ok := service.(TaskStepDetailService); ok {
 		group.GET("/tasks/:id/steps/:step_id", h.getTaskStepDetail(detailService))
 	}
 	if retryService, ok := service.(TaskStepRetryService); ok {
 		group.POST("/tasks/:id/steps/:step_id/retries", h.retryTaskStep(retryService))
+	}
+	if recoveryService, ok := service.(TaskModelRecoveryRetryService); ok {
+		group.POST("/tasks/:id/model-recovery-retries", h.retryTaskModelRecovery(recoveryService))
 	}
 	if fetchService, ok := service.(TaskFileFetchQueryService); ok {
 		group.GET("/tasks/:id/file-fetches/:fetch_id", h.getTaskFileFetch(fetchService))
@@ -596,6 +692,118 @@ func (h *api) registerTasks(group *gin.RouterGroup, service TaskService) {
 	group.POST("/tasks/:id/inputs", h.addTaskInput(service))
 	group.POST("/tasks/:id/approvals/:approval_id/responses", h.respondToTaskApproval(service))
 	group.GET("/tasks/:id/events", h.streamTaskEvents(service))
+}
+
+type taskModelRecoveryRetryRequest struct {
+	ExpectedRevision      int64 `json:"expected_revision"`
+	ExpectedEventSequence int64 `json:"expected_event_sequence"`
+}
+
+func (h *api) retryTaskModelRecovery(service TaskModelRecoveryRetryService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		principal, ok := principalFrom(c)
+		if !ok {
+			unauthenticated(c)
+			return
+		}
+		taskID, ok := safeID(c, "id", domain.ValidTaskID)
+		if !ok {
+			return
+		}
+		var request taskModelRecoveryRetryRequest
+		if !decodeStrictTaskJSON(c, &request) {
+			return
+		}
+		if request.ExpectedRevision < 0 || request.ExpectedEventSequence < 0 {
+			writeError(c, domain.InvalidArgument("task_model_recovery", "retry request is invalid"))
+			return
+		}
+		details, err := service.RetryTaskModelRecovery(c.Request.Context(), principal, taskID,
+			request.ExpectedRevision, request.ExpectedEventSequence, c.GetHeader("Idempotency-Key"))
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		response, err := toTaskResponse(details)
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		c.JSON(http.StatusAccepted, response)
+	}
+}
+
+func (h *api) confirmTaskRequirementManifest(service TaskRequirementConfirmationService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request.URL.RawQuery != "" {
+			writeError(c, domain.InvalidArgument("request", "task requirement confirmation does not accept a query string"))
+			return
+		}
+		principal, ok := principalFrom(c)
+		if !ok {
+			unauthenticated(c)
+			return
+		}
+		taskID, ok := safeID(c, "id", domain.ValidTaskID)
+		if !ok {
+			return
+		}
+		var request taskRequirementManifestConfirmationRequest
+		if !decodeStrictJSON(c, &request) {
+			return
+		}
+		ifMatchValues := c.Request.Header.Values("If-Match")
+		manifestDigest, validIfMatch := "", false
+		if len(ifMatchValues) == 1 {
+			manifestDigest, validIfMatch = taskRequirementManifestDigestIfMatch(ifMatchValues[0])
+		}
+		if !validIfMatch {
+			writeError(c, domain.InvalidArgument("If-Match", "a strong quoted manifest SHA-256 precondition is required"))
+			return
+		}
+		idempotencyKey := c.GetHeader("Idempotency-Key")
+		if idempotencyKey == "" {
+			writeError(c, domain.InvalidArgument("Idempotency-Key", "an idempotency key is required"))
+			return
+		}
+		confirmation, err := service.ConfirmTaskRequirementManifest(c.Request.Context(), principal, taskID,
+			app.TaskRequirementManifestConfirmationInput{TaskRevision: request.TaskRevision, PlanRevision: request.PlanRevision,
+				PlanEventSequence: request.PlanEventSequence, ManifestDigest: manifestDigest,
+				RequirementsCompleteAttested: request.RequirementsCompleteAttested, IdempotencyKey: idempotencyKey})
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		if !confirmation.RequirementsCompleteAttested || confirmation.AttestedAt == nil ||
+			confirmation.ManifestDigest != manifestDigest || confirmation.TaskID != taskID ||
+			confirmation.TaskRevision != request.TaskRevision || confirmation.PlanRevision != request.PlanRevision ||
+			confirmation.PlanEventSequence != request.PlanEventSequence {
+			writeError(c, domain.NewError(domain.CodeInternal, "task requirement attestation is invalid"))
+			return
+		}
+		c.Header("Cache-Control", "no-store")
+		c.Header("Pragma", "no-cache")
+		c.Header("Referrer-Policy", "no-referrer")
+		c.Header("ETag", `"`+confirmation.ManifestDigest+`"`)
+		c.JSON(http.StatusOK, taskRequirementManifestConfirmationResponse{
+			TaskID: confirmation.TaskID, TaskRevision: confirmation.TaskRevision, PlanRevision: confirmation.PlanRevision,
+			PlanEventSequence: confirmation.PlanEventSequence, ManifestDigest: confirmation.ManifestDigest,
+			RequirementsCompleteAttested: confirmation.RequirementsCompleteAttested,
+			AttestedAt:                   confirmation.AttestedAt, ConfirmedAt: confirmation.ConfirmedAt,
+		})
+	}
+}
+
+func taskRequirementManifestDigestIfMatch(value string) (string, bool) {
+	if len(value) != 66 || value[0] != '"' || value[len(value)-1] != '"' {
+		return "", false
+	}
+	digest := value[1 : len(value)-1]
+	decoded, err := hex.DecodeString(digest)
+	if err != nil || len(decoded) != 32 || hex.EncodeToString(decoded) != digest {
+		return "", false
+	}
+	return digest, true
 }
 
 func (h *api) getTaskStepDetail(service TaskStepDetailService) gin.HandlerFunc {
@@ -924,8 +1132,13 @@ func (h *api) addTaskInput(service TaskService) gin.HandlerFunc {
 			writeError(c, domain.InvalidArgument("input", "a clarification id, positive version, and answer are required"))
 			return
 		}
+		fileIntent, valid := parseFileDeliveryIntentRequest(request.FileDeliveryIntent, false)
+		if !valid {
+			writeError(c, domain.InvalidArgument("file_delivery_intent", "file delivery intent must be none or required"))
+			return
+		}
 		if err := service.AnswerClarificationRequest(c.Request.Context(), principal, taskID, request.ClarificationID,
-			request.ClarificationVersion, request.Answer, c.GetHeader("Idempotency-Key")); err != nil {
+			request.ClarificationVersion, request.Answer, fileIntent, c.GetHeader("Idempotency-Key")); err != nil {
 			writeError(c, err)
 			return
 		}
@@ -986,19 +1199,29 @@ func (h *api) submitTask(service TaskService) gin.HandlerFunc {
 		if !decodeStrictTaskJSON(c, &request) {
 			return
 		}
+		fileIntent, valid := parseFileDeliveryIntentRequest(request.FileDeliveryIntent, true)
+		if !valid {
+			writeError(c, domain.InvalidArgument("file_delivery_intent", "file delivery intent is invalid"))
+			return
+		}
 		budget, ok := requestBudget(c, request.Budget)
 		if !ok {
 			return
 		}
 		batchItems := make([]app.BatchItemInput, 0, len(request.BatchItems))
 		for _, item := range request.BatchItems {
-			batchItems = append(batchItems, app.BatchItemInput{Key: item.Key, Input: item.Input})
+			itemIntent, valid := parseFileDeliveryIntentRequest(item.FileDeliveryIntent, true)
+			if !valid {
+				writeError(c, domain.InvalidArgument("batch_items.file_delivery_intent", "batch item file delivery intent is invalid"))
+				return
+			}
+			batchItems = append(batchItems, app.BatchItemInput{Key: item.Key, Input: item.Input, FileDeliveryIntent: itemIntent})
 		}
 		result, err := service.Submit(c.Request.Context(), principal, app.SubmitTaskCommand{
 			HostID: request.HostID, WorkspaceID: request.WorkspaceID, InputRevision: request.InputRevision,
 			MCPConnectorIDs: request.MCPConnectorIDs,
 			ApplicationID:   request.ApplicationID, ModelID: request.ModelID,
-			Objective: request.Objective, Budget: budget, BatchItems: batchItems,
+			Objective: request.Objective, FileDeliveryIntent: fileIntent, Budget: budget, BatchItems: batchItems,
 			IdempotencyKey: c.GetHeader("Idempotency-Key"),
 		})
 		if err != nil {
@@ -1094,6 +1317,7 @@ func toTaskApprovalResponse(value app.TaskApproval) (taskApprovalResponse, error
 		value.TaskUpdatedAt.IsZero() || !domain.ValidPendingRequestID(request.ID) || request.TaskID != value.TaskID || request.Version < 1 ||
 		request.Kind != "approval" || (status != "pending" && status != "approved" && status != "rejected" && status != "cancelled" && status != "expired") ||
 		!validTaskText(request.Title, 512) || !validTaskText(request.Object, 512) || !validTaskText(request.Content, 512) || !validTaskText(request.Impact, 512) ||
+		!validTaskApprovalEvidenceFields(&request) ||
 		(request.ExpiresAt != nil && request.ExpiresAt.IsZero()) || (request.RespondedAt != nil && request.RespondedAt.IsZero()) ||
 		(request.MediaPreviewOperationID != "" && !domain.ValidOperationID(request.MediaPreviewOperationID)) {
 		return taskApprovalResponse{}, domain.NewError(domain.CodeInternal, "task approval query returned an invalid request")
@@ -1113,7 +1337,10 @@ func toTaskApprovalResponse(value app.TaskApproval) (taskApprovalResponse, error
 		Approval: taskApprovalSnapshotResponse{ID: request.ID, Version: request.Version, Status: status, Decision: request.Decision,
 			Kind: request.Kind, Title: request.Title, Object: request.Object, Content: request.Content, Impact: request.Impact,
 			Disclosures: unknownTaskApprovalDisclosures(), ExpiresAt: request.ExpiresAt, RespondedAt: request.RespondedAt,
-			CreatedAt: request.CreatedAt, MediaPreviewOperationID: request.MediaPreviewOperationID},
+			CreatedAt: request.CreatedAt, MediaPreviewOperationID: request.MediaPreviewOperationID,
+			EvidencePointer: request.EvidencePointer, ThisCostMicros: request.ThisCostMicros,
+			TotalCostMicros: request.TotalCostMicros, TriggerRule: request.TriggerRule,
+			RejectionConsequence: request.RejectionConsequence},
 	}, nil
 }
 
@@ -1246,7 +1473,8 @@ func toTaskSummaryResponseWithK2(value task.Task, projection app.TaskK2Projectio
 		WorkspaceID: value.WorkspaceID, InputRevision: value.InputRevision, CurrentRevision: value.CurrentRevision,
 		DesiredRevision: value.DesiredRevision, WorkspaceCheckpointRevision: value.WorkspaceCheckpointRevision,
 		ApplicationID: value.ApplicationID, ConversationID: value.ConversationID,
-		ModelID: value.ModelID, Objective: value.Objective, Status: value.Status, QueuePriority: priority, CurrentStep: stringPointer(value.CurrentStep),
+		ModelID: value.ModelID, Objective: value.Objective, Status: value.Status, WaitingReason: stringPointer(value.WaitingReason),
+		QueuePriority: priority, CurrentStep: stringPointer(value.CurrentStep),
 		StepCount: value.StepCount, CompletedStepCount: value.CompletedStepCount,
 		Budget: taskBudgetResponse(value.Budget), Usage: taskUsageResponse{
 			ActiveSeconds: value.Usage.ActiveSeconds, ToolCalls: value.Usage.ToolCalls, ModelTokens: value.Usage.ModelTokens,
@@ -1358,7 +1586,8 @@ func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 	if err != nil {
 		return taskResponse{}, err
 	}
-	if value.Task.EventSequence < 0 || (value.CurrentRevisionStarted != nil && value.Task.CurrentRevision == nil) {
+	if value.Task.EventSequence < 0 || !app.ValidTaskAttention(value.Attention, value.Task.EventSequence) ||
+		(value.CurrentRevisionStarted != nil && value.Task.CurrentRevision == nil) {
 		return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 	}
 	if value.Plan != nil && (value.Plan.Validate() != nil || value.Task.CurrentRevision == nil || value.Plan.TaskRevision != *value.Task.CurrentRevision) {
@@ -1369,11 +1598,22 @@ func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 		return taskResponse{}, err
 	}
 	response := taskResponse{
-		taskSummaryResponse: summary, EventSequence: value.Task.EventSequence,
+		taskSummaryResponse: summary, EventSequence: value.Task.EventSequence, Attention: value.Attention,
 		Result: stringPointer(value.Task.Result), CurrentRevisionStarted: value.CurrentRevisionStarted, ResultMessagePending: value.ResultMessagePending,
 		ResultMessagePublished: value.ResultMessagePublished, WaitingReason: stringPointer(value.Task.WaitingReason),
 		Steps: make([]taskStepResponse, 0, len(value.Steps)), Agents: make([]taskAgentResponse, 0, len(value.Agents)), BatchItems: make([]taskBatchItemResponse, 0, len(value.BatchItems)),
-		Artifacts: make([]taskArtifactResponse, 0, len(value.Artifacts)), FinishedAt: value.Task.FinishedAt, Plan: value.Plan, Billing: billing,
+		Artifacts: make([]taskArtifactResponse, 0, len(value.Artifacts)), FinishedAt: value.Task.FinishedAt, Plan: value.Plan,
+		PlanEventSequence: value.PlanEventSequence, Billing: billing,
+	}
+	if value.RequirementManifestConfirmation != nil {
+		if value.Plan == nil || value.Plan.RequirementManifest == nil || !value.RequirementManifestConfirmation.RequirementsCompleteAttested ||
+			value.RequirementManifestConfirmation.ManifestDigest != value.Plan.RequirementManifest.Digest || value.RequirementManifestConfirmation.AttestedAt == nil {
+			return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
+		}
+		response.RequirementManifestConfirmation = &taskRequirementManifestStatusResponse{
+			ManifestDigest:               value.RequirementManifestConfirmation.ManifestDigest,
+			RequirementsCompleteAttested: true, AttestedAt: value.RequirementManifestConfirmation.AttestedAt,
+		}
 	}
 	if evidence := value.ValidationEvidence; evidence != nil {
 		if value.Task.CurrentRevision == nil || evidence.TaskRevision != *value.Task.CurrentRevision || evidence.EventSequence > value.Task.EventSequence ||
@@ -1388,7 +1628,7 @@ func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 		if !domain.ValidMessageID(message.ID) || !domain.ValidConversationID(message.ConversationID) ||
 			message.ConversationID != value.Task.ConversationID || message.TaskID != value.Task.ID ||
 			(message.Sequence < 1 && status == "completed") || message.Sequence < 0 || message.Role != conversation.RoleAssistant || len(message.Content) == 0 ||
-			len(message.Content) > app.MaxAssistantMessageBytes || !utf8.ValidString(message.Content) ||
+			len(message.Content) > app.MaxAssistantReplyBytes || !utf8.ValidString(message.Content) ||
 			strings.ContainsRune(message.Content, '\x00') || message.CreatedAt.IsZero() ||
 			(assistant.TaskRevision != nil && *assistant.TaskRevision < 0) ||
 			(assistant.ResultEventSequence != nil && (*assistant.ResultEventSequence < 1 || assistant.TaskRevision == nil)) {
@@ -1422,6 +1662,7 @@ func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 				(pending.ExpiresAt != nil && pending.ExpiresAt.IsZero()) ||
 				(pending.MediaPreviewOperationID != "" && !domain.ValidOperationID(pending.MediaPreviewOperationID)) ||
 				!validTaskText(pending.Title, 512) || !validTaskText(pending.Object, 512) || !validTaskText(pending.Content, 512) || !validTaskText(pending.Impact, 512) ||
+				!validTaskApprovalEvidenceFields(pending) ||
 				!validTaskApprovalDisclosures(disclosures) {
 				return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 			}
@@ -1429,6 +1670,9 @@ func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 				ID: pending.ID, Version: pending.Version, Status: pendingStatus, Kind: pending.Kind, Title: pending.Title,
 				Object: pending.Object, Content: pending.Content, Impact: pending.Impact,
 				Disclosures: disclosures, ExpiresAt: pending.ExpiresAt, MediaPreviewOperationID: pending.MediaPreviewOperationID,
+				EvidencePointer: pending.EvidencePointer, ThisCostMicros: pending.ThisCostMicros,
+				TotalCostMicros: pending.TotalCostMicros, TriggerRule: pending.TriggerRule,
+				RejectionConsequence: pending.RejectionConsequence,
 			}
 		}
 	}
@@ -1436,7 +1680,11 @@ func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 		if clarification.Status != task.ClarificationPending {
 			continue
 		}
-		if value.Task.Status != task.StatusWaitingUser || value.Task.WaitingReason != "clarification_required" ||
+		routeFileDeliveryClarification := clarification.CallID == task.RouteFileDeliveryIntentClarificationCallID
+		waitingStatusValid := value.Task.Status == task.StatusWaitingUser && value.Task.WaitingReason == "clarification_required"
+		routeStatusValid := routeFileDeliveryClarification && (value.Task.Status == task.StatusPausing || value.Task.Status == task.StatusPaused) &&
+			value.Task.WaitingReason == ""
+		if (!waitingStatusValid && !routeStatusValid) ||
 			!domain.ValidPendingRequestID(clarification.ID) || clarification.TaskID != value.Task.ID || clarification.Version < 1 ||
 			!domain.ValidStepID(clarification.ModelStepID) || clarification.CallID == "" || len(clarification.CallID) > 256 ||
 			!validTaskText(clarification.Question, 4096) || clarification.Answer != "" || clarification.RespondedAt != nil {
@@ -1446,7 +1694,7 @@ func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 			return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 		}
 		response.ClarificationRequest = &taskClarificationRequestResponse{
-			ID: clarification.ID, Version: clarification.Version, Question: clarification.Question,
+			ID: clarification.ID, Version: clarification.Version, Question: clarification.Question, CallID: clarification.CallID,
 		}
 	}
 	if stop := value.StopRequest; stop != nil {

@@ -321,7 +321,6 @@ VALUES ($1,$2,$3,$3,$4,$5,0,'applied')`, oldRevisionMessageID, oldRevision.ID, f
 		{&staleDigest, "review bound to different bytes"},
 		{&oldRevision, "current revision one result"},
 		{&passed, "current result with pass evidence"},
-		{&failed, "current result with fail evidence"},
 	} {
 		if !f.complete(t, item.task, item.content) {
 			t.Fatalf("result was not queued for task %s", item.task.ID)
@@ -334,8 +333,24 @@ VALUES ($1,$2,$3,$3,$4,$5,0,'applied')`, oldRevisionMessageID, oldRevision.ID, f
 	seedConversationResultValidationReview(t, f, oldRevision, 0, oldRevision.EventSequence+100, oldDigest[:], app.TaskValidationPass)
 	passedDigest := sha256.Sum256([]byte(passed.Content))
 	seedConversationResultValidationReview(t, f, passed, passed.TaskRevision, passed.EventSequence, passedDigest[:], app.TaskValidationPass)
-	failedDigest := sha256.Sum256([]byte(failed.Content))
-	seedConversationResultValidationReview(t, f, failed, failed.TaskRevision, failed.EventSequence, failedDigest[:], app.TaskValidationFail)
+	// The failed task stays queued, so the batch is still pending; queue it
+	// explicitly to publish the four reviewed results first.
+	var pendingBatchID string
+	if err := f.store.pool.QueryRow(ctx, `SELECT message_id FROM conversation_result_batches WHERE state='pending'`).Scan(&pendingBatchID); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.WithTx(ctx, func(tx pgx.Tx) error {
+		queued, err := enqueueConversationResultReviewInTx(ctx, tx, pendingBatchID)
+		if err != nil {
+			return err
+		}
+		if !queued {
+			return fmt.Errorf("pending result batch was not queued")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 	f.runNextReview(t)
 
 	var messageID, content string
@@ -352,13 +367,15 @@ VALUES ($1,$2,$3,$3,$4,$5,0,'applied')`, oldRevisionMessageID, oldRevision.ID, f
 		{noEvidence, app.TaskValidationPending},
 		{staleDigest, app.TaskValidationPending},
 		{oldRevision, app.TaskValidationPending},
-		{passed, app.TaskValidationPass},
-		{failed, app.TaskValidationFail},
+		{passed, app.TaskValidationPending},
 	} {
 		want := fmt.Sprintf("- %s r%d：%s", check.task.ID, check.task.TaskRevision, check.state)
 		if !strings.Contains(content, want) {
 			t.Errorf("persisted result receipt missing current state %q: %q", want, content)
 		}
+	}
+	if strings.Contains(content, failed.ID) {
+		t.Errorf("published receipt must not mention the failed task: %q", content)
 	}
 	if !strings.HasPrefix(content, "结果摘要（主助手整理，不代表独立验收）：\n") ||
 		!strings.Contains(content, "Task 执行状态：completed\n服务端验收状态（当前修订）：") {
@@ -367,6 +384,60 @@ VALUES ($1,$2,$3,$3,$4,$5,0,'applied')`, oldRevisionMessageID, oldRevision.ID, f
 	var receiptCount int
 	if err := f.store.pool.QueryRow(ctx, `SELECT count(*) FROM conversation_messages WHERE id=$1 AND role='assistant'`, messageID).Scan(&receiptCount); err != nil || receiptCount != 1 {
 		t.Fatalf("receipt count=%d err=%v; want one persisted receipt", receiptCount, err)
+	}
+	// A failed review must be reported in the conversation rather than hidden.
+	if !f.complete(t, &failed, "current result with fail evidence") {
+		t.Fatalf("result was not queued for task %s", failed.ID)
+	}
+	failedDigest := sha256.Sum256([]byte(failed.Content))
+	seedConversationResultValidationReview(t, f, failed, failed.TaskRevision, failed.EventSequence, failedDigest[:], app.TaskValidationFail)
+	f.runNextReview(t)
+	var failedContent string
+	if err := f.store.pool.QueryRow(ctx, `SELECT message.content FROM conversation_result_batches batch
+JOIN conversation_messages message ON message.id=batch.published_message_id
+JOIN conversation_result_sources source ON source.batch_message_id=batch.message_id
+WHERE source.task_id=$1 AND batch.state='published'`, failed.ID).Scan(&failedContent); err != nil {
+		t.Fatalf("failed validation was not delivered: %v", err)
+	}
+	if !strings.Contains(failedContent, fmt.Sprintf("- %s r%d：pending", failed.ID, failed.TaskRevision)) ||
+		strings.Contains(failedContent, "FAIL（验证未通过") {
+		t.Fatalf("unbound failed validation should remain pending: %q", failedContent)
+	}
+}
+
+func TestConversationResultReviewHidesUnboundValidationStates(t *testing.T) {
+	f := newResultAggregationFixture(t)
+	ctx := context.Background()
+	passed := f.createTask(t, f.ownerID, "passing result")
+	failed := f.createTask(t, f.ownerID, "failing result")
+	if !f.complete(t, &passed, "fixed the bug") {
+		t.Fatalf("result was not queued for task %s", passed.ID)
+	}
+	if !f.complete(t, &failed, "broke the build") {
+		t.Fatalf("result was not queued for task %s", failed.ID)
+	}
+	passedDigest := sha256.Sum256([]byte(passed.Content))
+	seedConversationResultValidationReview(t, f, passed, passed.TaskRevision, passed.EventSequence, passedDigest[:], app.TaskValidationPass)
+	failedDigest := sha256.Sum256([]byte(failed.Content))
+	seedConversationResultValidationReview(t, f, failed, failed.TaskRevision, failed.EventSequence, failedDigest[:], app.TaskValidationFail)
+	f.runNextReview(t)
+
+	var content string
+	if err := f.store.pool.QueryRow(ctx, `SELECT message.content FROM conversation_result_batches batch
+JOIN conversation_messages message ON message.id=batch.published_message_id
+WHERE batch.state='published'`).Scan(&content); err != nil {
+		t.Fatalf("mixed result batch was not delivered: %v", err)
+	}
+	for _, expected := range []string{
+		fmt.Sprintf("- %s r%d：pending", passed.ID, passed.TaskRevision),
+		fmt.Sprintf("- %s r%d：pending", failed.ID, failed.TaskRevision),
+	} {
+		if !strings.Contains(content, expected) {
+			t.Fatalf("result receipt missing fail-closed validation state %q: %q", expected, content)
+		}
+	}
+	if strings.Contains(content, "PASS") || strings.Contains(content, "FAIL（验证未通过") {
+		t.Fatalf("result receipt exposed an unbound validation verdict: %q", content)
 	}
 }
 
@@ -389,8 +460,8 @@ func TestConversationResultReceiptLocksValidationInputsUntilCommit(t *testing.T)
 	source := app.ConversationTaskResultSource{TaskID: value.ID, TaskRevision: value.TaskRevision,
 		EventSequence: value.EventSequence, Content: value.Content}
 	state, err := conversationTaskResultValidationStateInTx(ctx, receiptTx, f.ownerID, source)
-	if err != nil || state != app.TaskValidationPass {
-		t.Fatalf("validation state = %q err=%v; want PASS", state, err)
+	if err != nil || state != app.TaskValidationPending {
+		t.Fatalf("validation state = %q err=%v; want pending without a bound execution response", state, err)
 	}
 	receipt := conversationTaskResultReceipt("verified summary", []app.ConversationTaskResultSource{source},
 		[]app.TaskValidationState{state})

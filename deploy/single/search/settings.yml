@@ -8,3 +8,15 @@ server:
 search:
   formats: [html, json]
 
+# 360's news widget provides direct publisher URLs. Its relative age labels are
+# intentionally discarded; only an original publisher page can verify dates.
+engines:
+  - name: morde 360 news
+    engine: morde_360_news
+    shortcut: mgn
+    categories: news
+    language: zh
+    time_range_support: true
+    paging: false
+    timeout: 12.0
+

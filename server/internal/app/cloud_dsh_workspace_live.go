@@ -108,7 +108,8 @@ func (t *cloudDSHWorkspaceTools) readLive(ctx context.Context, current task.Task
 	}
 	digest := sha256.Sum256(content)
 	encoded, err := json.Marshal(cloudDSHWorkspaceReadOutput{WorkspaceID: current.WorkspaceID, Revision: arguments.ExpectedRevision,
-		Path: arguments.Path, SizeBytes: int64(len(content)), SHA256: hex.EncodeToString(digest[:]), Content: string(content)})
+		SourceMode: cloudDSHWorkspaceSourceModeLiveDirectory, Path: arguments.Path, SizeBytes: int64(len(content)),
+		SHA256: hex.EncodeToString(digest[:]), Content: string(content)})
 	if err != nil {
 		return AgentToolResult{}, err
 	}
@@ -119,7 +120,8 @@ func (t *cloudDSHWorkspaceTools) searchLive(ctx context.Context, current task.Ta
 	if err := t.validateLiveRevision(ctx, current, arguments.ExpectedRevision); err != nil {
 		return cloudDSHWorkspaceFailure(err), nil
 	}
-	output := cloudDSHWorkspaceSearchOutput{WorkspaceID: current.WorkspaceID, Revision: arguments.ExpectedRevision, Complete: true,
+	output := cloudDSHWorkspaceSearchOutput{WorkspaceID: current.WorkspaceID, Revision: arguments.ExpectedRevision,
+		SourceMode: cloudDSHWorkspaceSourceModeLiveDirectory, Complete: true,
 		Matches: make([]cloudDSHWorkspaceSearchMatch, 0)}
 	query := strings.ToLower(strings.TrimSpace(arguments.Query))
 	maxResults := arguments.MaxResults
@@ -172,12 +174,15 @@ func (t *cloudDSHWorkspaceTools) searchLive(ctx context.Context, current task.Ta
 			}
 			output.FilesScanned++
 			bytesScanned += int64(len(content))
+			fileDigest := sha256.Sum256(content)
+			fileSHA256 := hex.EncodeToString(fileDigest[:])
 			for lineNumber, line := range strings.Split(string(content), "\n") {
 				if !strings.Contains(strings.ToLower(line), query) {
 					continue
 				}
 				output.Matches = append(output.Matches, cloudDSHWorkspaceSearchMatch{Path: filePath, Line: lineNumber + 1,
-					Text: truncateWorkspaceSearchSnippet(strings.TrimSpace(line), cloudDSHWorkspaceSearchMaxSnippetRunes)})
+					ContentSHA256: fileSHA256,
+					Text:          truncateWorkspaceSearchSnippet(strings.TrimSpace(line), cloudDSHWorkspaceSearchMaxSnippetRunes)})
 				if len(output.Matches) >= maxResults {
 					output.Complete = false
 					return errWorkspaceSearchLimit

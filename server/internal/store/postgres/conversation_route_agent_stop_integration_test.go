@@ -3,6 +3,8 @@ package postgres
 import (
 	"context"
 	"crypto/sha256"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -52,6 +54,68 @@ func TestPostgresConversationRouteStopAllRequiresAgentDecision(t *testing.T) {
 			assertConversationRouteActionTaskState(t, f, first, want, 0, 0)
 			assertConversationRouteActionTaskState(t, f, second, want, 0, 0)
 			assertConversationRouteActionTaskState(t, f, other, task.StatusRunning, 0, 0)
+		})
+	}
+}
+
+func TestPostgresConversationRouteStopAllTaskCountBoundaries(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		activeTasks    int
+		wantQueued     int
+		wantCancelling int
+		wantReply      string
+	}{
+		{name: "zero", activeTasks: 0, wantReply: "当前没有由你发起且仍在执行的任务。"},
+		{name: "limit", activeTasks: 256, wantCancelling: 256, wantReply: "已向你发起的 256 个活动任务提交停止请求"},
+		{name: "over limit is atomic", activeTasks: 257, wantQueued: 257, wantReply: "没有任务被停止"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newRouteActionsTestFixture(t)
+			ctx := context.Background()
+			if test.activeTasks > 0 {
+				taskIDs := make([]string, test.activeTasks)
+				for i := range taskIDs {
+					taskIDs[i] = mustID(t, domain.NewTaskID)
+				}
+				if _, err := f.store.pool.Exec(ctx, `INSERT INTO tasks
+(id,owner_id,conversation_id,project_id,initiator_id,model_id,objective,status,auth_kind,auth_token_id,
+ budget_active_seconds,budget_tool_calls,budget_model_tokens,usage_model_tokens,execution_location)
+SELECT id,$2,$3,NULLIF($4,''),$5,'p1234567','stop-all boundary test','queued','session',$6,120,5,1000,0,'server'
+FROM unnest($1::text[]) AS ids(id)`, taskIDs, f.ownerID, f.conversation.ID, f.conversation.ProjectID, f.ownerID, f.authorization.TokenID); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			claim := f.receive(t, fmt.Sprintf("stop-all-boundary-%d", test.activeTasks), "把我手头还在进行的工作都结束吧", app.ConversationRoutingInput{})
+			snapshot, err := f.store.LoadConversationRouteSnapshot(ctx, claim)
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshot.Context.ModelID = "p1234567"
+			decision := app.ConversationRouteDecision{Action: app.ConversationRouteStopAll, ModelOutput: `{"action":"stop_all"}`}
+			if err := f.store.ApplyConversationRoute(ctx, claim, snapshot, decision); err != nil {
+				t.Fatal(err)
+			}
+
+			var queued, cancelling int
+			if err := f.store.pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE status='queued'),count(*) FILTER (WHERE status='cancelling')
+FROM tasks WHERE owner_id=$1 AND initiator_id=$2`, f.ownerID, f.ownerID).Scan(&queued, &cancelling); err != nil {
+				t.Fatal(err)
+			}
+			if queued != test.wantQueued || cancelling != test.wantCancelling {
+				t.Fatalf("active Task counts after stop_all: queued=%d cancelling=%d, want queued=%d cancelling=%d",
+					queued, cancelling, test.wantQueued, test.wantCancelling)
+			}
+
+			var reply string
+			if err := f.store.pool.QueryRow(ctx, `SELECT content FROM conversation_messages
+WHERE conversation_id=$1 AND actor_id=$2 AND role='assistant' ORDER BY sequence DESC LIMIT 1`, f.conversation.ID, f.ownerID).Scan(&reply); err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(reply, test.wantReply) {
+				t.Fatalf("stop_all reply %q does not contain %q", reply, test.wantReply)
+			}
 		})
 	}
 }

@@ -110,11 +110,13 @@ func (s *ClientLoginService) Login(ctx context.Context, name, password, platform
 	if err != nil {
 		return ClientLoginResult{}, err
 	}
-	if user.MustChangePassword {
-		return ClientLoginResult{}, domain.NewError(domain.CodeForbidden, "password change is required before client login")
-	}
-	if err := s.credentials.ensureDefaultHost(ctx, user); err != nil {
-		return ClientLoginResult{}, err
+	// A first-time or reset password can bootstrap the PC password-change page;
+	// the API auth middleware carries MustChangePassword onto all issued tokens
+	// and blocks ordinary work until the user chooses a new password.
+	if !user.MustChangePassword {
+		if err := s.credentials.ensureDefaultHost(ctx, user); err != nil {
+			return ClientLoginResult{}, err
+		}
 	}
 	id, err := domain.NewClientInstallationID()
 	if err != nil {

@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -19,6 +20,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
@@ -43,6 +45,7 @@ func TestCloudDSHModelFailureCategoryUsesOnlySafeAllowlistedReason(t *testing.T)
 	}{
 		{name: "empty response", code: domain.CodeUpstreamError, reason: "empty_response", want: "empty_response"},
 		{name: "truncated response", code: domain.CodeUpstreamError, reason: "truncated_response", want: "truncated_response"},
+		{name: "content filtered response", code: domain.CodeUpstreamError, reason: "content_filtered", want: "content_filtered"},
 		{name: "unknown reason", code: domain.CodeUpstreamError, reason: "private provider response containing secrets", want: "upstream_error"},
 		{name: "non-exact reason", code: domain.CodeUpstreamError, reason: " empty_response", want: "upstream_error"},
 		{name: "non-string reason", code: domain.CodeUpstreamError, reason: []string{"empty_response"}, want: "upstream_error"},
@@ -51,6 +54,11 @@ func TestCloudDSHModelFailureCategoryUsesOnlySafeAllowlistedReason(t *testing.T)
 			providerCode: "context_length_exceeded", want: "provider_context_length_exceeded"},
 		{name: "empty reason requires upstream error code", code: domain.CodeInvalidState, reason: "empty_response", want: "usage_unknown"},
 		{name: "client validation", code: domain.CodeUpstreamError, stage: "client_validation", want: "client_request_invalid"},
+		{name: "provider auth without code", code: domain.CodeUpstreamError, stage: "provider_status", reason: string(app.ModelErrorAuthentication), want: "authentication_rejected"},
+		{name: "provider access without code", code: domain.CodeUpstreamError, stage: "provider_status", reason: string(app.ModelErrorAccess), want: "access_rejected"},
+		{name: "provider rate limit without code", code: domain.CodeRateLimited, stage: "provider_status", reason: string(app.ModelErrorRateLimited), want: "rate_limited"},
+		{name: "provider quota without code", code: domain.CodeUpstreamError, stage: "provider_status", reason: string(app.ModelErrorQuota), want: "quota_exhausted"},
+		{name: "unrecognized provider status", code: domain.CodeUpstreamError, stage: "provider_status", reason: "private provider detail", want: "provider_request_rejected"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			modelFailure := domain.NewError(test.code, "provider request failed")
@@ -95,13 +103,206 @@ type cloudDSHTestLaunch struct {
 }
 
 type cloudDSHTestSupervisor struct {
-	mu         sync.Mutex
-	cmd        *exec.Cmd
-	launch     cloudDSHTestLaunch
-	node       string
-	account    string
-	instances  *cloudDSHTestInstanceStore
-	badReceipt bool
+	mu                  sync.Mutex
+	diagnosticMu        sync.Mutex
+	cmd                 *exec.Cmd
+	launch              cloudDSHTestLaunch
+	node                string
+	account             string
+	instances           *cloudDSHTestInstanceStore
+	badReceipt          bool
+	firstFrameCategory  string
+	firstFrameBytes     int
+	firstFrameTruncated bool
+	stderrBytes         int
+	stderrTruncated     bool
+}
+
+const (
+	cloudDSHTestStderrByteLimit     = 64 << 10
+	cloudDSHTestFirstFrameByteLimit = 64 << 10
+)
+
+// The test supervisor intentionally keeps only counts and coarse categories.
+// Runtime stderr and the first protocol frame may contain sensitive data.
+type cloudDSHTestStderrCounter struct{ supervisor *cloudDSHTestSupervisor }
+
+func (w cloudDSHTestStderrCounter) Write(value []byte) (int, error) {
+	if w.supervisor == nil {
+		return len(value), nil
+	}
+	w.supervisor.diagnosticMu.Lock()
+	defer w.supervisor.diagnosticMu.Unlock()
+	remaining := cloudDSHTestStderrByteLimit - w.supervisor.stderrBytes
+	if remaining > 0 {
+		added := min(len(value), remaining)
+		w.supervisor.stderrBytes += added
+		if added < len(value) {
+			w.supervisor.stderrTruncated = true
+		}
+	} else if len(value) > 0 {
+		w.supervisor.stderrTruncated = true
+	}
+	return len(value), nil
+}
+
+type cloudDSHTestObservedOutput struct {
+	source     io.ReadCloser
+	supervisor *cloudDSHTestSupervisor
+	frame      []byte
+	frameBytes int
+	truncated  bool
+	finished   bool
+}
+
+func (r *cloudDSHTestObservedOutput) Read(target []byte) (int, error) {
+	n, err := r.source.Read(target)
+	if n > 0 {
+		r.observe(target[:n])
+	}
+	if err != nil && !r.finished {
+		category := "truncated_frame"
+		if r.frameBytes == 0 {
+			category = "no_frame"
+		}
+		if !errors.Is(err, io.EOF) {
+			category = "read_error"
+		}
+		r.finish(category)
+	}
+	return n, err
+}
+
+func (r *cloudDSHTestObservedOutput) Close() error { return r.source.Close() }
+
+func (r *cloudDSHTestObservedOutput) observe(value []byte) {
+	if r.finished {
+		return
+	}
+	newline := bytes.IndexByte(value, '\n')
+	complete := newline >= 0
+	if complete {
+		value = value[:newline]
+	}
+	remaining := cloudDSHTestFirstFrameByteLimit - r.frameBytes
+	if remaining > 0 {
+		added := min(len(value), remaining)
+		r.frame = append(r.frame, value[:added]...)
+		r.frameBytes += added
+		if added < len(value) {
+			r.truncated = true
+		}
+	} else if len(value) > 0 {
+		r.truncated = true
+	}
+	if complete {
+		category := "invalid_json"
+		if r.truncated {
+			category = "oversized_frame"
+		} else if json.Valid(r.frame) {
+			category = "valid_json"
+		}
+		r.finish(category)
+	}
+}
+
+func (r *cloudDSHTestObservedOutput) finish(category string) {
+	if r.finished {
+		return
+	}
+	r.finished = true
+	if r.supervisor != nil {
+		r.supervisor.diagnosticMu.Lock()
+		r.supervisor.firstFrameCategory = category
+		r.supervisor.firstFrameBytes = r.frameBytes
+		r.supervisor.firstFrameTruncated = r.truncated || category == "truncated_frame"
+		r.supervisor.diagnosticMu.Unlock()
+	}
+	// Do not retain even a bounded copy of a protocol frame after classifying it.
+	clear(r.frame)
+	r.frame = nil
+}
+
+func (s *cloudDSHTestSupervisor) startupDiagnostic(err error) string {
+	stage := "unavailable"
+	category := "startup_state_unavailable"
+	var staged interface{ RuntimeStartupStage() string }
+	if errors.As(err, &staged) {
+		switch staged.RuntimeStartupStage() {
+		case "runtime_supervisor_start":
+			stage, category = "runtime_supervisor_start", "runtime_startup_failure"
+		case "runtime_process_pipes":
+			stage, category = "runtime_process_pipes", "runtime_startup_failure"
+		case "runtime_handshake_write":
+			stage, category = "runtime_handshake_write", "handshake_write_failure"
+		case "runtime_handshake_timeout":
+			stage, category = "runtime_handshake_timeout", "first_frame_timeout"
+		case "runtime_handshake_response":
+			stage = "runtime_handshake_response"
+			cause := errors.Unwrap(err)
+			switch {
+			case errors.Is(cause, io.EOF):
+				category = "first_frame_eof"
+			case cause != nil:
+				category = "first_frame_read_error"
+			default:
+				category = "first_frame_rejected"
+			}
+		case "runtime_control_ready":
+			stage, category = "runtime_control_ready", "runtime_ready_persist_failure"
+		default:
+			stage, category = "other_runtime_startup_stage", "runtime_startup_failure"
+		}
+	}
+	firstFrameCategory := "unobserved"
+	firstFrameBytes := 0
+	firstFrameTruncated := false
+	stderrCategory := "empty"
+	stderrBytes := 0
+	stderrTruncated := false
+	if s != nil {
+		s.diagnosticMu.Lock()
+		firstFrameCategory = s.firstFrameCategory
+		firstFrameBytes = s.firstFrameBytes
+		firstFrameTruncated = s.firstFrameTruncated
+		stderrBytes = s.stderrBytes
+		stderrTruncated = s.stderrTruncated
+		s.diagnosticMu.Unlock()
+	}
+	if firstFrameCategory == "" {
+		firstFrameCategory = "unobserved"
+	}
+	if stderrBytes > 0 {
+		stderrCategory = "nonempty"
+	}
+	if category == "startup_state_unavailable" {
+		switch firstFrameCategory {
+		case "invalid_json":
+			category = "first_frame_parse_failure"
+		case "no_frame":
+			if stderrCategory == "nonempty" {
+				category = "runtime_startup_before_first_frame"
+			} else {
+				category = "no_first_frame_output"
+			}
+		case "truncated_frame", "oversized_frame", "read_error":
+			category = "first_frame_read_failure"
+		case "valid_json":
+			category = "first_frame_received"
+		}
+	}
+	if category == "first_frame_rejected" {
+		switch firstFrameCategory {
+		case "invalid_json":
+			category = "first_frame_parse_failure"
+		case "oversized_frame", "truncated_frame":
+			category = "first_frame_incomplete_or_oversized"
+		case "valid_json":
+			category = "first_frame_validation_failure"
+		}
+	}
+	return fmt.Sprintf("category=%s stage=%s first_frame=%s first_frame_bytes=%d first_frame_truncated=%t stderr=%s stderr_bytes_capped=%d stderr_truncated=%t",
+		category, stage, firstFrameCategory, firstFrameBytes, firstFrameTruncated, stderrCategory, stderrBytes, stderrTruncated)
 }
 
 type cloudDSHExecutorTestGuardian struct{ f01NodeTaskGuardian }
@@ -198,10 +399,17 @@ func (s *cloudDSHTestSupervisor) StartAccountRuntime(_ context.Context, _ app.Ac
 	expiresAt time.Time) (CloudDSHAccountRuntimeProcess, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.diagnosticMu.Lock()
+	s.firstFrameCategory = ""
+	s.firstFrameBytes = 0
+	s.firstFrameTruncated = false
+	s.stderrBytes = 0
+	s.stderrTruncated = false
+	s.diagnosticMu.Unlock()
 	command := exec.Command(s.node, s.account)
 	command.Dir = filepath.Dir(s.account)
 	command.Env = []string{"PATH=/usr/bin:/bin", "LANG=C.UTF-8", "NODE_ENV=production"}
-	command.Stderr = io.Discard
+	command.Stderr = cloudDSHTestStderrCounter{supervisor: s}
 	input, err := command.StdinPipe()
 	if err != nil {
 		return CloudDSHAccountRuntimeProcess{}, err
@@ -220,7 +428,7 @@ func (s *cloudDSHTestSupervisor) StartAccountRuntime(_ context.Context, _ app.Ac
 	s.launch.Environment = append([]string(nil), command.Env...)
 	s.launch.ExpiresAt = expiresAt
 	return CloudDSHAccountRuntimeProcess{ContainerID: strings.Repeat("a", 64), ContainerName: "test-conversation-runtime",
-		Input: input, Output: output}, nil
+		Input: input, Output: &cloudDSHTestObservedOutput{source: output, supervisor: s}}, nil
 }
 
 func (s *cloudDSHTestSupervisor) RenewAccountRuntime(context.Context, app.AccountAgentRuntimeFence, string, time.Time) error {
@@ -685,6 +893,61 @@ func (t *cloudDSHTestTools) PauseRecovery(context.Context, task.Task) error {
 	return nil
 }
 
+type cloudDSHRecoveryPauseTaskStore struct {
+	app.TaskStore
+	mu       sync.Mutex
+	details  app.TaskDetails
+	progress []app.TaskProgress
+}
+
+func (s *cloudDSHRecoveryPauseTaskStore) GetTask(ctx context.Context, taskID, ownerID string) (app.TaskDetails, error) {
+	if err := ctx.Err(); err != nil {
+		return app.TaskDetails{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if taskID != s.details.Task.ID || ownerID != s.details.Task.OwnerID {
+		return app.TaskDetails{}, errors.New("task not found")
+	}
+	return s.details, nil
+}
+
+func (s *cloudDSHRecoveryPauseTaskStore) CommitTaskProgress(ctx context.Context, progress app.TaskProgress) (task.Event, error) {
+	if err := ctx.Err(); err != nil {
+		return task.Event{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current := &s.details.Task
+	if progress.TaskID != current.ID || progress.LeaseOwner != current.Lease.Owner || progress.LeaseVersion != current.Lease.Version {
+		return task.Event{}, errors.New("stale task progress")
+	}
+	s.progress = append(s.progress, progress)
+	current.Status, current.CurrentStep, current.Result = progress.Status, progress.CurrentStep, progress.Result
+	current.WaitingReason, current.Usage = progress.WaitingReason, progress.Usage
+	current.EventSequence++
+	event := progress.Event
+	event.TaskID, event.Sequence = progress.TaskID, current.EventSequence
+	s.details.Steps = append(s.details.Steps, progress.Steps...)
+	return event, nil
+}
+
+type cloudDSHFailingDefinitionsBroker struct {
+	*app.CloudDSHToolBroker
+	definitionsErr error
+	executeCalls   int
+}
+
+func (b *cloudDSHFailingDefinitionsBroker) Definitions(context.Context, task.Task) ([]app.AgentToolDefinition, error) {
+	return nil, b.definitionsErr
+}
+
+func (b *cloudDSHFailingDefinitionsBroker) Execute(ctx context.Context, claimed task.Task,
+	call app.ModelToolCall) (app.AgentToolResult, error) {
+	b.executeCalls++
+	return b.CloudDSHToolBroker.Execute(ctx, claimed, call)
+}
+
 type cloudDSHTestCompleter struct {
 	instances  *cloudDSHTestInstanceStore
 	completion app.CloudDSHTaskCompletion
@@ -802,6 +1065,8 @@ func TestCloudDSHModelResponseFailureDiagnosticDistinguishesMalformedAndUnauthor
 			return value
 		}(), definitions: definitions, wantCategory: "invalid_response", wantReason: "tool_call_metadata_invalid", wantTool: "file_read"},
 		{name: "invalid base response", response: app.ModelResponse{Text: "", Usage: app.ModelUsage{Known: true}, StopReason: "stop"}, wantCategory: "invalid_response", wantReason: "response_shape_invalid"},
+		{name: "verified text truncation", response: app.ModelResponse{Text: "partial", Usage: app.ModelUsage{Known: true, InputTokens: 3, OutputTokens: 2},
+			StopReason: "length", ProviderReportedModel: "provider-model", KnownTextTruncation: true}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			got := cloudDSHModelResponseFailureDiagnostic(test.response, test.definitions)
@@ -813,6 +1078,54 @@ func TestCloudDSHModelResponseFailureDiagnosticDistinguishesMalformedAndUnauthor
 				t.Fatalf("failure stage = %q, want model_response_validation", got.Stage)
 			}
 		})
+	}
+}
+
+func TestWriteCloudDSHModelMapsOnlyVerifiedTaskTextTruncationToMaxTokens(t *testing.T) {
+	identity := cloudDSHIdentity{TaskID: "q1234567", OwnerID: "u1234567", AgentID: "agent_1", SessionID: "session_1", Generation: 2, AuthorizationVersion: 1}
+	response := app.ModelResponse{Text: "saved visible prefix", Usage: app.ModelUsage{Known: true, InputTokens: 3, OutputTokens: 2},
+		StopReason: "length", ProviderReportedModel: "provider-model", KnownTextTruncation: true}
+	if !app.ValidTaskModelTextTruncation(response) {
+		t.Fatal("verified text truncation was rejected before DSH framing")
+	}
+	var output cloudDSHBufferCloser
+	if err := writeCloudDSHModel(context.Background(), &output, "model_123", identity, response); err != nil {
+		t.Fatal(err)
+	}
+
+	scanner := bufio.NewScanner(bytes.NewReader(output.Bytes()))
+	var finish map[string]any
+	for scanner.Scan() {
+		var frame struct {
+			Type  string         `json:"type"`
+			Chunk map[string]any `json:"chunk"`
+		}
+		if err := json.Unmarshal(scanner.Bytes(), &frame); err != nil {
+			t.Fatal(err)
+		}
+		if frame.Type == "model_chunk" && frame.Chunk["type"] == "finish" {
+			finish = frame.Chunk
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if finish == nil {
+		t.Fatal("model finish chunk was not written")
+	}
+	if reason, ok := finish["reason"].(map[string]any); !ok || reason["kind"] != "max-tokens" {
+		t.Fatalf("verified text truncation finish reason = %#v", finish["reason"])
+	}
+	replayState, ok := finish["replayState"].(map[string]any)
+	marker, markerOK := replayState["response"].(map[string]any)
+	if !ok || !markerOK || marker["morde_task_text_truncated"] != true || marker["morde_task_call_id"] != "model_123" {
+		t.Fatalf("truncation recovery marker = %#v", finish["replayState"])
+	}
+
+	response.KnownTextTruncation = false
+	var rejected cloudDSHBufferCloser
+	if err := writeCloudDSHModel(context.Background(), &rejected, "model_123", identity, response); err == nil || rejected.Len() != 0 {
+		t.Fatalf("unverified length response reached DSH: bytes=%d err=%v", rejected.Len(), err)
 	}
 }
 
@@ -969,6 +1282,9 @@ func cloudDSHFixture(t *testing.T) (*CloudDSHExecutor, *cloudDSHTestSupervisor, 
 			_ = supervisor.cmd.Wait()
 		}
 		supervisor.mu.Unlock()
+		if t.Failed() {
+			t.Logf("DSH test Runtime diagnostic (safe summary): %s", supervisor.startupDiagnostic(nil))
+		}
 	})
 	checkpoints := &cloudDSHTestCheckpoints{}
 	models := &cloudDSHTestModels{response: app.ModelResponse{Text: "local result", StopReason: "stop", Usage: app.ModelUsage{Known: true, InputTokens: 2, OutputTokens: 1}}}
@@ -984,6 +1300,269 @@ func cloudDSHFixture(t *testing.T) (*CloudDSHExecutor, *cloudDSHTestSupervisor, 
 	return executor, supervisor, store, checkpoints, models, value
 }
 
+func TestCloudDSHTestRuntimeDiagnosticIsBoundedAndRedacted(t *testing.T) {
+	supervisor := &cloudDSHTestSupervisor{}
+	stderr := cloudDSHTestStderrCounter{supervisor: supervisor}
+	privateMarker := "synthetic-private-stderr-marker"
+	if _, err := stderr.Write([]byte(strings.Repeat(privateMarker, cloudDSHTestStderrByteLimit/len(privateMarker)+2))); err != nil {
+		t.Fatalf("count synthetic stderr bytes: %v", err)
+	}
+
+	firstFrame := `{"type":"runtime_ready","credential":"synthetic-private-frame-marker"` + "\n"
+	observed := &cloudDSHTestObservedOutput{source: io.NopCloser(strings.NewReader(firstFrame)), supervisor: supervisor}
+	if _, err := io.Copy(io.Discard, observed); err != nil {
+		t.Fatalf("observe synthetic first frame: %v", err)
+	}
+
+	startup := cloudDSHStartupFailure("runtime_supervisor_start", "test startup failed", errors.New(privateMarker))
+	startupDiagnostic := supervisor.startupDiagnostic(startup)
+	if !strings.Contains(startupDiagnostic, "category=runtime_startup_failure") ||
+		strings.Contains(startupDiagnostic, privateMarker) || strings.Contains(startupDiagnostic, "synthetic-private-frame-marker") {
+		t.Fatalf("startup diagnostic is not categorized and redacted: %s", startupDiagnostic)
+	}
+
+	parse := cloudDSHStartupFailure("runtime_handshake_response", "test handshake failed", nil)
+	parseDiagnostic := supervisor.startupDiagnostic(parse)
+	if !strings.Contains(parseDiagnostic, "category=first_frame_parse_failure") ||
+		!strings.Contains(parseDiagnostic, "first_frame=invalid_json") ||
+		!strings.Contains(parseDiagnostic, "stderr_bytes_capped=65536") ||
+		!strings.Contains(parseDiagnostic, "stderr_truncated=true") ||
+		strings.Contains(parseDiagnostic, privateMarker) || strings.Contains(parseDiagnostic, "synthetic-private-frame-marker") {
+		t.Fatalf("first-frame diagnostic must be bounded and contain no raw data: %s", parseDiagnostic)
+	}
+}
+
+type cloudDSHTaskPlanWorkerTestStore struct {
+	app.TaskStore
+	mu       sync.Mutex
+	details  app.TaskDetails
+	admitted []app.ModelToolCall
+	recovery []bool
+	progress []app.TaskProgress
+}
+
+func (s *cloudDSHTaskPlanWorkerTestStore) GetTask(ctx context.Context, taskID, ownerID string) (app.TaskDetails, error) {
+	if err := ctx.Err(); err != nil {
+		return app.TaskDetails{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if taskID != s.details.Task.ID || ownerID != s.details.Task.OwnerID {
+		return app.TaskDetails{}, errors.New("task not found")
+	}
+	details := s.details
+	details.Steps = append([]task.Step(nil), s.details.Steps...)
+	if details.Plan != nil {
+		plan := *details.Plan
+		details.Plan = &plan
+	}
+	return details, nil
+}
+
+func (s *cloudDSHTaskPlanWorkerTestStore) AdmitAgentToolCall(ctx context.Context, call app.ModelToolCall,
+	recovering bool) (app.AgentToolCallAdmission, error) {
+	if err := ctx.Err(); err != nil {
+		return app.AgentToolCallAdmission{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if call.TaskFence == nil || call.TaskFence.TaskID != s.details.Task.ID || call.TaskFence.OwnerID != s.details.Task.OwnerID {
+		return app.AgentToolCallAdmission{}, errors.New("Task tool admission fence does not match")
+	}
+	s.admitted = append(s.admitted, call)
+	s.recovery = append(s.recovery, recovering)
+	return app.AgentToolCallAdmission{Status: app.AgentToolCallAdmitted}, nil
+}
+
+func (s *cloudDSHTaskPlanWorkerTestStore) CommitTaskProgress(ctx context.Context, progress app.TaskProgress) (task.Event, error) {
+	if err := ctx.Err(); err != nil {
+		return task.Event{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current := s.details.Task
+	if progress.TaskID != current.ID || progress.LeaseOwner != current.Lease.Owner || progress.LeaseVersion != current.Lease.Version {
+		return task.Event{}, errors.New("stale plan test progress")
+	}
+	s.progress = append(s.progress, progress)
+	s.details.Task.Status, s.details.Task.CurrentStep = progress.Status, progress.CurrentStep
+	s.details.Task.Result, s.details.Task.Usage = progress.Result, progress.Usage
+	s.details.Steps = append(s.details.Steps, progress.Steps...)
+	if progress.CloudDSHTaskPlan != nil {
+		plan := progress.CloudDSHTaskPlan.Plan
+		s.details.Plan = &plan
+	}
+	s.details.Task.EventSequence++
+	event := progress.Event
+	event.TaskID, event.Sequence = current.ID, s.details.Task.EventSequence
+	return event, nil
+}
+
+func (s *cloudDSHTaskPlanWorkerTestStore) bindAgentSession(sessionID string) {
+	s.mu.Lock()
+	s.details.Task.AgentSessionID = sessionID
+	s.mu.Unlock()
+}
+
+type cloudDSHTaskPlanWorkerBrokerProbe struct {
+	*app.CloudDSHToolBroker
+	definitions []app.AgentToolDefinition
+	executed    []app.ModelToolCall
+}
+
+func (b *cloudDSHTaskPlanWorkerBrokerProbe) Definitions(ctx context.Context, claimed task.Task) ([]app.AgentToolDefinition, error) {
+	definitions, err := b.CloudDSHToolBroker.Definitions(ctx, claimed)
+	b.definitions = append([]app.AgentToolDefinition(nil), definitions...)
+	return definitions, err
+}
+
+func (b *cloudDSHTaskPlanWorkerBrokerProbe) Execute(ctx context.Context, claimed task.Task,
+	call app.ModelToolCall) (app.AgentToolResult, error) {
+	b.executed = append(b.executed, call)
+	return b.CloudDSHToolBroker.Execute(ctx, claimed, call)
+}
+
+func cloudDSHTaskPlanWorkerFixture(t *testing.T, executor *CloudDSHExecutor, value *task.Task, models *cloudDSHTestModels) (*cloudDSHTaskPlanWorkerTestStore, *cloudDSHTaskPlanWorkerBrokerProbe) {
+	t.Helper()
+	revision := int64(1)
+	value.CurrentRevision = &revision
+	value.Authorization = task.Authorization{Kind: string(identity.KindSession), TokenID: "t1234567", Version: 1,
+		Scopes: []string{string(identity.ScopeTaskRead), string(identity.ScopeTaskSubmit)}}
+	expires := time.Now().Add(time.Hour).UTC()
+	value.Authorization.ExpiresAt = &expires
+	store := &cloudDSHTaskPlanWorkerTestStore{details: app.TaskDetails{Task: *value}}
+	broker, err := app.NewCloudDSHToolBroker(store, &app.RuntimeToolExecutor{}, nil, nil)
+	if err != nil {
+		t.Fatalf("create Worker plan tool broker: %v", err)
+	}
+	probe := &cloudDSHTaskPlanWorkerBrokerProbe{CloudDSHToolBroker: broker}
+	definitions, err := probe.Definitions(context.Background(), *value)
+	if err != nil || !validCloudDSHToolDefinitions(definitions) {
+		var summary []string
+		for _, definition := range definitions {
+			summary = append(summary, fmt.Sprintf("%s description_bytes=%d parameters_bytes=%d individually_valid=%t",
+				definition.Name, len(definition.Description), len(definition.Parameters), validCloudDSHToolDefinitions([]app.AgentToolDefinition{definition})))
+		}
+		t.Fatalf("real plan Broker returned unavailable DSH tool definitions: count=%d definitions=%v err=%v", len(definitions), summary, err)
+	}
+	executor.options.Tools = probe
+	var nextResponse int
+	models.complete = func(ctx context.Context, call app.ModelCall) (app.ModelResponse, error) {
+		if call.Task == nil || call.Task.AgentSessionID == "" {
+			return app.ModelResponse{}, errors.New("DSH Worker did not bind the model call to its Task session")
+		}
+		store.bindAgentSession(call.Task.AgentSessionID)
+		if nextResponse >= len(models.responses) {
+			return app.ModelResponse{}, errors.New("scripted test model exhausted its responses")
+		}
+		response := models.responses[nextResponse]
+		nextResponse++
+		return response, nil
+	}
+	return store, probe
+}
+
+func cloudDSHModelRequestIncludesTool(t *testing.T, raw []byte, name string) bool {
+	t.Helper()
+	var request struct {
+		Tools []struct {
+			Name string `json:"name"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(raw, &request); err != nil {
+		t.Fatalf("decode DSH model request tool definitions: %v", err)
+	}
+	for _, tool := range request.Tools {
+		if tool.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// The tests run the CloudDSHExecutor and CloudDSHToolBroker with a scripted
+// ModelClient. They prove Worker-to-Broker dispatch and plan persistence, not
+// the Node DSH Runtime or production-model semantic tool selection.
+func TestCloudDSHWorkerPlanToolDispatchAndPersistencePath(t *testing.T) {
+	t.Run("scripted simple answer returns without plan dispatch", func(t *testing.T) {
+		executor, _, _, _, models, value := cloudDSHFixture(t)
+		value.Objective = "What is 2 + 2?"
+		models.responses = []app.ModelResponse{{Text: "4", StopReason: "stop", Usage: app.ModelUsage{Known: true, InputTokens: 3, OutputTokens: 1}}}
+		store, broker := cloudDSHTaskPlanWorkerFixture(t, executor, &value, models)
+		if err := executor.ExecuteTask(context.Background(), value); !errors.Is(err, ErrCloudDSHCompletionPending) {
+			t.Fatalf("simple-answer Task result = %v", err)
+		}
+		if len(models.calls) != 1 || len(broker.executed) != 0 || len(store.admitted) != 0 || len(store.progress) != 0 || store.details.Plan != nil {
+			t.Fatalf("simple answer dispatched or persisted a plan: model_calls=%d broker_calls=%+v admitted=%+v progress=%+v plan=%+v",
+				len(models.calls), broker.executed, store.admitted, store.progress, store.details.Plan)
+		}
+		if !cloudDSHModelRequestIncludesTool(t, models.calls[0].RawRequest, "morde_task_plan_update") ||
+			!validCloudDSHModelRequest(models.calls[0].RawRequest, value.ModelID, cloudDSHExpectedRootDefinitions(broker.definitions)) {
+			t.Fatal("simple-answer model request did not carry the real broker's valid plan-tool definition")
+		}
+	})
+
+	t.Run("scripted complex-task plan call reaches broker and persists", func(t *testing.T) {
+		executor, _, _, _, models, value := cloudDSHFixture(t)
+		value.Objective = "Inspect the routing and persistence paths, then run the focused regression tests."
+		planArguments := `{"goal":"Verify the task routing and persistence path","scope":"Inspect the Worker and plan persistence path only","verification_method":"Run the focused Worker regression","steps":[{"id":"inspect","title":"Inspect the paths","status":"pending","completion_criteria":["Identify the routing and persistence code involved."]},{"id":"verify","title":"Verify the path","status":"pending","depends_on":["inspect"],"completion_criteria":["Run the focused Worker regression and record its result."]}]}`
+		models.responses = []app.ModelResponse{
+			{ToolCalls: []app.ModelToolCall{{CallID: "call_plan_1", Name: "morde_task_plan_update", Arguments: planArguments}},
+				StopReason: "tool_calls", Usage: app.ModelUsage{Known: true, InputTokens: 12, OutputTokens: 6}},
+			{Text: "The plan was saved.", StopReason: "stop", Usage: app.ModelUsage{Known: true, InputTokens: 18, OutputTokens: 3}},
+		}
+		store, broker := cloudDSHTaskPlanWorkerFixture(t, executor, &value, models)
+		if err := executor.ExecuteTask(context.Background(), value); !errors.Is(err, ErrCloudDSHCompletionPending) {
+			t.Fatalf("complex-plan Task result = %v", err)
+		}
+		if len(models.calls) != 2 || len(broker.executed) != 1 || broker.executed[0].Name != "morde_task_plan_update" ||
+			broker.executed[0].CallID != "call_plan_1" || len(store.admitted) != 2 || len(store.recovery) != 2 ||
+			store.recovery[0] || !store.recovery[1] ||
+			len(store.progress) != 1 || store.progress[0].CloudDSHTaskPlan == nil || store.progress[0].Event.Type != "task.plan" {
+			t.Fatalf("plan did not traverse DSH Worker, Broker and persistence: model_calls=%d broker_calls=%d admissions=%d progress=%d",
+				len(models.calls), len(broker.executed), len(store.admitted), len(store.progress))
+		}
+		for _, admitted := range store.admitted {
+			if admitted.Name != "morde_task_plan_update" || admitted.CallID != "call_plan_1" {
+				t.Fatalf("unexpected Task tool admission: name=%q call_id=%q", admitted.Name, admitted.CallID)
+			}
+		}
+		if !cloudDSHModelRequestIncludesTool(t, models.calls[0].RawRequest, "morde_task_plan_update") ||
+			!validCloudDSHModelRequest(models.calls[0].RawRequest, value.ModelID, cloudDSHExpectedRootDefinitions(broker.definitions)) {
+			t.Fatal("complex-task model request did not carry the real broker's valid plan-tool definition")
+		}
+		commit := store.progress[0].CloudDSHTaskPlan
+		if commit.TaskID != value.ID || commit.OwnerID != value.OwnerID || commit.AgentSessionID == "" ||
+			commit.AuthorizationVersion != value.Authorization.Version || commit.CallID != "call_plan_1" ||
+			commit.FingerprintSHA256 == "" || commit.Plan.Goal != "Verify the task routing and persistence path" ||
+			commit.Plan.Revision != 1 || store.details.Plan == nil || store.details.Plan.Goal != commit.Plan.Goal {
+			t.Fatalf("persisted Task plan commit is incomplete: %+v stored=%+v", commit, store.details.Plan)
+		}
+		var resumedRequest struct {
+			Messages []struct {
+				Role       string `json:"role"`
+				ToolCallID string `json:"toolCallId"`
+				Content    []struct {
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.Unmarshal(models.calls[1].RawRequest, &resumedRequest); err != nil {
+			t.Fatal(err)
+		}
+		foundPlanResult := false
+		for _, message := range resumedRequest.Messages {
+			if message.Role == "tool" && message.ToolCallID == "call_plan_1" && len(message.Content) == 1 &&
+				strings.Contains(message.Content[0].Text, commit.Plan.Goal) {
+				foundPlanResult = true
+			}
+		}
+		if !foundPlanResult {
+			t.Fatal("next DSH model request did not contain the persisted plan-tool result")
+		}
+	})
+}
+
 func TestCloudDSHExecutorRunsHostlessServerTaskWithoutCompletingIt(t *testing.T) {
 	t.Setenv("MORDE_TEST_PRIVATE_ENV", "private")
 	executor, supervisor, store, checkpoints, models, value := cloudDSHFixture(t)
@@ -992,7 +1571,7 @@ func TestCloudDSHExecutorRunsHostlessServerTaskWithoutCompletingIt(t *testing.T)
 	}
 	err := executor.ExecuteTask(context.Background(), value)
 	if !errors.Is(err, ErrCloudDSHCompletionPending) {
-		t.Fatalf("candidate result = %v", err)
+		t.Fatalf("candidate result failed: %s", supervisor.startupDiagnostic(err))
 	}
 	if len(models.calls) != 1 || len(checkpoints.commands) == 0 || store.stopped != 1 {
 		t.Fatalf("models=%d checkpoints=%d stopped=%d", len(models.calls), len(checkpoints.commands), store.stopped)
@@ -1093,6 +1672,233 @@ func TestCloudDSHRequestTimeoutFrameRequiresExactFields(t *testing.T) {
 		if _, err := decodeCloudDSHFrame([]byte(raw)); err == nil {
 			t.Fatalf("invalid request timeout frame accepted: %s", raw)
 		}
+	}
+}
+
+func TestCloudDSHToolCallFrameAcceptsOnlyValidOptionalTaskTurnIdentity(t *testing.T) {
+	base := `"type":"tool_call","id":"model_123","task_id":"q1234567","owner_id":"u1234567","agent_id":"agent_1","generation":2,"authorization_version":1,"session_id":"session_1","through_seq":4,"call_id":"call_123","name":"plan_update","arguments":{}`
+	for _, test := range []struct {
+		name string
+		raw  string
+		want string
+		bad  bool
+	}{
+		{name: "legacy omission", raw: `{` + base + `}`},
+		{name: "valid trusted identity", raw: `{` + base + `,"current_task_turn_message_id":"m1234567"}`, want: "m1234567"},
+		{name: "empty identity rejected", raw: `{` + base + `,"current_task_turn_message_id":""}`, bad: true},
+		{name: "invalid identity rejected", raw: `{` + base + `,"current_task_turn_message_id":"not-a-message"}`, bad: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			frame, err := decodeCloudDSHFrame([]byte(test.raw))
+			if test.bad {
+				if err == nil {
+					t.Fatalf("invalid identity accepted: %s", test.raw)
+				}
+				return
+			}
+			if err != nil || frame.CurrentTaskTurnMessageID != test.want {
+				t.Fatalf("decoded frame = %+v, %v", frame, err)
+			}
+		})
+	}
+}
+
+func TestWriteCloudDSHModelPersistsSourceOnlyAsReplayMetadata(t *testing.T) {
+	identity := cloudDSHIdentity{TaskID: "q1234567", OwnerID: "u1234567", AgentID: "agent_1", SessionID: "session_1", Generation: 2, AuthorizationVersion: 1}
+	reader, writer := io.Pipe()
+	done := make(chan error, 1)
+	go func() {
+		done <- writeCloudDSHModel(context.Background(), writer, "model_123", identity, app.ModelResponse{
+			ToolCalls: []app.ModelToolCall{{CallID: "call_123", Name: "plan_update", Arguments: `{}`, CurrentTaskTurnMessageID: "m1234567"}},
+			Usage:     app.ModelUsage{Known: true, InputTokens: 2, OutputTokens: 1}, StopReason: "tool_calls",
+		})
+		_ = writer.Close()
+	}()
+	scanner := bufio.NewScanner(reader)
+	found := false
+	for scanner.Scan() {
+		var frame struct {
+			Type  string         `json:"type"`
+			Chunk map[string]any `json:"chunk"`
+		}
+		if err := json.Unmarshal(scanner.Bytes(), &frame); err != nil {
+			t.Fatal(err)
+		}
+		if frame.Type == "model_chunk" && frame.Chunk["type"] == "finish" {
+			replayState, ok := frame.Chunk["replayState"].(map[string]any)
+			response, responseOK := replayState["response"].(map[string]any)
+			if !ok || !responseOK || response["morde_task_turn_message_id"] != "m1234567" {
+				t.Fatalf("finish replay source metadata = %#v", frame.Chunk)
+			}
+			found = true
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("model finish did not persist source metadata for runtime recovery")
+	}
+}
+
+func TestWriteCloudDSHModelChunksLongUTF8ContentIntoBoundedFrames(t *testing.T) {
+	identity := cloudDSHIdentity{TaskID: "q1234567", OwnerID: "u1234567", AgentID: "agent_1", SessionID: "session_1", Generation: 2, AuthorizationVersion: 1}
+	text := strings.Repeat("中😀\x01", 200000) + "中"
+	reasoning := strings.Repeat("推理😀", 70000)
+	if len(text) <= cloudDSHMaxModelResponseBlockBytes || len(text) > cloudDSHMaxModelResponseContentBytes {
+		t.Fatalf("text fixture size = %d, outside intended long-response range", len(text))
+	}
+	if len(reasoning) <= app.MaxAssistantMessageBytes || len(reasoning) > cloudDSHMaxModelResponseContentBytes {
+		t.Fatalf("reasoning fixture size = %d, outside intended long-response range", len(reasoning))
+	}
+
+	var output cloudDSHBufferCloser
+	err := writeCloudDSHModel(context.Background(), &output, "model_123", identity, app.ModelResponse{
+		Text: text, Reasoning: reasoning,
+		Usage: app.ModelUsage{Known: true, InputTokens: 3, OutputTokens: 4}, StopReason: "stop",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	scanner := bufio.NewScanner(bytes.NewReader(output.Bytes()))
+	scanner.Buffer(make([]byte, 64<<10), cloudDSHMaxFrame)
+	deltas := make(map[int]*strings.Builder)
+	blockTypes := make(map[int]string)
+	var joinedText, joinedReasoning strings.Builder
+	lastChunkType := ""
+	frameCount := 0
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) > cloudDSHMaxFrame {
+			t.Fatalf("encoded model frame size = %d, exceeds %d", len(line), cloudDSHMaxFrame)
+		}
+		var frame struct {
+			Type  string         `json:"type"`
+			Chunk map[string]any `json:"chunk"`
+			Index int            `json:"index"`
+		}
+		if err := json.Unmarshal(line, &frame); err != nil {
+			t.Fatal(err)
+		}
+		frameCount++
+		if frame.Type != "model_chunk" {
+			continue
+		}
+		chunkType, _ := frame.Chunk["type"].(string)
+		lastChunkType = chunkType
+		blockIndexValue, hasBlockIndex := frame.Chunk["index"].(float64)
+		blockIndex := int(blockIndexValue)
+		if (chunkType == "block-start" || chunkType == "text-delta" || chunkType == "reasoning-delta" || chunkType == "block-end") && !hasBlockIndex {
+			t.Fatalf("model content chunk has no block index: %#v", frame.Chunk)
+		}
+		switch chunkType {
+		case "block-start":
+			blockType, _ := frame.Chunk["blockType"].(string)
+			blockTypes[blockIndex] = blockType
+			deltas[blockIndex] = &strings.Builder{}
+		case "text-delta", "reasoning-delta":
+			value, ok := frame.Chunk["text"].(string)
+			if !ok || len(value) > app.MaxAssistantMessageBytes || !utf8.ValidString(value) {
+				t.Fatalf("model delta is invalid or above limit: type=%s bytes=%d", chunkType, len(value))
+			}
+			builder := deltas[blockIndex]
+			if builder == nil {
+				t.Fatalf("delta arrived without block-start for index %d", blockIndex)
+			}
+			builder.WriteString(value)
+		case "block-end":
+			block, ok := frame.Chunk["block"].(map[string]any)
+			value, valueOK := block["text"].(string)
+			builder := deltas[blockIndex]
+			var deltaText string
+			if builder != nil {
+				deltaText = builder.String()
+			}
+			if !ok || !valueOK || builder == nil || value != deltaText {
+				t.Fatalf("completed block does not match its deltas: index=%d block=%#v deltas=%q", blockIndex, block, deltaText)
+			}
+			switch blockTypes[blockIndex] {
+			case "text":
+				joinedText.WriteString(value)
+			case "reasoning":
+				joinedReasoning.WriteString(value)
+			default:
+				t.Fatalf("unexpected response block type: %q", blockTypes[blockIndex])
+			}
+		case "usage", "finish":
+		default:
+			t.Fatalf("unexpected model chunk type: %q", chunkType)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if frameCount < 10 || joinedText.String() != text || joinedReasoning.String() != reasoning {
+		t.Fatalf("reassembled response differs: frames=%d text=%d/%d reasoning=%d/%d", frameCount,
+			joinedText.Len(), len(text), joinedReasoning.Len(), len(reasoning))
+	}
+	if lastChunkType != "finish" {
+		t.Fatalf("last model chunk = %q, want finish after usage", lastChunkType)
+	}
+}
+
+func TestWriteCloudDSHModelRejectsInvalidOrOversizedContentBeforeWriting(t *testing.T) {
+	identity := cloudDSHIdentity{TaskID: "q1234567", OwnerID: "u1234567", AgentID: "agent_1", SessionID: "session_1", Generation: 2, AuthorizationVersion: 1}
+	for _, test := range []struct {
+		name string
+		text string
+	}{
+		{name: "above total byte cap", text: strings.Repeat("x", cloudDSHMaxModelResponseContentBytes+1)},
+		{name: "invalid UTF-8", text: string([]byte{0xff, 0xfe})},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var output cloudDSHBufferCloser
+			err := writeCloudDSHModel(context.Background(), &output, "model_123", identity, app.ModelResponse{
+				Text: test.text, Usage: app.ModelUsage{Known: true, InputTokens: 1, OutputTokens: 1}, StopReason: "stop",
+			})
+			if err == nil {
+				t.Fatal("invalid response content was accepted")
+			}
+			if output.Len() != 0 {
+				t.Fatalf("invalid response wrote %d bytes before rejection", output.Len())
+			}
+		})
+	}
+}
+
+type cloudDSHBlockingFrameWriter struct {
+	started chan struct{}
+}
+
+func (w *cloudDSHBlockingFrameWriter) Write([]byte) (int, error) {
+	return 0, errors.New("unexpected direct write")
+}
+func (w *cloudDSHBlockingFrameWriter) Close() error { return nil }
+func (w *cloudDSHBlockingFrameWriter) writeFrame(ctx context.Context, _ any) error {
+	close(w.started)
+	<-ctx.Done()
+	return context.Cause(ctx)
+}
+
+func TestWriteCloudDSHModelPropagatesCancellation(t *testing.T) {
+	identity := cloudDSHIdentity{TaskID: "q1234567", OwnerID: "u1234567", AgentID: "agent_1", SessionID: "session_1", Generation: 2, AuthorizationVersion: 1}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	writer := &cloudDSHBlockingFrameWriter{started: make(chan struct{})}
+	done := make(chan error, 1)
+	go func() {
+		done <- writeCloudDSHModel(ctx, writer, "model_123", identity, app.ModelResponse{
+			Text: "long reply", Usage: app.ModelUsage{Known: true, InputTokens: 1, OutputTokens: 1}, StopReason: "stop",
+		})
+	}()
+	<-writer.started
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled model frame write error = %v, want context.Canceled", err)
 	}
 }
 
@@ -1791,6 +2597,106 @@ func TestCloudDSHModelFailureWaitsForConfirmedStopBeforeRecovery(t *testing.T) {
 	}
 }
 
+func TestCloudDSHRecoveredRuntimeErrorPausesSafelyThroughBroker(t *testing.T) {
+	executor, _, _, checkpoints, models, value := cloudDSHFixture(t)
+	value.AgentInstanceID = "agent_previous"
+	value.AgentGeneration = 1
+	value.AgentSessionID = "session_previous"
+	value.AgentEngineVersion = cloudDSHEngineVersion
+	value.AgentProfileVersion = cloudDSHProfileVersion
+	value.CheckpointThroughSequence = 0
+	value.CheckpointDigest = bytes.Repeat([]byte{9}, sha256.Size)
+
+	store := &cloudDSHRecoveryPauseTaskStore{details: app.TaskDetails{Task: value}}
+	broker, err := app.NewCloudDSHToolBroker(store, &app.RuntimeToolExecutor{}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const privateRuntimeError = "private protocol failure with credential=do-not-persist"
+	tools := &cloudDSHFailingDefinitionsBroker{CloudDSHToolBroker: broker, definitionsErr: errors.New(privateRuntimeError)}
+	executor.options.Tools = tools
+
+	err = executor.ExecuteTask(context.Background(), value)
+	if err == nil || strings.Contains(err.Error(), privateRuntimeError) {
+		t.Fatalf("recovery runtime error was missing or exposed raw detail: %v", err)
+	}
+	if len(models.calls) != 0 || tools.executeCalls != 0 || len(checkpoints.reads) != 0 || len(checkpoints.commands) != 0 {
+		t.Fatalf("recovery error reached model/tool/checkpoint work: models=%d tools=%d checkpoint_reads=%d checkpoint_writes=%d",
+			len(models.calls), tools.executeCalls, len(checkpoints.reads), len(checkpoints.commands))
+	}
+	if store.details.Task.Status != task.StatusWaitingUser || store.details.Task.WaitingReason != "dsh_recovery_unresolved" ||
+		len(store.details.Steps) != 1 || store.details.Steps[0].Status != task.StepUnknown || len(store.progress) != 1 {
+		t.Fatalf("recovery error was not durably paused: task=%+v steps=%+v progress=%d",
+			store.details.Task, store.details.Steps, len(store.progress))
+	}
+
+	progress := store.progress[0]
+	var event struct {
+		Summary string                     `json:"summary"`
+		Detail  map[string]json.RawMessage `json:"detail"`
+	}
+	if err := json.Unmarshal(progress.Event.Payload, &event); err != nil {
+		t.Fatalf("decode persisted recovery event: %v", err)
+	}
+	var stage, reason string
+	if err := json.Unmarshal(event.Detail["recovery_stage"], &stage); err != nil {
+		t.Fatalf("decode persisted recovery stage: %v", err)
+	}
+	if err := json.Unmarshal(event.Detail["recovery_reason"], &reason); err != nil {
+		t.Fatalf("decode persisted recovery reason: %v", err)
+	}
+	allowedDetails := map[string]bool{"phase": true, "source": true, "recovery_stage": true, "recovery_reason": true}
+	for key := range event.Detail {
+		if !allowedDetails[key] {
+			t.Errorf("recovery event contains non-allowlisted diagnostic field %q", key)
+		}
+	}
+	if stage != app.AgentRecoveryStageCloudDSHRun || reason != app.AgentRecoveryReasonUnclassifiedRuntime ||
+		strings.Contains(strings.ToLower(event.Summary), "checkpoint") || strings.Contains(event.Summary, stage) ||
+		strings.Contains(event.Summary, reason) || strings.Contains(string(progress.Event.Payload), privateRuntimeError) {
+		t.Fatalf("persisted recovery event is inaccurate or unsafe: summary=%q stage=%q reason=%q payload=%s",
+			event.Summary, stage, reason, progress.Event.Payload)
+	}
+}
+
+func TestCloudDSHExecutorPausesUnconfirmedModelFailures(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		failure  error
+		category string
+	}{
+		{name: "unconfirmed usage", failure: domain.NewError(domain.CodeInvalidState, "usage requires reconciliation"), category: "usage_unknown"},
+		{name: "provider rate limit", failure: domain.NewError(domain.CodeRateLimited, "synthetic limit"), category: "rate_limited"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			executor, _, _, _, models, value := cloudDSHFixture(t)
+			tools := &cloudDSHModelPauseCapture{cloudDSHTestTools: &cloudDSHTestTools{}}
+			executor.options.Tools = tools
+			models.complete = func(context.Context, app.ModelCall) (app.ModelResponse, error) {
+				return app.ModelResponse{}, test.failure
+			}
+			if err := executor.ExecuteTask(context.Background(), value); !errors.Is(err, errCloudDSHModelResultUnavailable) {
+				t.Fatalf("model failure = %v", err)
+			}
+			if len(models.calls) != 1 || tools.pauseCalls != 1 || tools.diagnostic.Category != test.category {
+				t.Fatalf("model calls=%d pauses=%d diagnostic=%+v", len(models.calls), tools.pauseCalls, tools.diagnostic)
+			}
+		})
+	}
+}
+
+type cloudDSHModelPauseCapture struct {
+	*cloudDSHTestTools
+	pauseCalls int
+	diagnostic app.AgentModelFailureDiagnostic
+}
+
+func (s *cloudDSHModelPauseCapture) PauseModelRecoveryDiagnostic(_ context.Context, _ task.Task, diagnostic app.AgentModelFailureDiagnostic) error {
+	s.pauseCalls++
+	s.diagnostic = diagnostic
+	return nil
+}
+
 func cloudDSHTestUserPrompt(t *testing.T, call app.ModelCall) string {
 	t.Helper()
 	var request struct {
@@ -2337,14 +3243,16 @@ func TestCloudDSHExecutorRunsAndSettlesPersistedChildSession(t *testing.T) {
 		len(children.settleCommand.CheckpointDigest) != sha256.Size || children.settleCommand.Summary != "Child result" {
 		t.Fatalf("child lifecycle create=%#v settle=%#v counts=%d/%d", children.createCommand, children.settleCommand, children.creates, children.settles)
 	}
+	// The default permits a coordinator child to delegate one more level.
 	expectedChildDefinitions, err := cloudDSHChildDelegationTools([]app.AgentToolDefinition{tool}, true)
 	if err != nil {
 		t.Fatalf("child coordinator tool definitions: %v", err)
 	}
+	expectedChildDefinitions = cloudDSHAddPlanSelectorsToDelegate(expectedChildDefinitions)
 	if len(models.calls) != 4 || models.calls[1].Task == nil || models.calls[1].Task.AgentSessionID != "child_test" ||
 		models.calls[1].Task.AgentRootSessionID != rootSessionID || models.calls[1].Task.TaskID != value.ID ||
 		!validCloudDSHModelRequest(models.calls[1].RawRequest, value.ModelID, expectedChildDefinitions) {
-		t.Fatalf("child model call was not scoped to its persisted Session: %#v", models.calls)
+		t.Fatalf("child model call was not scoped to its persisted Session; model calls=%d", len(models.calls))
 	}
 	if len(tools.calls) != 1 || !strings.HasPrefix(tools.calls[0].CallID, "dsh_") {
 		t.Fatalf("child tool call was not namespaced to its Session: %#v", tools.calls)
@@ -2370,6 +3278,28 @@ func TestCloudDSHExecutorRunsAndSettlesPersistedChildSession(t *testing.T) {
 	}
 	if !foundChildCheckpoint {
 		t.Fatal("child checkpoint was not bound to its root Agent Session")
+	}
+}
+
+func TestCloudDSHExecutorPreservesDelegatedPlanSelection(t *testing.T) {
+	executor, _, _, _, models, value := cloudDSHFixture(t)
+	tool := cloudDSHReadTool()
+	children := &cloudDSHTestChildSessions{}
+	executor.options.Tools = &cloudDSHTestTools{definitions: []app.AgentToolDefinition{tool}}
+	executor.options.Children = children
+	models.responses = []app.ModelResponse{
+		{ToolCalls: []app.ModelToolCall{{CallID: "delegate_plan_1", Name: cloudDSHDelegateToolName,
+			Arguments: `{"title":"Inspect","objective":"Read the source.","tool_names":["file_read"],"morde_plan_step_id":"inspect","morde_plan_revision":3}`}},
+			StopReason: "tool_calls", Usage: app.ModelUsage{Known: true, InputTokens: 4, OutputTokens: 2}},
+		{Text: "Child result", StopReason: "stop", Usage: app.ModelUsage{Known: true, InputTokens: 4, OutputTokens: 1}},
+		{Text: "Parent result", StopReason: "stop", Usage: app.ModelUsage{Known: true, InputTokens: 4, OutputTokens: 1}},
+	}
+	if err := executor.ExecuteTask(context.Background(), value); !errors.Is(err, ErrCloudDSHCompletionPending) {
+		t.Fatalf("child Agent result = %v", err)
+	}
+	if children.creates != 1 || children.settles != 1 || children.createCommand.PlanStepID != "inspect" ||
+		children.createCommand.PlanRevision != 3 || bytes.Contains(children.createCommand.Arguments, []byte("morde_plan_")) {
+		t.Fatalf("delegated plan selection was not preserved separately: %#v", children.createCommand)
 	}
 }
 

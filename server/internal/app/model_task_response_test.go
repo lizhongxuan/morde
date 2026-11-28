@@ -82,3 +82,150 @@ func TestTaskModelResponseSealOpenAndRejectsChangedFence(t *testing.T) {
 		t.Fatalf("valid successor generation could not open prior response: %v", err)
 	}
 }
+
+func TestTaskModelResponseSealOpenKnownTextTruncationWithoutReasoning(t *testing.T) {
+	sealer, reservation := taskModelResponseFixture(t)
+	response := ModelResponse{Reasoning: "private reasoning", Text: "saved visible prefix",
+		Usage: ModelUsage{Known: true, InputTokens: 6, OutputTokens: 3}, StopReason: "length", ProviderReportedModel: "provider-snapshot-3"}
+	partial := response
+	partial.Reasoning = ""
+	if !validTaskModelTruncatedTextResponse(partial) {
+		t.Fatal("valid known text truncation was rejected")
+	}
+	record, err := SealTaskModelResponse(sealer, reservation, partial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := OpenTaskModelResponse(sealer, record, reservation)
+	if err != nil || got.StopReason != "length" || got.Text != response.Text || got.Reasoning != "" || got.Usage != response.Usage {
+		t.Fatalf("partial response round trip = %#v, err=%v", got, err)
+	}
+	for name, invalid := range map[string]ModelResponse{
+		"content filter": {Text: "filtered", Usage: response.Usage, StopReason: "content_filter", ProviderReportedModel: response.ProviderReportedModel},
+		"unknown usage":  {Text: "partial", StopReason: "length", ProviderReportedModel: response.ProviderReportedModel},
+		"empty prefix":   {StopReason: "length", Usage: response.Usage, ProviderReportedModel: response.ProviderReportedModel},
+		"tool call": {Text: "partial", ToolCalls: []ModelToolCall{{CallID: "call-1", Name: "lookup", Arguments: `{}`}},
+			Usage: response.Usage, StopReason: "length", ProviderReportedModel: response.ProviderReportedModel},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if validTaskModelTruncatedTextResponse(invalid) {
+				t.Fatal("invalid partial response was accepted")
+			}
+			if _, err := SealTaskModelResponse(sealer, reservation, invalid); err == nil {
+				t.Fatal("invalid partial response was sealed")
+			}
+		})
+	}
+}
+
+func TestTaskModelResponseBindsAdaptiveLedgerAndFinalDSHCallIDsSeparately(t *testing.T) {
+	sealer, reservation := taskModelResponseFixture(t)
+	reservation.Task = normalizedModelTaskFence(reservation.Task)
+	reservation.Task.ThroughSequence = 7
+	ledgerCallID, err := DSHModelCallID(reservation.Task.TaskID, reservation.Task.AgentSessionID, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dshCallID, err := DSHModelCallID(reservation.Task.TaskID, reservation.Task.AgentSessionID, reservation.Task.ThroughSequence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ledgerCallID == dshCallID {
+		t.Fatal("fixture must keep prepare ledger and final DSH call identities distinct")
+	}
+	reservation.CallID, reservation.DSHCallID = ledgerCallID, dshCallID
+	reservation.BudgetPlanID, reservation.BudgetCallID, reservation.BudgetRequestDigest =
+		"budget-plan-123", "budget-call-123", strings.Repeat("a", 64)
+	response := ModelResponse{Text: "budgeted response", Usage: ModelUsage{Known: true, InputTokens: 4, OutputTokens: 2},
+		StopReason: "stop", ProviderReportedModel: "provider-snapshot-3"}
+	record, err := SealTaskModelResponse(sealer, reservation, response)
+	if err != nil {
+		t.Fatalf("seal budgeted response with separate ledger and DSH identities: %v", err)
+	}
+	if got, err := OpenTaskModelResponse(sealer, record, reservation); err != nil || got.Text != response.Text {
+		t.Fatalf("budgeted response did not round trip with separate IDs: response=%+v err=%v", got, err)
+	}
+
+	changedFrame := reservation
+	changedFrame.DSHCallID, _ = DSHModelCallID(reservation.Task.TaskID, reservation.Task.AgentSessionID, 6)
+	if _, err := OpenTaskModelResponse(sealer, record, changedFrame); err == nil {
+		t.Fatal("adaptive response opened for a different final DSH frame")
+	}
+	changedLedger := reservation
+	changedLedger.CallID, _ = DSHModelCallID(reservation.Task.TaskID, reservation.Task.AgentSessionID, 4)
+	if _, err := OpenTaskModelResponse(sealer, record, changedLedger); err == nil {
+		t.Fatal("adaptive response opened for a different ledger call")
+	}
+
+	sameID := reservation
+	sameID.CallID = dshCallID
+	sameRecord, err := SealTaskModelResponse(sealer, sameID, response)
+	if err != nil {
+		t.Fatalf("seal budgeted response when prepare and final IDs are equal: %v", err)
+	}
+	if got, err := OpenTaskModelResponse(sealer, sameRecord, sameID); err != nil || got.Text != response.Text {
+		t.Fatalf("budgeted response with equal ledger and DSH IDs did not round trip: response=%+v err=%v", got, err)
+	}
+	wrongSameID := sameID
+	wrongSameID.CallID = ledgerCallID
+	if _, err := OpenTaskModelResponse(sealer, sameRecord, wrongSameID); err == nil {
+		t.Fatal("adaptive response with equal IDs opened for a different ledger call")
+	}
+
+	partialBudget := reservation
+	partialBudget.BudgetRequestDigest = ""
+	if _, err := SealTaskModelResponse(sealer, partialBudget, response); err == nil {
+		t.Fatal("response with a partial adaptive budget identity was sealed")
+	}
+	missingFrameID := reservation
+	missingFrameID.DSHCallID = ""
+	if _, err := SealTaskModelResponse(sealer, missingFrameID, response); err == nil {
+		t.Fatal("response with a missing adaptive DSH frame ID was sealed")
+	}
+}
+
+func TestTaskModelResponseBindsRecoveryLedgerAndDSHFrameSeparately(t *testing.T) {
+	sealer, reservation := taskModelResponseFixture(t)
+	dshCallID := reservation.CallID
+	reservation.Task = normalizedModelTaskFence(reservation.Task)
+	reservation.Task.TaskRevision = 9
+	failedCallID, err := DSHModelCallID(reservation.Task.TaskID, reservation.Task.AgentSessionID, reservation.Task.ThroughSequence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservation.Task.RecoveryCallID, err = TaskModelRecoveryCallID(reservation.Task.TaskID, reservation.Task.TaskRevision,
+		failedCallID, reservation.Task.ThroughSequence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservation.Task.RecoveryDSHCallID, err = TaskModelRecoveryDSHCallID(reservation.Task.TaskID, reservation.Task.TaskRevision,
+		failedCallID, reservation.Task.ThroughSequence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservation.CallID = reservation.Task.RecoveryCallID
+	reservation.DSHCallID = reservation.Task.RecoveryDSHCallID
+	if reservation.DSHCallID == dshCallID {
+		t.Fatal("recovery DSH identity reused the failed call identity")
+	}
+	response := ModelResponse{Text: "recovered", Usage: ModelUsage{Known: true, InputTokens: 2, OutputTokens: 1},
+		StopReason: "stop", ProviderReportedModel: "provider-snapshot-3"}
+	record, err := SealTaskModelResponse(sealer, reservation, response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := OpenTaskModelResponse(sealer, record, reservation); err != nil || got.Text != response.Text {
+		t.Fatalf("recovery response did not round trip with separate frame and ledger IDs: response=%+v err=%v", got, err)
+	}
+	changedFrame := reservation
+	changedFrame.DSHCallID = "mdl_another_123"
+	if _, err := OpenTaskModelResponse(sealer, record, changedFrame); err == nil {
+		t.Fatal("recovery response opened for a different DSH frame")
+	}
+	changedRevision := reservation
+	changedRevision.Task = normalizedModelTaskFence(reservation.Task)
+	changedRevision.Task.TaskRevision++
+	if _, err := OpenTaskModelResponse(sealer, record, changedRevision); err == nil {
+		t.Fatal("recovery response opened for a different Task revision")
+	}
+}

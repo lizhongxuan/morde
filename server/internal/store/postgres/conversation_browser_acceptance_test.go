@@ -381,7 +381,8 @@ FROM conversation_messages WHERE conversation_id=$1`, mainConversation.Conversat
 	}
 	apiDeps := api.Deps{Hosts: hostService, TLSAuthorizer: nativeAcceptanceTLS{}, Verifier: credentials,
 		Auth: nativeAcceptanceAuth{credentials: credentials, users: users}, ClientLogin: clients, Tasks: tasks, Conversations: conversations,
-		WorkspaceOps: workspaceOps, Onboarding: onboarding,
+		TaskPCDeliveryObservations: tasks,
+		WorkspaceOps:               workspaceOps, Onboarding: onboarding,
 		PersonalData: personalData, PersonalSync: personalSync, PersonalDataQuotaUser: personalQuotaUser,
 		PersonalAttachments: personalAttachments,
 		ModelConnections:    models, ModelGateway: gateway, ExecutionControl: execution,
@@ -649,7 +650,8 @@ FROM conversation_messages WHERE conversation_id=$1`, mainConversation.Conversat
 				if activity != nil {
 					minimumReplies = 0
 					for _, scenario := range activity.required {
-						if scenario != "failed" && scenario != "approval" && scenario != "approval-revoked" && scenario != "approval-host-member-revoked" && scenario != "mcp-retry" &&
+						if scenario != "failed" && scenario != "approval" && scenario != "approval-rejected" && scenario != "approval-expired" &&
+							scenario != "approval-revoked" && scenario != "approval-host-member-revoked" && scenario != "mcp-retry" &&
 							scenario != "recovery-unknown" && scenario != "target-control" {
 							minimumReplies = 1
 							break
@@ -1648,9 +1650,9 @@ AND message.delivery_status='applied' AND route.state='routed'`, ownerID, conver
 // GET /__morde_fixture/bootstrap/{scenario} for native UI tests.
 // MORDE_BROWSER_ACCEPTANCE_LISTEN_ADDR may select a fixed loopback port; absent
 // it, the fixture binds a random loopback port. POST /__morde_fixture/advance/{name}/{start|progress|
-// stream|complete|candidate|commit|fail|approval|clarification|unknown|retry-success} releases one stage, without a request body.
+// stream|complete|candidate|commit|fail|approval|expire|clarification|unknown|retry-success} releases one stage, without a request body.
 // The search scenario uses a fixed local result and never accesses the network.
-// MORDE_BROWSER_ACTIVITY_SCENARIOS=search,queued,failed,approval,approval-resume,approval-host-member-revoked,clarification,recovery-unknown,completion-race,target-control selects individual
+// MORDE_BROWSER_ACTIVITY_SCENARIOS=search,queued,failed,approval,approval-rejected,approval-expired,approval-resume,approval-host-member-revoked,clarification,recovery-unknown,completion-race,target-control selects individual
 // scenarios; omit it to require the full merge, separate, search, stream and
 // reconnect set. target-control waits for two similar independent Tasks, then
 // verifies that stopping B leaves A running. For a full run, merge-a and merge-b must complete within the
@@ -1661,7 +1663,7 @@ AND message.delivery_status='applied' AND route.state='routed'`, ownerID, conver
 // MORDE_BROWSER_ACCEPTANCE_AUTO_STOP=1 lets the fixture stop itself after all
 // selected activity scenarios have passed their verify endpoints.
 // GET /__morde_fixture/verify/{merge|separate|reconnect|search|stream|failed|
-// approval|approval-resume|approval-revoked|approval-host-member-revoked|clarification|recovery-unknown|completion-race|interrupted|mcp-retry|route-retry|target-control} checks result identity and ordering, reconnect cursors, or the
+// approval|approval-rejected|approval-expired|approval-resume|approval-revoked|approval-host-member-revoked|clarification|recovery-unknown|completion-race|interrupted|mcp-retry|route-retry|target-control} checks result identity and ordering, reconnect cursors, or the
 // persisted accepted route and requested Task outcome. The fixture does not
 // pass until all selected checks succeed; visual deduplication still needs to
 // be checked in both clients after refresh/relaunch. MORDE_BROWSER_ACTIVITY_CROSS_CLIENT=1
@@ -1784,11 +1786,14 @@ type browserActivityTaskListRequest struct {
 }
 
 type browserActivityTaskSnapshotRequest struct {
-	Client        string `json:"client"`
-	TaskID        string `json:"task_id"`
-	StatusCode    int    `json:"status_code"`
-	Status        string `json:"status,omitempty"`
-	WaitingReason string `json:"waiting_reason,omitempty"`
+	Client         string `json:"client"`
+	TaskID         string `json:"task_id"`
+	StatusCode     int    `json:"status_code"`
+	Status         string `json:"status,omitempty"`
+	WaitingReason  string `json:"waiting_reason,omitempty"`
+	PendingID      string `json:"pending_id,omitempty"`
+	PendingVersion int64  `json:"pending_version,omitempty"`
+	PendingStatus  string `json:"pending_status,omitempty"`
 }
 
 type browserActivityMessageSnapshotRequest struct {
@@ -1892,6 +1897,8 @@ func browserActivitySelection(raw string) ([]string, []string, error) {
 		"queued":                       {"queued"},
 		"failed":                       {"failed"},
 		"approval":                     {"approval"},
+		"approval-rejected":            {"approval"},
+		"approval-expired":             {"approval"},
 		"approval-resume":              {"approval-resume"},
 		"approval-revoked":             {"approval-revoked"},
 		"approval-host-member-revoked": {"approval-host-member-revoked"},
@@ -1905,6 +1912,7 @@ func browserActivitySelection(raw string) ([]string, []string, error) {
 	}
 	var selected, required []string
 	seen := make(map[string]bool)
+	selectedSeen := make(map[string]bool)
 	for _, item := range strings.Split(raw, ",") {
 		scenario := strings.TrimSpace(item)
 		runs, ok := groups[scenario]
@@ -1916,7 +1924,13 @@ func browserActivitySelection(raw string) ([]string, []string, error) {
 		if scenario == "stream" {
 			required = append(required, "reconnect")
 		}
-		selected = append(selected, runs...)
+		for _, run := range runs {
+			if selectedSeen[run] {
+				return nil, nil, fmt.Errorf("browser activity scenarios share the same synthetic run; select one approval outcome at a time")
+			}
+			selectedSeen[run] = true
+			selected = append(selected, run)
+		}
 	}
 	return selected, required, nil
 }
@@ -1936,6 +1950,9 @@ func TestBrowserActivitySelection(t *testing.T) {
 		{name: "queued only", input: "queued", selected: "queued", required: "queued"},
 		{name: "failed only", input: "failed", selected: "failed", required: "failed"},
 		{name: "approval only", input: "approval", selected: "approval", required: "approval"},
+		{name: "approval rejection only", input: "approval-rejected", selected: "approval", required: "approval-rejected"},
+		{name: "approval expiry only", input: "approval-expired", selected: "approval", required: "approval-expired"},
+		{name: "approval outcomes require independent runs", input: "approval,approval-rejected", wantErr: true},
 		{name: "approval resume only", input: "approval-resume", selected: "approval-resume", required: "approval-resume"},
 		{name: "approval authorization revocation only", input: "approval-revoked", selected: "approval-revoked", required: "approval-revoked"},
 		{name: "shared Host member grant revocation only", input: "approval-host-member-revoked", selected: "approval-host-member-revoked", required: "approval-host-member-revoked"},
@@ -2037,6 +2054,23 @@ func TestBrowserActivityOutcomeVerifyEndpoint(t *testing.T) {
 				wantError = "authorization revocation is incomplete"
 			}
 			if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), wantError) {
+				t.Fatalf("verify endpoint status=%d body=%q", response.Code, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestBrowserActivityApprovalDecisionVerifyEndpointsRequireRecordedOutcomes(t *testing.T) {
+	for _, scenario := range []string{"approval-rejected", "approval-expired"} {
+		t.Run(scenario, func(t *testing.T) {
+			activity := &browserAcceptanceActivity{controlToken: "fixture-token", runs: map[string]*browserActivityRun{
+				"approval": {name: "approval", stage: "progress"},
+			}}
+			request := httptest.NewRequest(http.MethodGet, "/__morde_fixture/verify/"+scenario, nil)
+			request.Header.Set("X-Morde-Fixture-Token", activity.controlToken)
+			response := httptest.NewRecorder()
+			activity.serveControl(response, request)
+			if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "approval outcome is unavailable at stage progress") {
 				t.Fatalf("verify endpoint status=%d body=%q", response.Code, response.Body.String())
 			}
 		})
@@ -3313,12 +3347,20 @@ func (a *browserAcceptanceActivity) serveControl(w http.ResponseWriter, r *http.
 		a.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		result := map[string]any{"scenario": parts[1], "status": "verified"}
+		if isApprovalOutcomeVerification(parts[1]) {
+			coverage, uncovered := browserActivityApprovalCoverage(parts[1])
+			result["coverage"], result["uncovered"] = coverage, uncovered
+		}
 		switch parts[1] {
 		case "failed":
 			result["agent_acknowledged"], result["task_status"] = true, string(task.StatusFailed)
 		case "approval":
 			result["agent_acknowledged"], result["task_status"] = true, string(task.StatusWaitingUser)
 			result["waiting_reason"], result["pending_request_status"] = "approval_required", string(task.PendingRequestPending)
+		case "approval-rejected":
+			result["outcome"], result["task_id"] = "rejected_without_dispatch", a.approvalTaskID()
+		case "approval-expired":
+			result["outcome"], result["task_id"] = "server_expired_without_dispatch", a.approvalTaskID()
 		case "approval-resume":
 			a.mu.Lock()
 			run := a.runs["approval-resume"]
@@ -3399,6 +3441,36 @@ func (a *browserAcceptanceActivity) assertVerified() error {
 }
 
 func (a *browserAcceptanceActivity) advance(ctx context.Context, name, phase string) error {
+	if phase == "expire" {
+		if name != "approval" {
+			return errors.New("approval expiry is only available for the approval scenario")
+		}
+		a.mu.Lock()
+		run := a.runs[name]
+		if run == nil || run.stage != "waiting_user" || run.busy || run.current.ID == "" || run.approvalID == "" {
+			a.mu.Unlock()
+			return errors.New("approval expiry is unavailable before the Task is waiting for approval")
+		}
+		run.busy = true
+		taskID, approvalID := run.current.ID, run.approvalID
+		a.mu.Unlock()
+		updated, err := a.store.pool.Exec(ctx, `UPDATE task_pending_requests
+SET created_at=clock_timestamp()-interval '2 minutes', expires_at=clock_timestamp()-interval '1 minute'
+WHERE id=$1 AND task_id=$2 AND status='pending' AND expires_at>clock_timestamp()`, approvalID, taskID)
+		if err == nil && updated.RowsAffected() != 1 {
+			err = errors.New("pending approval was not active when expiry was requested")
+		}
+		a.mu.Lock()
+		run.busy = false
+		if err != nil {
+			run.failure = err.Error()
+		}
+		a.mu.Unlock()
+		if err != nil {
+			return fmt.Errorf("expire local pending approval: %w", err)
+		}
+		return nil
+	}
 	if phase == "revoke" {
 		if name != "approval-revoked" && name != "approval-host-member-revoked" {
 			return errors.New("authorization revocation is only available for approval-revoked scenarios")
@@ -3602,42 +3674,58 @@ func (a *browserAcceptanceActivity) serveTaskSnapshot(w http.ResponseWriter, r *
 			validationPreviewApplied = true
 		}
 	}
-	crossClientScenario := browserActivityCrossClientScenario()
-	crossClientTaskSnapshot := false
-	if crossClientScenario != "" {
-		a.mu.Lock()
-		run := a.runs[crossClientScenario]
-		crossClientTaskSnapshot = run != nil && run.current.ID == id
-		a.mu.Unlock()
+	trackTaskSnapshot := false
+	a.mu.Lock()
+	for _, run := range a.runs {
+		if run.current.ID == id {
+			trackTaskSnapshot = true
+			break
+		}
 	}
+	a.mu.Unlock()
 	client := "browser"
 	if strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
 		client = "ios"
-	} else if crossClientTaskSnapshot {
+	} else if trackTaskSnapshot {
 		cookie, err := r.Cookie("ch_portal")
 		if err != nil || cookie.Value == "" {
 			client = "other"
 		}
 	}
 	snapshotStatus, waitingReason := "", ""
-	if crossClientTaskSnapshot && recorder.Code == http.StatusOK {
+	pendingID, pendingStatus := "", ""
+	var pendingVersion int64
+	if trackTaskSnapshot && recorder.Code == http.StatusOK {
 		var snapshot struct {
-			Status        string  `json:"status"`
-			WaitingReason *string `json:"waiting_reason"`
+			Status         string  `json:"status"`
+			WaitingReason  *string `json:"waiting_reason"`
+			PendingRequest *struct {
+				ID      string `json:"id"`
+				Version int64  `json:"version"`
+				Status  string `json:"status"`
+			} `json:"pending_request"`
 		}
 		if json.Unmarshal(body, &snapshot) == nil {
 			snapshotStatus = snapshot.Status
 			if snapshot.WaitingReason != nil {
 				waitingReason = *snapshot.WaitingReason
 			}
+			if snapshot.PendingRequest != nil {
+				pendingID = snapshot.PendingRequest.ID
+				pendingVersion = snapshot.PendingRequest.Version
+				pendingStatus = snapshot.PendingRequest.Status
+			}
 		}
 	}
-	a.mu.Lock()
-	a.taskSnapshots = append(a.taskSnapshots, browserActivityTaskSnapshotRequest{
-		Client: client, TaskID: id, StatusCode: recorder.Code,
-		Status: snapshotStatus, WaitingReason: waitingReason,
-	})
-	a.mu.Unlock()
+	if trackTaskSnapshot {
+		a.mu.Lock()
+		a.taskSnapshots = append(a.taskSnapshots, browserActivityTaskSnapshotRequest{
+			Client: client, TaskID: id, StatusCode: recorder.Code,
+			Status: snapshotStatus, WaitingReason: waitingReason,
+			PendingID: pendingID, PendingVersion: pendingVersion, PendingStatus: pendingStatus,
+		})
+		a.mu.Unlock()
+	}
 	for key, values := range recorder.Header() {
 		w.Header()[key] = append([]string(nil), values...)
 	}
@@ -3827,6 +3915,76 @@ func verifyApprovalClientSnapshots(snapshots []browserActivityTaskSnapshotReques
 	return verifyCrossClientTaskSnapshots(snapshots, taskID, string(task.StatusWaitingUser), "approval_required")
 }
 
+func latestBrowserTaskSnapshot(snapshots []browserActivityTaskSnapshotRequest, taskID string) (browserActivityTaskSnapshotRequest, bool) {
+	for index := len(snapshots) - 1; index >= 0; index-- {
+		if snapshots[index].Client == "browser" && snapshots[index].TaskID == taskID {
+			return snapshots[index], true
+		}
+	}
+	return browserActivityTaskSnapshotRequest{}, false
+}
+
+func verifyPCTaskSnapshot(snapshots []browserActivityTaskSnapshotRequest, taskID, status, waitingReason string,
+	pendingID string, pendingVersion int64, pendingStatus string) error {
+	snapshot, ok := latestBrowserTaskSnapshot(snapshots, taskID)
+	if !ok {
+		return errors.New("PC verification is missing a successful Task snapshot")
+	}
+	if snapshot.StatusCode != http.StatusOK || snapshot.Status != status || snapshot.WaitingReason != waitingReason {
+		return fmt.Errorf("PC Task snapshot = HTTP %d %s/%s, want %s/%s",
+			snapshot.StatusCode, snapshot.Status, snapshot.WaitingReason, status, waitingReason)
+	}
+	if pendingID != "" && (snapshot.PendingID != pendingID || snapshot.PendingVersion != pendingVersion || snapshot.PendingStatus != pendingStatus) {
+		return fmt.Errorf("PC approval snapshot = %s/%d/%s, want %s/%d/%s",
+			snapshot.PendingID, snapshot.PendingVersion, snapshot.PendingStatus, pendingID, pendingVersion, pendingStatus)
+	}
+	return nil
+}
+
+func isApprovalOutcomeVerification(scenario string) bool {
+	switch scenario {
+	case "approval", "approval-rejected", "approval-expired", "approval-revoked", "approval-host-member-revoked":
+		return true
+	default:
+		return false
+	}
+}
+
+func browserActivityApprovalCoverage(scenario string) (string, []string) {
+	configured := browserActivityCrossClientScenario()
+	if (scenario == "approval" || scenario == "approval-revoked" || scenario == "approval-host-member-revoked") && configured == scenario {
+		return "pc-and-ios", []string{}
+	}
+	return "pc-only", []string{"iOS Task snapshot"}
+}
+
+func (a *browserAcceptanceActivity) approvalTaskID() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if run := a.runs["approval"]; run != nil {
+		return run.current.ID
+	}
+	return ""
+}
+
+func (a *browserAcceptanceActivity) verifyApprovalNoSideEffects(ctx context.Context, taskID string) error {
+	var hostOperations, connectorOperations, resultEvents int
+	if err := a.store.pool.QueryRow(ctx, `SELECT count(*) FROM task_operations WHERE task_id=$1`, taskID).Scan(&hostOperations); err != nil {
+		return fmt.Errorf("count Host operations for approval Task: %w", err)
+	}
+	if err := a.store.pool.QueryRow(ctx, `SELECT count(*) FROM task_mcp_connector_operations WHERE task_id=$1`, taskID).Scan(&connectorOperations); err != nil {
+		return fmt.Errorf("count connector operations for approval Task: %w", err)
+	}
+	if err := a.store.pool.QueryRow(ctx, `SELECT count(*) FROM task_events WHERE task_id=$1 AND event_type='task.result'`, taskID).Scan(&resultEvents); err != nil {
+		return fmt.Errorf("count result events for approval Task: %w", err)
+	}
+	if hostOperations != 0 || connectorOperations != 0 || resultEvents != 0 {
+		return fmt.Errorf("approval created a side effect or result: Host operations=%d connector operations=%d result events=%d",
+			hostOperations, connectorOperations, resultEvents)
+	}
+	return nil
+}
+
 func verifyApprovalResumeClientSnapshots(snapshots []browserActivityTaskSnapshotRequest, taskID string) error {
 	latestByClient := make(map[string]browserActivityTaskSnapshotRequest, 2)
 	for _, snapshot := range snapshots {
@@ -3999,6 +4157,71 @@ func TestVerifyApprovalClientSnapshots(t *testing.T) {
 	}
 }
 
+func TestVerifyPCTaskSnapshot(t *testing.T) {
+	taskID, approvalID := "t1234567", "r1234567"
+	approvedWait := browserActivityTaskSnapshotRequest{Client: "browser", TaskID: taskID, StatusCode: http.StatusOK,
+		Status: string(task.StatusWaitingUser), WaitingReason: "approval_required", PendingID: approvalID,
+		PendingVersion: 2, PendingStatus: string(task.PendingRequestPending)}
+	tests := []struct {
+		name      string
+		snapshots []browserActivityTaskSnapshotRequest
+		status    string
+		reason    string
+		pendingID string
+		version   int64
+		pending   string
+		wantErr   bool
+	}{
+		{name: "latest PC snapshot matches", snapshots: []browserActivityTaskSnapshotRequest{
+			{Client: "browser", TaskID: taskID, StatusCode: http.StatusOK, Status: string(task.StatusQueued)}, approvedWait},
+			status: string(task.StatusWaitingUser), reason: "approval_required", pendingID: approvalID, version: 2,
+			pending: string(task.PendingRequestPending)},
+		{name: "missing PC snapshot", snapshots: []browserActivityTaskSnapshotRequest{
+			{Client: "ios", TaskID: taskID, StatusCode: http.StatusOK, Status: string(task.StatusWaitingUser), WaitingReason: "approval_required"}},
+			status: string(task.StatusWaitingUser), reason: "approval_required", wantErr: true},
+		{name: "wrong Task state", snapshots: []browserActivityTaskSnapshotRequest{
+			{Client: "browser", TaskID: taskID, StatusCode: http.StatusOK, Status: string(task.StatusQueued)}},
+			status: string(task.StatusWaitingUser), reason: "approval_required", wantErr: true},
+		{name: "wrong approval version", snapshots: []browserActivityTaskSnapshotRequest{approvedWait},
+			status: string(task.StatusWaitingUser), reason: "approval_required", pendingID: approvalID, version: 1,
+			pending: string(task.PendingRequestPending), wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := verifyPCTaskSnapshot(test.snapshots, taskID, test.status, test.reason, test.pendingID, test.version, test.pending)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("verifyPCTaskSnapshot() error = %v, wantErr %t", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestBrowserActivityApprovalCoverage(t *testing.T) {
+	tests := []struct {
+		name        string
+		scenario    string
+		crossEnv    string
+		want        string
+		wantUncover int
+	}{
+		{name: "approval PC only", scenario: "approval", want: "pc-only", wantUncover: 1},
+		{name: "approval cross client opt-in", scenario: "approval", crossEnv: "approval", want: "pc-and-ios"},
+		{name: "rejection stays independently PC only", scenario: "approval-rejected", crossEnv: "approval", want: "pc-only", wantUncover: 1},
+		{name: "expiry PC only", scenario: "approval-expired", want: "pc-only", wantUncover: 1},
+		{name: "revocation PC only", scenario: "approval-revoked", want: "pc-only", wantUncover: 1},
+		{name: "revocation cross client opt-in", scenario: "approval-revoked", crossEnv: "approval-revoked", want: "pc-and-ios"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Setenv("MORDE_BROWSER_ACTIVITY_CROSS_CLIENT", test.crossEnv)
+			got, uncovered := browserActivityApprovalCoverage(test.scenario)
+			if got != test.want || len(uncovered) != test.wantUncover {
+				t.Fatalf("browserActivityApprovalCoverage() = %q/%v, want %q with %d uncovered clients", got, uncovered, test.want, test.wantUncover)
+			}
+		})
+	}
+}
+
 func TestVerifyApprovalResumeClientSnapshots(t *testing.T) {
 	taskID := "t1234567"
 	pc := browserActivityTaskSnapshotRequest{Client: "browser", TaskID: taskID, StatusCode: http.StatusOK,
@@ -4119,6 +4342,12 @@ func (a *browserAcceptanceActivity) verifyResult(ctx context.Context, scenario s
 	}
 	if scenario == "approval-resume" {
 		return a.verifyApprovalResumeOutcome(ctx)
+	}
+	if scenario == "approval-rejected" {
+		return a.verifyApprovalDecisionOutcome(ctx, task.PendingRequestRejected)
+	}
+	if scenario == "approval-expired" {
+		return a.verifyApprovalDecisionOutcome(ctx, task.PendingRequestExpired)
 	}
 	if scenario == "approval-revoked" || scenario == "approval-host-member-revoked" {
 		return a.verifyApprovalRevokedOutcome(ctx, scenario)
@@ -4662,6 +4891,11 @@ func (a *browserAcceptanceActivity) verifyAcceptedOutcome(ctx context.Context, s
 			return errors.New("recovery-unknown task does not point to a clearly unknown progress step")
 		}
 	}
+	if scenario == "approval" {
+		if err := a.verifyApprovalNoSideEffects(ctx, current.ID); err != nil {
+			return err
+		}
+	}
 	page, err := a.store.ListMessages(ctx, current.InitiatorID, a.conversationID, app.PageRequest{Limit: 100})
 	if err != nil {
 		return fmt.Errorf("read accepted synthetic route: %w", err)
@@ -4685,6 +4919,129 @@ func (a *browserAcceptanceActivity) verifyAcceptedOutcome(ctx context.Context, s
 		}
 	}
 	return errors.New("synthetic route was not persisted with agent_acknowledged=true")
+}
+
+func (a *browserAcceptanceActivity) verifyApprovalDecisionOutcome(ctx context.Context, expected task.PendingRequestStatus) error {
+	a.mu.Lock()
+	run := a.runs["approval"]
+	if run == nil || run.stage != "waiting_user" {
+		stage := "missing"
+		if run != nil {
+			stage = run.stage
+		}
+		a.mu.Unlock()
+		return fmt.Errorf("approval outcome is unavailable at stage %s", stage)
+	}
+	current, userMessageID := run.current, run.userMessageID
+	approvalID, approvalVersion := run.approvalID, run.approvalVersion
+	snapshots := append([]browserActivityTaskSnapshotRequest(nil), a.taskSnapshots...)
+	a.mu.Unlock()
+	if !domain.ValidPendingRequestID(approvalID) || approvalVersion < 1 {
+		return errors.New("approval outcome is missing the original pending request identity")
+	}
+	details, err := a.store.GetTask(ctx, current.ID, current.InitiatorID)
+	if err != nil {
+		return fmt.Errorf("read decided approval Task: %w", err)
+	}
+	if details.PendingRequest == nil || details.PendingRequest.ID != approvalID || details.PendingRequest.Version != approvalVersion ||
+		details.PendingRequest.Status != expected || details.PendingRequest.Decision != task.PendingDecisionReject ||
+		details.PendingRequest.RespondedAt == nil || details.Task.WaitingReason != "" {
+		return fmt.Errorf("approval outcome = Task %s/%s request %v, want %s with a cleared wait",
+			details.Task.Status, details.Task.WaitingReason, details.PendingRequest, expected)
+	}
+	if details.Task.Status != task.StatusQueued && details.Task.Status != task.StatusRunning && details.Task.Status != task.StatusFailed {
+		return fmt.Errorf("approval outcome Task status=%s, want queued, running, or failed after the wait was resolved", details.Task.Status)
+	}
+	switch expected {
+	case task.PendingRequestRejected:
+		if details.PendingRequest.ExpiresAt != nil && !details.PendingRequest.RespondedAt.Before(*details.PendingRequest.ExpiresAt) {
+			return errors.New("rejected approval was recorded after its expiry")
+		}
+	case task.PendingRequestExpired:
+		if details.PendingRequest.ExpiresAt == nil || details.PendingRequest.RespondedAt.Before(*details.PendingRequest.ExpiresAt) {
+			return errors.New("expired approval is missing a response at or after its expiry")
+		}
+	default:
+		return fmt.Errorf("unsupported approval outcome %q", expected)
+	}
+	if err := a.verifyApprovalResponseEvent(ctx, current, approvalID, approvalVersion, expected); err != nil {
+		return err
+	}
+	if err := a.verifyApprovalNoSideEffects(ctx, current.ID); err != nil {
+		return err
+	}
+	if err := a.verifyAcceptedApprovalRoute(ctx, current, userMessageID); err != nil {
+		return err
+	}
+	snapshot, ok := latestBrowserTaskSnapshot(snapshots, current.ID)
+	if !ok || snapshot.StatusCode != http.StatusOK || snapshot.WaitingReason != "" ||
+		(snapshot.Status != string(task.StatusQueued) && snapshot.Status != string(task.StatusRunning) && snapshot.Status != string(task.StatusFailed)) {
+		return fmt.Errorf("PC has not refreshed the resolved approval Task: HTTP %d status=%s waiting_reason=%s",
+			snapshot.StatusCode, snapshot.Status, snapshot.WaitingReason)
+	}
+	if expected == task.PendingRequestExpired &&
+		(snapshot.PendingID != approvalID || snapshot.PendingVersion != approvalVersion || snapshot.PendingStatus != string(task.PendingRequestExpired)) {
+		return fmt.Errorf("PC expiry snapshot = %s/%d/%s, want %s/%d/expired",
+			snapshot.PendingID, snapshot.PendingVersion, snapshot.PendingStatus, approvalID, approvalVersion)
+	}
+	return nil
+}
+
+func (a *browserAcceptanceActivity) verifyApprovalResponseEvent(ctx context.Context, current task.Task, approvalID string,
+	approvalVersion int64, expected task.PendingRequestStatus) error {
+	events, err := a.store.ListTaskEvents(ctx, current.InitiatorID, current.ID, 0, 100)
+	if err != nil {
+		return fmt.Errorf("read approval response events: %w", err)
+	}
+	matches := 0
+	for _, event := range events {
+		if event.Type != "task.response" {
+			continue
+		}
+		var payload struct {
+			PendingID      string `json:"pending_id"`
+			PendingVersion int64  `json:"pending_version"`
+			Decision       string `json:"decision"`
+			Reason         string `json:"reason"`
+			Status         string `json:"status"`
+		}
+		if err := json.Unmarshal(event.Payload, &payload); err != nil {
+			return fmt.Errorf("decode approval response event: %w", err)
+		}
+		if payload.PendingID != approvalID {
+			continue
+		}
+		matches++
+		if payload.PendingVersion != approvalVersion || payload.Decision != string(task.PendingDecisionReject) || payload.Status != string(task.StatusQueued) {
+			return fmt.Errorf("approval response event = %s/%d/%s/%s, want queued reject for %s/%d",
+				payload.Status, payload.PendingVersion, payload.Decision, payload.Reason, approvalID, approvalVersion)
+		}
+		if expected == task.PendingRequestRejected && payload.Reason != "" {
+			return fmt.Errorf("rejected approval response has unexpected reason %q", payload.Reason)
+		}
+		if expected == task.PendingRequestExpired && payload.Reason != "approval_expired" {
+			return fmt.Errorf("expired approval response reason=%q, want approval_expired", payload.Reason)
+		}
+	}
+	if matches != 1 {
+		return fmt.Errorf("approval response event count=%d, want exactly one for %s/%d", matches, approvalID, approvalVersion)
+	}
+	return nil
+}
+
+func (a *browserAcceptanceActivity) verifyAcceptedApprovalRoute(ctx context.Context, current task.Task, userMessageID string) error {
+	page, err := a.store.ListMessages(ctx, current.InitiatorID, a.conversationID, app.PageRequest{Limit: 100})
+	if err != nil {
+		return fmt.Errorf("read accepted approval message route: %w", err)
+	}
+	for _, message := range page.Items {
+		if message.ID == userMessageID && message.TaskID == current.ID && message.Role == conversation.RoleUser &&
+			message.AgentAcknowledged && message.RoutingStatus == conversation.RoutingRouted &&
+			message.DeliveryStatus == conversation.DeliveryApplied {
+			return nil
+		}
+	}
+	return errors.New("approval outcome is missing its accepted user message")
 }
 
 func (a *browserAcceptanceActivity) verifyApprovalResumeOutcome(ctx context.Context) error {
@@ -4850,19 +5207,8 @@ func (a *browserAcceptanceActivity) verifyApprovalRevokedOutcome(ctx context.Con
 		details.Task.Status == task.StatusCancelled && details.StopRequest.Status != task.StopRequestCompleted {
 		return fmt.Errorf("revoked approval stop request status=%s does not match Task status=%s", details.StopRequest.Status, details.Task.Status)
 	}
-	var hostOperations, connectorOperations, resultEvents int
-	if err := a.store.pool.QueryRow(ctx, `SELECT count(*) FROM task_operations WHERE task_id=$1`, current.ID).Scan(&hostOperations); err != nil {
-		return fmt.Errorf("count dispatched Host operations after approval revocation: %w", err)
-	}
-	if err := a.store.pool.QueryRow(ctx, `SELECT count(*) FROM task_mcp_connector_operations WHERE task_id=$1`, current.ID).Scan(&connectorOperations); err != nil {
-		return fmt.Errorf("count connector operations after approval revocation: %w", err)
-	}
-	if err := a.store.pool.QueryRow(ctx, `SELECT count(*) FROM task_events WHERE task_id=$1 AND event_type='task.result'`, current.ID).Scan(&resultEvents); err != nil {
-		return fmt.Errorf("count Task result events after approval revocation: %w", err)
-	}
-	if hostOperations != 0 || connectorOperations != 0 || resultEvents != 0 {
-		return fmt.Errorf("revoked approval created work or a completion: Host operations=%d connector operations=%d result events=%d",
-			hostOperations, connectorOperations, resultEvents)
+	if err := a.verifyApprovalNoSideEffects(ctx, current.ID); err != nil {
+		return fmt.Errorf("after authorization revocation: %w", err)
 	}
 	page, err := a.store.ListMessages(ctx, current.InitiatorID, a.conversationID, app.PageRequest{Limit: 100})
 	if err != nil {
@@ -4883,7 +5229,10 @@ func (a *browserAcceptanceActivity) verifyApprovalRevokedOutcome(ctx context.Con
 	a.mu.Lock()
 	run.stopStatus = string(details.Task.Status)
 	a.mu.Unlock()
-	return verifyCrossClientTaskSnapshots(snapshots, current.ID, string(details.Task.Status), "")
+	if browserActivityCrossClientScenario() == scenario {
+		return verifyCrossClientTaskSnapshots(snapshots, current.ID, string(details.Task.Status), "")
+	}
+	return verifyPCTaskSnapshot(snapshots, current.ID, string(details.Task.Status), "", "", 0, "")
 }
 
 func (a *browserAcceptanceActivity) verifyMCPRetrySucceeded(ctx context.Context) error {

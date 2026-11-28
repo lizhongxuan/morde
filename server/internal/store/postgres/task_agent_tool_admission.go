@@ -97,7 +97,16 @@ func (s *Store) AdmitAgentToolCall(ctx context.Context, call app.ModelToolCall, 
 			return nil
 		}
 		if len(pending) == 0 {
-			if err := persistTaskAgentToolCallAdmission(ctx, tx, value, operationKey, rootSessionID, rootThroughSequence); err != nil {
+			allowRecoveryRebind := false
+			if recovering {
+				_, dispatchedOrTerminal, err := agentToolCallDurableState(ctx, tx, value, rootSessionID, operationKey, call)
+				if err != nil {
+					return err
+				}
+				allowRecoveryRebind = dispatchedOrTerminal
+			}
+			if err := persistTaskAgentToolCallAdmission(ctx, tx, value, operationKey, rootSessionID,
+				rootThroughSequence, allowRecoveryRebind); err != nil {
 				return err
 			}
 			admission = app.AgentToolCallAdmission{Status: app.AgentToolCallAdmitted}
@@ -109,7 +118,8 @@ func (s *Store) AdmitAgentToolCall(ctx context.Context, call app.ModelToolCall, 
 			return err
 		}
 		if dispatchedOrTerminal {
-			if err := persistTaskAgentToolCallAdmission(ctx, tx, value, operationKey, rootSessionID, rootThroughSequence); err != nil {
+			if err := persistTaskAgentToolCallAdmission(ctx, tx, value, operationKey, rootSessionID,
+				rootThroughSequence, recovering); err != nil {
 				return err
 			}
 			admission = app.AgentToolCallAdmission{Status: app.AgentToolCallAdmitted}
@@ -121,7 +131,8 @@ func (s *Store) AdmitAgentToolCall(ctx context.Context, call app.ModelToolCall, 
 			// conservative fence so any operation final gate also sees the applied
 			// steer, then stop this child once instead of repeatedly superseding
 			// fresh call IDs forever.
-			if err := persistTaskAgentToolCallAdmission(ctx, tx, value, operationKey, rootSessionID, rootThroughSequence); err != nil {
+			if err := persistTaskAgentToolCallAdmission(ctx, tx, value, operationKey, rootSessionID,
+				rootThroughSequence, false); err != nil {
 				return err
 			}
 			admission = app.AgentToolCallAdmission{Status: app.AgentToolCallBaselineUnverifiable,
@@ -225,7 +236,8 @@ func agentToolAdmissionIdentifier(value string) bool {
 		return false
 	}
 	for _, char := range value {
-		if !(char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9' || char == '_' || char == '-') {
+		if (char < 'a' || char > 'z') && (char < 'A' || char > 'Z') &&
+			(char < '0' || char > '9') && char != '_' && char != '-' {
 			return false
 		}
 	}
@@ -293,10 +305,6 @@ ORDER BY sequence`, taskID, ownerID, initiatorID, conversationID)
 		}
 	}
 	return messageValues, nil
-}
-
-func pendingTaskAgentToolSteers(ctx context.Context, tx pgx.Tx, value app.ModelTaskFence, projectID, conversationID string) ([]app.AgentConversationMessage, error) {
-	return pendingTaskAgentSteers(ctx, tx, value.TaskID, value.OwnerID, value.InitiatorID, projectID, conversationID)
 }
 
 func pendingTaskAgentSteersForLockedTask(ctx context.Context, tx pgx.Tx, taskID, ownerID string) ([]app.AgentConversationMessage, error) {
@@ -417,7 +425,7 @@ WHERE task_id=$1 AND owner_id=$2 AND session_id=$3 AND parent_session_id IS NOT 
 }
 
 func persistTaskAgentToolCallAdmission(ctx context.Context, tx pgx.Tx, value app.ModelTaskFence,
-	operationKey, rootSessionID string, rootThroughSequence int64) error {
+	operationKey, rootSessionID string, rootThroughSequence int64, allowRecoveryRebind bool) error {
 	_, err := tx.Exec(ctx, `INSERT INTO task_agent_tool_call_admissions
 	(task_id,owner_id,operation_key,agent_instance_id,agent_generation,root_session_id,call_session_id,through_sequence,root_through_sequence)
 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (task_id,operation_key) DO NOTHING`,
@@ -434,15 +442,23 @@ FROM task_agent_tool_call_admissions WHERE task_id=$1 AND owner_id=$2 AND operat
 		value.TaskID, value.OwnerID, operationKey).Scan(&storedInstance, &storedGeneration, &storedRoot, &storedSession, &storedThrough, &storedRootThroughSequence); err != nil {
 		return fmt.Errorf("read persisted Task tool-call admission fence: %w", err)
 	}
-	if storedRoot != rootSessionID || storedSession != value.AgentSessionID || storedThrough != value.ThroughSequence ||
-		storedRootThroughSequence != rootThroughSequence || storedGeneration > value.AgentGeneration ||
+	checkpointChanged := storedThrough != value.ThroughSequence || storedRootThroughSequence != rootThroughSequence
+	recoveryRebind := allowRecoveryRebind && storedGeneration < value.AgentGeneration
+	if storedRoot != rootSessionID || storedSession != value.AgentSessionID || checkpointChanged && !recoveryRebind ||
+		storedGeneration > value.AgentGeneration ||
 		storedGeneration == value.AgentGeneration && storedInstance != value.AgentInstanceID {
 		return domain.NewError(domain.CodeIdempotencyConflict, "tool-call admission key was reused with a different session fence")
 	}
 	if storedGeneration < value.AgentGeneration {
-		if _, err := tx.Exec(ctx, `UPDATE task_agent_tool_call_admissions SET agent_instance_id=$4,agent_generation=$5,updated_at=clock_timestamp()
-WHERE task_id=$1 AND owner_id=$2 AND operation_key=$3 AND agent_generation<=$5`,
-			value.TaskID, value.OwnerID, operationKey, value.AgentInstanceID, value.AgentGeneration); err != nil {
+		query := `UPDATE task_agent_tool_call_admissions SET agent_instance_id=$4,agent_generation=$5,updated_at=clock_timestamp()
+WHERE task_id=$1 AND owner_id=$2 AND operation_key=$3 AND agent_generation<=$5`
+		arguments := []any{value.TaskID, value.OwnerID, operationKey, value.AgentInstanceID, value.AgentGeneration}
+		if recoveryRebind {
+			query = `UPDATE task_agent_tool_call_admissions SET agent_instance_id=$4,agent_generation=$5,through_sequence=$6,
+root_through_sequence=$7,updated_at=clock_timestamp() WHERE task_id=$1 AND owner_id=$2 AND operation_key=$3 AND agent_generation<=$5`
+			arguments = append(arguments, value.ThroughSequence, rootThroughSequence)
+		}
+		if _, err := tx.Exec(ctx, query, arguments...); err != nil {
 			return fmt.Errorf("rebind Task tool-call admission fence: %w", err)
 		}
 	}

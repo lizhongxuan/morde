@@ -9,18 +9,20 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 )
 
 const (
-	conversationSummaryMaintenanceLease          = 2 * time.Minute
-	conversationSummaryMaintenanceMaxPages       = 512
-	conversationSummaryMaintenanceMaxSources     = 256
-	conversationSummaryMaintenanceOverheadBytes  = 1024
-	conversationSummaryMaintenanceMaxInputBytes  = 96 << 10
-	conversationSummaryMaintenanceMaxOutputBytes = 16 << 10
+	conversationSummaryMaintenanceLease               = 2 * time.Minute
+	conversationSummaryMaintenanceMaxPages            = 512
+	conversationSummaryMaintenanceMaxSources          = 256
+	conversationSummaryMaintenanceOverheadBytes       = 1024
+	conversationSummaryMaintenanceMaxInputBytes       = 96 << 10
+	conversationSummaryMaintenanceOutputReserveTokens = 16_384
+	conversationSummaryMaintenanceMaxOutputTokens     = 8_192
 )
 
 const conversationSummaryIncompleteNotice = "【历史摘要不完整】当前摘要尚未覆盖全部可访问历史；需要更早的细节时请检索会话原文。"
@@ -32,17 +34,18 @@ type conversationSummaryMaintainer interface {
 }
 
 type conversationSummaryMaintenanceInput struct {
-	identity        app.ConversationSummaryIdentity
-	head            app.ConversationSummaryHead
-	previousText    string
-	previousProofs  []app.ConversationSummarySource
-	previousDigest  []byte
-	previousVersion int64
-	historyComplete bool
-	sources         []app.ConversationSummaryPromptSource
-	proofs          []app.ConversationSummarySource
-	inputBytes      int
-	inputTokens     int
+	identity           app.ConversationSummaryIdentity
+	head               app.ConversationSummaryHead
+	previousText       string
+	previousProofs     []app.ConversationSummarySource
+	previousDigest     []byte
+	previousVersion    int64
+	historyComplete    bool
+	sources            []app.ConversationSummaryPromptSource
+	proofs             []app.ConversationSummarySource
+	inputBytes         int
+	inputTokens        int
+	pendingPredecessor bool
 }
 
 func (w *ConversationRouteWorker) compactConversationSummary(ctx context.Context, claim app.ConversationRouteClaim, routeModelID string) (bool, error) {
@@ -72,7 +75,7 @@ func (w *ConversationRouteWorker) compactConversationSummary(ctx context.Context
 		return false, err
 	}
 	inputDigest, err := conversationSummaryOperationInputDigest(input.identity, input.head.Version,
-		input.previousVersion, input.previousDigest, modelID, contextWindow, input.sources)
+		input.previousVersion, input.previousDigest, modelID, contextWindow, input.pendingPredecessor, input.sources)
 	if err != nil {
 		return false, err
 	}
@@ -109,7 +112,7 @@ func (w *ConversationRouteWorker) compactConversationSummary(ctx context.Context
 	result, err := maintainer.CompactConversationSummary(ctx, CloudDSHConversationSummaryRequest{
 		Claim: claim, Operation: operation, Sources: input.sources,
 		PreviousSummaryText: input.previousText, PreviousSummaryVersion: input.previousVersion,
-		PreviousSummarySHA256: input.previousDigest,
+		PreviousSummarySHA256: input.previousDigest, PendingPredecessor: input.pendingPredecessor,
 	})
 	if err != nil {
 		return false, err
@@ -121,7 +124,7 @@ func (w *ConversationRouteWorker) compactConversationSummary(ctx context.Context
 	if !input.historyComplete {
 		text = conversationSummaryIncompleteNotice + "\n\n" + text
 	}
-	if len(text) > conversationSummaryMaintenanceMaxOutputBytes ||
+	if utf8.RuneCountInString(text) > app.MaxConversationSummaryCharacters ||
 		len(text) >= input.inputBytes || result.ModelID != modelID || result.SessionID == "" || result.Through < 0 {
 		return false, domain.NewError(domain.CodeInvalidState, "conversation summary did not produce a smaller bounded result")
 	}
@@ -138,7 +141,7 @@ func (w *ConversationRouteWorker) compactConversationSummary(ctx context.Context
 	}
 	if err := w.options.SummaryStore.CommitConversationSummary(ctx, app.ConversationSummaryCommit{
 		Claim: claim, Identity: input.identity, OperationID: operation.OperationID, LeaseOwner: leaseOwner,
-		LeaseVersion: operation.LeaseVersion, BaselineVersion: input.head.Version,
+		LeaseVersion: operation.LeaseVersion, BaselineVersion: input.head.Version, PendingPredecessor: input.pendingPredecessor,
 		SummarySHA256: stored.SummarySHA256, SourcesSHA256: stored.SourcesSHA256,
 		Ciphertext: stored.Ciphertext, Sources: proofs,
 	}); err != nil {
@@ -151,7 +154,8 @@ func (w *ConversationRouteWorker) compactConversationSummary(ctx context.Context
 func collectConversationSummaryMaintenanceInput(ctx context.Context, pages app.ConversationSummaryInputPageStore,
 	maintainer conversationSummaryMaintainer, claim app.ConversationRouteClaim, modelID string, contextWindow int,
 	first app.ConversationSummaryInputPage, sealer *app.Sealer) (conversationSummaryMaintenanceInput, bool, error) {
-	input := conversationSummaryMaintenanceInput{identity: first.Identity, head: first.Head}
+	input := conversationSummaryMaintenanceInput{identity: first.Identity, head: first.Head,
+		pendingPredecessor: first.PendingPredecessor}
 	if first.BoundarySequence != claim.Message.Sequence-1 || first.Head.Identity != first.Identity {
 		return input, false, domain.NewError(domain.CodeConflict, "conversation summary input boundary changed")
 	}
@@ -207,7 +211,8 @@ func collectConversationSummaryMaintenanceInput(ctx context.Context, pages app.C
 	}
 	for pageIndex := 0; pageIndex < conversationSummaryMaintenanceMaxPages; pageIndex++ {
 		if page.Identity != input.identity || page.Head.Version != input.head.Version ||
-			!bytes.Equal(page.Head.Digest, input.head.Digest) || page.BoundarySequence != first.BoundarySequence {
+			!bytes.Equal(page.Head.Digest, input.head.Digest) || page.BoundarySequence != first.BoundarySequence ||
+			page.PendingPredecessor != input.pendingPredecessor {
 			return input, false, domain.NewError(domain.CodeConflict, "conversation summary input changed while paging")
 		}
 		if len(page.Sources) == 0 && page.Next != nil {
@@ -278,7 +283,7 @@ func collectConversationSummaryMaintenanceInput(ctx context.Context, pages app.C
 	counts, err := maintainer.EstimateConversationSummaryTokenPressure(ctx, CloudDSHConversationSummaryEstimateRequest{
 		Claim: claim, ModelID: modelID, ContextWindowTokens: contextWindow, Sources: input.sources,
 		PreviousSummaryText: input.previousText, PreviousSummaryVersion: input.previousVersion,
-		PreviousSummarySHA256: input.previousDigest,
+		PreviousSummarySHA256: input.previousDigest, PendingPredecessor: input.pendingPredecessor,
 	})
 	if err != nil {
 		return input, false, err
@@ -313,7 +318,7 @@ func collectConversationSummaryMaintenanceInput(ctx context.Context, pages app.C
 		input.inputBytes = conversationSummaryMaintenanceInputBytes(input.previousText, input.sources)
 		exhausted = false
 	}
-	input.historyComplete = exhausted && selectedEnd == len(counts)
+	input.historyComplete = exhausted && selectedEnd == len(counts) && !input.pendingPredecessor
 	if tokenLimitReached && selectedEnd > 0 || input.inputBytes >= conversationSummaryMaintenanceMaxInputBytes*3/4 || capped {
 		ready = true
 	}
@@ -331,9 +336,23 @@ func conversationSummaryMaintenanceTokenBudget(contextWindow int) int {
 	if contextWindow < 4096 || contextWindow > app.MaxModelContextWindowTokens {
 		return 0
 	}
-	headroom := min(4096, contextWindow/8)
-	maxTokens := min(2048, max(256, contextWindow/16))
-	return contextWindow - headroom - maxTokens
+	headroom := min(4096, max(512, contextWindow/8))
+	return contextWindow - headroom - conversationSummaryMaintenanceOutputTokens(contextWindow)
+}
+
+func conversationSummaryMaintenanceOutputTokens(contextWindow int) int {
+	if contextWindow < 4096 || contextWindow > app.MaxModelContextWindowTokens {
+		return 0
+	}
+	return min(conversationSummaryMaintenanceMaxOutputTokens,
+		conversationSummaryMaintenanceReserveTokens(contextWindow)*4/5)
+}
+
+func conversationSummaryMaintenanceReserveTokens(contextWindow int) int {
+	if contextWindow < 4096 || contextWindow > app.MaxModelContextWindowTokens {
+		return 0
+	}
+	return min(conversationSummaryMaintenanceOutputReserveTokens, contextWindow/4)
 }
 
 func conversationSummaryMaintenanceInputBytes(previous string, sources []app.ConversationSummaryPromptSource) int {
@@ -345,7 +364,8 @@ func conversationSummaryMaintenanceInputBytes(previous string, sources []app.Con
 }
 
 func conversationSummaryOperationInputDigest(identity app.ConversationSummaryIdentity, baseline, previousVersion int64,
-	previousDigest []byte, modelID string, contextWindow int, sources []app.ConversationSummaryPromptSource) ([]byte, error) {
+	previousDigest []byte, modelID string, contextWindow int, pendingPredecessor bool,
+	sources []app.ConversationSummaryPromptSource) ([]byte, error) {
 	promptDigest, err := app.ConversationSummaryPromptDigest(sources)
 	if err != nil {
 		return nil, err
@@ -354,15 +374,16 @@ func conversationSummaryOperationInputDigest(identity app.ConversationSummaryIde
 		return nil, domain.InvalidArgument("conversation_summary_source", "prior summary proof is invalid")
 	}
 	encoded, err := json.Marshal(struct {
-		Version       int                             `json:"version"`
-		Identity      app.ConversationSummaryIdentity `json:"identity"`
-		Baseline      int64                           `json:"baseline_version"`
-		Previous      int64                           `json:"previous_summary_version"`
-		PreviousSHA   []byte                          `json:"previous_summary_sha256"`
-		ModelID       string                          `json:"model_id"`
-		ContextWindow int                             `json:"context_window_tokens"`
-		PromptSHA     []byte                          `json:"prompt_sha256"`
-	}{1, identity, baseline, previousVersion, previousDigest, modelID, contextWindow, promptDigest})
+		Version            int                             `json:"version"`
+		Identity           app.ConversationSummaryIdentity `json:"identity"`
+		Baseline           int64                           `json:"baseline_version"`
+		Previous           int64                           `json:"previous_summary_version"`
+		PreviousSHA        []byte                          `json:"previous_summary_sha256"`
+		ModelID            string                          `json:"model_id"`
+		ContextWindow      int                             `json:"context_window_tokens"`
+		PendingPredecessor bool                            `json:"pending_predecessor"`
+		PromptSHA          []byte                          `json:"prompt_sha256"`
+	}{1, identity, baseline, previousVersion, previousDigest, modelID, contextWindow, pendingPredecessor, promptDigest})
 	if err != nil {
 		return nil, fmt.Errorf("encode conversation summary operation input: %w", err)
 	}

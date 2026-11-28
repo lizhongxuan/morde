@@ -18,6 +18,7 @@ import (
 	"morde/server/internal/domain/execution"
 	"morde/server/internal/domain/host"
 	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/project"
 	"morde/server/internal/domain/schedule"
 	"morde/server/internal/domain/task"
 	"morde/server/internal/domain/workspace"
@@ -167,18 +168,33 @@ func (s *Store) GetTask(ctx context.Context, id, ownerID string) (app.TaskDetail
 		var requestHash []byte
 		var pendingRevision pgtype.Int8
 		var expiresAt, respondedAt pgtype.Timestamptz
+		var evidencePointer, triggerRule, rejectionConsequence string
+		var thisCostMicros, totalCostMicros pgtype.Int8
 		err = tx.QueryRow(ctx, `SELECT id, task_id, version, kind, title, object, content, impact, call_id, COALESCE(media_preview_operation_id,''), tool_name,
-task_revision, request_hash, runtime_generation, runtime_instance_id, control_version, status, decision, created_at, expires_at, responded_at
+task_revision, request_hash, runtime_generation, runtime_instance_id, control_version, status, decision, created_at, expires_at, responded_at,
+COALESCE(evidence_pointer,''), this_cost_micros, total_cost_micros, COALESCE(trigger_rule,''), COALESCE(rejection_consequence,'')
 FROM task_pending_requests WHERE task_id=$1 ORDER BY version DESC LIMIT 1`, id).Scan(
 			&pending.ID, &pending.TaskID, &pending.Version, &pending.Kind, &pending.Title, &pending.Object, &pending.Content,
 			&pending.Impact, &pending.CallID, &pending.MediaPreviewOperationID, &pending.ToolName, &pendingRevision, &requestHash, &pending.RuntimeGeneration,
-			&pending.RuntimeInstanceID, &pending.ControlVersion, &pending.Status, &pending.Decision, &pending.CreatedAt, &expiresAt, &respondedAt)
+			&pending.RuntimeInstanceID, &pending.ControlVersion, &pending.Status, &pending.Decision, &pending.CreatedAt, &expiresAt, &respondedAt,
+			&evidencePointer, &thisCostMicros, &totalCostMicros, &triggerRule, &rejectionConsequence)
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			return fmt.Errorf("read latest task pending request: %w", err)
 		}
 		var pendingRequest *task.PendingRequest
 		if err == nil {
 			pending.RequestHash = append([]byte(nil), requestHash...)
+			pending.EvidencePointer = evidencePointer
+			if thisCostMicros.Valid {
+				value := thisCostMicros.Int64
+				pending.ThisCostMicros = &value
+			}
+			if totalCostMicros.Valid {
+				value := totalCostMicros.Int64
+				pending.TotalCostMicros = &value
+			}
+			pending.TriggerRule = triggerRule
+			pending.RejectionConsequence = rejectionConsequence
 			if pendingRevision.Valid {
 				revision := pendingRevision.Int64
 				pending.TaskRevision = &revision
@@ -235,6 +251,9 @@ FROM task_clarification_requests WHERE task_id=$1 ORDER BY version`, id)
 		if err := populateTaskRevisionProjection(ctx, tx, projected); err != nil {
 			return err
 		}
+		if err := loadTaskModelRecoveryIntents(ctx, tx, projected); err != nil {
+			return err
+		}
 		var resultMessagePending, resultMessagePublished, currentRevisionStarted bool
 		if err := tx.QueryRow(ctx, `SELECT EXISTS (
  SELECT 1 FROM conversation_result_sources source
@@ -259,9 +278,36 @@ FROM task_clarification_requests WHERE task_id=$1 ORDER BY version`, id)
 		if err != nil {
 			return err
 		}
-		plan, err := latestTaskPlan(ctx, tx, row.ID, *projected[0].CurrentRevision)
+		plan, planEventSequence, err := latestTaskPlanWithSequence(ctx, tx, row.ID, *projected[0].CurrentRevision)
 		if err != nil {
 			return err
+		}
+		var planEventSequencePointer *int64
+		var requirementManifestConfirmation *app.TaskRequirementManifestConfirmation
+		if plan != nil {
+			sequence := planEventSequence
+			planEventSequencePointer = &sequence
+			if plan.RequirementManifest != nil {
+				digest, digestErr := plan.RequirementManifestDigest()
+				if digestErr != nil {
+					return domain.NewError(domain.CodeInvalidState, "stored task requirement manifest is invalid")
+				}
+				authorized, authErr := requireCurrentTaskAuthorizationSnapshot(ctx, tx, row)
+				if authErr != nil {
+					return authErr
+				}
+				if authorized {
+					confirmation, found, confirmationErr := readTaskRequirementManifestConfirmationForPlan(ctx, tx,
+						row.OwnerID, row.ID, *projected[0].CurrentRevision, plan.Revision, planEventSequence,
+						row.AuthVersion, digest)
+					if confirmationErr != nil {
+						return confirmationErr
+					}
+					if found {
+						requirementManifestConfirmation = &confirmation
+					}
+				}
+			}
 		}
 		billing, err := s.taskBilling(ctx, tx, row.ID, projected[0].InitiatorID, projected[0].ProjectID)
 		if err != nil {
@@ -275,7 +321,8 @@ FROM task_clarification_requests WHERE task_id=$1 ORDER BY version`, id)
 			ScheduleObservation: scheduleObservation, Steps: steps, Agents: agents,
 			BatchItems: mapRows(items, taskBatchItemDomain), Artifacts: mapRows(artifacts, taskArtifactDomain),
 			PendingRequest: pendingRequest, ClarificationRequests: clarifications,
-			StopRequest: stopRequest, StopOperationIDs: stopOperationIDs, Plan: plan, Billing: &billing,
+			StopRequest: stopRequest, StopOperationIDs: stopOperationIDs, Plan: plan, PlanEventSequence: planEventSequencePointer,
+			RequirementManifestConfirmation: requirementManifestConfirmation, Billing: &billing,
 		}
 		return nil
 	})
@@ -726,7 +773,7 @@ VALUES ($1,$2,$3,$4,'streaming',$5)`, delta.TaskID, delta.MessageID, delta.TurnI
 			(snapshotRevision.Valid && snapshotRevision.Int64 != currentRevision) || (!snapshotRevision.Valid && currentRevision != 0) {
 			return domain.NewError(domain.CodeInvalidState, "assistant message snapshot identity is already finalized")
 		}
-		if len(content)+len(delta.Delta) > app.MaxAssistantMessageBytes {
+		if len(content)+len(delta.Delta) > app.MaxAssistantReplyBytes {
 			return domain.InvalidArgument("text_delta", "assistant message exceeds the size limit")
 		}
 		if _, err := tx.Exec(ctx, `UPDATE task_assistant_message_snapshots
@@ -1008,6 +1055,26 @@ AND (lease_expires_at > clock_timestamp() OR EXISTS (
 		if err != nil {
 			return fmt.Errorf("read task authorization before claim: %w", err)
 		}
+		var recoveryIntent task.ModelRecoveryIntent
+		var hasRecoveryIntent bool
+		if taskRow.CurrentRevision >= 0 {
+			recoveryIntent, hasRecoveryIntent, err = loadTaskModelRecoveryIntent(ctx, tx, taskRow.ID, taskRow.OwnerID, taskRow.CurrentRevision, false)
+			if err != nil {
+				return err
+			}
+		}
+		recoveryQueue := taskRow.Status == string(task.StatusQueued) && taskRow.WaitingReason == taskModelRecoveryScheduledReason
+		activeRecoveryIntent := hasRecoveryIntent && (recoveryIntent.State == task.ModelRecoveryScheduled || recoveryIntent.State == task.ModelRecoveryAttempting)
+		if recoveryQueue || activeRecoveryIntent {
+			matches := hasRecoveryIntent && intentMatchesCurrentTaskForClaim(recoveryIntent, rowTaskDomain(taskRow))
+			if !matches || recoveryQueue && (recoveryIntent.State != task.ModelRecoveryScheduled || recoveryIntent.EventSequence != taskRow.EventSeq) ||
+				taskRow.Status == string(task.StatusQueued) && (!recoveryQueue || recoveryIntent.State != task.ModelRecoveryScheduled) {
+				if err := quarantineInvalidTaskModelRecoveryClaim(ctx, tx, taskRow, recoveryIntent, hasRecoveryIntent); err != nil {
+					return err
+				}
+				return nil
+			}
+		}
 		var queueEnteredAt time.Time
 		if taskRow.Status == string(task.StatusQueued) {
 			if err := tx.QueryRow(ctx, `SELECT COALESCE((
@@ -1169,6 +1236,10 @@ WHERE id=$1 AND current_revision=desired_revision RETURNING event_seq`, id, work
 			return fmt.Errorf("read claimed task: %w", err)
 		}
 		claimed = rowTaskDomain(row)
+		if hasRecoveryIntent {
+			intentCopy := recoveryIntent
+			claimed.ModelRecovery = &intentCopy
+		}
 		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM conversation_route_internal_tool_calls WHERE task_id=$1 AND owner_id=$2)`,
 			claimed.ID, claimed.OwnerID).Scan(&claimed.InternalTool); err != nil {
 			return fmt.Errorf("read internal route tool claim type: %w", err)
@@ -1299,6 +1370,39 @@ func requireCurrentTaskAuthorization(ctx context.Context, tx pgx.Tx, value sqlcg
 		return false, nil
 	}
 	return requireCurrentTaskCredentialAuthorization(ctx, tx, value, true)
+}
+
+// Read-only Task snapshots cannot take row locks. Validate the authorization
+// against the same repeatable-read snapshot instead of issuing SELECT FOR SHARE;
+// write paths continue to use requireCurrentTaskAuthorization for revocation
+// serialization.
+func requireCurrentTaskAuthorizationSnapshot(ctx context.Context, tx pgx.Tx, value sqlcgen.Task) (bool, error) {
+	if value.AuthTokenID == "" || value.AuthVersion < 1 || !domain.ValidUserID(value.InitiatorID) {
+		return false, nil
+	}
+	if !projectWorkspaceAuthorizationPermit(ctx, value) {
+		if value.ProjectID.Valid {
+			if !project.ValidID(value.ProjectID.String) {
+				return false, nil
+			}
+			var member bool
+			err := tx.QueryRow(ctx, `SELECT EXISTS (
+ SELECT 1 FROM projects p
+ JOIN project_members m ON m.project_id=p.id AND m.user_id=$2 AND m.role IN ('owner','member')
+ JOIN users u ON u.id=m.user_id AND u.status='approved'
+ WHERE p.id=$1
+)`, value.ProjectID.String, value.InitiatorID).Scan(&member)
+			if err != nil {
+				return false, fmt.Errorf("check Task initiator project membership in read snapshot: %w", err)
+			}
+			if !member {
+				return false, nil
+			}
+		} else if value.InitiatorID != value.OwnerID {
+			return false, nil
+		}
+	}
+	return requireCurrentTaskCredentialAuthorization(ctx, tx, value, false)
 }
 
 // A verified project Workspace permit already holds these rows in the outer
@@ -1706,7 +1810,7 @@ func (s *Store) CommitTaskProgress(ctx context.Context, progress app.TaskProgres
 	if message := progress.AssistantMessage; message != nil {
 		if message.Role != conversation.RoleAssistant || message.TaskID != progress.TaskID || message.OwnerID == "" ||
 			message.ConversationID == "" || progress.Status != task.StatusRunning || progress.Event.Type != "task.step" ||
-			len(message.Content) > app.MaxAssistantMessageBytes || !utf8.ValidString(message.Content) || strings.ContainsRune(message.Content, '\x00') {
+			len(message.Content) > app.MaxAssistantReplyBytes || !utf8.ValidString(message.Content) || strings.ContainsRune(message.Content, '\x00') {
 			return task.Event{}, domain.InvalidArgument("assistant_message", "assistant message fields are invalid")
 		}
 		if err := validateMessage(*message); err != nil {
@@ -1988,6 +2092,9 @@ WHERE t.id=$1 AND t.owner_id=$2 AND ec.state='enabled' AND ec.epoch=t.execution_
 				return domain.NewError(domain.CodeUnauthenticated, "cloud dsh skill authorization expired")
 			}
 			if err := validateCloudDSHSkillReadEvent(progress.Event.Payload, *skillRead); err != nil {
+				return err
+			}
+			if err := validateCloudDSHPersonalSkillReadInTx(ctx, tx, *skillRead); err != nil {
 				return err
 			}
 			existing, found, err := findCloudDSHSkillReadEvent(ctx, tx, progress.TaskID, skillRead.AgentSessionID, skillRead.CallID)
@@ -2341,12 +2448,34 @@ RETURNING event_seq`,
 			if pending.MediaPreviewOperationID != "" {
 				mediaOperationID = pgtype.Text{String: pending.MediaPreviewOperationID, Valid: true}
 			}
+			evidencePointer := pgtype.Text{}
+			if pending.EvidencePointer != "" {
+				evidencePointer = pgtype.Text{String: pending.EvidencePointer, Valid: true}
+			}
+			thisCostMicros := pgtype.Int8{}
+			if pending.ThisCostMicros != nil {
+				thisCostMicros = pgtype.Int8{Int64: *pending.ThisCostMicros, Valid: true}
+			}
+			totalCostMicros := pgtype.Int8{}
+			if pending.TotalCostMicros != nil {
+				totalCostMicros = pgtype.Int8{Int64: *pending.TotalCostMicros, Valid: true}
+			}
+			triggerRule := pgtype.Text{}
+			if pending.TriggerRule != "" {
+				triggerRule = pgtype.Text{String: pending.TriggerRule, Valid: true}
+			}
+			rejectionConsequence := pgtype.Text{}
+			if pending.RejectionConsequence != "" {
+				rejectionConsequence = pgtype.Text{String: pending.RejectionConsequence, Valid: true}
+			}
 			_, err = tx.Exec(ctx, `INSERT INTO task_pending_requests
 (id, task_id, version, task_revision, kind, title, object, content, impact, call_id, media_preview_operation_id, tool_name, request_hash,
- runtime_generation, runtime_instance_id, control_version, status, expires_at)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'pending',$17)`,
+ runtime_generation, runtime_instance_id, control_version, status, expires_at,
+ evidence_pointer, this_cost_micros, total_cost_micros, trigger_rule, rejection_consequence)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'pending',$17,$18,$19,$20,$21,$22)`,
 				pending.ID, pending.TaskID, pending.Version, pending.TaskRevision, pending.Kind, pending.Title, pending.Object, pending.Content, pending.Impact,
-				pending.CallID, mediaOperationID, pending.ToolName, pending.RequestHash, pending.RuntimeGeneration, pending.RuntimeInstanceID, pending.ControlVersion, pending.ExpiresAt)
+				pending.CallID, mediaOperationID, pending.ToolName, pending.RequestHash, pending.RuntimeGeneration, pending.RuntimeInstanceID, pending.ControlVersion, pending.ExpiresAt,
+				evidencePointer, thisCostMicros, totalCostMicros, triggerRule, rejectionConsequence)
 			if err != nil {
 				return fmt.Errorf("persist task pending request: %w", err)
 			}
@@ -2379,6 +2508,16 @@ VALUES ($1,$2,$3,$4,$5,$6,'pending')`, clarification.ID, clarification.TaskID, c
 		progress.Event.Payload = eventPayload
 		if err := insertTaskEvent(ctx, tx, progress.Event); err != nil {
 			return err
+		}
+		if progress.Status == task.StatusWaitingUser && progress.Event.Type == "task.waiting_user" {
+			if err := enqueueTaskWaitingUnknownDeliveryInTx(ctx, tx, progress.TaskID, sequence, progress.Event.Type); err != nil {
+				return err
+			}
+		}
+		if progress.Status == task.StatusFailed || progress.Status == task.StatusCancelled {
+			if err := enqueueTaskTerminalDeliveryInTx(ctx, tx, progress.TaskID, sequence, progress.Event.Type); err != nil {
+				return err
+			}
 		}
 		if progress.AssistantMessage == nil {
 			if progress.Status != task.StatusRunning {
@@ -2611,6 +2750,20 @@ func validTaskToolCallFailureEvidence(call app.TaskToolCallProgress, step task.S
 			app.IsMCPConnectorStepRetryTool(call.ToolName)
 	case "tool_execution_failed":
 		return !call.Retryable && call.Phase == "execute" && step.Kind == "tool" && step.Status == task.StepFailed
+	case "test_failed":
+		// Stamped by the app only for a failed shell run of a test command;
+		// same shape as a definitive tool failure, and the E03 gate re-checks
+		// the tool name when it reads the record back.
+		return !call.Retryable && call.Phase == "execute" && step.Kind == "tool" && step.Status == task.StepFailed
+	case "test_passed", "test_suite_passed":
+		// Stamped by the app only for a succeeded shell run of a test
+		// command (test_suite_passed: the run included a full-suite test
+		// command); the E07 gate reads these back as the passing-test
+		// record. A succeeded step carries the phase of its status
+		// ("succeeded"); the "execute" phase is accepted as well for tool
+		// steps committed through the execute path.
+		return !call.Retryable && step.Kind == "tool" && step.Status == task.StepSucceeded &&
+			(call.Phase == "succeeded" || call.Phase == "execute")
 	default:
 		return false
 	}
@@ -3282,8 +3435,19 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,'
 }
 
 func (s *Store) UpdateOperation(ctx context.Context, update app.OperationUpdate) (task.Operation, error) {
-	if !domain.ValidTaskID(update.TaskID) || update.OperationKey == "" || update.LeaseOwner == "" || update.LeaseVersion < 1 || !validOperationStatus(update.Status) {
+	if !domain.ValidTaskID(update.TaskID) || update.OperationKey == "" || update.LeaseOwner == "" || update.LeaseVersion < 1 || !validOperationStatus(update.Status) ||
+		update.PlanRevision < 0 || (update.PlanRevision == 0) != (update.PlanStepID == "") ||
+		(update.PlanStepID != "" && !validTaskPlanStepID(update.PlanStepID)) ||
+		(update.Status != task.OperationDispatched && (update.PlanRevision != 0 || update.PlanStepID != "")) ||
+		(update.InternalPurpose == "" && len(update.EvidenceSources) != 0) ||
+		(update.InternalPurpose != "" && (update.InternalPurpose != app.InternalOperationDispatchPurposeFileEvidenceRead ||
+			update.Status != task.OperationDispatched || update.PlanRevision != 0 || update.PlanStepID != "")) {
 		return task.Operation{}, domain.InvalidArgument("operation", "operation update fields are invalid")
+	}
+	if update.InternalPurpose == app.InternalOperationDispatchPurposeFileEvidenceRead {
+		if _, err := app.FileEvidenceReadRequestHash(update.OperationKey, update.EvidenceSources); err != nil {
+			return task.Operation{}, domain.InvalidArgument("operation.evidence_sources", "internal file evidence source proof is invalid")
+		}
 	}
 	var result task.Operation
 	var authorizationDenied bool
@@ -3466,6 +3630,21 @@ FROM tasks WHERE id=$1 FOR UPDATE`, update.TaskID).Scan(
 		}
 		if adoptingPrepared || rearming || update.Status == task.OperationDispatched {
 			if err := requireRunningTaskApplication(ctx, tx, row); err != nil {
+				return err
+			}
+		}
+		if update.Status == task.OperationDispatched {
+			current := rowTaskDomain(authorizationRow)
+			desiredRevision := authorizationRow.DesiredRevision
+			current.DesiredRevision = &desiredRevision
+			var err error
+			if update.InternalPurpose == app.InternalOperationDispatchPurposeFileEvidenceRead {
+				err = admitCloudDSHInternalFileEvidenceReadDispatchInTx(ctx, tx, current, operation, update.EvidenceSources)
+			} else {
+				err = admitCloudDSHTaskPlanStepOperationDispatchInTx(ctx, tx, current, operation,
+					update.PlanRevision, update.PlanStepID)
+			}
+			if err != nil {
 				return err
 			}
 		}

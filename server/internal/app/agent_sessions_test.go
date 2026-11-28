@@ -119,6 +119,48 @@ func TestAgentChildSessionServiceHashesArgumentsAndRejectsNonObject(t *testing.T
 	}
 }
 
+func TestAgentChildSessionServiceCarriesPlanSelectionIntoChildIdentity(t *testing.T) {
+	store := &agentChildSessionStoreStub{}
+	service, err := NewAgentChildSessionService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := AgentChildSessionCommand{
+		Fence: AgentInstanceFence{TaskID: "q1234567", OwnerID: "u1234567", InitiatorID: "u1234567", AgentInstanceID: "agent_1", AgentGeneration: 1,
+			AgentSessionID: "session_root", SupervisorID: "supervisor_1", LeaseOwner: "worker_1", LeaseVersion: 1,
+			AuthorizationVersion: 1, EngineVersion: "engine", ProfileVersion: "profile"},
+		ParentSessionID: "session_root", SpawnKey: "call_plan_1", PlanStepID: "collect_sources", PlanRevision: 3,
+		Arguments: []byte(`{"objective":"Collect sources"}`), Title: "Collect sources", AllowedTools: []string{"file_read"},
+	}
+	if _, _, err := service.Create(context.Background(), command); err != nil {
+		t.Fatal(err)
+	}
+	if store.request.PlanStepID != command.PlanStepID || store.request.PlanRevision != command.PlanRevision {
+		t.Fatalf("plan selector was not carried to Store: %+v", store.request)
+	}
+	argumentsHash := sha256.Sum256(command.Arguments)
+	if bytes.Equal(store.request.RequestHash, argumentsHash[:]) {
+		t.Fatal("plan selector was omitted from child request identity")
+	}
+	firstRequestHash := append([]byte(nil), store.request.RequestHash...)
+	command.PlanRevision++
+	if _, _, err := service.Create(context.Background(), command); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(firstRequestHash, store.request.RequestHash) {
+		t.Fatal("changing plan revision did not change child request identity")
+	}
+	for _, invalid := range []struct {
+		stepID   string
+		revision int64
+	}{{stepID: "collect_sources"}, {revision: 3}, {stepID: "bad.step", revision: 3}, {stepID: "collect_sources", revision: 0}} {
+		command.PlanStepID, command.PlanRevision = invalid.stepID, invalid.revision
+		if _, _, err := service.Create(context.Background(), command); err == nil || store.calls != 2 {
+			t.Fatalf("invalid plan selection reached Store: selection=%+v calls=%d err=%v", invalid, store.calls, err)
+		}
+	}
+}
+
 func TestAgentChildSessionListingAndCancelFenceRoot(t *testing.T) {
 	store := &agentChildSessionStoreStub{}
 	service, err := NewAgentChildSessionService(store)

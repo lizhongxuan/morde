@@ -4,6 +4,7 @@ import { Link, useLocation, useNavigate, useOutletContext } from 'react-router';
 import { useInfiniteQuery, useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
 import { errorDetails, newIdempotencyKey, portalApi } from '../app/api';
 import type { ConversationDeliveryStatus, HostEmbedTicket, HostEmbedTicketRequest, HostMemberPermission } from '../app/api';
+import type { components } from '../api/schema';
 import { readK2TaskProjection } from '../app/k2-task-projection';
 import type { K2ResultReview } from '../app/k2-task-projection';
 import type { MessageOutboxEntry } from '../app/use-message-outbox';
@@ -12,11 +13,12 @@ import { useMessageVariantOutbox } from '../app/use-message-variant-outbox';
 import type { MessageVariantOutboxEntry } from '../app/use-message-variant-outbox';
 import { buildMessageVariantTimeline, createMessageVariant, messageVariantActionLabel } from '../app/message-variants';
 import type { VersionableMessage } from '../app/message-variants';
-import { clearProcessingRetryKey } from '../app/message-processing-retry';
+import { clearProcessingRetryKey, processingRetryKey } from '../app/message-processing-retry';
+import { routingFailureText } from '../app/message-status';
 import { maxMessageBytes, needsMessageUpload, uploadMessage } from '../app/message-upload';
 import { conversationTitleFromText, firstOutboxConversationMessage, messageOutbox, outboxReceiptRequest } from '../app/message-outbox';
 import type { PendingConversationMessage, PendingMessageAttachment } from '../app/message-outbox';
-import { ApiError } from '../api/client';
+import { ApiError, consumeServerSentEvents, requestFetch } from '../api/client';
 import { isTransientNetworkError } from '../api/errors';
 import { useAuth } from '../app/auth';
 import { formatBytes, formatDate, hostStateLabel } from '../app/format';
@@ -41,11 +43,51 @@ type Conversation = Awaited<ReturnType<typeof portalApi.conversations>>['items']
 type ConversationMessage = Awaited<ReturnType<typeof portalApi.conversationMessages>>['items'][number];
 type ConversationMessagePage = Awaited<ReturnType<typeof portalApi.conversationMessages>>;
 type ConversationMessagesData = { pages: ConversationMessagePage[]; pageParams: unknown[] };
+type ConversationResponseMode = 'short' | 'long_form';
+type ConversationMessageRequest = components['schemas']['AcceptConversationMessageRequest'] & { response_mode?: ConversationResponseMode };
 type TaskSummary = Awaited<ReturnType<typeof portalApi.tasks>>['items'][number];
 type Task = Awaited<ReturnType<typeof portalApi.task>>;
+type AssistantTaskAttention = {
+  kind: 'needs_user_action' | 'recovering' | 'paused_retryable' | 'interrupted' | 'result_unverified';
+  reason: string;
+  action: 'approve' | 'clarify' | 'retry' | 'view_details' | null;
+  event_sequence: number;
+};
+type AssistantTaskStatusInput = {
+  status: string;
+  event_sequence?: number;
+  current_revision?: number | null;
+  desired_revision?: number | null;
+  result_message_published?: boolean;
+  waiting_reason?: string | null;
+  initiator_id?: string;
+  pending_request?: Task['pending_request'] | null;
+  clarification_request?: Task['clarification_request'] | null;
+  attention?: unknown;
+};
+type AssistantTaskAttentionView = {
+  kind: AssistantTaskAttention['kind'];
+  label: string;
+  detail: string;
+  action: AssistantTaskAttention['action'];
+};
+
+function taskModelRecoveryRetryIsAvailable(task: AssistantTaskStatusInput): boolean {
+  const rawAttention = task.attention;
+  if (!rawAttention || typeof rawAttention !== 'object' || Array.isArray(rawAttention)) return false;
+  const attention = rawAttention as Partial<AssistantTaskAttention>;
+  return attention.kind === 'paused_retryable' && attention.reason === 'retry_available' && attention.action === 'retry' &&
+    Number.isSafeInteger(task.event_sequence) && Number.isSafeInteger(attention.event_sequence) &&
+    attention.event_sequence === task.event_sequence && Number.isSafeInteger(task.current_revision) &&
+    task.current_revision! >= 0 && task.current_revision === task.desired_revision && task.status !== 'completed' &&
+    task.result_message_published !== true;
+}
 type TaskStep = Task['steps'][number];
+type TaskPlanStep = NonNullable<Task['plan']>['steps'][number];
 type TaskStepDetail = Awaited<ReturnType<typeof portalApi.taskStepDetail>>;
 type TaskStepDetailWithExecution = Omit<TaskStepDetail, 'execution'> & { execution?: TaskStepDetail['execution'] | null };
+type TaskStepSourceLocation = NonNullable<TaskStepDetail['source_locations']>[number];
+type TaskValidationClaim = NonNullable<Task['validation_detail']>['claims'][number];
 type TaskArtifact = Task['artifacts'][number];
 type ClarificationInteraction = {
   clarificationID: string;
@@ -103,6 +145,10 @@ function nativeWorkbenchBridge(): NativeWorkbenchBridge | undefined {
 type AssistantDisplayMessage = Omit<ConversationMessage, 'delivery_status'> & { delivery_status?: ConversationDeliveryStatus } & {
   snapshotStatus?: 'streaming' | 'completed' | 'interrupted';
 } & Pick<VersionableMessage, 'variant_group_id' | 'variant_version' | 'variant_action'>;
+type RoutingFailureMessage = Pick<ConversationMessage,
+  'id' | 'role' | 'routing_status' | 'routing_failure_reason' | 'task_id' | 'related_task_id' | 'duplicate_of_message_id'> & {
+  actor_id?: unknown;
+};
 type ComposerAttachment = { id: string; file: File; displayName?: string; objectID: string; objectKey: string; uploadKey: string; commitKey: string; attachmentID?: string; needsPreparation?: boolean; preparationCancelled?: boolean };
 type OfficePreviewState = { status: 'loading' } | { status: 'ready'; text: string };
 
@@ -118,9 +164,190 @@ function clarificationDraftKey(taskID: string, clarificationID: string, version:
   return `${taskID}:${clarificationID}:${version}`;
 }
 
+function conversationMessageActorID(message: RoutingFailureMessage): string | undefined {
+  const actorID = message.actor_id;
+  return typeof actorID === 'string' ? actorID : undefined;
+}
+
+function isUnlinkedRoutingFailure(message: RoutingFailureMessage): boolean {
+  return message.role === 'user' && message.routing_status === 'failed'
+    && !message.task_id && !message.related_task_id && !message.duplicate_of_message_id;
+}
+
+function conversationResponseMode(value: unknown): ConversationResponseMode | undefined {
+  if (!value || typeof value !== 'object' || !('response_mode' in value)) return undefined;
+  return value.response_mode === 'short' || value.response_mode === 'long_form' ? value.response_mode : undefined;
+}
+
+function retryEligibilityReasonText(reason: string): string {
+  switch (reason) {
+    case 'route_not_failed': return '服务端确认这条消息当前不再处于失败状态；刷新对话后核对最新状态。';
+    case 'task_already_created': return '服务端确认这条消息已关联任务；请从该任务查看进度。';
+    case 'message_too_long': return '原文超过当前处理限制；请缩短后重新发送，不能原样重试。';
+    case 'reconciliation_required': return '上次共享模型调用仍待对账；完成对账前不会重复处理。';
+    case 'route_processing': return '这条消息仍在处理中；请稍后刷新状态。';
+    case 'result_review_not_retryable': return '这条结果复核不支持从原消息重试。';
+    case 'result_review_outcome_unknown': return '结果复核调用状态仍未知；核对完成前不会重试。';
+    case 'retry_limit_reached': return '这条消息已达到重试次数上限。';
+    default: return '服务端暂时无法确认这条消息是否可以重试；原消息仍已保留。';
+  }
+}
+
+function retryEligibilityAllowsDispatch(eligibility: { retry_eligible: boolean; retry_reason: string; retry_warning?: string } | undefined): boolean {
+  return eligibility?.retry_eligible === true && eligibility.retry_reason === 'retry_available'
+    && (!eligibility.retry_warning || eligibility.retry_warning === 'previous_personal_model_call_outcome_unknown');
+}
+
+function routingFailureNextStep(message: RoutingFailureMessage, actorMatches: boolean,
+  capability: 'confirmed' | 'unsupported' | 'unknown', eligibility?: {
+    isFetching: boolean;
+    isError: boolean;
+    data?: { retry_eligible: boolean; retry_reason: string; retry_warning?: string };
+  }): string {
+  if (message.routing_failure_reason === 'message_too_long') return '原文已保留；请缩短后重新发送，不能重试这条原文。';
+  if (!actorMatches) return '只有发送这条消息的账号可以重新处理。';
+  if (capability === 'unknown') return '服务身份或消息处理能力尚未确认；请检查服务状态后再试。';
+  if (capability === 'unsupported') return '当前服务未开放安全重试；消息已保留，请稍后检查服务功能。';
+  if (!eligibility || eligibility.isFetching) return '正在核对服务端重试条件；核对完成前不会发送重试。';
+  if (eligibility.isError || !eligibility.data) return '暂时无法确认重试资格；原消息已保留，请稍后重新核对。';
+  if (!eligibility.data.retry_eligible) return retryEligibilityReasonText(eligibility.data.retry_reason);
+  if (eligibility.data.retry_reason !== 'retry_available') return retryEligibilityReasonText(eligibility.data.retry_reason);
+  if (eligibility.data.retry_warning === 'previous_personal_model_call_outcome_unknown') {
+    return '上一次个人模型调用结果仍未知；新的尝试可能产生重复调用，确认后才会继续。';
+  }
+  if (eligibility.data.retry_warning) return '服务端返回尚未支持的重试警告；为避免重复操作，暂不重试。';
+  return '';
+}
+
+const fileDeliveryIntentClarificationCallIDs = new Set([
+  'morde-file-delivery-intent',
+  'morde-route-file-delivery-intent',
+]);
+const routeFileDeliveryIntentClarificationCallID = 'morde-route-file-delivery-intent';
+
+function isFileDeliveryIntentClarification(callID: string | null | undefined): boolean {
+  return callID != null && fileDeliveryIntentClarificationCallIDs.has(callID);
+}
+
+function taskAttentionActionIsAvailable(task: AssistantTaskStatusInput, action: AssistantTaskAttention['action'], actorID?: string,
+  requireInitiator = true): boolean {
+  if (!actorID || (requireInitiator && (!task.initiator_id || actorID !== task.initiator_id))) return false;
+  if (action === 'approve') {
+    if (task.status !== 'waiting_user' ||
+        (requireInitiator && !['approval', 'approval_required'].includes(task.waiting_reason ?? ''))) return false;
+    const approval = task.pending_request;
+    if (!approval || approval.status !== 'pending') return false;
+    const expiresAt = approval.expires_at === null ? null : Date.parse(approval.expires_at);
+    return expiresAt === null || (Number.isFinite(expiresAt) && expiresAt > Date.now());
+  }
+  if (action === 'clarify') {
+    const clarification = task.clarification_request;
+    const waitingForClarification = task.status === 'waiting_user' &&
+      (!requireInitiator || task.waiting_reason === 'clarification_required');
+    const activeFileDeliveryChoice = clarification?.call_id === routeFileDeliveryIntentClarificationCallID &&
+      (task.status === 'running' || task.status === 'pausing' || task.status === 'paused');
+    return Boolean(clarification?.question && (waitingForClarification || activeFileDeliveryChoice));
+  }
+  return false;
+}
+
+function taskAttentionActionIsAvailableForCurrentUser(task: AssistantTaskStatusInput,
+  action: AssistantTaskAttention['action'], actorID?: string): boolean {
+  const rawAttention = task.attention;
+  if (rawAttention && typeof rawAttention === 'object' && !Array.isArray(rawAttention)) {
+    const attention = rawAttention as Partial<AssistantTaskAttention>;
+    if (!Number.isSafeInteger(task.event_sequence) || !Number.isSafeInteger(attention.event_sequence) ||
+        attention.event_sequence !== task.event_sequence || attention.kind !== 'needs_user_action' || attention.action !== action) return false;
+    return taskAttentionActionIsAvailable(task, action, actorID, false);
+  }
+  return taskAttentionActionIsAvailable(task, action, actorID);
+}
+
+function taskAttentionPresentation(task: AssistantTaskStatusInput, actorID?: string): AssistantTaskAttentionView | null {
+  const rawAttention = task.attention;
+  if (rawAttention && typeof rawAttention === 'object' && !Array.isArray(rawAttention)) {
+    const attention = rawAttention as Partial<AssistantTaskAttention>;
+    const sequenceMatches = Number.isSafeInteger(task.event_sequence) &&
+      Number.isSafeInteger(attention.event_sequence) && attention.event_sequence === task.event_sequence;
+    if (sequenceMatches) {
+      switch (attention.kind) {
+        case 'needs_user_action':
+          if (attention.action && taskAttentionActionIsAvailableForCurrentUser(task, attention.action, actorID)) {
+            return { kind: attention.kind, label: '需要你操作', detail: '请在这条对话中完成所需操作。', action: attention.action };
+          }
+          break;
+        case 'recovering':
+          if (attention.reason === 'model_budget_capacity') {
+            return { kind: attention.kind, label: '等待模型容量', detail: '模型并发容量暂时占满，系统会在等待期限内自动重试。', action: null };
+          }
+          return { kind: attention.kind, label: '正在恢复', detail: '服务端已安排继续处理。', action: attention.action ?? null };
+        case 'paused_retryable':
+          if (attention.reason === 'retry_available' && attention.action === 'retry' && taskModelRecoveryRetryIsAvailable(task)) {
+            return { kind: attention.kind, label: '已暂停，可重试', detail: '任务已暂停，服务端确认当前任务可以安全重试。', action: attention.action };
+          }
+          return { kind: 'interrupted', label: '已中断', detail: '这次任务已暂停，当前没有可用的继续操作。', action: attention.action ?? null };
+        case 'interrupted':
+          if (attention.reason === 'model_budget_capacity_timeout') {
+            return { kind: attention.kind, label: '等待超时，已暂停', detail: '等待模型并发容量超时，任务已暂停。', action: null };
+          }
+          if (attention.reason === 'model_budget_exhausted') {
+            return { kind: attention.kind, label: '预算不足，已暂停', detail: '当前预算无法满足模型调用最低额度，任务已暂停。', action: null };
+          }
+          if (attention.reason === 'model_budget_capacity_invalidated') {
+            return { kind: attention.kind, label: '运行条件已变化，已暂停', detail: '等待期间授权或模型运行条件发生变化，任务已暂停。请检查后重新提交。', action: null };
+          }
+          return { kind: attention.kind, label: '已中断', detail: '这次没有拿到已核实的结果。', action: attention.action ?? null };
+        case 'result_unverified':
+          return { kind: attention.kind, label: '结果待核对', detail: '执行结果尚未确认，暂不能安全地重复操作。', action: attention.action ?? null };
+      }
+    }
+    if (task.status === 'waiting_user') {
+      return ['tool_result_unknown', 'usage_unknown', 'result_unknown', 'model_call_unknown'].includes(task.waiting_reason ?? '')
+        ? { kind: 'result_unverified', label: '结果待核对', detail: '执行结果尚未确认，暂不能安全地重复操作。', action: null }
+        : { kind: 'interrupted', label: '已中断', detail: '这次任务已暂停，当前没有可用的继续操作。', action: null };
+    }
+    return null;
+  }
+
+  if (task.status === 'paused' && task.waiting_reason === 'model_budget_capacity_timeout') {
+    return { kind: 'interrupted', label: '等待超时，已暂停', detail: '等待模型并发容量超时，任务已暂停。', action: null };
+  }
+  if (task.status === 'paused' && task.waiting_reason === 'model_budget_exhausted') {
+    return { kind: 'interrupted', label: '预算不足，已暂停', detail: '当前预算无法满足模型调用最低额度，任务已暂停。', action: null };
+  }
+  if (task.status === 'paused' && task.waiting_reason === 'model_budget_capacity_invalidated') {
+    return { kind: 'interrupted', label: '运行条件已变化，已暂停', detail: '等待期间授权或模型运行条件发生变化，任务已暂停。请检查后重新提交。', action: null };
+  }
+  if (task.status !== 'waiting_user') return null;
+  if (task.waiting_reason === 'model_budget_capacity') {
+    return { kind: 'recovering', label: '等待模型容量', detail: '模型并发容量暂时占满，系统会在等待期限内自动重试。', action: null };
+  }
+  if (taskAttentionActionIsAvailableForCurrentUser(task, 'approve', actorID)) {
+    return { kind: 'needs_user_action', label: '需要你操作', detail: '请在这条对话中审核待处理的操作。', action: 'approve' };
+  }
+  if (taskAttentionActionIsAvailableForCurrentUser(task, 'clarify', actorID)) {
+    return { kind: 'needs_user_action', label: '需要你操作', detail: '请在这条对话中补充所需信息。', action: 'clarify' };
+  }
+  if (['tool_result_unknown', 'usage_unknown', 'result_unknown', 'model_call_unknown'].includes(task.waiting_reason ?? '')) {
+    return { kind: 'result_unverified', label: '结果待核对', detail: '执行结果尚未确认，暂不能安全地重复操作。', action: null };
+  }
+  return { kind: 'interrupted', label: '已中断', detail: '这次任务已暂停，当前没有可用的继续操作。', action: null };
+}
+
 function UserMessageContent({ content, attachmentIDs = [] }: { content: string; attachmentIDs?: string[] }) {
+  const [expanded, setExpanded] = useState(false);
+  const isLong = content.length > 600 || content.split(/\r?\n/u).length > 8;
   return <>
-    <p>{content}</p>
+    <p className={isLong && !expanded ? 'chat-message-user-collapsed' : undefined}>{content}</p>
+    {isLong && <button type="button" className="chat-message-expand" aria-expanded={expanded} onClick={(event) => {
+      if (expanded) {
+        const message = event.currentTarget.closest('.chat-message');
+        window.requestAnimationFrame(() => message?.scrollIntoView({ behavior: 'smooth', block: 'start' }));
+      }
+      setExpanded((value) => !value);
+    }}>
+      {expanded ? '收起' : '显示更多'}<span className={`chat-message-expand-chevron${expanded ? ' is-expanded' : ''}`} aria-hidden="true" />
+    </button>}
     {attachmentIDs.length > 0 && <small className="chat-message-attachments">附件 · {attachmentIDs.length}
       {attachmentIDs.map((attachmentID, attachmentIndex) => <span key={attachmentID}> · <a
         href={`/api/personal-data/attachments/${encodeURIComponent(attachmentID)}`} download>下载附件 {attachmentIndex + 1}</a></span>)}
@@ -621,6 +848,8 @@ function TaskStepDetails({ task, step, conversationID, actorID, serviceInstanceI
     data.content_evidence.preview.length <= 4_096 && /^[0-9a-f]{64}$/u.test(data.content_evidence.sha256) &&
     typeof data.content_evidence.truncated === 'boolean' ? data.content_evidence : null;
   const safeContentEvidence = contentEvidence ? safeTaskActivityText(contentEvidence.preview, 4_096) : null;
+  const sourceLocations = data.detail_state === 'available' && step.status === 'succeeded' &&
+    Array.isArray(data.source_locations) ? data.source_locations : [];
   const execution = data.detail_state === 'available' && data.execution && !Array.isArray(data.execution) &&
     typeof data.execution === 'object' ? data.execution : null;
   const isShell = data.tool_name === 'shell_exec';
@@ -655,6 +884,13 @@ function TaskStepDetails({ task, step, conversationID, actorID, serviceInstanceI
         {contentEvidence.truncated && <p>只显示有界预览；完整内容的 SHA-256 为 <code>{contentEvidence.sha256}</code>。</p>}
         {!contentEvidence.truncated && <p>完整记录的 SHA-256 为 <code>{contentEvidence.sha256}</code>。</p>}
       </details>}
+      {sourceLocations.length > 0 && <details className="task-step-web-evidence task-step-source-locations">
+        <summary>查看记录的位置</summary>
+        <p>位置来自已完成工具步骤的记录；它们不代表回答内容已通过独立核验。</p>
+        <ul>
+          {sourceLocations.map((source, index) => renderTaskStepSourceLocation(source, index))}
+        </ul>
+      </details>}
       {execution ? <>
         {(location || isShell) && <p><strong>执行位置</strong> {location?.value || '未记录'}</p>}
         {(command || isShell) && <p><strong>命令</strong> {command?.value || '未记录'}</p>}
@@ -681,15 +917,229 @@ function TaskStepDetails({ task, step, conversationID, actorID, serviceInstanceI
   </div>;
 }
 
+function safeTaskStepWebRequestURI(value: unknown): string | null {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 4_096 || /[?#]/u.test(value)) return null;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== 'https:' || !url.hostname || url.username || url.password || url.search || url.hash) return null;
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+function safeTaskStepWorkspacePath(value: unknown): string | null {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 2_048 || value.startsWith('/') ||
+    value.includes('\\') || Array.from(value).some((character) => {
+      const code = character.charCodeAt(0);
+      return code < 0x20 || code === 0x7f;
+    })) return null;
+  const segments = value.split('/');
+  if (segments.some((segment) => segment.length === 0 || segment === '.' || segment === '..')) return null;
+  return value;
+}
+
+function renderTaskStepSourceLocation(source: TaskStepSourceLocation, index: number) {
+  const key = `${typeof source?.id === 'string' ? source.id : 'source'}:${index}`;
+  if (!source || typeof source !== 'object') {
+    return <li key={key}>来源位置暂不可用。</li>;
+  }
+
+  if (source.kind === 'public_web_page') {
+    const requestURI = source.state === 'requested_uri_only' ? safeTaskStepWebRequestURI(source.uri) : null;
+    return <li key={key}>
+      <strong>网页请求地址（未核实最终来源）</strong>
+      {requestURI ? <p><a href={requestURI} target="_blank" rel="noopener noreferrer">{requestURI}</a></p>
+        : <p>请求地址暂不可显示。</p>}
+      <p>这是工具提交的 HTTPS 请求地址，不代表页面最终跳转地址或内容已独立核实。</p>
+    </li>;
+  }
+
+  if (source.kind === 'workspace_file' || source.kind === 'workspace_search_match') {
+    const path = safeTaskStepWorkspacePath(source.path);
+    if (!path) return <li key={key}>工作区位置暂不可用。</li>;
+    const safePath = safeTaskActivityText(path, 2_048);
+    const line = Number.isSafeInteger(source.line) && (source.line ?? 0) > 0 ? source.line : null;
+    const revision = Number.isSafeInteger(source.revision) && (source.revision ?? -1) >= 0 ? source.revision : null;
+    const locationState = source.state === 'immutable_workspace_revision' && revision !== null
+      ? `工作区修订 ${revision}`
+      : source.state === 'live_workspace_directory' ? '任务工作区检查点' : null;
+    return <li key={key}>
+      <strong>{source.kind === 'workspace_search_match' ? '工作区匹配位置' : '工作区文件位置'}</strong>
+      <p><code>{safePath.value}{line === null ? '' : `:${line}`}</code></p>
+      {locationState && <p>{locationState}</p>}
+      <p>这是已授权读取记录中的位置，不代表回答内容已由该文件独立核实。</p>
+    </li>;
+  }
+
+  return <li key={key}>该来源位置类型暂不支持展示。</li>;
+}
+
+function taskValidationClaimText(result: string | null, claim: TaskValidationClaim): string | null {
+  if (!result || !Number.isSafeInteger(claim.start_byte) || !Number.isSafeInteger(claim.end_byte) ||
+    claim.start_byte < 0 || claim.end_byte <= claim.start_byte) return null;
+  try {
+    const bytes = new TextEncoder().encode(result);
+    if (claim.end_byte > bytes.length) return null;
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes.slice(claim.start_byte, claim.end_byte));
+  } catch {
+    return null;
+  }
+}
+
+function taskValidationSourceLocationStateText(state: TaskValidationClaim['source_location_state']): string {
+  switch (state) {
+    case 'mapped': return '已关联此结论引用步骤中的来源位置。位置本身不代表内容或结论已独立核实。';
+    case 'partial': return '只有部分引用步骤的位置可用；另有位置缺失、不可读取或受限。';
+    case 'unavailable': return '引用步骤的来源位置未记录、已过期或无法读取。';
+    case 'restricted': return '引用步骤的来源位置受当前 Workspace 权限限制。';
+    case 'no_locator': return '引用步骤没有可展示的来源位置。';
+    case 'truncated': return '来源位置数量超过展示上限，当前无法列出位置。';
+    default: return '来源映射未记录。';
+  }
+}
+
+function TaskResultSources({ task }: { task: Task }) {
+  const evidence = task.validation_detail;
+  if (!task.result) return null;
+  if (!evidence?.claims.length) return <section className="task-activity-k2 task-result-sources" aria-label="结论与来源位置">
+    <h3>结论与来源位置</h3>
+    <p role="status">逐条结论与来源位置的映射未记录。</p>
+  </section>;
+  const locationsByID = new Map((evidence.source_locations ?? []).map((source) => [source.id, source]));
+  return <section className="task-activity-k2 task-result-sources" aria-label="结论与来源位置">
+    <h3>结论与来源位置</h3>
+    <p>每条结论的定位来自它引用的同一修订工具步骤。网页请求地址和 Workspace 实时目录各自保留原有的版本限制。</p>
+    <ol>
+      {evidence.claims.map((claim) => {
+        const text = taskValidationClaimText(task.result, claim);
+        const locations = (claim.source_location_ids ?? []).map((id) => locationsByID.get(id)).filter((source): source is TaskStepSourceLocation => source !== undefined);
+        return <li key={claim.claim_id}>
+          <p><strong>结论</strong> {text ? safeTaskActivityText(text, 1_000).value : '结论文本暂不可读取。'}</p>
+          <p role="status">{taskValidationSourceLocationStateText(claim.source_location_state)}</p>
+          {locations.length > 0 && <ul>{locations.map((source, index) => renderTaskStepSourceLocation(source, index))}</ul>}
+        </li>;
+      })}
+    </ol>
+  </section>;
+}
+
+function TaskRequirementManifestReview({ task }: { task: Task }) {
+  const queryClient = useQueryClient();
+  const [attested, setAttested] = useState(false);
+  const idempotency = useRef<{ fence: string; key: string } | null>(null);
+  const mutation = useMutation({
+    mutationFn: () => {
+      const plan = task.plan;
+      const manifest = plan?.requirement_manifest;
+      const planEventSequence = task.plan_event_sequence;
+      if (!plan || !manifest || task.current_revision !== plan.task_revision ||
+        !Number.isSafeInteger(planEventSequence) || (planEventSequence ?? 0) < 1 || !/^[0-9a-f]{64}$/u.test(manifest.digest)) {
+        throw new Error('当前计划版本暂不可确认，请刷新任务状态。');
+      }
+      const fence = `${task.id}:${plan.task_revision}:${plan.revision}:${planEventSequence}:${manifest.digest}`;
+      const currentIdempotency = idempotency.current;
+      const idempotencyKey = currentIdempotency?.fence === fence ? currentIdempotency.key : newIdempotencyKey();
+      idempotency.current = { fence, key: idempotencyKey };
+      return portalApi.confirmTaskRequirementManifest(task.id, {
+        expected_task_revision: plan.task_revision,
+        expected_plan_revision: plan.revision,
+        expected_plan_event_sequence: planEventSequence!,
+        requirements_complete_attested: true,
+      }, manifest.digest, idempotencyKey);
+    },
+    onSuccess: async () => {
+      setAttested(false);
+      idempotency.current = null;
+      await queryClient.invalidateQueries({ queryKey: ['task', task.id] });
+    },
+  });
+  const plan = task.plan;
+  const manifest = plan?.requirement_manifest;
+  if (!plan || !manifest) return null;
+  const obligationsByID = new Map(manifest.obligations.map((obligation) => [obligation.id, obligation]));
+  const checksByObligation = new Map<string, Array<{ stepID: string; stepTitle: string; check: NonNullable<TaskPlanStep['verification_check']> }>>();
+  const duplicateObligationIDs = obligationsByID.size !== manifest.obligations.length;
+  let invalidRequiredCheckMapping = false;
+  for (const step of plan.steps) {
+    const check = step.verification_check;
+    if (check?.basis !== 'required') continue;
+    const requirementIDs = check.requirement_ids ?? [];
+    if (requirementIDs.length === 0 || requirementIDs.some((id) => !obligationsByID.has(id))) {
+      invalidRequiredCheckMapping = true;
+    }
+    for (const requirementID of requirementIDs) {
+      if (!obligationsByID.has(requirementID)) continue;
+      const entries = checksByObligation.get(requirementID) ?? [];
+      entries.push({ stepID: step.id, stepTitle: step.title, check });
+      checksByObligation.set(requirementID, entries);
+    }
+  }
+  const mappingReady = !duplicateObligationIDs && !invalidRequiredCheckMapping && manifest.obligations.every((obligation) =>
+    checksByObligation.get(obligation.id)?.length === 1);
+  const savedConfirmation = task.requirement_manifest_confirmation;
+  const confirmed = mappingReady && savedConfirmation?.manifest_digest === manifest.digest &&
+    savedConfirmation.requirements_complete_attested === true && Number.isFinite(Date.parse(savedConfirmation.attested_at));
+  const ready = mappingReady && task.current_revision === plan.task_revision && Number.isSafeInteger(task.plan_event_sequence) &&
+    (task.plan_event_sequence ?? 0) > 0 && /^[0-9a-f]{64}$/u.test(manifest.digest);
+  const checkKindLabel: Record<string, string> = {
+    test: '测试', build: '构建', lint: 'Lint', typecheck: '类型检查', other: '其他检查',
+  };
+  return <section className="task-activity-k2 task-activity-requirements" aria-label="验证要求清单审阅">
+    <h3>验证要求清单</h3>
+    <p>请逐条核对要求、范围和来源。确认后，服务端会按当前 Task、计划修订、来源身份和清单摘要保存你的完整性声明；计划变化后必须重新确认。</p>
+    {manifest.obligations.length > 0 ? <ol>
+      {manifest.obligations.map((obligation) => {
+        const source = obligation.source;
+        return <li key={obligation.id}>
+          <strong>{obligation.statement}</strong>
+          <span>{checkKindLabel[obligation.kind] ?? '验证'} · {obligation.scope_mode === 'full_suite' ? '全量范围' : '定向范围'}</span>
+          <small>覆盖范围：{obligation.coverage_paths.join('、')}{obligation.selectors?.length ? ` · 选择器：${obligation.selectors.join('、')}` : ''}</small>
+          {source.kind === 'user_message'
+            ? <small>需求来源：<a href={`#conversation-message-${encodeURIComponent(source.message_id)}`}>对话消息 {source.message_id}</a></small>
+            : <small>需求来源：项目文件 {source.workspace_path} · Workspace 修订 {source.workspace_revision}</small>}
+          <small>对应检查：</small>
+          {checksByObligation.get(obligation.id)?.length === 1
+            ? checksByObligation.get(obligation.id)?.map((entry) => <small key={entry.stepID}>
+              {safeTaskActivityText(entry.stepTitle, 160).value}（步骤 {safeTaskActivityText(entry.stepID, 40).value}）· {checkKindLabel[entry.check.kind] ?? '其他检查'} ·
+              {entry.check.scope_mode === 'full_suite' ? '全量范围' : '定向范围'}
+              {` · 命令：${safeTaskActivityText(entry.check.command, 1_024).value}`}
+              {` · 覆盖：${entry.check.coverage_paths.map((path) => safeTaskActivityText(path, 512).value).join('、')}`}
+              {entry.check.selectors?.length ? ` · 选择器：${entry.check.selectors.map((selector) => safeTaskActivityText(selector, 256).value).join('、')}` : ''}
+            </small>)
+            : <small role="alert">没有且仅有一个对应的必需检查；此要求不能用于完整性确认。</small>}
+        </li>;
+      })}
+    </ol> : <p role="status">当前候选清单为空。只有确认没有适用的明确验证要求时，才继续确认。</p>}
+    {duplicateObligationIDs && <p role="alert">要求清单包含重复的 obligation ID，无法安全确认。</p>}
+    {invalidRequiredCheckMapping && <p role="alert">计划包含未映射要求或未知要求 ID；服务端不能据此判定要求集完整。</p>}
+    {!mappingReady && !duplicateObligationIDs && !invalidRequiredCheckMapping && <p role="alert">每条要求都必须对应且只对应一个必需检查；当前映射不完整，暂不能确认。</p>}
+    {confirmed
+      ? <p className="task-requirement-confirmed" role="status">已确认此版本的要求清单完整且准确 · {formatDate(savedConfirmation.attested_at)}</p>
+      : <>
+        <label className="task-requirement-attestation">
+          <input type="checkbox" checked={attested} onChange={(event) => setAttested(event.currentTarget.checked)} disabled={!ready || mutation.isPending} />
+          <span>我已逐条核对，确认此清单覆盖本任务适用的用户与项目要求，并准确表达其验证范围。</span>
+        </label>
+        {!ready && <p role="status">计划版本或来源摘要正在更新，暂不能确认。</p>}
+        {mutation.isError && <p role="alert">确认未完成：{errorDetails(mutation.error).message}</p>}
+        <button type="button" className="button button-small button-primary" disabled={!ready || !attested || mutation.isPending}
+          onClick={() => mutation.mutate()}>{mutation.isPending ? '正在保存确认…' : '确认要求完整且准确'}</button>
+      </>}
+  </section>;
+}
+
 function taskActivityIsExecuting(status: string): boolean {
   return status === 'running' || status === 'cancelling';
 }
 
-function taskStatusText(status: string): string {
-  switch (status) {
+function taskStatusText(task: AssistantTaskStatusInput, actorID?: string): string {
+  const attention = taskAttentionPresentation(task, actorID);
+  if (attention) return attention.label;
+  switch (task.status) {
     case 'queued': return '排队中';
     case 'running': return '执行中';
-    case 'waiting_user': return '等待你处理';
+    case 'waiting_user': return '已中断';
     case 'pausing': return '正在暂停';
     case 'paused': return '已暂停';
     case 'cancelling': return '正在停止';
@@ -877,15 +1327,15 @@ function TaskStream({ task, conversationID, onState }: {
   const terminal = terminalTaskStatuses.has(task.status);
   useEffect(() => { cursor.current = Math.max(cursor.current, task.event_sequence); }, [task.event_sequence]);
   useEffect(() => {
-    if (terminal || typeof EventSource === 'undefined') return;
-    const source = new EventSource(`/api/tasks/${encodeURIComponent(task.id)}/events?after=${cursor.current}`);
+    if (terminal) return;
+    const controller = new AbortController();
     let disposed = false;
     let resyncing = false;
     let retry: ReturnType<typeof setTimeout> | undefined;
     const resync = (reconnectDelay = 0) => {
       if (disposed || resyncing) return;
       resyncing = true;
-      source.close();
+      controller.abort();
       onState(task.id, 'resyncing');
       void client.fetchQuery({ queryKey: ['task', task.id], queryFn: () => portalApi.task(task.id), staleTime: 0,
         structuralSharing: latestTaskSnapshot }).then((snapshot) => {
@@ -908,13 +1358,10 @@ function TaskStream({ task, conversationID, onState }: {
         }
       });
     };
-    source.onopen = () => { if (!disposed && !resyncing) onState(task.id, 'connected'); };
-    source.onerror = () => resync(1500);
-    for (const type of taskEventTypes) {
-      source.addEventListener(type, (event) => {
+    const consumeEvent = (type: string, eventData: string) => {
         if (disposed || resyncing) return;
         let value: unknown;
-        try { value = JSON.parse((event as MessageEvent<string>).data); } catch { return; }
+        try { value = JSON.parse(eventData); } catch { return; }
         if (type === 'task.snapshot_required') {
           resync();
           return;
@@ -938,10 +1385,97 @@ function TaskStream({ task, conversationID, onState }: {
         if (revisionStarted || type === 'task.message' || type === 'task.result' || type === 'task.response') {
           void client.invalidateQueries({ queryKey: ['conversation-messages', conversationID] });
         }
-      });
-    }
-    return () => { disposed = true; if (retry) clearTimeout(retry); source.close(); };
+    };
+    const connect = async () => {
+      try {
+        const response = await requestFetch(`/api/tasks/${encodeURIComponent(task.id)}/events?after=${cursor.current}`, {
+          headers: { accept: 'text/event-stream' }, signal: controller.signal,
+        });
+        if (!response.ok) {
+          const traceID = response.headers.get('x-trace-id');
+          const reference = traceID && /^[0-9a-f]{32}$/.test(traceID) ? `; trace ID ${traceID}` : '';
+          throw new ApiError({ message: `Task event stream failed (HTTP ${response.status})${reference}`,
+            code: 'unavailable', status: response.status,
+            details: { request_id: response.headers.get('x-request-id'), trace_id: traceID } });
+        }
+        if (!response.body) throw new ApiError({ message: 'Task event stream response has no body', code: 'unavailable', status: response.status });
+        if (!disposed && !resyncing) onState(task.id, 'connected');
+        await consumeServerSentEvents(response, (event) => {
+          if (taskEventTypes.includes(event.event as (typeof taskEventTypes)[number])) consumeEvent(event.event, event.data);
+        }, controller.signal);
+        if (!disposed && !resyncing && !controller.signal.aborted) resync(1500);
+      } catch {
+        if (!disposed && !resyncing && !controller.signal.aborted) resync(1500);
+      }
+    };
+    void connect();
+    return () => { disposed = true; if (retry) clearTimeout(retry); controller.abort(); };
   }, [client, conversationID, generation, onState, task.id, terminal]);
+  return null;
+}
+
+function PCDeliveryVisibilityObservation(props: { taskID: string; messageID: string; taskRevision: number }) {
+  const { taskID, messageID, taskRevision } = props;
+  useEffect(() => {
+    const target = document.getElementById(`conversation-message-${encodeURIComponent(messageID)}`);
+    if (!target || typeof IntersectionObserver === 'undefined') return;
+
+    let visible = false;
+    let observed = false;
+    let inFlight = false;
+    let attempts = 0;
+    let retryDelay = 0;
+    let timer: number | undefined;
+    const schedule = () => {
+      if (!visible || document.visibilityState !== 'visible' || observed || inFlight || attempts >= 3 || timer !== undefined) return;
+      timer = window.setTimeout(() => {
+        timer = undefined;
+        attempts += 1;
+        inFlight = true;
+        void portalApi.observeTaskReplyInPC(taskID, messageID, taskRevision)
+          .then(() => { observed = true; })
+          .catch((error: unknown) => {
+            const retryable = !(error instanceof ApiError) || error.status === 429 || error.status >= 500;
+            if (retryable && attempts < 3 && visible && document.visibilityState === 'visible') {
+              retryDelay = attempts * 1000;
+            }
+          })
+          .finally(() => {
+            inFlight = false;
+            if (retryDelay > 0) {
+              const delay = retryDelay;
+              retryDelay = 0;
+              timer = window.setTimeout(() => { timer = undefined; schedule(); }, delay);
+            }
+          });
+      }, 700);
+    };
+    const observer = new IntersectionObserver((entries) => {
+      const entry = entries.find((item) => item.target === target);
+      visible = Boolean(entry?.isIntersecting && entry.intersectionRatio >= 0.25);
+      if (!visible && timer !== undefined) {
+        window.clearTimeout(timer);
+        timer = undefined;
+      } else {
+        schedule();
+      }
+    }, { threshold: [0.25] });
+    const onVisibilityChange = () => {
+      if (document.visibilityState !== 'visible' && timer !== undefined) {
+        window.clearTimeout(timer);
+        timer = undefined;
+      } else {
+        schedule();
+      }
+    };
+    observer.observe(target);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      observer.disconnect();
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [messageID, taskID, taskRevision]);
   return null;
 }
 
@@ -965,9 +1499,12 @@ export function Assistant() {
   const [composerDraftError, setComposerDraftError] = useState<string | null>(null);
   const [hydratedComposerDraftKey, setHydratedComposerDraftKey] = useState<string | null>(null);
   const observedProcessingRetryStates = useRef(new Map<string, string>());
+  const processingRetryInFlight = useRef(new Set<string>());
+  const currentRetryIdentity = useRef<{ actorID?: string; serviceInstanceID?: string }>({});
   const [modelID, setModelID] = useState('');
   const [mcpConnectorIDs, setMcpConnectorIDs] = useState<string[]>([]);
   const [content, setContent] = useState(() => hasNavigationIdea ? ideaPrompt : '');
+  const [responseMode, setResponseMode] = useState<ConversationResponseMode>('short');
   const [savingMessage, setSavingMessage] = useState(false);
   const [composerAttachments, setComposerAttachments] = useState<ComposerAttachment[]>([]);
   const [officePreviews, setOfficePreviews] = useState<Record<string, OfficePreviewState>>({});
@@ -977,7 +1514,10 @@ export function Assistant() {
   const [taskDetailStepID, setTaskDetailStepID] = useState<string | null>(null);
   const [visibleTaskPanelCount, setVisibleTaskPanelCount] = useState(5);
   const [pendingTaskActions, setPendingTaskActions] = useState<Map<string, { fingerprint: string; key: string }>>(() => new Map());
+  const [modelRecoveryRetryingTaskIDs, setModelRecoveryRetryingTaskIDs] = useState<ReadonlySet<string>>(() => new Set());
+  const modelRecoveryRetriesInFlight = useRef(new Set<string>());
   const [clarificationAnswers, setClarificationAnswers] = useState<Record<string, string>>({});
+  const [clarificationFileDeliveryIntents, setClarificationFileDeliveryIntents] = useState<Record<string, 'none' | 'required'>>({});
   const [clarificationInteractions, setClarificationInteractions] = useState<Record<string, ClarificationInteraction>>({});
   const clarificationSubmissionsInFlight = useRef(new Set<string>());
   const [taskEventFeeds, setTaskEventFeeds] = useState<Record<string, TaskFeedState>>({});
@@ -1117,6 +1657,9 @@ export function Assistant() {
   }, []);
   const [visibleSideConversationCount, setVisibleSideConversationCount] = useState(5);
   const capabilities = useQuery({ queryKey: ['service-capabilities'], queryFn: portalApi.capabilities });
+  useLayoutEffect(() => {
+    currentRetryIdentity.current = { actorID: user?.id, serviceInstanceID: capabilities.data?.service_instance_id };
+  }, [capabilities.data?.service_instance_id, user?.id]);
   const outbox = useMessageOutbox(user?.id, capabilities.data?.service_instance_id);
   const variantOutbox = useMessageVariantOutbox(user?.id, capabilities.data?.service_instance_id);
   const activeOutboxScope = useRef(outbox.currentScope);
@@ -1512,11 +2055,133 @@ export function Assistant() {
     getNextPageParam: (page) => page.next_cursor ?? undefined,
     enabled: Boolean(conversationID),
     refetchInterval: (query) => !isResourceNoLongerAccessible(query.state.error) && query.state.data?.pages.some((page) => page.items.some((item) =>
-      item.routing_status === 'pending' || item.routing_status === 'processing' || item.routing_status === 'waiting_adjustment' ||
+      item.routing_status === 'pending' || item.routing_status === 'processing' || item.routing_status === 'cancel_requested' || item.routing_status === 'waiting_adjustment' ||
       ['queued', 'running', 'waiting_user'].includes(conversationToolActivity(item)?.status ?? ''))) ? 2000 : false,
   });
   const conversationContentAccessRevoked = isResourceNoLongerAccessible(messages.error);
   const conversationMessageItems = conversationContentAccessRevoked ? [] : flattenConversationPages(messages.data);
+  const routingRetryCapabilityConfirmed = capabilities.isSuccess && !capabilities.isError && !capabilities.isFetching
+    && Boolean(capabilities.data?.service_instance_id)
+    && capabilities.data.supported_features.includes('conversation_auto_routing_v1');
+  const routingRetryCapabilityState: 'confirmed' | 'unsupported' | 'unknown' = !capabilities.isSuccess || capabilities.isError
+    || capabilities.isFetching || !capabilities.data?.service_instance_id ? 'unknown'
+      : routingRetryCapabilityConfirmed ? 'confirmed' : 'unsupported';
+  const routingRetryCandidateMessages = conversationMessageItems.filter((item) =>
+    isUnlinkedRoutingFailure(item) && Boolean(user?.id) && conversationMessageActorID(item) === user?.id);
+  const routingRetryEligibilityQueries = useQueries({ queries: routingRetryCandidateMessages.map((item) => {
+    const actorID = user!.id;
+    const serviceInstanceID = capabilities.data?.service_instance_id ?? '';
+    return {
+      queryKey: ['conversation-message-retry-eligibility', item.conversation_id, item.id, actorID, serviceInstanceID],
+      queryFn: () => portalApi.conversationMessageRetryEligibility(item.conversation_id, item.id, serviceInstanceID, actorID),
+      enabled: Boolean(routingRetryCapabilityConfirmed && serviceInstanceID),
+      staleTime: 5_000,
+      retry: false,
+      refetchOnWindowFocus: false,
+    };
+  }) });
+  const routingRetryEligibilityByMessageID = new Map(routingRetryCandidateMessages.map((item, index) =>
+    [item.id, routingRetryEligibilityQueries[index]] as const));
+  const [unknownRetryConfirmation, setUnknownRetryConfirmation] = useState<{ messageID: string; warning: string } | null>(null);
+  const retryConversationMessageProcessing = useMutation({
+    mutationFn: async (targetInput: { messageID: string; confirmedWarning?: string }): Promise<{ conversationID: string; messageID: string } | null> => {
+      const { messageID, confirmedWarning } = targetInput;
+      if (processingRetryInFlight.current.has(messageID)) return null;
+      const target = conversationMessageItems.find((item) => item.id === messageID && item.conversation_id === conversationID);
+      const actorID = user?.id;
+      const serviceInstanceID = capabilities.data?.service_instance_id;
+      if (!target || !isUnlinkedRoutingFailure(target) || target.routing_failure_reason === 'message_too_long'
+        || !actorID || conversationMessageActorID(target) !== actorID
+        || !capabilities.isSuccess || capabilities.isError || capabilities.isFetching || !serviceInstanceID
+        || !capabilities.data.supported_features.includes('conversation_auto_routing_v1')) {
+        throw new Error('此消息、账号或服务状态尚未通过安全重试检查。');
+      }
+      processingRetryInFlight.current.add(messageID);
+      try {
+        const [currentCapabilities, currentEligibility] = await Promise.all([
+          portalApi.capabilities(),
+          portalApi.conversationMessageRetryEligibility(target.conversation_id, target.id, serviceInstanceID, actorID),
+        ]);
+        if (currentCapabilities.service_instance_id !== serviceInstanceID
+          || !currentCapabilities.supported_features.includes('conversation_auto_routing_v1')) {
+          throw new Error('服务身份已变化或尚不支持消息处理；未发送重试请求。');
+        }
+        if (currentRetryIdentity.current.actorID !== actorID || currentRetryIdentity.current.serviceInstanceID !== serviceInstanceID) {
+          throw new Error('账号或服务身份已变化；未发送重试请求。');
+        }
+        if (!retryEligibilityAllowsDispatch(currentEligibility)) {
+          const unknownWarning = currentEligibility.retry_eligible && currentEligibility.retry_reason === 'retry_available'
+            && currentEligibility.retry_warning;
+          if (unknownWarning) {
+            throw new Error('服务端返回尚未支持的重试警告；为避免重复操作，暂不重试。');
+          }
+          throw new Error(retryEligibilityReasonText(currentEligibility.retry_reason));
+        }
+        if (currentEligibility.retry_warning && currentEligibility.retry_warning !== confirmedWarning) {
+          setUnknownRetryConfirmation({ messageID, warning: currentEligibility.retry_warning });
+          return null;
+        }
+        const key = processingRetryKey(serviceInstanceID, actorID, '', target.conversation_id, target.id);
+        await portalApi.retryConversationMessageProcessing(target.conversation_id, target.id, key, serviceInstanceID, actorID);
+        // A confirmed 202 has consumed this key. If the new attempt fails
+        // before the next poll, its next retry must use a fresh key.
+        try {
+          clearProcessingRetryKey(serviceInstanceID, actorID, '', target.conversation_id, target.id);
+        } catch {
+          // A storage error must not turn a confirmed acceptance into a failure.
+        }
+        return { conversationID: target.conversation_id, messageID: target.id };
+      } finally {
+        processingRetryInFlight.current.delete(messageID);
+      }
+    },
+    onSuccess: (target) => {
+      if (target) {
+        void client.invalidateQueries({ queryKey: ['conversation-messages', target.conversationID] });
+        void client.invalidateQueries({ queryKey: ['conversation-message-retry-eligibility', target.conversationID, target.messageID] });
+      }
+    },
+    onError: (error, target) => {
+      void client.invalidateQueries({ queryKey: ['conversation-message-retry-eligibility', conversationID, target.messageID] });
+      notify(errorDetails(error).message, 'error');
+    },
+  });
+  const cancelLongReply = useMutation({
+    mutationFn: async (targetInput: { conversationID: string; messageID: string }) => {
+      const target = conversationMessageItems.find((item) => item.id === targetInput.messageID &&
+        item.conversation_id === targetInput.conversationID);
+      const actorID = user?.id;
+      const serviceInstanceID = capabilities.data?.service_instance_id;
+      const routingStatus = target?.routing_status as string | undefined;
+      if (!target || target.role !== 'user' || conversationResponseMode(target) !== 'long_form' ||
+        !['pending', 'processing'].includes(routingStatus ?? '') || !actorID || conversationMessageActorID(target) !== actorID ||
+        !serviceInstanceID || !capabilities.isSuccess || capabilities.isError || capabilities.isFetching ||
+        currentRetryIdentity.current.actorID !== actorID || currentRetryIdentity.current.serviceInstanceID !== serviceInstanceID) {
+        throw new Error('长回复、账号或服务状态尚未通过取消检查。');
+      }
+      const result = await portalApi.cancelConversationMessage(target.conversation_id, target.id, serviceInstanceID, actorID);
+      return { ...result, conversationID: target.conversation_id, messageID: target.id };
+    },
+    onSuccess: async (result) => {
+      const queryKey = ['conversation-messages', result.conversationID] as const;
+      client.setQueryData<ConversationMessagesData>(queryKey, (previous) => previous && ({
+        ...previous,
+        pages: previous.pages.map((page) => ({
+          ...page,
+          items: page.items.map((item) => item.id === result.messageID ? result.message : item),
+        })),
+      }));
+      await client.invalidateQueries({ queryKey });
+      const routingStatus = String(result.message.routing_status);
+      notify(routingStatus === 'cancelled' ? '长回复已取消。'
+        : routingStatus === 'partial' ? '长回复已停止，已保存的部分内容仍保留。'
+          : '取消请求已受理，正在核对长回复状态。', 'success');
+    },
+    onError: (error, target) => {
+      void client.invalidateQueries({ queryKey: ['conversation-messages', target.conversationID] });
+      notify(`无法确认长回复是否已取消：${errorDetails(error).message}`, 'error');
+    },
+  });
   const conversationTasks = useQuery({
     queryKey: ['conversation-tasks', conversationID],
     queryFn: () => portalApi.conversationTasks(conversationID!),
@@ -1912,6 +2577,14 @@ export function Assistant() {
     const linkedTaskID = message.task_id ?? message.related_task_id;
     if (message.role === 'user' && linkedTaskID) latestUserMessageByTaskID.set(linkedTaskID, message.id);
   }
+  const acknowledgedUserMessageByTaskID = new Map<string, string>();
+  const ambiguousAcknowledgementTaskIDs = new Set<string>();
+  for (const message of displayMessages) {
+    const linkedTaskID = message.task_id ?? message.related_task_id;
+    if (message.role !== 'user' || !linkedTaskID || message.agent_acknowledged !== true) continue;
+    if (acknowledgedUserMessageByTaskID.has(linkedTaskID)) ambiguousAcknowledgementTaskIDs.add(linkedTaskID);
+    else acknowledgedUserMessageByTaskID.set(linkedTaskID, message.id);
+  }
   const variantSelectionSignature = JSON.stringify(Object.entries(selectedMessageVariantVersions).sort(([left], [right]) => left.localeCompare(right)));
   let showConversationThinking = displayMessages.some((message) => message.role === 'assistant' && message.snapshotStatus === 'streaming');
   const checkedTaskIDs = new Set<string>();
@@ -1979,6 +2652,55 @@ export function Assistant() {
       return;
     }
     notify(details.message, 'error');
+  };
+  const refreshModelRecoveryTaskViews = async (taskID: string, targetConversationID: string) => Promise.all([
+    client.invalidateQueries({ queryKey: ['task', taskID] }),
+    client.invalidateQueries({ queryKey: ['assistant-account-tasks'] }),
+    client.invalidateQueries({ queryKey: ['conversation-tasks', targetConversationID] }),
+    client.invalidateQueries({ queryKey: ['conversation-messages', targetConversationID] }),
+  ]);
+  const retryTaskModelRecovery = async (task: Task) => {
+    if (!user?.id || modelRecoveryRetriesInFlight.current.has(task.id)) return;
+    modelRecoveryRetriesInFlight.current.add(task.id);
+    setModelRecoveryRetryingTaskIDs((current) => new Set(current).add(task.id));
+    const actionScope = `model-recovery:${task.id}`;
+    let idempotencyKey: string | undefined;
+    try {
+      const freshTask = await client.fetchQuery({
+        queryKey: ['task', task.id], queryFn: () => portalApi.task(task.id), staleTime: 0,
+      });
+      if (freshTask.conversation_id !== task.conversation_id || !taskModelRecoveryRetryIsAvailable(freshTask)) {
+        await refreshModelRecoveryTaskViews(task.id, task.conversation_id);
+        notify('任务状态已变化，已刷新最新状态。请核对后再操作。', 'error');
+        return;
+      }
+      const request = {
+        expected_revision: freshTask.current_revision!,
+        expected_event_sequence: freshTask.event_sequence!,
+      };
+      const fingerprint = JSON.stringify(request);
+      idempotencyKey = taskActionKey(actionScope, fingerprint);
+      const updatedTask = await portalApi.retryTaskModelRecovery(task.id, request, idempotencyKey);
+      client.setQueryData<Task>(['task', task.id], (current) => current && current.event_sequence > updatedTask.event_sequence
+        ? current : updatedTask);
+      clearTaskActionKey(actionScope, idempotencyKey);
+      await refreshModelRecoveryTaskViews(task.id, freshTask.conversation_id);
+      notify('已提交任务恢复请求，正在更新最新状态。', 'success');
+    } catch (error) {
+      if (errorDetails(error).code === 'conflict' && idempotencyKey) clearTaskActionKey(actionScope, idempotencyKey);
+      await refreshModelRecoveryTaskViews(task.id, task.conversation_id);
+      const uncertain = !(error instanceof ApiError) || error.status >= 500 || [408, 425, 429].includes(error.status);
+      if (uncertain) notify('任务恢复请求结果待确认，正在刷新任务状态；请核对后再操作。', 'error');
+      else await handleTaskActionError(error, task.id);
+    } finally {
+      modelRecoveryRetriesInFlight.current.delete(task.id);
+      setModelRecoveryRetryingTaskIDs((current) => {
+        if (!current.has(task.id)) return current;
+        const next = new Set(current);
+        next.delete(task.id);
+        return next;
+      });
+    }
   };
   const sendVariantOperation = async (entry: MessageVariantOutboxEntry): Promise<boolean> => {
     const key = entry.operation.input.idempotencyKey;
@@ -2136,7 +2858,10 @@ export function Assistant() {
       }
 
       if (!accepted) {
-        const request = outboxReceiptRequest(message);
+        const request: ConversationMessageRequest = {
+          ...outboxReceiptRequest(message),
+          ...(conversationResponseMode(message.request) === 'long_form' ? { response_mode: 'long_form' } : {}),
+        };
         await outbox.change(scope, id, (current) => ({ ...current, status: 'sending', error: undefined }));
         checkScope();
         let receipt: ConversationMessage;
@@ -2227,7 +2952,8 @@ export function Assistant() {
   });
   const submitApprovalDecision = (task: Task, decision: 'approve' | 'reject') => {
     const request = task.pending_request;
-    if (!request || request.status !== 'pending' || task.conversation_id !== conversationID) {
+    if (!request || request.status !== 'pending' || task.conversation_id !== conversationID ||
+        !taskAttentionActionIsAvailableForCurrentUser(task, 'approve', user?.id)) {
       return Promise.reject(new Error('审批状态已变化，请刷新后核对。'));
     }
     const actionScope = `approval:${task.id}:${request.id}`;
@@ -2237,18 +2963,22 @@ export function Assistant() {
   };
   const submitClarificationAnswer = async (task: Task) => {
     const request = task.clarification_request;
-    if (task.status !== 'waiting_user' || task.waiting_reason !== 'clarification_required' || !request ||
-      task.conversation_id !== conversationID) {
+    if (!request || !taskAttentionActionIsAvailableForCurrentUser(task, 'clarify', user?.id) || task.conversation_id !== conversationID) {
       notify('澄清请求已变化，请核对任务最新状态。', 'error');
       return;
     }
     const draftKey = clarificationDraftKey(task.id, request.id, request.version);
     const answer = (clarificationAnswers[draftKey] ?? '').trim();
     if (!answer) return;
+    const isFileDeliveryClarification = isFileDeliveryIntentClarification(request.call_id);
+    const fileDeliveryIntent = isFileDeliveryClarification ? clarificationFileDeliveryIntents[draftKey] : undefined;
+    if (isFileDeliveryClarification && (!fileDeliveryIntent ||
+      (fileDeliveryIntent === 'required' && !task.workspace_id))) return;
     if (clarificationSubmissionsInFlight.current.has(task.id)) return;
     clarificationSubmissionsInFlight.current.add(task.id);
     const actionScope = `clarification:${task.id}:${request.id}`;
-    const fingerprint = JSON.stringify({ version: request.version, answer });
+    const fingerprint = JSON.stringify({ call_id: request.call_id, version: request.version, answer,
+      ...(fileDeliveryIntent ? { file_delivery_intent: fileDeliveryIntent } : {}) });
     const key = taskActionKey(actionScope, fingerprint);
     setClarificationInteractions((current) => ({ ...current, [task.id]: {
       clarificationID: request.id, version: request.version, question: request.question, status: 'sending',
@@ -2258,9 +2988,16 @@ export function Assistant() {
         clarification_id: request.id,
         clarification_version: request.version,
         answer,
+        ...(fileDeliveryIntent ? { file_delivery_intent: fileDeliveryIntent } : {}),
       }, key);
       clearTaskActionKey(actionScope, key);
       setClarificationAnswers((current) => ({ ...current, [draftKey]: '' }));
+      setClarificationFileDeliveryIntents((current) => {
+        if (!(draftKey in current)) return current;
+        const next = { ...current };
+        delete next[draftKey];
+        return next;
+      });
       setClarificationInteractions((current) => ({ ...current, [task.id]: {
         clarificationID: request.id, version: request.version, question: request.question,
         status: 'submitted', message: '补充信息已提交，等待任务状态更新。',
@@ -2529,6 +3266,7 @@ export function Assistant() {
     const text = content;
     if (!text.trim() && !composerAttachments.length) return;
     const effectiveText = text.trim() ? text : '请阅读并处理我附加的文件。';
+    const selectedResponseMode = responseMode;
     const timeZone = browserIanaTimeZone();
     if (new TextEncoder().encode(effectiveText).length > maxMessageBytes) {
       notify('单条消息不能超过 8 MiB；完整内容仍保留在输入框中。', 'error');
@@ -2548,16 +3286,18 @@ export function Assistant() {
     savingMessageRef.current = true;
     setSavingMessage(true);
     const previous = pendingMessageSave.current.then(async () => {
+      const request: ConversationMessageRequest = {
+        client_message_id: id, content: effectiveText,
+        ...(timeZone ? { time_zone: timeZone } : {}),
+        ...(submissionModelID ? { model_id: submissionModelID } : {}),
+        ...(preferredHostID && selectedResponseMode === 'short' ? { host_id: preferredHostID } : {}),
+        ...(mcpConnectorIDs.length && selectedResponseMode === 'short' ? { mcp_connector_ids: [...mcpConnectorIDs] } : {}),
+        ...(attachments.length ? { client_attachment_ids: attachments.map((item) => item.id) } : {}),
+        ...(selectedResponseMode === 'long_form' ? { response_mode: 'long_form' } : {}),
+      };
       const message: PendingConversationMessage = {
         actorID: user?.id ?? '',
-        request: {
-          client_message_id: id, content: effectiveText,
-          ...(timeZone ? { time_zone: timeZone } : {}),
-          ...(submissionModelID ? { model_id: submissionModelID } : {}),
-          ...(preferredHostID ? { host_id: preferredHostID } : {}),
-          ...(mcpConnectorIDs.length ? { mcp_connector_ids: [...mcpConnectorIDs] } : {}),
-          ...(attachments.length ? { client_attachment_ids: attachments.map((item) => item.id) } : {}),
-        },
+        request,
         conversationID, ...(createKey ? { conversationCreateKey: createKey } : {}),
         ...(capabilities.data?.service_instance_id ? { serviceInstanceID: capabilities.data.service_instance_id } : {}),
         attachments, status: 'pending', createdAt: Date.now(),
@@ -3035,7 +3775,10 @@ export function Assistant() {
     const groups = taskAgentActivityGroups(task);
     const isRunning = taskActivityIsExecuting(task.status);
     const title = taskActivityTitle(task.objective);
-    const taskStatus = taskStatusText(task.status);
+    const taskStatus = taskStatusText(task, user?.id);
+    const retryableModelRecovery = Boolean(user?.id && taskModelRecoveryRetryIsAvailable(task) &&
+      taskAttentionPresentation(task, user.id)?.action === 'retry');
+    const retryingModelRecovery = modelRecoveryRetryingTaskIDs.has(task.id);
     const showFeedStatus = !terminalTaskStatuses.has(task.status) ||
       (task.status === 'completed' && (task.result_message_pending || ['pending', 'processing'].includes(task.result_review?.state ?? '')));
     const projectionRead = readK2TaskProjection(task);
@@ -3054,6 +3797,11 @@ export function Assistant() {
           {taskStatus}
         </span>
       </header>
+      {retryableModelRecovery && <button type="button" className="button button-small button-secondary task-model-recovery-retry"
+        aria-label="重试任务" disabled={retryingModelRecovery} onClick={() => void retryTaskModelRecovery(task)}>
+        <MordeIcon name="refresh" />{retryingModelRecovery ? '正在重试…' : '重试任务'}
+      </button>}
+      <TaskRequirementManifestReview task={task} />
       {projection && (projection.dependencies.length > 0 || projection.child_jobs.length > 0) && <section className="task-activity-k2" aria-label="任务依赖与子任务">
         <h3>任务依赖与子任务</h3>
         {projection.dependencies.map((dependency) => <p key={`${dependency.task_id}:${dependency.required_revision}`}>
@@ -3064,7 +3812,7 @@ export function Assistant() {
       {showFeedStatus && ['disconnected', 'resyncing'].includes(taskEventFeeds[task.id] ?? '') && !showConsolidatedNetworkError &&
         <p role="status">连接中断，正在重连…</p>}
       {task.status === 'failed' && <p role="alert">任务执行失败，请查看当前状态和处理提示。</p>}
-      {task.waiting_reason === 'clarification_required' && task.clarification_request?.question && <section className="task-activity-k2 task-activity-clarification" aria-label="待补充信息">
+      {taskAttentionActionIsAvailableForCurrentUser(task, 'clarify', user?.id) && task.clarification_request?.question && <section className="task-activity-k2 task-activity-clarification" aria-label="待补充信息">
         <h3>等待补充信息</h3>
         <p>{safeTaskActivityText(task.clarification_request.question, 1_000).value}</p>
         <p className="muted">请直接在对话中回复，Morde 会按当前任务继续处理。</p>
@@ -3082,6 +3830,7 @@ export function Assistant() {
         </li>)}</ul>}
         {hasUnverifiedArtifacts && <p role="status">有成果尚未通过完整核验，当前不提供下载。可查看相关工作项。</p>}
       </section>}
+      <TaskResultSources task={task} />
       <section className="task-detail-work" aria-label="任务工作项">
         {groups.length ? groups.map((group) => <section className="task-agent-group" key={group.id}>
           <h4><strong>{group.title}</strong><span aria-hidden="true" /></h4>
@@ -3109,7 +3858,7 @@ export function Assistant() {
     const task = allTasksByID.get(summary.id);
     const title = taskActivityTitle(task?.objective ?? summary.objective);
     const status = task?.status ?? summary.status;
-    const statusText = taskStatusText(status);
+    const statusText = taskStatusText(task ?? summary, user?.id);
     const updatedAt = task?.updated_at ?? summary.updated_at;
     const isRunning = taskActivityIsExecuting(status);
     const subtitle = taskActivityLatestWorkText(summary, task);
@@ -3394,10 +4143,38 @@ export function Assistant() {
                 </div>}
                 {displayMessages.map((message, index) => {
                   const messageTaskID = message.task_id ?? message.related_task_id ?? '';
+                  const messageResponseMode = conversationResponseMode(message);
+                  const messageRoutingStatus = message.routing_status as string | undefined;
+                  const longReplyIsPending = message.role === 'user' && messageResponseMode === 'long_form' && messageRoutingStatus === 'pending';
+                  const longReplyIsProcessing = message.role === 'user' && messageResponseMode === 'long_form' && messageRoutingStatus === 'processing';
+                  const longReplyIsCancelRequested = message.role === 'user' && messageResponseMode === 'long_form' && messageRoutingStatus === 'cancel_requested';
+                  const longReplyIsPartial = message.role === 'user' && messageResponseMode === 'long_form' && messageRoutingStatus === 'partial';
+                  const longReplyIsCancelled = message.role === 'user' && messageResponseMode === 'long_form' && messageRoutingStatus === 'cancelled';
+                  const cancellingThisLongReply = cancelLongReply.isPending && cancelLongReply.variables?.messageID === message.id;
                   const messageTask = tasksByID.get(messageTaskID);
-                  const activeClarification = messageTask?.conversation_id === conversationID && messageTask.status === 'waiting_user' &&
-                    messageTask.waiting_reason === 'clarification_required' && messageTask.clarification_request?.question
+                  const messageActorID = conversationMessageActorID(message);
+                  const acknowledgedByServer = message.role === 'user' && message.agent_acknowledged === true &&
+                    Boolean(user?.id) && messageActorID === user?.id &&
+                    Boolean(messageTaskID) && !ambiguousAcknowledgementTaskIDs.has(messageTaskID) &&
+                    acknowledgedUserMessageByTaskID.get(messageTaskID) === message.id &&
+                    (!messageTask || messageTask.initiator_id === messageActorID);
+                  const taskAttention = messageTask?.conversation_id === conversationID && messageTask.initiator_id === messageActorID
+                    ? taskAttentionPresentation(messageTask, user?.id) : null;
+                  const taskHasTerminalReply = Boolean(messageTask?.result_message_published) || Boolean(messageTask && displayMessages.some((item) =>
+                    item.role === 'assistant' && item.task_id === messageTask.id && item.delivery_status === 'applied'));
+                  const showTaskAttention = Boolean(message.role === 'user' && messageTask && taskAttention &&
+                    taskAttention.kind !== 'needs_user_action' && !ambiguousAcknowledgementTaskIDs.has(messageTaskID) &&
+                    taskAttention.kind !== 'result_unverified' &&
+                    !taskHasTerminalReply &&
+                    (acknowledgedUserMessageByTaskID.get(messageTaskID) ?? latestUserMessageByTaskID.get(messageTaskID)) === message.id);
+                  const canRetryModelRecovery = Boolean(user?.id && messageTask && taskAttention?.kind === 'paused_retryable' &&
+                    taskAttention.action === 'retry' && taskModelRecoveryRetryIsAvailable(messageTask));
+                  const retryingModelRecovery = messageTask ? modelRecoveryRetryingTaskIDs.has(messageTask.id) : false;
+                  const activeClarification = messageTask?.conversation_id === conversationID &&
+                    taskAttentionActionIsAvailableForCurrentUser(messageTask, 'clarify', user?.id)
                     ? messageTask.clarification_request : null;
+                  const canHandleApproval = messageTask?.conversation_id === conversationID &&
+                    taskAttentionActionIsAvailableForCurrentUser(messageTask, 'approve', user?.id);
                   const savedClarificationInteraction = messageTaskID ? clarificationInteractions[messageTaskID] : undefined;
                   const clarificationInteraction = activeClarification && savedClarificationInteraction &&
                     (savedClarificationInteraction.clarificationID !== activeClarification.id || savedClarificationInteraction.version !== activeClarification.version)
@@ -3410,6 +4187,19 @@ export function Assistant() {
                   const clarificationDraftID = activeClarification
                     ? clarificationDraftKey(messageTaskID, activeClarification.id, activeClarification.version) : '';
                   const clarificationAnswer = clarificationDraftID ? clarificationAnswers[clarificationDraftID] ?? '' : '';
+                  const fileDeliveryClarification = isFileDeliveryIntentClarification(activeClarification?.call_id);
+                  const clarificationFileDeliveryIntent = fileDeliveryClarification
+                    ? clarificationFileDeliveryIntents[clarificationDraftID] : undefined;
+                  const showRoutingFailure = isUnlinkedRoutingFailure(message);
+                  const routingRetryActorMatches = conversationMessageActorID(message) === user?.id;
+                  const retryEligibilityQuery = routingRetryEligibilityByMessageID.get(message.id);
+                  const canRetryRoutingFailure = showRoutingFailure && routingRetryActorMatches && routingRetryCapabilityConfirmed
+                    && retryEligibilityQuery?.isSuccess === true && !retryEligibilityQuery.isFetching
+                    && retryEligibilityAllowsDispatch(retryEligibilityQuery.data);
+                  const retryingRoutingFailure = retryConversationMessageProcessing.isPending
+                    && retryConversationMessageProcessing.variables?.messageID === message.id;
+                  const routingFailureNextStepText = routingFailureNextStep(message, routingRetryActorMatches,
+                    routingRetryCapabilityState, retryEligibilityQuery);
                   const showClarificationCard = message.role === 'user' && Boolean(messageTaskID) &&
                     latestUserMessageByTaskID.get(messageTaskID) === message.id && Boolean(clarificationDisplay);
                   const previous = displayMessages[index - 1];
@@ -3424,26 +4214,98 @@ export function Assistant() {
                     <article id={`conversation-message-${encodeURIComponent(message.id)}`} className={`chat-message chat-message-${message.role}`}
                       aria-label={message.role === 'assistant' ? 'Morde 的回复' : '你的消息'} tabIndex={0}>
                       {message.role === 'assistant' ? <ChatMarkdown content={message.content} />
-                        : <UserMessageContent content={message.content} attachmentIDs={message.attachment_ids ?? []} />}
+                        : <><UserMessageContent content={message.content} attachmentIDs={message.attachment_ids ?? []} />
+                          {acknowledgedByServer && <span className="chat-message-agent-acknowledged" role="img" aria-label="已接下后台任务" title="已接下后台任务">👌🏻</span>}
+                        </>}
                     </article>
+                    {message.role === 'assistant' && message.task_id && message.delivery_status === 'applied'
+                      && message.output_status === 'completed' && typeof message.output_task_revision === 'number'
+                      && Number.isSafeInteger(message.output_task_revision) && typeof message.output_result_event_sequence === 'number'
+                      && <PCDeliveryVisibilityObservation taskID={message.task_id} messageID={message.id} taskRevision={message.output_task_revision} />}
                     <div className="chat-message-meta">
                       <time className="chat-message-time" dateTime={message.created_at}
                         aria-label={`${message.role === 'assistant' ? '回复' : '消息'}时间：${formatDate(message.created_at)}`}>{formatDate(message.created_at)}</time>
+                      {messageResponseMode === 'long_form' && message.role === 'user' && <span className="chat-message-status" aria-label="长回复模式">长回复</span>}
                       <button type="button" className="chat-message-copy"
                         aria-label={message.role === 'assistant' ? '复制 Morde 回复' : '复制你的消息'}
                         title={message.role === 'assistant' ? '复制回复' : '复制消息'}
                         onClick={() => void copyConversationMessage(message.content, message.role)}><MordeIcon name="copy" /></button>
                     </div>
+                    {showTaskAttention && taskAttention && <section className={`chat-message-task-attention task-attention-${taskAttention.kind}`}
+                      role="status" aria-label={`任务状态：${taskAttention.label}`}>
+                      <strong>{taskAttention.label}</strong>
+                      <p>{taskAttention.detail}</p>
+                      {(taskAttention.action === 'view_details' || taskAttention.kind === 'interrupted' || taskAttention.kind === 'result_unverified') &&
+                        <button type="button" className="button button-small button-secondary" aria-label="查看任务详情"
+                          onClick={() => {
+                            if (!messageTask) return;
+                            setTaskDetailStepID(null);
+                            setTaskPanelTab('tasks');
+                            setTaskPanelOpen(true);
+                            setTaskDetailTaskID(messageTask.id);
+                          }}>查看任务详情</button>}
+                      {canRetryModelRecovery && messageTask && <button type="button" className="button button-small button-secondary task-model-recovery-retry"
+                        aria-label="重试任务" disabled={retryingModelRecovery} onClick={() => void retryTaskModelRecovery(messageTask)}>
+                        <MordeIcon name="refresh" />{retryingModelRecovery ? '正在重试…' : '重试任务'}
+                      </button>}
+                    </section>}
                     </div>
                     </div>
+                    {(longReplyIsPending || longReplyIsProcessing || longReplyIsCancelRequested || longReplyIsPartial || longReplyIsCancelled) && <div
+                      className="chat-message-row chat-message-row-assistant" role="group"
+                      aria-label={`长回复状态：${longReplyIsPartial ? '部分完成' : longReplyIsCancelled ? '已取消' : longReplyIsCancelRequested ? '正在取消' : longReplyIsPending ? '等待处理' : '正在生成'}`}>
+                      <span className="assistant-logo assistant-logo-message" aria-hidden="true" />
+                      <div className="chat-message-body"><strong className="chat-message-author">Morde</strong>
+                        <div className="chat-message-processing-status" role="status" aria-live="polite">
+                          <strong className="chat-message-processing-title">{longReplyIsPartial ? '长回复未完整生成' : longReplyIsCancelled ? '长回复已取消' : longReplyIsCancelRequested ? '正在取消长回复' : longReplyIsPending ? '长回复等待处理' : '正在生成长回复'}</strong>
+                          {longReplyIsPartial && <p>已保存的部分内容仍保留在对话中。</p>}
+                          {longReplyIsCancelled && <p>这条长回复已停止。</p>}
+                          {longReplyIsCancelRequested && <p>取消请求已受理，正在停止本次生成。</p>}
+                          {longReplyIsPending && <p>消息已保存，等待开始生成。</p>}
+                          {longReplyIsProcessing && <p>长回复仍在生成；你可以取消本次生成。</p>}
+                          {(longReplyIsPending || longReplyIsProcessing) && <button type="button" className="button button-secondary chat-message-processing-retry"
+                            aria-label="取消长回复" disabled={cancellingThisLongReply}
+                            onClick={() => cancelLongReply.mutate({ conversationID: message.conversation_id, messageID: message.id })}>
+                            {cancellingThisLongReply ? '正在取消…' : '取消长回复'}
+                          </button>}
+                        </div>
+                      </div>
+                    </div>}
+                    {showRoutingFailure && <div className="chat-message-row chat-message-row-assistant" role="group" aria-label="Morde 的消息处理状态">
+                      <span className="assistant-logo assistant-logo-message" aria-hidden="true" />
+                      <div className="chat-message-body"><strong className="chat-message-author">Morde</strong>
+                        <div className="chat-message-processing-status" role="status" aria-live="polite">
+                          <strong className="chat-message-processing-title">刚才没能处理你的消息</strong>
+                          <p>{message.routing_failure_reason === 'message_too_long'
+                            ? '消息内容或上下文超过当前处理上限，原消息已保留。'
+                            : `${routingFailureText(message.routing_failure_reason)}，原消息已保留。`}</p>
+                          {routingFailureNextStepText && <p className="chat-message-processing-hint">{routingFailureNextStepText}</p>}
+                          {canRetryRoutingFailure && <button type="button" className="button button-secondary chat-message-processing-retry"
+                            aria-label="重新处理这条消息" disabled={retryingRoutingFailure}
+                            onClick={() => {
+                              if (processingRetryInFlight.current.has(message.id)) return;
+                              retryConversationMessageProcessing.mutate({ messageID: message.id });
+                            }}><MordeIcon name="refresh" />{retryingRoutingFailure ? '正在重试…' : retryEligibilityQuery?.data.retry_warning
+                              ? '核对后重试' : '再试一次'}</button>}
+                          {routingRetryActorMatches && message.routing_failure_reason !== 'message_too_long'
+                            && ((routingRetryCapabilityState === 'unknown' && !capabilities.isFetching)
+                              || (routingRetryCapabilityConfirmed && retryEligibilityQuery?.isError && !retryEligibilityQuery.isFetching))
+                            && <button type="button" className="button button-secondary chat-message-processing-retry"
+                              onClick={() => {
+                                if (!routingRetryCapabilityConfirmed) void capabilities.refetch();
+                                else void retryEligibilityQuery?.refetch();
+                              }}><MordeIcon name="refresh" />重新检查</button>}
+                        </div>
+                      </div>
+                    </div>}
                     {message.role === 'user' && messageTaskID && latestUserMessageByTaskID.get(messageTaskID) === message.id &&
                       messageTask?.pending_request &&
-                      (messageTask.pending_request.status !== 'pending' || messageTask.status === 'waiting_user') &&
+                      (messageTask.pending_request.status !== 'pending' || canHandleApproval) &&
                       messageTask.conversation_id === conversationID &&
                       <div className="chat-message-row chat-message-row-assistant" role="group" aria-label="Morde 的审批请求">
                         <span className="assistant-logo assistant-logo-message" aria-hidden="true" />
                         <div className="chat-message-body"><strong className="chat-message-author">Morde</strong>
-                          <TaskApprovalCard approval={messageTask.pending_request} submitting={respondToApproval.isPending}
+                          <TaskApprovalCard taskID={messageTask.id} approval={messageTask.pending_request} submitting={respondToApproval.isPending}
                             onDecision={(decision) => submitApprovalDecision(messageTask, decision)} />
                         </div>
                       </div>}
@@ -3471,9 +4333,24 @@ export function Assistant() {
                               <textarea id={`clarification-answer-${encodeURIComponent(messageTaskID)}`} aria-label="澄清问题答复"
                                 value={clarificationAnswer} maxLength={16_384}
                                 onChange={(event) => setClarificationAnswers((current) => ({ ...current, [clarificationDraftID]: event.target.value }))}
-                                placeholder="在这里补充信息…" />
+                                placeholder="在这里补充信息…" disabled={clarificationInteraction?.status === 'unknown'} />
+                              {fileDeliveryClarification && <fieldset aria-label="文件交付方式">
+                                <legend>文件交付方式</legend>
+                                <label><input type="radio" name={`file-delivery-intent-${encodeURIComponent(messageTaskID)}`}
+                                  checked={clarificationFileDeliveryIntent === 'none'}
+                                  disabled={clarificationInteraction?.status === 'unknown'}
+                                  onChange={() => setClarificationFileDeliveryIntents((current) => ({ ...current, [clarificationDraftID]: 'none' }))} />
+                                  只需在聊天中回答</label>
+                                {messageTask?.workspace_id ? <label><input type="radio" name={`file-delivery-intent-${encodeURIComponent(messageTaskID)}`}
+                                  checked={clarificationFileDeliveryIntent === 'required'}
+                                  disabled={clarificationInteraction?.status === 'unknown'}
+                                  onChange={() => setClarificationFileDeliveryIntents((current) => ({ ...current, [clarificationDraftID]: 'required' }))} />
+                                  需要交付文件</label> : <p role="note">当前任务尚未绑定 Workspace。若需要交付文件，请先绑定 Workspace，再重新提交此澄清。</p>}
+                              </fieldset>}
                               <div className="chat-approval-actions">
-                                <button type="submit" className="button button-primary" disabled={!clarificationAnswer.trim()}>
+                                <button type="submit" className="button button-primary"
+                                  disabled={!clarificationAnswer.trim() || (fileDeliveryClarification && (!clarificationFileDeliveryIntent ||
+                                    (clarificationFileDeliveryIntent === 'required' && !messageTask?.workspace_id)))}>
                                   {clarificationInteraction?.status === 'unknown' ? '使用相同回答重试' : '提交并继续'}
                                 </button>
                               </div>
@@ -3605,7 +4482,7 @@ export function Assistant() {
                 {enabledMCPConnectors.length > 0 && <details className="assistant-tool-menu"><summary><MordeIcon name="sliders" />工具</summary>
                   <fieldset className="assistant-tool-connectors"><legend>工具连接</legend>
                     <div>{enabledMCPConnectors.map((connector) => <label key={connector.id}>
-                      <input type="checkbox" checked={composerDraftReady && mcpConnectorIDs.includes(connector.id)} disabled={!composerDraftReady}
+                  <input type="checkbox" checked={composerDraftReady && mcpConnectorIDs.includes(connector.id)} disabled={!composerDraftReady || responseMode === 'long_form'}
                         onChange={(event) => {
                           composerEditRevision.current += 1;
                           const snapshot = latestComposerDraft.current;
@@ -3630,15 +4507,23 @@ export function Assistant() {
                   updateComposerDraftSnapshot({ content: value });
                   setContent(value);
                 }} />
+                <button type="button" className="button button-small button-secondary" aria-label="回复长度"
+                  aria-pressed={responseMode === 'long_form'} title="默认短答；打开后按长回复处理消息，关闭后恢复短答。"
+                  disabled={!composerDraftReady || savingMessage || (responseMode === 'short' && (composerAttachments.length > 0 || mcpConnectorIDs.length > 0))}
+                  onClick={() => setResponseMode((current) => current === 'long_form' ? 'short' : 'long_form')}>
+                  {responseMode === 'long_form' ? '长回复' : '短答'}
+                </button>
                 {preparingAttachmentCount > 0 && <button type="button" className="button button-secondary" onClick={cancelComposerAttachmentPreparation}>取消读取</button>}
-                <button className="button button-primary assistant-send" type="submit" disabled={!composerDraftReady || savingMessage || preparingAttachmentCount > 0 || composerAttachments.some((item) => item.needsPreparation) || (!content.trim() && !composerAttachments.length)}>
+                <button className="button button-primary assistant-send" type="submit" disabled={!composerDraftReady || savingMessage || preparingAttachmentCount > 0 || composerAttachments.some((item) => item.needsPreparation) || (!content.trim() && !composerAttachments.length) || (responseMode === 'long_form' && (composerAttachments.length > 0 || mcpConnectorIDs.length > 0))}>
                   {preparingAttachmentCount > 0 || composerAttachments.some((item) => item.needsPreparation) ? '读取附件…' : savingMessage ? '保存中…' : '发送'}
                   <svg className="assistant-send-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5m-5 5 5-5 5 5" /></svg>
                 </button>
               </div>
             </div>
           </form>
-          <p className="assistant-composer-hint">Enter 发送 · Shift + Enter 换行</p>
+          <p className="assistant-composer-hint">Enter 发送 · Shift + Enter 换行 · 当前：{responseMode === 'long_form' ? '长回复' : '短答'}</p>
+          {responseMode === 'long_form' && (composerAttachments.length > 0 || mcpConnectorIDs.length > 0) &&
+            <p className="assistant-composer-hint" role="status">长回复仅支持纯文本；移除附件和工具连接，或切回短答后发送。</p>}
         </section>
       </div>
       {taskPanelOpen && <aside id="assistant-task-panel" className="assistant-task-panel" aria-label="用户任务与文件侧边栏">
@@ -3793,5 +4678,15 @@ export function Assistant() {
       confirmLabel="确认启用" busy={enableExecution.isPending} onClose={() => setEnableExecutionConfirmationOpen(false)} onConfirm={confirmExecutionEnable}>
       {enableExecution.isError && <p role="alert">{errorDetails(enableExecution.error).message}。确认结果不明时会先核对服务端状态。</p>}
     </ConfirmDialog>}
+    {unknownRetryConfirmation && conversationMessageItems.some((message) => message.id === unknownRetryConfirmation.messageID)
+      && <ConfirmDialog title="上一次模型调用结果未知"
+        description="上一次个人模型调用没有确定结果。继续会创建新的独立尝试，可能产生重复调用；服务端不会重复派发旧调用。请确认后继续。"
+        confirmLabel="确认后重试" busy={retryConversationMessageProcessing.isPending}
+        onClose={() => setUnknownRetryConfirmation(null)}
+        onConfirm={() => {
+          const confirmation = unknownRetryConfirmation;
+          setUnknownRetryConfirmation(null);
+          retryConversationMessageProcessing.mutate({ messageID: confirmation.messageID, confirmedWarning: confirmation.warning });
+        }} />}
   </section>;
 }

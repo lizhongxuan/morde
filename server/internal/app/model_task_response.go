@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -34,6 +35,8 @@ type taskModelResponseIdentity struct {
 	TaskOwnerID          string `json:"task_owner_id"`
 	TaskID               string `json:"task_id"`
 	CallID               string `json:"call_id"`
+	DSHCallID            string `json:"dsh_call_id,omitempty"`
+	TaskRevision         int64  `json:"task_revision,omitempty"`
 	RequestDigest        string `json:"request_digest"`
 	ModelID              string `json:"model_id"`
 	ProviderModel        string `json:"provider_model"`
@@ -71,7 +74,65 @@ type taskModelResponseEnvelope struct {
 	Response        taskModelResponseBody     `json:"response"`
 }
 
+// validTaskModelTruncatedTextResponse accepts only a known, nonempty pure-text
+// provider result terminated by the output-token limit. It is persisted for
+// recovery/display as partial content, never as a successful DSH response.
+func validTaskModelTruncatedTextResponse(response ModelResponse) bool {
+	return response.StopReason == "length" && len(response.ToolCalls) == 0 &&
+		response.Reasoning == "" && strings.TrimSpace(response.Text) != "" &&
+		utf8.ValidString(response.Text) && len(response.Text) <= MaxDSHModelResponseTextBytes &&
+		!strings.ContainsRune(response.Text, 0) && response.Usage.Known &&
+		response.Usage.InputTokens > 0 && response.Usage.InputTokens <= maxDSHModelResponseTokenCount &&
+		response.Usage.OutputTokens > 0 && response.Usage.OutputTokens <= maxDSHModelResponseTokenCount &&
+		response.ProviderReportedModel != "" && ValidProviderReportedModel(response.ProviderReportedModel)
+}
+
+// ValidTaskModelTextTruncation reports whether Gateway marked a response as a
+// verified, bounded pure-text Task truncation suitable for DSH max-tokens.
+func ValidTaskModelTextTruncation(response ModelResponse) bool {
+	return response.KnownTextTruncation && validTaskModelTruncatedTextResponse(response)
+}
+
+func validTaskModelTruncatedTextProviderResponse(response ModelResponse) bool {
+	return response.StopReason == "length" && len(response.ToolCalls) == 0 &&
+		utf8.ValidString(response.Reasoning) && len(response.Reasoning) <= MaxDSHModelResponseTextBytes &&
+		!strings.ContainsRune(response.Reasoning, 0) && strings.TrimSpace(response.Text) != "" &&
+		utf8.ValidString(response.Text) && len(response.Text) <= MaxDSHModelResponseTextBytes &&
+		!strings.ContainsRune(response.Text, 0) && response.Usage.Known &&
+		response.Usage.InputTokens > 0 && response.Usage.InputTokens <= maxDSHModelResponseTokenCount &&
+		response.Usage.OutputTokens > 0 && response.Usage.OutputTokens <= maxDSHModelResponseTokenCount &&
+		response.ProviderReportedModel != "" && ValidProviderReportedModel(response.ProviderReportedModel)
+}
+
+func validTaskModelTruncatedTextRequest(request ModelRequest) bool {
+	if request.JSONMode || request.RequiredTool != "" || len(request.Tools) != 0 || len(request.Input) == 0 {
+		return false
+	}
+	for _, input := range request.Input {
+		if input.Type != "message" || len(input.Images) != 0 || input.CallID != "" || input.Name != "" ||
+			input.Arguments != "" || input.Output != "" {
+			return false
+		}
+		for _, part := range input.Parts {
+			if part.Type != "text" || part.Image != nil {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func validTaskModelTruncatedTextForRequest(request ModelRequest, response ModelResponse) bool {
+	return validTaskModelTruncatedTextRequest(request) && validTaskModelTruncatedTextProviderResponse(response)
+}
+
 func taskModelResponseAAD(reservation ModelCallReservation) (taskModelResponseIdentity, []byte, error) {
+	adaptiveBudget := reservation.BudgetPlanID != "" || reservation.BudgetCallID != "" || reservation.BudgetRequestDigest != ""
+	if adaptiveBudget && (!idempotencyKeyPattern.MatchString(reservation.BudgetPlanID) ||
+		!idempotencyKeyPattern.MatchString(reservation.BudgetCallID) ||
+		!modelBudgetDigestPattern.MatchString(reservation.BudgetRequestDigest) || reservation.DSHCallID == "") {
+		return taskModelResponseIdentity{}, nil, domain.InvalidArgument("task_model_response", "task model response budget identity is invalid")
+	}
 	if reservation.Source != ModelCallTask || reservation.Task == nil || reservation.OwnerID != reservation.Task.InitiatorID ||
 		!domain.ValidUserID(reservation.OwnerID) || !domain.ValidUserID(reservation.Task.OwnerID) || !domain.ValidTaskID(reservation.Task.TaskID) ||
 		!domain.ValidModelConnectionID(reservation.ModelID) || taskValidationModelIdentityRouteKey(reservation.ProviderEndpoint) == "" || len(reservation.RequestDigest) != sha256.Size ||
@@ -79,13 +140,35 @@ func taskModelResponseAAD(reservation ModelCallReservation) (taskModelResponseId
 		reservation.Task.AgentGeneration < 1 || reservation.Task.AgentInstanceID == "" || len(reservation.Task.AgentInstanceID) > 128 ||
 		!dshModelIdentityPattern.MatchString(reservation.Task.AgentSessionID) ||
 		!dshModelIdentityPattern.MatchString(reservation.Task.AgentRootSessionID) ||
-		reservation.Task.AuthorizationVersion < 1 || reservation.Task.ThroughSequence < 0 ||
+		reservation.Task.AuthorizationVersion < 1 || reservation.Task.TaskRevision < 0 || reservation.Task.ThroughSequence < 0 ||
 		!idempotencyKeyPattern.MatchString(reservation.CallID) || reservation.Task.EngineVersion == "" ||
 		reservation.Task.ProfileVersion == "" {
 		return taskModelResponseIdentity{}, nil, domain.InvalidArgument("task_model_response", "task model response identity is invalid")
 	}
-	expectedCallID, err := DSHModelCallID(reservation.Task.TaskID, reservation.Task.AgentSessionID, reservation.Task.ThroughSequence)
-	if err != nil || expectedCallID != reservation.CallID {
+	dshCallID := reservation.DSHCallID
+	if dshCallID == "" {
+		dshCallID = reservation.CallID
+	}
+	failedCallID, err := DSHModelCallID(reservation.Task.TaskID, reservation.Task.AgentSessionID, reservation.Task.ThroughSequence)
+	if err != nil {
+		return taskModelResponseIdentity{}, nil, domain.InvalidArgument("task_model_response", "task model response call identity is invalid")
+	}
+	recoveryDSHCallID, dshRecoveryErr := TaskModelRecoveryDSHCallID(reservation.Task.TaskID, reservation.Task.TaskRevision,
+		failedCallID, reservation.Task.ThroughSequence)
+	recoveryLedgerCallID, ledgerRecoveryErr := TaskModelRecoveryCallID(reservation.Task.TaskID, reservation.Task.TaskRevision,
+		failedCallID, reservation.Task.ThroughSequence)
+	if reservation.Task.RecoveryCallID == "" {
+		if adaptiveBudget {
+			if dshCallID != failedCallID || !strings.HasPrefix(reservation.CallID, "mdl_") ||
+				reservation.Task.RecoveryDSHCallID != "" {
+				return taskModelResponseIdentity{}, nil, domain.InvalidArgument("task_model_response", "task model response call identity is invalid")
+			}
+		} else if dshCallID != failedCallID || reservation.CallID != failedCallID || reservation.Task.RecoveryDSHCallID != "" {
+			return taskModelResponseIdentity{}, nil, domain.InvalidArgument("task_model_response", "task model response call identity is invalid")
+		}
+	} else if dshRecoveryErr != nil || ledgerRecoveryErr != nil || dshCallID != recoveryDSHCallID ||
+		reservation.CallID != recoveryLedgerCallID || reservation.Task.RecoveryDSHCallID != recoveryDSHCallID ||
+		reservation.Task.RecoveryCallID != recoveryLedgerCallID || reservation.CallID == dshCallID {
 		return taskModelResponseIdentity{}, nil, domain.InvalidArgument("task_model_response", "task model response call identity is invalid")
 	}
 	identity := taskModelResponseIdentity{Version: 1, OwnerID: reservation.OwnerID, TaskOwnerID: reservation.Task.OwnerID,
@@ -96,6 +179,12 @@ func taskModelResponseAAD(reservation ModelCallReservation) (taskModelResponseId
 		AgentSessionID: reservation.Task.AgentSessionID, AgentRootSessionID: reservation.Task.AgentRootSessionID,
 		AuthorizationVersion: reservation.Task.AuthorizationVersion, ThroughSequence: reservation.Task.ThroughSequence,
 		EngineVersion: reservation.Task.EngineVersion, ProfileVersion: reservation.Task.ProfileVersion}
+	if reservation.Task.RecoveryCallID != "" || adaptiveBudget && dshCallID != reservation.CallID {
+		identity.DSHCallID = dshCallID
+	}
+	if reservation.Task.RecoveryCallID != "" {
+		identity.TaskRevision = reservation.Task.TaskRevision
+	}
 	aad, err := json.Marshal(identity)
 	if err != nil {
 		return taskModelResponseIdentity{}, nil, domain.NewError(domain.CodeInternal, "task model response identity could not be encoded")
@@ -108,7 +197,7 @@ func SealTaskModelResponse(sealer *Sealer, reservation ModelCallReservation, res
 	if err != nil {
 		return TaskModelResponseRecord{}, err
 	}
-	if sealer == nil || !ValidDSHModelResponse(response) {
+	if sealer == nil || (!ValidDSHModelResponse(response) && !validTaskModelTruncatedTextResponse(response)) {
 		return TaskModelResponseRecord{}, domain.InvalidArgument("task_model_response", "task model response is invalid")
 	}
 	body := taskModelResponseBody{Reasoning: response.Reasoning, Text: response.Text, Usage: response.Usage,
@@ -179,7 +268,7 @@ func OpenTaskModelResponse(sealer *Sealer, record TaskModelResponseRecord, reser
 			response.ToolCalls[index] = ModelToolCall{CallID: call.CallID, Name: call.Name, Arguments: call.Arguments}
 		}
 	}
-	if !ValidDSHModelResponse(response) {
+	if !ValidDSHModelResponse(response) && !validTaskModelTruncatedTextResponse(response) {
 		return ModelResponse{}, domain.NewError(domain.CodeInvalidState, "stored task model response is invalid")
 	}
 	if record.ProviderReportedModel != "" && record.ProviderReportedModel != response.ProviderReportedModel ||
@@ -211,10 +300,11 @@ func validateTaskModelResponse(request ModelRequest, response ModelResponse) err
 func invalidTaskModelResponseError(response ModelResponse, message string) *domain.Error {
 	reason := ModelErrorInvalidResponse
 	switch {
-	case response.ProviderReportedModel != "" && ValidProviderReportedModel(response.ProviderReportedModel) && response.Usage.Known &&
-		response.Usage.InputTokens > 0 && response.Usage.InputTokens <= maxDSHModelResponseTokenCount &&
-		response.Usage.OutputTokens > 0 && response.Usage.OutputTokens <= maxDSHModelResponseTokenCount && response.StopReason == "length":
+	case validTaskModelTruncatedTextProviderResponse(response):
 		reason = ModelErrorTruncatedResponse
+	case response.ProviderReportedModel != "" && ValidProviderReportedModel(response.ProviderReportedModel) &&
+		response.Usage.Known && response.StopReason == "content_filter":
+		reason = ModelErrorContentFiltered
 	case response.ProviderReportedModel != "" && ValidProviderReportedModel(response.ProviderReportedModel) && response.StopReason == "stop" &&
 		len(response.ToolCalls) == 0 && response.Text == "" && response.Reasoning == "" && response.Usage.Known &&
 		response.Usage.InputTokens > 0 && response.Usage.InputTokens <= maxDSHModelResponseTokenCount && response.Usage.OutputTokens == 0:

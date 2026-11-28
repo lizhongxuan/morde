@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -23,6 +24,124 @@ type routeActionsTestFixture struct {
 	conversation  conversation.Conversation
 	instanceID    string
 	authorization task.Authorization
+}
+
+func TestProjectConversationRouteFailsClosedWhenAcceptedWorkspaceSnapshotChanges(t *testing.T) {
+	tests := []struct {
+		name     string
+		wantCode domain.ErrorCode
+		mutate   func(t *testing.T, fixture projectRouteWorkspaceFixture, claim *app.ConversationRouteClaim,
+			snapshot *app.ConversationRouteSnapshot)
+	}{
+		{
+			name:     "project resource version",
+			wantCode: domain.CodeWorkspaceConflict,
+			mutate: func(t *testing.T, fixture projectRouteWorkspaceFixture, _ *app.ConversationRouteClaim, _ *app.ConversationRouteSnapshot) {
+				_, err := fixture.attachment.store.pool.Exec(context.Background(), `UPDATE project_resources SET version=version+1
+WHERE project_id=$1 AND kind='workspace' AND resource_id=$2`, fixture.attachment.projectID, fixture.workspace.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name:     "receipt Workspace owner changed",
+			wantCode: domain.CodeWorkspaceConflict,
+			mutate: func(t *testing.T, fixture projectRouteWorkspaceFixture, claim *app.ConversationRouteClaim,
+				snapshot *app.ConversationRouteSnapshot) {
+				claim.Input.WorkspaceOwnerID = fixture.attachment.member.UserID
+				metadata, err := json.Marshal(claim.Input)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := fixture.attachment.store.pool.Exec(context.Background(), `UPDATE conversation_message_routes
+SET request_metadata=$2::jsonb WHERE message_id=$1`, claim.Message.ID, metadata); err != nil {
+					t.Fatal(err)
+				}
+				snapshot.Context.ExecutionScopeDigest, err = app.ConversationRouteExecutionScopeDigest(claim.Input)
+				if err != nil {
+					t.Fatal(err)
+				}
+				snapshot.Context.ControlScopeDigest, err = app.ConversationRouteControlScopeDigest(claim.Input)
+				if err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name:     "Workspace revision",
+			wantCode: domain.CodeWorkspaceConflict,
+			mutate: func(t *testing.T, fixture projectRouteWorkspaceFixture, _ *app.ConversationRouteClaim, _ *app.ConversationRouteSnapshot) {
+				_, err := fixture.attachment.store.pool.Exec(context.Background(), `UPDATE workspaces SET revision=revision+1 WHERE id=$1`, fixture.workspace.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name:     "manifest digest at unchanged revision",
+			wantCode: domain.CodeWorkspaceConflict,
+			mutate: func(t *testing.T, fixture projectRouteWorkspaceFixture, _ *app.ConversationRouteClaim, _ *app.ConversationRouteSnapshot) {
+				file := syncTestFile("receipt-snapshot.txt", []byte("changed manifest"))
+				chunks, err := json.Marshal(file.Chunks)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, err = fixture.attachment.store.pool.Exec(context.Background(), `INSERT INTO workspace_revision_files
+(workspace_id,valid_from_revision,file_path,folded_path,size_bytes,sha256,mode,chunks)
+VALUES ($1,$2,$3,lower($3),$4,$5,$6,$7)`, fixture.workspace.ID, fixture.workspace.Revision, file.Path,
+					file.SizeBytes, file.SHA256, int32(file.Mode), chunks)
+				if err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name:     "Workspace grant revoked",
+			wantCode: domain.CodeForbidden,
+			mutate: func(t *testing.T, fixture projectRouteWorkspaceFixture, _ *app.ConversationRouteClaim, _ *app.ConversationRouteSnapshot) {
+				result, err := fixture.attachment.store.pool.Exec(context.Background(), `UPDATE host_members
+SET revoked_at=clock_timestamp() WHERE owner_id=$1 AND user_id=$2 AND revoked_at IS NULL
+AND host_id=(SELECT host_id FROM workspace_bindings WHERE workspace_id=$3 AND owner_id=$1 AND state='active')`,
+					fixture.attachment.owner.UserID, fixture.attachment.member.UserID, fixture.workspace.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if result.RowsAffected() != 1 {
+					t.Fatalf("revoked %d Workspace grants, want one", result.RowsAffected())
+				}
+			},
+		},
+	}
+
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newProjectRouteWorkspaceFixture(t)
+			clientID := fmt.Sprintf("project-snapshot-change-%02d", index)
+			claim := fixture.receive(t, clientID, fixture.digest)
+			snapshot, err := fixture.attachment.store.LoadConversationRouteSnapshot(context.Background(), claim)
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshot.Context.ModelID = claim.Input.ModelID
+			test.mutate(t, fixture, &claim, &snapshot)
+			err = fixture.attachment.store.ApplyConversationRoute(context.Background(), claim, snapshot, app.ConversationRouteDecision{
+				Action: app.ConversationRouteNew, FileDeliveryIntent: task.FileDeliveryRequired,
+				ModelOutput: `{"action":"new","task_id":"","file_delivery_intent":"required"}`,
+			})
+			if err == nil || domain.CodeOf(err) != test.wantCode {
+				t.Fatalf("route error after %s = %v, want %s", test.name, err, test.wantCode)
+			}
+			var taskCount int
+			if err := fixture.attachment.store.pool.QueryRow(context.Background(),
+				`SELECT count(*) FROM conversation_messages WHERE id=$1 AND task_id IS NOT NULL`, claim.Message.ID).Scan(&taskCount); err != nil {
+				t.Fatal(err)
+			}
+			if taskCount != 0 {
+				t.Fatalf("stale Workspace snapshot created %d Tasks; route error=%v", taskCount, err)
+			}
+		})
+	}
 }
 
 type conversationRouteTestBroker struct {
@@ -381,6 +500,82 @@ lease_expires_at=clock_timestamp()+interval '1 minute' WHERE id=$1`, taskID); er
 	}
 }
 
+func TestConversationAcknowledgementStaysOnOriginalTaskMessageAcrossRevision(t *testing.T) {
+	f := newRouteActionsTestFixture(t)
+	ctx := context.Background()
+	const originalClientID = "route-ack-anchor-original"
+	original := f.receive(t, originalClientID, "Please do a longer task", app.ConversationRoutingInput{})
+	snapshot, err := f.store.LoadConversationRouteSnapshot(ctx, original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot.Context.ModelID = "p1234567"
+	if err := f.store.ApplyConversationRoute(ctx, original, snapshot, app.ConversationRouteDecision{
+		Action: app.ConversationRouteNew, Acknowledge: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var taskID string
+	if err := f.store.pool.QueryRow(ctx, `SELECT task_id FROM conversation_messages WHERE id=$1`, original.Message.ID).Scan(&taskID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.pool.Exec(ctx, `UPDATE tasks SET status='running',lease_owner='ack-anchor-test',lease_version=1,
+lease_expires_at=clock_timestamp()+interval '1 minute' WHERE id=$1`, taskID); err != nil {
+		t.Fatal(err)
+	}
+	startTaskRevision := func() {
+		t.Helper()
+		tx, err := f.store.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		if err := recordTaskRevisionStartedInTx(ctx, tx, taskID); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	startTaskRevision()
+	var currentRevision int64
+	if err := f.store.pool.QueryRow(ctx, `SELECT current_revision FROM tasks WHERE id=$1`, taskID).Scan(&currentRevision); err != nil {
+		t.Fatal(err)
+	}
+	const followupClientID = "route-ack-anchor-followup"
+	followup := f.receive(t, followupClientID, "Add one more requirement", app.ConversationRoutingInput{})
+	if _, err := f.store.pool.Exec(ctx, `UPDATE conversation_message_routes SET acknowledgement_requested=true WHERE message_id=$1`, followup.Message.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.pool.Exec(ctx, `INSERT INTO task_revision_intents
+(message_id,task_id,owner_id,initiator_id,conversation_id,message_sequence,expected_revision)
+VALUES ($1,$2,$3,$3,$4,$5,$6)`, followup.Message.ID, taskID, f.ownerID, f.conversation.ID, followup.Message.Sequence, currentRevision); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.pool.Exec(ctx, `UPDATE tasks SET current_revision=current_revision+1,desired_revision=desired_revision+1 WHERE id=$1`, taskID); err != nil {
+		t.Fatal(err)
+	}
+	startTaskRevision()
+
+	page, err := f.store.ListMessages(ctx, f.ownerID, f.conversation.ID, app.PageRequest{Limit: 10})
+	if err != nil || len(page.Items) != 2 {
+		t.Fatalf("conversation messages = %+v err=%v", page.Items, err)
+	}
+	acknowledged := make(map[string]bool, len(page.Items))
+	for _, message := range page.Items {
+		acknowledged[message.ClientMessageID] = message.AgentAcknowledged
+	}
+	if !acknowledged[originalClientID] || acknowledged[followupClientID] {
+		t.Fatalf("Task acknowledgement moved from its original request: original=%t followup=%t messages=%+v",
+			acknowledged[originalClientID], acknowledged[followupClientID], page.Items)
+	}
+	var anchorID string
+	if err := f.store.pool.QueryRow(ctx, `SELECT acknowledgement_message_id FROM task_revision_starts
+WHERE task_id=$1 AND revision=$2`, taskID, currentRevision+1).Scan(&anchorID); err != nil || anchorID != original.Message.ID {
+		t.Fatalf("persisted acknowledgement anchor = %q, want %q, err=%v", anchorID, original.Message.ID, err)
+	}
+}
+
 func TestConversationRouteJoinWaitsOnOriginalRequestWithoutCreatingTask(t *testing.T) {
 	f := newRouteActionsTestFixture(t)
 	ctx := context.Background()
@@ -538,6 +733,63 @@ JOIN tasks task ON task.id=intent.task_id WHERE message.id=$1`, joined.Message.I
 		actualContent != addition || currentRevision != 1 {
 		t.Fatalf("joined input was lost from the same Task revision: task=%q intent=%q content=%q revision=%d err=%v",
 			actualTaskID, intentState, actualContent, currentRevision, err)
+	}
+}
+
+func TestConversationRouteJoinRevalidatesAuthorizationSnapshotUnderLock(t *testing.T) {
+	f := newRouteActionsTestFixture(t)
+	ctx := context.Background()
+	input := app.ConversationRoutingInput{HostID: "h1234567"}
+	root := f.receive(t, "route-join-auth-root", "整理项目资料并生成设计方案", input)
+	rootSnapshot, err := f.store.LoadConversationRouteSnapshot(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootSnapshot.Context.ModelID = "p1234567"
+	if err := f.store.ApplyConversationRoute(ctx, root, rootSnapshot, app.ConversationRouteDecision{Action: app.ConversationRouteNew}); err != nil {
+		t.Fatalf("create root Task: %v", err)
+	}
+	joined := f.receive(t, "route-join-auth-addition", "补充项目的验收标准。", input)
+	joinedSnapshot, err := f.store.LoadConversationRouteSnapshot(ctx, joined)
+	if err != nil || len(joinedSnapshot.Context.RequestCandidates) != 1 ||
+		joinedSnapshot.Context.RequestCandidates[0].MessageID != root.Message.ID ||
+		!joinedSnapshot.Context.RequestCandidates[0].SameAuthorization {
+		t.Fatalf("authorized root was not offered as a join candidate: candidates=%+v err=%v",
+			joinedSnapshot.Context.RequestCandidates, err)
+	}
+	// Simulate an authorization change after semantic classification but
+	// before the join helper locks and revalidates its target row.
+	if _, err := f.store.pool.Exec(ctx, `UPDATE conversation_message_routes
+SET authorization_snapshot=jsonb_set(authorization_snapshot,'{Version}','2'::jsonb)
+WHERE message_id=$1`, root.Message.ID); err != nil {
+		t.Fatalf("change root authorization snapshot: %v", err)
+	}
+	tx, err := f.store.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := lockConversationRouteClaim(ctx, tx, joined); err != nil {
+		t.Fatalf("lock joined route claim: %v", err)
+	}
+	if err := linkDuplicateConversationRouteInTx(ctx, tx, joined, joinedSnapshot, root.Message.ID); err != nil {
+		t.Fatalf("reclassify stale authorization instead of joining: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit stale-authorization reclassification: %v", err)
+	}
+	var state, duplicateOf string
+	var routeAttempt int64
+	var revisionIntentCount int
+	if err := f.store.pool.QueryRow(ctx, `SELECT state,COALESCE(duplicate_of_message_id,''),route_attempt,
+(SELECT count(*) FROM task_revision_intents WHERE message_id=$1)
+FROM conversation_message_routes WHERE message_id=$1`, joined.Message.ID).
+		Scan(&state, &duplicateOf, &routeAttempt, &revisionIntentCount); err != nil {
+		t.Fatal(err)
+	}
+	if state != "pending" || duplicateOf != "" || routeAttempt != joined.RouteAttempt+1 || revisionIntentCount != 0 {
+		t.Fatalf("stale join changed target or created a Task revision: state=%q duplicate=%q attempt=%d intents=%d",
+			state, duplicateOf, routeAttempt, revisionIntentCount)
 	}
 }
 
@@ -846,6 +1098,36 @@ func TestConversationRouteJoinRejectsDifferentExecutionScope(t *testing.T) {
 	if err := f.store.pool.QueryRow(ctx, `SELECT state,COALESCE(duplicate_of_message_id,'') FROM conversation_message_routes WHERE message_id=$1`,
 		duplicate.Message.ID).Scan(&state, &association); err != nil || state != "processing" || association != "" {
 		t.Fatalf("rejected join changed the message route: state=%s association=%q err=%v", state, association, err)
+	}
+}
+
+func TestConversationRouteJoinRejectsTargetFromDifferentConversation(t *testing.T) {
+	f := newRouteActionsTestFixture(t)
+	ctx := context.Background()
+	otherConversation := createMainConversationForTest(t, f.store, f.ownerID)
+	foreignRoot := f.receiveInConversation(t, otherConversation.ID, "route-join-foreign-conversation-root",
+		"分析 Morde 项目", app.ConversationRoutingInput{HostID: "h1234567"})
+	current := f.receive(t, "route-join-cross-conversation", "补充项目验收标准。", app.ConversationRoutingInput{HostID: "h1234567"})
+	snapshot, err := f.store.LoadConversationRouteSnapshot(ctx, current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, candidate := range snapshot.Context.RequestCandidates {
+		if candidate.MessageID == foreignRoot.Message.ID {
+			t.Fatalf("route snapshot exposed another conversation's message: %+v", candidate)
+		}
+	}
+	if err := f.store.ApplyConversationRoute(ctx, current, snapshot, app.ConversationRouteDecision{
+		Action: app.ConversationRouteJoin, TargetMessageID: foreignRoot.Message.ID,
+	}); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("cross-conversation join was accepted: %v", err)
+	}
+	var state, association string
+	if err := f.store.pool.QueryRow(ctx, `SELECT state,COALESCE(duplicate_of_message_id,'')
+FROM conversation_message_routes WHERE message_id=$1`, current.Message.ID).Scan(&state, &association); err != nil ||
+		state != "processing" || association != "" {
+		t.Fatalf("rejected cross-conversation join changed the current route: state=%s association=%q err=%v",
+			state, association, err)
 	}
 }
 
@@ -1370,6 +1652,65 @@ func TestConversationRouteRetryReusesMessageAndFencesIdempotency(t *testing.T) {
 	if err := f.store.pool.QueryRow(ctx, `SELECT count(*) FROM conversation_messages WHERE conversation_id=$1`, f.conversation.ID).Scan(&count); err != nil || count != 1 {
 		t.Fatalf("retry duplicated message: count=%d err=%v", count, err)
 	}
+}
+
+func TestConversationRouteRetryRejectsUnchangedOversizedMessage(t *testing.T) {
+	f := newRouteActionsTestFixture(t)
+	ctx := context.Background()
+	claim := f.receive(t, "route-retry-oversized-001", "Keep this oversized source unchanged", app.ConversationRoutingInput{})
+	if err := f.store.FailConversationRoute(ctx, claim, "message_too_long"); err != nil {
+		t.Fatal(err)
+	}
+	principal := identity.Principal{UserID: f.ownerID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: f.authorization.TokenID,
+		Scopes: []identity.Scope{identity.ScopeTaskSubmit}}
+	eligibility, err := f.store.GetConversationMessageRetryEligibility(ctx, principal, "", f.conversation.ID, claim.Message.ID, f.instanceID)
+	if err != nil || eligibility.Eligible || eligibility.Reason != app.ConversationMessageRetryReasonMessageTooLong {
+		t.Fatalf("oversized retry eligibility = %+v, %v; want message_too_long", eligibility, err)
+	}
+	if err := f.store.RetryConversationRoute(ctx, principal, "", f.conversation.ID, claim.Message.ID, f.instanceID,
+		"route-retry-oversized-key-001"); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("unchanged oversized message retry = %v, want invalid state", err)
+	}
+	var state, failureReason string
+	var attempt int64
+	if err := f.store.pool.QueryRow(ctx, `SELECT state,failure_reason,route_attempt FROM conversation_message_routes WHERE message_id=$1`,
+		claim.Message.ID).Scan(&state, &failureReason, &attempt); err != nil || state != "failed" || failureReason != "message_too_long" || attempt != claim.RouteAttempt {
+		t.Fatalf("rejected oversized retry changed route: state=%q reason=%q attempt=%d err=%v", state, failureReason, attempt, err)
+	}
+}
+
+func TestConversationRouteRetryEligibilityMatchesWriteGateAndAuthorization(t *testing.T) {
+	f := newRouteActionsTestFixture(t)
+	ctx := context.Background()
+	claim := f.receive(t, "route-retry-eligibility-001", "Retry this saved message", app.ConversationRoutingInput{})
+	principal := identity.Principal{UserID: f.ownerID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: f.authorization.TokenID,
+		Scopes: []identity.Scope{identity.ScopeTaskSubmit}}
+	check := func(wantEligible bool, wantReason string) {
+		t.Helper()
+		eligibility, err := f.store.GetConversationMessageRetryEligibility(ctx, principal, "", f.conversation.ID, claim.Message.ID, f.instanceID)
+		if err != nil || eligibility.Eligible != wantEligible || eligibility.Reason != wantReason {
+			t.Fatalf("retry eligibility = %+v, %v; want eligible=%t reason=%q", eligibility, err, wantEligible, wantReason)
+		}
+	}
+	check(false, app.ConversationMessageRetryReasonNotFailed)
+	if err := f.store.FailConversationRoute(ctx, claim, "model_unavailable"); err != nil {
+		t.Fatal(err)
+	}
+	check(true, app.ConversationMessageRetryReasonAvailable)
+	if _, err := f.store.pool.Exec(ctx, `UPDATE tokens SET revoked_at=clock_timestamp() WHERE id=$1`, principal.TokenID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.GetConversationMessageRetryEligibility(ctx, principal, "", f.conversation.ID, claim.Message.ID, f.instanceID); domain.CodeOf(err) != domain.CodeUnauthenticated {
+		t.Fatalf("revoked token retry eligibility error = %v, want unauthenticated", err)
+	}
+	if _, err := f.store.pool.Exec(ctx, `UPDATE tokens SET revoked_at=NULL WHERE id=$1`, principal.TokenID); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.RetryConversationRoute(ctx, principal, "", f.conversation.ID, claim.Message.ID, f.instanceID,
+		"route-retry-eligibility-key-001"); err != nil {
+		t.Fatalf("retry after eligible preflight: %v", err)
+	}
+	check(false, app.ConversationMessageRetryReasonNotFailed)
 }
 
 func TestConcurrentConversationRouteRetryWithSameKeyCreatesOneAttempt(t *testing.T) {

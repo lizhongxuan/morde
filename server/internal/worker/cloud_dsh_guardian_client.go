@@ -90,6 +90,11 @@ func (g *unixSocketDockerCloudDSHGuardian) StopTaskProcess(ctx context.Context, 
 	return g.client.StopTaskProcess(ctx, guard)
 }
 
+func (g *unixSocketDockerCloudDSHGuardian) SnapshotTaskProcess(ctx context.Context,
+	runtimeFence app.AccountAgentRuntimeFence, taskFence app.AgentInstanceFence) (dshguardian.TaskProcessSnapshot, error) {
+	return g.client.SnapshotTaskProcess(ctx, runtimeFence, taskFence)
+}
+
 func (g *unixSocketDockerCloudDSHGuardian) RecoverTaskProcessStopped(ctx context.Context, runtimeFence app.AccountAgentRuntimeFence,
 	taskFence app.AgentInstanceFence, nonceSHA256 string) (app.AccountAgentTaskStopAttestation, error) {
 	return g.client.RecoverTaskProcessStopped(ctx, runtimeFence, taskFence, nonceSHA256)

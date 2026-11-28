@@ -19,7 +19,7 @@ let package = Package(
                 "MordeWorkspaceTransfer.swift",
                 "Tests",
             ],
-            sources: ["MordeCredentialExpiry.swift", "MordeHostStatusProjection.swift", "MordeCodexSessionPolicy.swift"]
+            sources: ["MordeCredentialExpiry.swift", "MordeHostStatusProjection.swift", "MordeCodexSessionPolicy.swift", "MordeTraceContext.swift"]
         ),
         .testTarget(
             name: "MordeTaskIsolationTests",

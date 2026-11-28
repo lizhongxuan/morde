@@ -20,7 +20,10 @@ func (s *Store) CreateModelConnection(ctx context.Context, value app.ModelConnec
 		ModelName: value.ModelName, ContextWindowTokens: nullableInt4(value.ContextWindowTokens),
 		ContextWindowOverrideTokens: nullableInt4(value.ContextWindowOverrideTokens), ContextWindowSource: string(modelContextWindowSource(value.ContextWindowSource)),
 		ContextWindowResolvedAt: nullableTimestamp(value.ContextWindowResolvedAt), ContextWindowCatalogVersion: nullableTextPointer(value.ContextWindowCatalogVersion),
-		ApiKeyCipher: value.APIKeyCipher,
+		ApiKeyCipher: value.APIKeyCipher, MaxOutputTokens: nullableInt4(value.MaxOutputTokens),
+		MaxOutputOverrideTokens: nullableInt4(value.MaxOutputOverrideTokens), MaxOutputSource: string(modelMaxOutputSource(value.MaxOutputSource)),
+		MaxOutputResolvedAt: nullableTimestamp(value.MaxOutputResolvedAt), MaxOutputCatalogVersion: nullableTextPointer(value.MaxOutputCatalogVersion),
+		MaxOutputSourceUrl: nullableTextPointer(value.MaxOutputSourceURL),
 	})
 	if err != nil {
 		var postgresErr *pgconn.PgError
@@ -95,6 +98,12 @@ func (s *Store) UpdateModelConnection(ctx context.Context, value app.ModelConnec
 		ContextWindowSource:             string(modelContextWindowSource(value.ContextWindowSource)),
 		ContextWindowResolvedAt:         nullableTimestamp(value.ContextWindowResolvedAt),
 		ContextWindowCatalogVersion:     nullableTextPointer(value.ContextWindowCatalogVersion),
+		MaxOutputTokens:                 nullableInt4(value.MaxOutputTokens),
+		MaxOutputOverrideTokens:         nullableInt4(value.MaxOutputOverrideTokens),
+		MaxOutputSource:                 string(modelMaxOutputSource(value.MaxOutputSource)),
+		MaxOutputResolvedAt:             nullableTimestamp(value.MaxOutputResolvedAt),
+		MaxOutputCatalogVersion:         nullableTextPointer(value.MaxOutputCatalogVersion),
+		MaxOutputSourceUrl:              nullableTextPointer(value.MaxOutputSourceURL),
 		ApiKeyCipher:                    value.APIKeyCipher,
 		CapabilityText:                  value.Capabilities.Text,
 		CapabilityTools:                 value.Capabilities.Tools,
@@ -125,6 +134,9 @@ func (s *Store) DeleteModelConnection(ctx context.Context, id string) error {
 func modelConnectionDomain(row sqlcgen.ModelConnection) app.ModelConnectionRecord {
 	return app.ModelConnectionRecord{
 		ID: row.ID, OwnerID: row.OwnerID.String, Name: row.Name, BaseURL: row.BaseUrl, ModelName: row.ModelName,
+		MaxOutputTokens: intPointer(row.MaxOutputTokens), MaxOutputOverrideTokens: intPointer(row.MaxOutputOverrideTokens),
+		MaxOutputSource: app.ModelMaxOutputSource(row.MaxOutputSource), MaxOutputResolvedAt: timePointer(row.MaxOutputResolvedAt),
+		MaxOutputCatalogVersion: textPointer(row.MaxOutputCatalogVersion), MaxOutputSourceURL: textPointer(row.MaxOutputSourceUrl),
 		ContextWindowTokens: intPointer(row.ContextWindowTokens), ContextWindowOverrideTokens: intPointer(row.ContextWindowOverrideTokens),
 		ContextWindowSource: app.ModelContextWindowSource(row.ContextWindowSource), ContextWindowResolvedAt: timePointer(row.ContextWindowResolvedAt),
 		ContextWindowCatalogVersion: textPointer(row.ContextWindowCatalogVersion), APIKeyCipher: append([]byte(nil), row.ApiKeyCipher...),
@@ -143,6 +155,13 @@ func modelConnectionDomain(row sqlcgen.ModelConnection) app.ModelConnectionRecor
 func modelContextWindowSource(value app.ModelContextWindowSource) app.ModelContextWindowSource {
 	if value == "" {
 		return app.ModelContextWindowUnknown
+	}
+	return value
+}
+
+func modelMaxOutputSource(value app.ModelMaxOutputSource) app.ModelMaxOutputSource {
+	if value == "" {
+		return app.ModelMaxOutputUnknown
 	}
 	return value
 }

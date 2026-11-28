@@ -26,6 +26,7 @@ const (
 	ConversationSummarySourceMemory      = "memory"
 	MaxConversationSummarySources        = 8192
 	MaxConversationSummaryBytes          = 256 << 10
+	MaxConversationSummaryCharacters     = 16_000
 	MaxConversationSummaryCiphertext     = 1 << 20
 	MaxConversationSummaryInputPageBytes = 64 << 10
 )
@@ -145,16 +146,17 @@ type ConversationSummaryCheckpoint struct {
 }
 
 type ConversationSummaryCommit struct {
-	Claim           ConversationRouteClaim
-	Identity        ConversationSummaryIdentity
-	OperationID     string
-	LeaseOwner      string
-	LeaseVersion    int64
-	BaselineVersion int64
-	SummarySHA256   []byte
-	SourcesSHA256   []byte
-	Ciphertext      []byte
-	Sources         []ConversationSummarySource
+	Claim              ConversationRouteClaim
+	Identity           ConversationSummaryIdentity
+	OperationID        string
+	LeaseOwner         string
+	LeaseVersion       int64
+	BaselineVersion    int64
+	PendingPredecessor bool
+	SummarySHA256      []byte
+	SourcesSHA256      []byte
+	Ciphertext         []byte
+	Sources            []ConversationSummarySource
 }
 
 type ConversationSummaryOperationRelease struct {
@@ -379,10 +381,12 @@ func DSHConversationSummaryModelCallID(conversationID, operationID, sessionID st
 func SealConversationSummaryModelOutput(sealer *Sealer, output ConversationSummaryModelOutput) ([]byte, []byte, error) {
 	if sealer == nil || !validConversationSummaryIdentity(output.Identity) || !domain.ValidOperationID(output.OperationID) ||
 		len(output.CallID) < 8 || len(output.CallID) > 128 || strings.TrimSpace(output.CallID) != output.CallID ||
-		!domain.ValidModelConnectionID(output.ModelID) || strings.TrimSpace(output.Text) == "" || !utf8.ValidString(output.Text) ||
-		strings.ContainsRune(output.Text, '\x00') || len(output.Text) > MaxConversationSummaryBytes || !output.Usage.Known ||
+		!domain.ValidModelConnectionID(output.ModelID) || !output.Usage.Known ||
 		output.Usage.InputTokens < 0 || output.Usage.OutputTokens < 0 || output.Usage.InputTokens > int64(^uint64(0)>>1)-output.Usage.OutputTokens {
 		return nil, nil, domain.InvalidArgument("conversation_summary_model_output", "conversation summary model output is invalid")
+	}
+	if failure := validateConversationSummaryText(output.Text); failure != nil {
+		return nil, nil, domain.InvalidArgument("conversation_summary_model_output", "conversation summary model output is invalid: "+failure.Error())
 	}
 	plain, err := json.Marshal(output)
 	if err != nil || len(plain) > MaxConversationSummaryCiphertext {
@@ -428,9 +432,11 @@ func OpenConversationSummaryModelOutput(sealer *Sealer, ciphertext, digest []byt
 
 func SealConversationSummary(sealer *Sealer, document ConversationSummaryDocument) (StoredConversationSummary, error) {
 	if sealer == nil || !validConversationSummaryIdentity(document.Identity) || document.Version < 1 ||
-		!domain.ValidOperationID(document.OperationID) || strings.TrimSpace(document.Text) == "" ||
-		!utf8.ValidString(document.Text) || strings.ContainsRune(document.Text, '\x00') || len(document.Text) > MaxConversationSummaryBytes {
+		!domain.ValidOperationID(document.OperationID) {
 		return StoredConversationSummary{}, domain.InvalidArgument("conversation_summary", "conversation summary is invalid")
+	}
+	if failure := validateConversationSummaryText(document.Text); failure != nil {
+		return StoredConversationSummary{}, domain.InvalidArgument("conversation_summary", "conversation summary is invalid: "+failure.Error())
 	}
 	sourceDigest, err := ConversationSummarySourcesDigest(document.Sources)
 	if err != nil {

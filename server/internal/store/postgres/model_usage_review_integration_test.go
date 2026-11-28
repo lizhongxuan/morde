@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"testing"
 	"time"
 
@@ -13,6 +14,58 @@ import (
 	"morde/server/internal/domain/project"
 	"morde/server/internal/domain/task"
 )
+
+type reviewRateLimitResolver struct{ version time.Time }
+
+func (r reviewRateLimitResolver) ResolveGatewayEndpoint(context.Context, string, string, bool, bool) (app.ModelGatewayEndpoint, error) {
+	return app.ModelGatewayEndpoint{Endpoint: app.ModelEndpoint{BaseURL: "https://model.example/v1", APIKey: "synthetic-key", ModelID: "test-model"},
+		Version: r.version}, nil
+}
+
+func (r reviewRateLimitResolver) ResolveProbeEndpoint(ctx context.Context, _ identity.Principal, _ string) (app.ModelGatewayEndpoint, error) {
+	return r.ResolveGatewayEndpoint(ctx, "", "", false, false)
+}
+
+func (reviewRateLimitResolver) SaveProbeCapabilities(_ context.Context, _ identity.Principal, _ string, _ time.Time, value app.ModelCapabilities) (app.ModelCapabilities, error) {
+	return value, nil
+}
+
+func TestPostgresReviewRateLimitKeepsUnknownAndDoesNotRedispatch(t *testing.T) {
+	f, fence := completedReviewModelFence(t)
+	call := reviewModelReservation(t, f.store, fence, "")
+	client := &routeModelClientTest{err: &app.ModelClientError{
+		Kind: app.ModelErrorRateLimited, Stage: "provider_status", RetryAfter: 90 * time.Second,
+	}}
+	gateway, err := app.NewModelGatewayService(f.store, reviewRateLimitResolver{version: call.ConnectionVersion}, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealer, err := app.NewSealer(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.SetModelResponseSealer(sealer); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	raw := []byte(`{"provider":"morde","model":"p7654321","messages":[{"role":"user","content":[{"type":"text","text":"Review the result."}]}],"tools":[],"max_tokens":64}`)
+	_, err = gateway.CompleteTaskValidationReviewDSHModel(ctx, fence, call.ModelID, raw)
+	var modelErr *domain.Error
+	if !errors.As(err, &modelErr) || modelErr.Code != domain.CodeRateLimited ||
+		modelErr.RetryAfter != 90*time.Second || client.calls.Load() != 1 {
+		t.Fatalf("review rate limit error=%v calls=%d", err, client.calls.Load())
+	}
+	var state string
+	if err := f.store.pool.QueryRow(context.Background(), `SELECT state FROM model_call_ledger
+WHERE owner_id=$1 AND source='review' AND call_id=$2`, call.OwnerID, call.CallID).Scan(&state); err != nil || state != "unknown" {
+		t.Fatalf("review account ledger=%s err=%v", state, err)
+	}
+	_, err = gateway.CompleteTaskValidationReviewDSHModel(ctx, fence, call.ModelID, raw)
+	if domain.CodeOf(err) != domain.CodeInvalidState || client.calls.Load() != 1 {
+		t.Fatalf("unknown review was redispatched: calls=%d err=%v", client.calls.Load(), err)
+	}
+}
 
 func TestPostgresModelSettlementRejectsReviewTextDigestOutsideReview(t *testing.T) {
 	store := &Store{}

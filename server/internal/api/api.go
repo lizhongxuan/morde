@@ -13,6 +13,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
 	"morde/server/internal/app"
@@ -63,6 +64,7 @@ type Deps struct {
 	Control                      ControlService
 	ExecutionControl             ExecutionControlService
 	Tasks                        TaskService
+	TaskPCDeliveryObservations   TaskPCDeliveryObservationService
 	Codex                        CodexService
 	TaskArtifactContent          TaskArtifactContentEndpointService
 	TaskMedia                    TaskMediaService
@@ -83,6 +85,7 @@ type Deps struct {
 	ModelGateway                 ModelGateway
 	ModelUsageAdmin              ModelUsageAdmin
 	BlindEvaluations             BlindEvaluationManager
+	WorkflowTraces               WorkflowTraceReader
 	Hub                          app.HubConnectionService
 	Devices                      deviceService
 	PersonalData                 personalDataService
@@ -99,6 +102,7 @@ type Deps struct {
 	AdminQualityActivity         AdminQualityActivityService
 	AdminControls                AdminControlsService
 	AdminOperations              AdminOperationsService
+	Observability                AdminObservabilityDeps
 	AdminModelBudgetDefaults     AdminModelBudgetDefaultService
 	AdminModelDefaults           AdminModelDefaultService
 	RecordConsents               RecordConsentService
@@ -118,6 +122,7 @@ type Deps struct {
 type Options struct {
 	Logger                *zap.Logger
 	Metrics               prometheus.Registerer
+	TracerProvider        trace.TracerProvider
 	ServiceInstanceID     string
 	APIMaxBodyBytes       int64
 	MCPMaxBodyBytes       int64
@@ -161,7 +166,7 @@ func New(deps Deps, options Options) (*gin.Engine, error) {
 		return nil, errors.New("api preview port minimum must be between 1 and 65535")
 	}
 
-	middleware, err := httpserver.Base(httpserver.Options{Server: "api", Logger: options.Logger, Metrics: options.Metrics})
+	middleware, err := httpserver.Base(httpserver.Options{Server: "api", Logger: options.Logger, Metrics: options.Metrics, TracerProvider: options.TracerProvider})
 	if err != nil {
 		return nil, err
 	}
@@ -225,6 +230,7 @@ func New(deps Deps, options Options) (*gin.Engine, error) {
 		group.GET("/tasks/:id/media/:operation_id/preview", h.getTaskMediaPreview)
 	}
 	h.registerTaskWorkbenchObservationTickets(group, deps.TaskObservationTickets)
+	h.registerTaskPCDeliveryObservations(group, deps.TaskPCDeliveryObservations)
 	h.registerResources(group)
 	h.registerAgentWorkspaceFiles(group, deps.AgentWorkspaceFiles)
 	h.registerWorkspaceSync(group, deps.WorkspaceSync, deps.WorkspaceSyncDevices)
@@ -261,11 +267,13 @@ func New(deps Deps, options Options) (*gin.Engine, error) {
 	h.registerAdmin(group)
 	h.registerAdminQualityActivity(group)
 	h.registerBlindEvaluationRoutes(group)
+	h.registerAdminWorkflowTrace(group)
 	h.registerAdminControls(group)
 	h.registerAdminOperations(group)
 	h.registerAdminRecords(group)
 	h.registerAdminPersonalDataQuota(group)
 	h.registerAdminModelUsage(group)
+	h.registerAdminObservability(group)
 	engine.NoRoute(h.noRoute)
 	engine.NoMethod(func(c *gin.Context) {
 		httpserver.WriteError(c, domain.NewError(domain.CodeNotFound, "not found"))
@@ -424,7 +432,7 @@ func (h *api) authenticate(c *gin.Context) {
 	if principal.Kind == identity.KindSession && principal.ClientInstallationID != "" {
 		principal.Role = identity.RoleUser
 	}
-	if principal.Kind == identity.KindSession && principal.MustChangePassword && !passwordChangeRoute(c.Request.Method, c.FullPath()) {
+	if principal.MustChangePassword && !passwordChangeAccessRoute(principal.Kind, c.Request.Method, c.FullPath()) {
 		writeError(c, domain.NewError(domain.CodeForbidden, "password change is required before continuing"))
 		c.Abort()
 		return
@@ -465,6 +473,19 @@ func (h *api) authenticate(c *gin.Context) {
 func passwordChangeRoute(method, path string) bool {
 	return (method == http.MethodGet && path == "/api/me") ||
 		(method == http.MethodPost && (path == "/api/me/password" || path == "/api/auth/logout"))
+}
+
+func passwordChangeAccessRoute(kind identity.Kind, method, path string) bool {
+	if kind == identity.KindSession {
+		return passwordChangeRoute(method, path)
+	}
+	// A client credential issued with an initial or reset password may only
+	// mint the restricted web session needed to show the password-change page,
+	// read its own profile for the client's periodic authorization check, or log
+	// out. All other client, sync-device, and service actions stay blocked.
+	return kind == identity.KindClient &&
+		(method == http.MethodGet && path == "/api/me" || method == http.MethodPost &&
+			(path == "/api/auth/client-web-session" || path == "/api/auth/client-logout"))
 }
 
 func (h *api) checkOrigin(c *gin.Context) {
@@ -614,6 +635,7 @@ func clientCredentialRoute(method, path string) bool {
 			"/api/codex/connections", "/api/codex/sessions", "/api/codex/sessions/:id/events", "/api/codex/sessions/:id/events/stream",
 			"/api/shared-hosts", "/api/workspaces", "/api/workspaces/:id", "/api/conversations", "/api/conversations/:id",
 			"/api/conversations/:id/messages", "/api/conversations/:id/tasks", "/api/conversations/:id/message-uploads/:client_message_id",
+			"/api/conversations/:id/messages/:message_id/retry-eligibility",
 			"/api/projects", "/api/projects/:id", "/api/projects/:id/members", "/api/projects/:id/resources",
 			"/api/projects/:id/budget", "/api/projects/:id/budget/ledger", "/api/projects/:id/work-items",
 			"/api/projects/:id/work-items/:work_item_id", "/api/me/project-invitations",
@@ -621,6 +643,7 @@ func clientCredentialRoute(method, path string) bool {
 			"/api/projects/:id/conversations/:conversation_id/messages", "/api/projects/:id/conversations/:conversation_id/tasks",
 			"/api/projects/:id/conversations/:conversation_id/message-uploads/:client_message_id",
 			"/api/projects/:id/conversations/:conversation_id/messages/:message_id/attachments/:client_attachment_id",
+			"/api/projects/:id/conversations/:conversation_id/messages/:message_id/retry-eligibility",
 			"/api/projects/:id/conversations/:conversation_id/messages/:message_id/attachments/:client_attachment_id/content",
 			"/api/projects/:id/conversations/:conversation_id/messages/:message_id/attachments-by-id/:attachment_id",
 			"/api/projects/:id/conversations/:conversation_id/messages/:message_id/attachments-by-id/:attachment_id/content",

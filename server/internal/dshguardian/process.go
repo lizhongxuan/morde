@@ -13,6 +13,12 @@ type taskProcessInspector interface {
 	RemoveTaskCgroup(containerID string, runtimeProof processProof, proof taskProcessProof, taskKey string) error
 }
 
+// taskProcessSnapshotInspector is optional so unsupported hosts and existing
+// test inspectors continue to fail closed without gaining a fake snapshot.
+type taskProcessSnapshotInspector interface {
+	SnapshotTaskProcess(containerID string, runtimeProof processProof, proof taskProcessProof, taskKey string) ([]TaskProcessSnapshotEntry, error)
+}
+
 func containerCgroupMatches(path, containerID string) bool {
 	if !validCgroupPath(path) || !containerIDRE.MatchString(containerID) {
 		return false

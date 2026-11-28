@@ -4,6 +4,13 @@ import type { components, operations } from '../api/schema';
 
 type AuditQuery = NonNullable<operations['listAuditLogs']['parameters']['query']>;
 
+const taskMediaPreviewTypes = new Set([
+  'image/png', 'image/jpeg', 'image/webp',
+  'video/mp4',
+  'audio/mpeg', 'audio/ogg', 'audio/opus', 'audio/wav', 'audio/aac',
+]);
+const maxTaskMediaPreviewBytes = 300 * 1024 * 1024;
+
 function personalIdentityHeaders(serviceInstanceID?: string, actorID?: string) {
   if (Boolean(serviceInstanceID) !== Boolean(actorID)) throw new Error('个人数据操作必须同时提供服务实例和账号身份。');
   return serviceInstanceID && actorID ? {
@@ -203,6 +210,19 @@ export const portalApi = {
           ...(actorID ? { 'X-Morde-Actor-ID': actorID } : {}) } } : {}) },
     }));
   },
+  observeTaskReplyInPC: async (taskID: string, messageID: string, taskRevision: number) => {
+    const response = await requestFetch(`/api/tasks/${encodeURIComponent(taskID)}/pc-delivery-observations`, {
+      method: 'POST', body: JSON.stringify({ message_id: messageID, task_revision: taskRevision }),
+    });
+    if (!response.ok) await throwResponseError(response);
+  },
+  conversationMessageRetryEligibility: async (conversationID: string, messageID: string, serviceInstanceID: string, actorID: string) => {
+    if (!serviceInstanceID || !actorID) throw new Error('服务或账号身份尚未确认。');
+    return unwrapApiResponse(await api.GET('/api/conversations/{id}/messages/{message_id}/retry-eligibility', {
+      params: { path: { id: conversationID, message_id: messageID },
+        header: { 'X-Morde-Service-Instance-ID': serviceInstanceID, 'X-Morde-Actor-ID': actorID } },
+    }));
+  },
   conversationPreview: async (id: string) => unwrapApiResponse(await api.GET('/api/conversations/{id}/messages', {
     params: { path: { id }, query: { limit: 5 } },
   })),
@@ -239,16 +259,65 @@ export const portalApi = {
     throw new Error('任务页数超过读取上限');
   },
   task: async (id: string) => unwrapApiResponse(await api.GET('/api/tasks/{id}', { params: { path: { id } } })),
+  confirmTaskRequirementManifest: async (id: string,
+    body: components['schemas']['TaskRequirementManifestConfirmationRequest'], manifestDigest: string, idempotencyKey: string) => {
+    const confirmation = unwrapApiResponse(await api.POST('/api/tasks/{id}/requirement-manifest/confirm', {
+      params: { path: { id }, header: { 'Idempotency-Key': idempotencyKey, 'If-Match': `"${manifestDigest}"` } }, body,
+    }));
+    if (confirmation.task_id !== id || confirmation.task_revision !== body.expected_task_revision ||
+      confirmation.plan_revision !== body.expected_plan_revision || confirmation.plan_event_sequence !== body.expected_plan_event_sequence ||
+      confirmation.manifest_digest !== manifestDigest || confirmation.requirements_complete_attested !== true ||
+      !Number.isFinite(Date.parse(confirmation.attested_at)) || !Number.isFinite(Date.parse(confirmation.confirmed_at))) {
+      throw new Error('服务端没有确认当前任务要求清单，请重新读取任务状态。');
+    }
+    return confirmation;
+  },
   taskApprovals: async (options: { conversationID?: string; cursor?: string } = {}): Promise<components['schemas']['TaskApprovalPage']> =>
     unwrapApiResponse(await api.GET('/api/me/task-approvals', { params: { query: {
       limit: 100, ...(options.conversationID ? { conversation_id: options.conversationID } : {}),
       ...(options.cursor ? { cursor: options.cursor } : {}),
     } } })),
   taskArtifactContentURL: (id: string, artifactID: string) => `/api/tasks/${encodeURIComponent(id)}/artifacts/${encodeURIComponent(artifactID)}/content`,
+  taskMediaPreview: async (id: string, operationID: string): Promise<Blob> => {
+    const response = await requestFetch(`/api/tasks/${encodeURIComponent(id)}/media/${encodeURIComponent(operationID)}/preview`, {
+      redirect: 'manual',
+    });
+    const responseURL = response.url ? new URL(response.url, window.location.origin) : null;
+    if (response.type === 'opaqueredirect' || (response.status >= 300 && response.status < 400) || response.redirected ||
+      (responseURL && responseURL.origin !== window.location.origin)) {
+      throw new Error('媒体预览请求发生重定向，已拒绝显示。');
+    }
+    if (!response.ok) await throwResponseError(response);
+    const mediaType = response.headers.get('Content-Type') ?? '';
+    const contentLength = response.headers.get('Content-Length');
+    const declaredSize = contentLength === null ? null : Number(contentLength);
+    if (!taskMediaPreviewTypes.has(mediaType) ||
+      (declaredSize !== null && (!Number.isSafeInteger(declaredSize) || declaredSize < 1 || declaredSize > maxTaskMediaPreviewBytes))) {
+      throw new Error('媒体预览类型或大小无效，无法安全显示。');
+    }
+    const body = await response.blob();
+    if (body.size < 1 || body.size > maxTaskMediaPreviewBytes) throw new Error('媒体预览大小无效，无法安全显示。');
+    return new Blob([body], { type: mediaType });
+  },
   agentWorkspaceFileURL: (id: string, path: string) => `/api/workspaces/${encodeURIComponent(id)}/files/${path.split('/').map(encodeURIComponent).join('/')}`,
   taskStepDetail: async (id: string, stepID: string) => unwrapApiResponse(await api.GET('/api/tasks/{id}/steps/{step_id}', {
     params: { path: { id, step_id: stepID } },
   })),
+  retryTaskModelRecovery: async (id: string, body: { expected_revision: number; expected_event_sequence: number }, idempotencyKey: string) => {
+    const response = await requestFetch(`/api/tasks/${encodeURIComponent(id)}/model-recovery-retries`, {
+      method: 'POST', headers: { 'Idempotency-Key': idempotencyKey }, body: JSON.stringify(body),
+    });
+    if (!response.ok) await throwResponseError(response);
+    if (response.status !== 202) throw new Error('服务端未确认任务模型恢复请求，请核对任务状态。');
+    const value: unknown = await response.json();
+    if (!value || typeof value !== 'object' || !('id' in value) || value.id !== id ||
+      !('current_revision' in value) || value.current_revision !== body.expected_revision ||
+      !('event_sequence' in value) || typeof value.event_sequence !== 'number' ||
+      !Number.isSafeInteger(value.event_sequence) || value.event_sequence <= body.expected_event_sequence) {
+      throw new Error('服务端返回的任务模型恢复状态无效，请刷新任务核对。');
+    }
+    return value as components['schemas']['Task'];
+  },
   retryTaskStep: async (id: string, stepID: string, body: components['schemas']['TaskStepRetryRequest'], idempotencyKey: string) => {
     const result = await api.POST('/api/tasks/{id}/steps/{step_id}/retries', {
       params: { path: { id, step_id: stepID }, header: { 'Idempotency-Key': idempotencyKey } }, body,
@@ -303,6 +372,24 @@ export const portalApi = {
     });
     if (result.error !== undefined) unwrapApiResponse(result);
     if (result.response.status !== 202) throw new Error('服务端未确认消息重试。');
+  },
+  cancelConversationMessage: async (conversationID: string, messageID: string, serviceInstanceID: string, actorID: string) => {
+    if (!serviceInstanceID || !actorID) throw new Error('服务或账号身份尚未确认。');
+    const response = await requestFetch(`/api/conversations/${encodeURIComponent(conversationID)}/messages/${encodeURIComponent(messageID)}/cancel`, {
+      method: 'POST', headers: {
+        'X-Morde-Service-Instance-ID': serviceInstanceID,
+        'X-Morde-Actor-ID': actorID,
+      },
+    });
+    if (!response.ok) await throwResponseError(response);
+    if (response.status !== 202) throw new Error('服务端未确认取消长回复。');
+    const value: unknown = await response.json();
+    if (!value || typeof value !== 'object' || !('message' in value) || !('replayed' in value) || typeof value.replayed !== 'boolean' ||
+      !value.message || typeof value.message !== 'object' || !('id' in value.message) || value.message.id !== messageID ||
+      !('conversation_id' in value.message) || value.message.conversation_id !== conversationID) {
+      throw new Error('取消消息响应与当前会话不匹配。');
+    }
+    return value as { message: components['schemas']['ConversationMessage']; replayed: boolean };
   },
   answerTaskInput: async (id: string, body: components['schemas']['TaskInputRequest'], idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.POST('/api/tasks/{id}/inputs', {
     params: { path: { id }, header: { 'Idempotency-Key': idempotencyKey } }, body,
@@ -447,6 +534,14 @@ export const portalApi = {
   adminOverview: async () => unwrapApiResponse(await api.GET('/api/admin/overview')),
   adminModelConnections: async () => unwrapApiResponse(await api.GET('/api/admin/model-connections')),
   adminUsage: async (days: 7 | 30 | 90) => unwrapApiResponse(await api.GET('/api/admin/usage', { params: { query: { days } } })),
+  adminObservabilityOverview: async () => unwrapApiResponse(await api.GET('/api/admin/observability/overview', { cache: 'no-store' })),
+  adminObservabilityTraces: async (query: NonNullable<operations['listAdminObservabilityTraces']['parameters']['query']>) =>
+    unwrapApiResponse(await api.GET('/api/admin/observability/traces', { params: { query }, cache: 'no-store' })),
+  adminObservabilityTrace: async (traceID: string) => unwrapApiResponse(await api.GET('/api/admin/observability/traces/{trace_id}', { params: { path: { trace_id: traceID } }, cache: 'no-store' })),
+  adminObservabilityEvents: async (traceID: string, query: NonNullable<operations['listAdminObservabilityTraceEvents']['parameters']['query']>) =>
+    unwrapApiResponse(await api.GET('/api/admin/observability/traces/{trace_id}/events', { params: { path: { trace_id: traceID }, query }, cache: 'no-store' })),
+  adminObservabilityLogs: async (traceID: string, query: NonNullable<operations['listAdminObservabilityTraceLogs']['parameters']['query']>) =>
+    unwrapApiResponse(await api.GET('/api/admin/observability/traces/{trace_id}/logs', { params: { path: { trace_id: traceID }, query }, cache: 'no-store' })),
   adminQuality: async (days: 7 | 30 | 90 = 7) => unwrapApiResponse(await api.GET('/api/admin/quality', { params: { query: { days } } })),
   createBlindEvaluationBatch: async (body: operations['createBlindEvaluationBatch']['requestBody']['content']['application/json']) =>
     unwrapApiResponse(await api.POST('/api/admin/evaluation-batches', { body })),
@@ -506,6 +601,7 @@ export const portalApi = {
   adminUserAuthorizations: async (id: string, offset = 0) => unwrapApiResponse(await api.GET('/api/admin/users/{id}/authorizations', { params: { path: { id }, query: { limit: 25, offset } } })),
   adminUserModelCalls: async (id: string, offset = 0) => unwrapApiResponse(await api.GET('/api/admin/users/{id}/model-usage/ledger', { params: { path: { id }, query: { limit: 25, offset } } })),
   updateUser: async (id: string, body: components['schemas']['UpdateUserRequest']) => unwrapApiResponse(await api.PATCH('/api/admin/users/{id}', { params: { path: { id } }, body })),
+  resetAdminUserPassword: async (id: string, body: components['schemas']['AdminResetUserPasswordRequest']) => unwrapApiResponse(await api.POST('/api/admin/users/{id}/password', { params: { path: { id } }, body })),
   adminUnknownModelUsage: async (ownerID: string) => unwrapApiResponse(await api.GET('/api/admin/model-usage/unknown', {
     params: { query: { owner_id: ownerID, limit: 100 } },
   })),

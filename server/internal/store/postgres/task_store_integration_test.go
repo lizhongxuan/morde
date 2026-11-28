@@ -308,9 +308,16 @@ func TestPostgresTaskPersistsFileDeliveryIntent(t *testing.T) {
 	}{
 		{key: "persist-intent-none", objective: "Explain what caused the error.", want: task.FileDeliveryNone},
 		{key: "persist-intent-file", objective: "Generate and save a PDF report.", want: task.FileDeliveryRequired},
-		{key: "persist-intent-unclear", objective: "Write a report about the project.", want: task.FileDeliveryUnclear},
 	} {
 		submission := newTestTaskSubmission(t, owner.ID, "", test.key, test.objective)
+		submission.Task.FileDeliveryIntent = test.want
+		if test.want == task.FileDeliveryRequired {
+			workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "file-intent-"+test.key)
+			revision := workspaceValue.Revision
+			submission.Task.WorkspaceID = workspaceValue.ID
+			submission.Task.InputRevision = &revision
+			submission.Task.ContextDigest = hashBytes("workspace input snapshot:" + test.key)
+		}
 		created, err := store.SubmitTask(ctx, submission)
 		if err != nil {
 			t.Fatalf("submit %s task: %v", test.want, err)
@@ -322,6 +329,43 @@ func TestPostgresTaskPersistsFileDeliveryIntent(t *testing.T) {
 		if created.Task.FileDeliveryIntent != test.want || loaded.Task.FileDeliveryIntent != test.want {
 			t.Fatalf("file delivery intent create/read = %q/%q, want %q", created.Task.FileDeliveryIntent, loaded.Task.FileDeliveryIntent, test.want)
 		}
+	}
+}
+
+func TestPostgresTaskStoreDoesNotInferMissingFileDeliveryIntentFromObjective(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	submission := newTestTaskSubmission(t, owner.ID, "", "missing-intent-does-not-classify", "Generate and save a PDF report.")
+	submission.Task.FileDeliveryIntent = ""
+	created, err := store.SubmitTask(ctx, submission)
+	if err != nil {
+		t.Fatalf("submit with omitted structured intent: %v", err)
+	}
+	if created.Task.FileDeliveryIntent != task.FileDeliveryNone {
+		t.Fatalf("omitted structured intent = %q, want %q", created.Task.FileDeliveryIntent, task.FileDeliveryNone)
+	}
+}
+
+func TestPostgresTaskUnclearFileDeliveryIntentRequiresInitialClarification(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+
+	taskIntentSubmission := newTestTaskSubmission(t, owner.ID, "", "unclear-task-intent", "process this request")
+	taskIntentSubmission.Task.FileDeliveryIntent = task.FileDeliveryUnclear
+	if _, err := store.SubmitTask(ctx, taskIntentSubmission); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("queued Task with unclear file intent and no clarification error = %v, want invalid argument", err)
+	}
+
+	batchIntentSubmission := newTestTaskSubmission(t, owner.ID, "", "unclear-batch-intent", "process this batch")
+	batchIntentSubmission.Task.FileDeliveryIntent = task.FileDeliveryNone
+	batchIntentSubmission.BatchItems = []task.BatchItem{{
+		ID: mustID(t, domain.NewBatchItemID), Key: "file-result", Input: "produce a report",
+		FileDeliveryIntent: task.FileDeliveryUnclear,
+	}}
+	if _, err := store.SubmitTask(ctx, batchIntentSubmission); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("queued Task with unclear batch intent and no matching clarification error = %v, want invalid argument", err)
 	}
 }
 
@@ -343,20 +387,17 @@ func TestPostgresTaskRevisionDoesNotInventFileDeliveryIntentWithoutSettledDecisi
 	if err := f.store.pool.QueryRow(ctx, `SELECT task_id FROM conversation_messages WHERE id=$1`, initial.Message.ID).Scan(&taskID); err != nil {
 		t.Fatal(err)
 	}
-	for index, revision := range []struct {
-		content string
-		intent  task.FileDeliveryIntent
-	}{
-		{content: "Generate and save a PDF report.", intent: task.FileDeliveryRequired},
-		{content: "Continue the explanation."},
+	for index, content := range []string{
+		"Generate and save a PDF report.",
+		"Continue the explanation.",
 	} {
-		message := f.receive(t, fmt.Sprintf("file-intent-update-%d", index), revision.content, app.ConversationRoutingInput{ReferenceTaskID: taskID})
+		message := f.receive(t, fmt.Sprintf("file-intent-update-%d", index), content, app.ConversationRoutingInput{ReferenceTaskID: taskID})
 		updated, err := f.store.LoadConversationRouteSnapshot(ctx, message)
 		if err != nil || len(updated.Context.Candidates) != 1 {
 			t.Fatalf("file intent revision candidates=%+v err=%v", updated.Context.Candidates, err)
 		}
 		if err := f.store.ApplyConversationRoute(ctx, message, updated, app.ConversationRouteDecision{Action: app.ConversationRouteUpdate,
-			TaskID: taskID, ExpectedRevision: updated.Context.Candidates[0].Revision, FileDeliveryIntent: revision.intent}); err != nil {
+			TaskID: taskID, ExpectedRevision: updated.Context.Candidates[0].Revision}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1852,9 +1893,10 @@ func TestPostgresAssistantMessageSnapshotSupportsNonStreamingCommit(t *testing.T
 		t.Fatalf("ClaimNextTask() = %#v found=%t err=%v", claimed, found, err)
 	}
 	turnID := mustID(t, domain.NewStepID)
+	longAnswer := strings.Repeat("complete non-streamed answer ", 2048)
 	message := conversation.Message{
 		ID: mustID(t, domain.NewMessageID), ConversationID: created.Conversation.ID, OwnerID: owner.ID,
-		ActorID: claimed.InitiatorID, Role: conversation.RoleAssistant, Content: "A complete non-streamed answer.", TaskID: claimed.ID,
+		ActorID: claimed.InitiatorID, Role: conversation.RoleAssistant, Content: longAnswer, TaskID: claimed.ID,
 	}
 	step := task.Step{ID: turnID, TaskID: claimed.ID, Sequence: 1, Kind: "model", Status: task.StepSucceeded, Title: "Ask the model", Summary: "Received a complete response."}
 	if _, err := store.CommitTaskProgress(ctx, app.TaskProgress{
@@ -1905,8 +1947,14 @@ func TestPostgresAssistantMessageSnapshotBoundsAccumulatedText(t *testing.T) {
 		t.Fatalf("ClaimNextTask() = %#v found=%t err=%v", claimed, found, err)
 	}
 	messageID, turnID := mustID(t, domain.NewMessageID), mustID(t, domain.NewStepID)
-	delta := strings.Repeat("x", app.MaxAssistantMessageBytes/2)
-	for range 2 {
+	if _, err := store.AppendAssistantTextDelta(ctx, app.AssistantTextDelta{
+		TaskID: claimed.ID, LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version,
+		MessageID: messageID, TurnID: turnID, Delta: strings.Repeat("x", app.MaxAssistantMessageBytes+1),
+	}); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("oversized assistant delta error = %v, want invalid argument", err)
+	}
+	delta := strings.Repeat("x", app.MaxAssistantMessageBytes)
+	for range app.MaxAssistantReplyBytes / len(delta) {
 		if _, err := store.AppendAssistantTextDelta(ctx, app.AssistantTextDelta{
 			TaskID: claimed.ID, LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version,
 			MessageID: messageID, TurnID: turnID, Delta: delta,
@@ -1914,15 +1962,22 @@ func TestPostgresAssistantMessageSnapshotBoundsAccumulatedText(t *testing.T) {
 			t.Fatalf("append bounded delta: %v", err)
 		}
 	}
+	details, err := store.GetTask(ctx, claimed.ID, owner.ID)
+	if err != nil || details.AssistantMessage == nil || len(details.AssistantMessage.Message.Content) != app.MaxAssistantReplyBytes {
+		t.Fatalf("bounded snapshot = %#v, err=%v", details, err)
+	}
+	beforeOverflowSequence := details.Task.EventSequence
 	if _, err := store.AppendAssistantTextDelta(ctx, app.AssistantTextDelta{
 		TaskID: claimed.ID, LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version,
 		MessageID: messageID, TurnID: turnID, Delta: "x",
 	}); domain.CodeOf(err) != domain.CodeInvalidArgument {
-		t.Fatalf("overflowing assistant delta error = %v, want invalid argument", err)
+		t.Fatalf("second assistant reply overflow error = %v, want invalid argument", err)
 	}
-	details, err := store.GetTask(ctx, claimed.ID, owner.ID)
-	if err != nil || details.AssistantMessage == nil || len(details.AssistantMessage.Message.Content) != app.MaxAssistantMessageBytes || details.Task.EventSequence != 4 {
-		t.Fatalf("bounded snapshot = %#v, err=%v", details, err)
+	afterOverflow, err := store.GetTask(ctx, claimed.ID, owner.ID)
+	if err != nil || afterOverflow.AssistantMessage == nil ||
+		len(afterOverflow.AssistantMessage.Message.Content) != app.MaxAssistantReplyBytes ||
+		afterOverflow.Task.EventSequence != beforeOverflowSequence {
+		t.Fatalf("overflow changed persisted assistant reply: snapshot=%#v err=%v", afterOverflow, err)
 	}
 }
 

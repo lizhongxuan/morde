@@ -1865,6 +1865,7 @@ struct MIFTaskDetailView: View {
     @State private var detailGeneration = UUID()
     @State private var actionGeneration = UUID()
     @State private var clarificationAnswer = ""
+    @State private var clarificationFileDeliveryIntents: [String: String] = [:]
     @State private var fileFetchPreview: MIFTaskFileFetchPreview?
     @State private var fileFetchToCancel: MordeTaskFileFetch?
     @State private var fileFetchToDelete: MordeTaskFileFetch?
@@ -2369,6 +2370,10 @@ struct MIFTaskDetailView: View {
     @ViewBuilder
     private func taskClarification(_ task: MordeTask) -> some View {
         if let clarification = task.clarification_request {
+            let isFileDeliveryClarification = clarification.isFileDeliveryIntent
+            let hasBoundWorkspace = task.workspace_id.map { !$0.isEmpty } == true
+            let clarificationKey = "\(task.id):\(clarification.id):\(clarification.version)"
+            let selectedFileDeliveryIntent = clarificationFileDeliveryIntents[clarificationKey] ?? ""
             MIFTaskSection(title: AppLocalized("Waiting for your input")) {
                 VStack(alignment: .leading, spacing: 10) {
                     Text(clarification.question)
@@ -2385,6 +2390,28 @@ struct MIFTaskDetailView: View {
                         .focused($isClarificationFocused)
                         .disabled(store.actionInFlight || isLoadingDetail || detailError != nil)
                         .accessibilityIdentifier("morde.task.clarification.answer")
+                    if isFileDeliveryClarification {
+                        Picker(AppLocalized("File delivery"), selection: Binding(
+                            get: { selectedFileDeliveryIntent == "required" && !hasBoundWorkspace
+                                ? "" : selectedFileDeliveryIntent },
+                            set: { clarificationFileDeliveryIntents[clarificationKey] = $0.isEmpty ? nil : $0 }
+                        )) {
+                            Text(AppLocalized("Choose one")).tag("")
+                            Text(AppLocalized("Chat answer only")).tag("none")
+                                .accessibilityIdentifier("morde.task.clarification.fileDeliveryIntent.none")
+                            if hasBoundWorkspace {
+                                Text(AppLocalized("Deliver a file")).tag("required")
+                                    .accessibilityIdentifier("morde.task.clarification.fileDeliveryIntent.required")
+                            }
+                        }
+                        .disabled(store.actionInFlight || isLoadingDetail || detailError != nil)
+                        .accessibilityIdentifier("morde.task.clarification.fileDeliveryIntent")
+                        if !hasBoundWorkspace {
+                            Text("需要交付文件时，请先绑定 Workspace，再重新提交此澄清。")
+                                .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
+                                .accessibilityIdentifier("morde.task.clarification.workspaceGuidance")
+                        }
+                    }
                     Button {
                         guard let requestScope = loadedScopeKey,
                               requestScope == store.scopeKey,
@@ -2393,15 +2420,18 @@ struct MIFTaskDetailView: View {
                         let requestGeneration = detailGeneration
                         let requestTaskID = task.id
                         let requestAnswer = clarificationAnswer
+                        let requestFileDeliveryIntent = isFileDeliveryClarification ? selectedFileDeliveryIntent : nil
                         isClarificationFocused = false
                         Task {
                             let accepted = await store.answerClarification(
                                 taskID: requestTaskID, clarificationID: clarification.id,
-                                version: clarification.version, answer: requestAnswer)
+                                version: clarification.version, answer: requestAnswer,
+                                fileDeliveryIntent: requestFileDeliveryIntent)
                             guard !Task.isCancelled, requestGeneration == detailGeneration,
                                   requestScope == store.scopeKey, requestTaskID == self.taskID else { return }
                             if accepted, store.details[requestTaskID]?.clarification_request?.id != clarification.id {
                                 clarificationAnswer = ""
+                                clarificationFileDeliveryIntents[clarificationKey] = nil
                             }
                         }
                     } label: {
@@ -2410,7 +2440,11 @@ struct MIFTaskDetailView: View {
                     .buttonStyle(.borderedProminent)
                     .tint(NanoMuseTones.action)
                     .disabled(store.actionInFlight || isLoadingDetail || detailError != nil ||
-                              !MordeTaskResponsePolicy.hasValidAnswer(clarificationAnswer))
+                              !MordeTaskResponsePolicy.hasValidAnswer(clarificationAnswer) ||
+                              (isFileDeliveryClarification && (![
+                                "none", "required",
+                              ].contains(selectedFileDeliveryIntent) ||
+                                (selectedFileDeliveryIntent == "required" && !hasBoundWorkspace))))
                     .accessibilityIdentifier("morde.task.clarification.submit")
 
                     if let error = store.actionErrors[task.id] {

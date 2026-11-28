@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"io"
 	"sync"
@@ -33,7 +34,9 @@ func (s *cloudDSHHubTaskStore) PrepareTaskHubOperation(_ context.Context, value 
 		if existing.OwnerID != value.OwnerID || existing.TaskID != value.TaskID || existing.ToolName != value.ToolName ||
 			existing.TargetInstallationID != value.TargetInstallationID || existing.Action != value.Action ||
 			existing.TaskAuthorizationVersion != value.TaskAuthorizationVersion || existing.TargetGrantVersion != value.TargetGrantVersion ||
-			existing.TaskRevision != value.TaskRevision ||
+			existing.TaskRevision != value.TaskRevision || existing.AgentSessionID != value.AgentSessionID ||
+			existing.CallID != value.CallID || !bytes.Equal(existing.ToolCallDigest, value.ToolCallDigest) ||
+			existing.PlanTaskRevision != value.PlanTaskRevision || existing.PlanRevision != value.PlanRevision || existing.PlanStepID != value.PlanStepID ||
 			!bytes.Equal(existing.RequestHash, value.RequestHash) {
 			return TaskHubOperation{}, false, domain.NewError(domain.CodeIdempotencyConflict, "task Hub operation changed")
 		}
@@ -48,6 +51,7 @@ func (s *cloudDSHHubTaskStore) PrepareTaskHubOperation(_ context.Context, value 
 		return existing, true, nil
 	}
 	value.RequestHash = append([]byte(nil), value.RequestHash...)
+	value.ToolCallDigest = append([]byte(nil), value.ToolCallDigest...)
 	s.operations[value.Key] = value
 	return value, false, nil
 }
@@ -530,6 +534,54 @@ func TestCloudDSHHubAuthorizedCommandUsesTaskFence(t *testing.T) {
 	operation, err := store.GetTaskHubOperation(context.Background(), claimed.OwnerID, claimed.ID, agentOperationKey(call.CallID))
 	if err != nil || operation.Status != task.OperationSucceeded || len(operation.ResultHash) != 32 {
 		t.Fatalf("authorized command operation = %#v, err=%v", operation, err)
+	}
+}
+
+func TestCloudDSHHubCommandPersistsPlanStepIdentity(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, nil)
+	hubService, _ := newHubFixture(t)
+	target := connectHubTestPeer(t, hubService, "u1234567", "i7654321")
+	_ = target.next(t, "devices")
+	broker, store, claimed := newCloudDSHHubBroker(t, fixture, hubService)
+	claimed.AgentInstanceID, claimed.AgentGeneration, claimed.AgentSessionID = "agent-plan-hub", 1, "session-plan-hub"
+	fixture.store.details.Task = claimed
+	fixture.store.details.Plan = &task.Plan{TaskRevision: *claimed.CurrentRevision, Revision: 1, Goal: "Run the command",
+		Scope: "Use the assigned computer", VerificationMethod: "Read the command result", CostEstimateState: "unknown",
+		Steps: []task.PlanStep{{ID: "command", Title: "Run command", Status: task.PlanStepPending,
+			CompletionCriteria: []string{"the command result is recorded"}, Outputs: []string{}}}}
+
+	commandName := hubTaskToolName("morde_hub_command", "i7654321", 5)
+	call := ModelToolCall{CallID: "call-hub-plan-command", Name: commandName,
+		Arguments: `{"command":"printf ok","timeout_ms":1000,"morde_plan_step_id":"command","morde_plan_revision":1}`,
+		TaskFence: &ModelTaskFence{TaskID: claimed.ID, OwnerID: claimed.OwnerID, InitiatorID: claimed.InitiatorID,
+			LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version, AgentInstanceID: claimed.AgentInstanceID,
+			AgentGeneration: claimed.AgentGeneration, AgentSessionID: claimed.AgentSessionID,
+			AuthorizationVersion: claimed.Authorization.Version}}
+	ctx := withCloudDSHToolActivity(context.Background(), claimed, call, nil)
+	resultCh := make(chan AgentToolResult, 1)
+	errorCh := make(chan error, 1)
+	go func() {
+		value, err := broker.Execute(ctx, claimed, call)
+		resultCh <- value
+		errorCh <- err
+	}()
+	answerHubTaskInfo(t, target, []string{hub.ActionInfo, hub.ActionCommand}, int64(5))
+	action := target.next(t, "call")
+	args, ok := action["args"].(map[string]any)
+	if !ok || args["command"] != "printf ok" || args[cloudDSHPlanStepIDArgumentName] != nil || args[cloudDSHPlanRevisionArgumentName] != nil {
+		t.Fatalf("Hub received plan metadata or malformed command arguments: %#v", action["args"])
+	}
+	target.push(t, map[string]any{"type": "result", "id": action["id"], "ok": true,
+		"body": map[string]any{"exit_code": 0, "stdout": "ok", "stderr": "", "timed_out": false, "stopped": false, "target_grant_version": 5}})
+	result, err := <-resultCh, <-errorCh
+	if err != nil || result.Status != AgentToolSucceeded {
+		t.Fatalf("planned Hub command result = %#v, err=%v", result, err)
+	}
+	operation, err := store.GetTaskHubOperation(context.Background(), claimed.OwnerID, claimed.ID, agentOperationKey(call.CallID))
+	if err != nil || operation.Status != task.OperationSucceeded || operation.AgentSessionID != claimed.AgentSessionID ||
+		operation.CallID != call.CallID || operation.PlanTaskRevision != *claimed.CurrentRevision || operation.PlanRevision != 1 ||
+		operation.PlanStepID != "command" || len(operation.ToolCallDigest) != sha256.Size {
+		t.Fatalf("planned Hub operation identity = %#v, err=%v", operation, err)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -26,6 +27,15 @@ func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error)
 func newTestClient(t *testing.T, transport http.RoundTripper) *ResponsesClient {
 	t.Helper()
 	client, err := newResponsesClient([]string{"api.example.test"}, transport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client
+}
+
+func newTestClientWithTimeouts(t *testing.T, transport http.RoundTripper, total, idle time.Duration) *ResponsesClient {
+	t.Helper()
+	client, err := newResponsesClientWithTimeouts([]string{"api.example.test"}, transport, total, idle)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -341,6 +351,68 @@ func TestCompleteStreamsOnlyUserVisibleTextDeltasAndReturnsFinalResponse(t *test
 	}
 }
 
+func TestCompleteStreamsLargeResponseAboveLegacyLimitWithoutLoss(t *testing.T) {
+	const (
+		largeTextBytes = 512 << 10
+		maxDeltaBytes  = 64 << 10
+	)
+	fullText := strings.Repeat("x", largeTextBytes)
+	var body strings.Builder
+	for offset := 0; offset < len(fullText); offset += maxDeltaBytes {
+		end := min(offset+maxDeltaBytes, len(fullText))
+		event, err := json.Marshal(responseStreamEvent{Type: "response.output_text.delta", Delta: fullText[offset:end]})
+		if err != nil {
+			t.Fatal(err)
+		}
+		fmt.Fprintf(&body, "event: response.output_text.delta\ndata: %s\n\n", event)
+	}
+	inputTokens, outputTokens := int64(8), int64(100_000)
+	terminalResponse, err := json.Marshal(responseBodyJSON{
+		Status: "completed",
+		Model:  "provider-large-stream-v1",
+		Output: []responseOutputItem{{Type: "message", Content: []responseContent{{Type: "output_text", Text: fullText}}}},
+		Usage:  &responseUsage{InputTokens: &inputTokens, OutputTokens: &outputTokens},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	terminalEvent, err := json.Marshal(responseStreamEvent{Type: "response.completed", Response: terminalResponse})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Fprintf(&body, "event: response.completed\ndata: %s\n\n", terminalEvent)
+
+	client := newTestClient(t, roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.Header.Get("Accept") != "text/event-stream" {
+			t.Fatalf("Accept = %q, want text/event-stream", request.Header.Get("Accept"))
+		}
+		return &http.Response{StatusCode: http.StatusOK,
+			Header: http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:   io.NopCloser(strings.NewReader(body.String())), Request: request}, nil
+	}))
+	var deltas []string
+	response, err := client.Complete(context.Background(), app.ModelRequest{
+		Endpoint: app.ModelEndpoint{
+			BaseURL: "https://api.example.test/v1", APIKey: "test-secret-key", ModelID: "model-test", VerifiedMaxOutputTokens: 100_000,
+		},
+		Input: []app.ModelInput{{Type: "message", Role: "user", Text: "write a long answer"}}, MaxOutputTokens: 100_000,
+		OnTextDelta: func(delta string) error {
+			if len(delta) > maxDeltaBytes {
+				t.Errorf("stream delta size = %d bytes, limit %d", len(delta), maxDeltaBytes)
+			}
+			deltas = append(deltas, delta)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(deltas) != largeTextBytes/maxDeltaBytes || strings.Join(deltas, "") != fullText || response.Text != fullText {
+		t.Fatalf("large response was not delivered exactly: delta_count=%d streamed_bytes=%d response_bytes=%d want_bytes=%d",
+			len(deltas), len(strings.Join(deltas, "")), len(response.Text), len(fullText))
+	}
+}
+
 func TestCompleteReturnsIncompleteStreamAndRejectsMissingTerminalResponse(t *testing.T) {
 	incomplete := strings.Join([]string{
 		"event: response.output_text.delta", `data: {"type":"response.output_text.delta","delta":"Partial"}`, "",
@@ -525,6 +597,12 @@ func TestProductionClientUsesTLSAndGuardedDialer(t *testing.T) {
 	if !ok || transport.Proxy != nil || transport.TLSClientConfig == nil || transport.TLSClientConfig.InsecureSkipVerify || transport.DialContext == nil {
 		t.Fatalf("production transport is not guarded: %#v", client.httpClient.Transport)
 	}
+	if client.httpClient.Timeout != 10*time.Minute || client.totalTimeout != 10*time.Minute || client.bodyIdleTimeout != 60*time.Second ||
+		transport.ResponseHeaderTimeout != 20*time.Second || transport.TLSHandshakeTimeout != 10*time.Second || providerDialTimeout != 10*time.Second {
+		t.Fatalf("provider timeout policy is not bounded as intended: client=%s total=%s body_idle=%s headers=%s tls=%s dial=%s",
+			client.httpClient.Timeout, client.totalTimeout, client.bodyIdleTimeout, transport.ResponseHeaderTimeout,
+			transport.TLSHandshakeTimeout, providerDialTimeout)
+	}
 	if _, err := transport.DialContext(context.Background(), "tcp", "other.example.test:443"); err == nil || !strings.Contains(err.Error(), "allowlisted") {
 		t.Fatalf("unlisted host dial error = %v", err)
 	}
@@ -534,6 +612,127 @@ func TestProductionClientUsesTLSAndGuardedDialer(t *testing.T) {
 	if _, err := transport.DialContext(context.Background(), "tcp", "api.example.test:"); err == nil || !strings.Contains(err.Error(), "address is invalid") {
 		t.Fatalf("empty port dial error = %v", err)
 	}
+}
+
+type idleTestBody struct {
+	ctx          context.Context
+	data         []byte
+	interval     time.Duration
+	progress     bool
+	eofAfterData bool
+	started      chan struct{}
+	startOnce    atomic.Bool
+	closeCount   atomic.Int32
+}
+
+func (b *idleTestBody) Read(dst []byte) (int, error) {
+	if b.startOnce.CompareAndSwap(false, true) && b.started != nil {
+		close(b.started)
+	}
+	if len(b.data) > 0 {
+		n := copy(dst, b.data)
+		b.data = b.data[n:]
+		return n, nil
+	}
+	if b.eofAfterData {
+		return 0, io.EOF
+	}
+	if b.progress {
+		timer := time.NewTimer(b.interval)
+		defer timer.Stop()
+		select {
+		case <-b.ctx.Done():
+			return 0, b.ctx.Err()
+		case <-timer.C:
+			return copy(dst, ":\n"), nil
+		}
+	}
+	<-b.ctx.Done()
+	return 0, b.ctx.Err()
+}
+
+func (b *idleTestBody) Close() error {
+	b.closeCount.Add(1)
+	return nil
+}
+
+func TestCompleteAppliesBodyIdleAndTotalTimeoutsAndClosesResponses(t *testing.T) {
+	request := app.ModelRequest{Endpoint: testEndpoint(), Input: []app.ModelInput{{Type: "message", Role: "user", Text: "hello"}},
+		MaxOutputTokens: 10, OnTextDelta: func(string) error { return nil }}
+	newStreamResponse := func(request *http.Request, body *idleTestBody) *http.Response {
+		body.ctx = request.Context()
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: body, Request: request}
+	}
+
+	t.Run("slow first body byte", func(t *testing.T) {
+		body := &idleTestBody{started: make(chan struct{})}
+		client := newTestClientWithTimeouts(t, roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			return newStreamResponse(request, body), nil
+		}), time.Second, 20*time.Millisecond)
+		_, err := client.Complete(context.Background(), request)
+		if modelErrorKind(t, err) != app.ModelErrorTimeout || !body.startOnce.Load() || body.closeCount.Load() != 1 {
+			t.Fatalf("slow initial body read: error=%v read_started=%t close_count=%d", err, body.startOnce.Load(), body.closeCount.Load())
+		}
+	})
+
+	t.Run("long interval after visible chunk", func(t *testing.T) {
+		prefix := "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n"
+		body := &idleTestBody{data: []byte(prefix), started: make(chan struct{})}
+		client := newTestClientWithTimeouts(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return newStreamResponse(req, body), nil
+		}), time.Second, 30*time.Millisecond)
+		var visible strings.Builder
+		request.OnTextDelta = func(delta string) error { _, _ = visible.WriteString(delta); return nil }
+		_, err := client.Complete(context.Background(), request)
+		if modelErrorKind(t, err) != app.ModelErrorTimeout || visible.String() != "partial" || body.closeCount.Load() != 1 {
+			t.Fatalf("idle gap: visible=%q error=%v close_count=%d", visible.String(), err, body.closeCount.Load())
+		}
+	})
+
+	t.Run("slow consumer does not trigger provider idle timeout", func(t *testing.T) {
+		bodyText := strings.Join([]string{
+			"event: response.output_text.delta", `data: {"type":"response.output_text.delta","delta":"done"}`, "",
+			"event: response.completed", `data: {"type":"response.completed","response":{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"done"}]}]}}`, "",
+		}, "\n")
+		body := &idleTestBody{data: []byte(bodyText), eofAfterData: true}
+		client := newTestClientWithTimeouts(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return newStreamResponse(req, body), nil
+		}), time.Second, 20*time.Millisecond)
+		streamRequest := request
+		streamRequest.OnTextDelta = func(string) error {
+			time.Sleep(50 * time.Millisecond)
+			return nil
+		}
+		response, err := client.Complete(context.Background(), streamRequest)
+		if err != nil || response.Text != "done" || body.closeCount.Load() != 1 {
+			t.Fatalf("slow consumer: response=%#v error=%v close_count=%d", response, err, body.closeCount.Load())
+		}
+	})
+
+	t.Run("non-stream body idle timeout", func(t *testing.T) {
+		body := &idleTestBody{started: make(chan struct{})}
+		client := newTestClientWithTimeouts(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			body.ctx = req.Context()
+			return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: body, Request: req}, nil
+		}), time.Second, 20*time.Millisecond)
+		nonStreamRequest := request
+		nonStreamRequest.OnTextDelta = nil
+		_, err := client.Complete(context.Background(), nonStreamRequest)
+		if modelErrorKind(t, err) != app.ModelErrorTimeout || !body.startOnce.Load() || body.closeCount.Load() != 1 {
+			t.Fatalf("non-stream idle: error=%v read_started=%t close_count=%d", err, body.startOnce.Load(), body.closeCount.Load())
+		}
+	})
+
+	t.Run("total timeout despite periodic progress", func(t *testing.T) {
+		body := &idleTestBody{progress: true, interval: 10 * time.Millisecond, started: make(chan struct{})}
+		client := newTestClientWithTimeouts(t, roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return newStreamResponse(req, body), nil
+		}), 160*time.Millisecond, 80*time.Millisecond)
+		_, err := client.Complete(context.Background(), request)
+		if modelErrorKind(t, err) != app.ModelErrorTimeout || body.closeCount.Load() != 1 {
+			t.Fatalf("total timeout: error=%v close_count=%d", err, body.closeCount.Load())
+		}
+	})
 }
 
 func TestModelProxyConnectsToValidatedIPWithoutForwardingCredentials(t *testing.T) {
@@ -673,13 +872,14 @@ func TestProviderErrorsAreClassifiedAndDoNotExposeCredentialsOrBody(t *testing.T
 		want             app.ModelClientErrorKind
 		wantStage        string
 		wantProviderCode string
+		wantNoUsage      bool
 	}{
 		{name: "unauthorized", status: 401, body: `{"error":{"message":"test-secret-key user prompt"}}`, want: app.ModelErrorAuthentication},
 		{name: "forbidden", status: 403, body: `{}`, want: app.ModelErrorAccess},
-		{name: "rate limited", status: 429, body: `{"error":{"type":"rate_limit_exceeded"}}`, want: app.ModelErrorRateLimited},
+		{name: "rate limited", status: 429, body: `{"error":{"type":"rate_limit_exceeded"}}`, want: app.ModelErrorRateLimited, wantNoUsage: true},
 		{name: "quota", status: 400, body: `{"error":{"code":"insufficient_quota","message":"test-secret-key"}}`, want: app.ModelErrorQuota},
 		{name: "other client error", status: 400, body: `{"error":{"code":"invalid_request_error","message":"test-secret-key"}}`, want: app.ModelErrorInvalidRequest, wantStage: "provider_status", wantProviderCode: "invalid_request_error"},
-		{name: "server", status: 503, body: `{"error":{"message":"test-secret-key"}}`, want: app.ModelErrorUnavailable},
+		{name: "server", status: 503, body: `{"error":{"message":"test-secret-key"}}`, want: app.ModelErrorUnavailable, wantNoUsage: true},
 		{name: "untrusted response header", status: 401, body: `{}`, want: app.ModelErrorAuthentication},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -693,6 +893,10 @@ func TestProviderErrorsAreClassifiedAndDoNotExposeCredentialsOrBody(t *testing.T
 			})
 			if got := modelErrorKind(t, err); got != test.want {
 				t.Fatalf("error kind = %q, want %q", got, test.want)
+			}
+			var classified *app.ModelClientError
+			if !errors.As(err, &classified) || classified.ConfirmedNoUsage != test.wantNoUsage {
+				t.Fatalf("confirmed no-usage evidence = %+v, want %t", classified, test.wantNoUsage)
 			}
 			if test.wantStage != "" {
 				var clientErr *app.ModelClientError
@@ -719,6 +923,108 @@ func TestProviderRateLimitCarriesBoundedRetryAfter(t *testing.T) {
 	var providerErr *app.ModelClientError
 	if !errors.As(err, &providerErr) || providerErr.Kind != app.ModelErrorRateLimited || providerErr.RetryAfter != 3*time.Second {
 		t.Fatalf("provider rate-limit retry hint = %#v, err=%v", providerErr, err)
+	}
+}
+
+func TestProviderRateLimitCarriesRetryAfterMilliseconds(t *testing.T) {
+	client := newTestClient(t, roundTripFunc(func(*http.Request) (*http.Response, error) {
+		response := jsonResponse(http.StatusTooManyRequests, `{"error":{"type":"rate_limit_exceeded"}}`)
+		response.Header.Set("Retry-After-Ms", "2500.1")
+		return response, nil
+	}))
+	_, err := client.Complete(context.Background(), app.ModelRequest{
+		Endpoint: testEndpoint(), Input: []app.ModelInput{{Type: "message", Role: "user", Text: "hello"}}, MaxOutputTokens: 10,
+	})
+	var providerErr *app.ModelClientError
+	if !errors.As(err, &providerErr) || providerErr.Kind != app.ModelErrorRateLimited || providerErr.RetryAfter != 2501*time.Millisecond {
+		t.Fatalf("provider rate-limit millisecond hint = %#v, err=%v", providerErr, err)
+	}
+}
+
+func TestProviderRateLimitUsesExhaustedQuotaResetWhenNoExplicitHint(t *testing.T) {
+	now := time.Date(2026, 11, 27, 12, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name       string
+		status     int
+		headers    http.Header
+		want       time.Duration
+		wantOK     bool
+		wantBeyond bool
+	}{
+		{
+			name:   "OpenAI exhausted token bucket",
+			status: http.StatusTooManyRequests,
+			headers: http.Header{
+				"x-ratelimit-remaining-tokens": {"0"},
+				"x-ratelimit-reset-tokens":     {"1m2.5s"},
+			},
+			want:   62500 * time.Millisecond,
+			wantOK: true,
+		},
+		{
+			name:   "Anthropic exhausted input bucket",
+			status: http.StatusTooManyRequests,
+			headers: http.Header{
+				"anthropic-ratelimit-input-tokens-remaining": {"0"},
+				"anthropic-ratelimit-input-tokens-reset":     {now.Add(1500 * time.Millisecond).Format(time.RFC3339Nano)},
+			},
+			want:   1500 * time.Millisecond,
+			wantOK: true,
+		},
+		{
+			name:   "explicit hint takes precedence over reset",
+			status: http.StatusTooManyRequests,
+			headers: http.Header{
+				"Retry-After":                  {"7"},
+				"x-ratelimit-remaining-tokens": {"0"},
+				"x-ratelimit-reset-tokens":     {"25h"},
+			},
+			want:   7 * time.Second,
+			wantOK: true,
+		},
+		{
+			name:   "millisecond header beyond horizon fails closed",
+			status: http.StatusTooManyRequests,
+			headers: http.Header{
+				"Retry-After-Ms": {"86400001"},
+			},
+			wantBeyond: true,
+			wantOK:     true,
+		},
+		{
+			name:   "remaining quota ignores reset",
+			status: http.StatusTooManyRequests,
+			headers: http.Header{
+				"x-ratelimit-remaining-tokens": {"1"},
+				"x-ratelimit-reset-tokens":     {"9s"},
+			},
+		},
+		{
+			name:   "non-rate-limit status ignores reset",
+			status: http.StatusServiceUnavailable,
+			headers: http.Header{
+				"x-ratelimit-remaining-tokens": {"0"},
+				"x-ratelimit-reset-tokens":     {"9s"},
+			},
+		},
+		{
+			name:   "over-horizon reset fails closed",
+			status: http.StatusTooManyRequests,
+			headers: http.Header{
+				"x-ratelimit-remaining-tokens": {"0"},
+				"x-ratelimit-reset-tokens":     {"25h"},
+			},
+			wantBeyond: true,
+			wantOK:     true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, gotOK, gotBeyond := parseProviderRetryAfterHeaders(test.status, test.headers, now)
+			if got != test.want || gotOK != test.wantOK || gotBeyond != test.wantBeyond {
+				t.Fatalf("parseProviderRetryAfterHeaders() = %s, %t, %t; want %s, %t, %t",
+					got, gotOK, gotBeyond, test.want, test.wantOK, test.wantBeyond)
+			}
+		})
 	}
 }
 
@@ -860,6 +1166,65 @@ func TestRequestInputAndOutputAreBoundedAndValidated(t *testing.T) {
 	_, err := client.Complete(context.Background(), request)
 	if got := modelErrorKind(t, err); got != app.ModelErrorInvalidRequest {
 		t.Fatalf("invalid API key error = %v", err)
+	}
+}
+
+func TestEncodeRequestAllowsOnlyVerifiedModelOutputLimit(t *testing.T) {
+	base := app.ModelRequest{
+		Endpoint: testEndpoint(),
+		Input:    []app.ModelInput{{Type: "message", Role: "user", Text: "write a detailed answer"}},
+	}
+
+	request := base
+	request.Endpoint.VerifiedMaxOutputTokens = 64_000
+	request.MaxOutputTokens = 40_000
+	payload, err := encodeRequest(request, nil)
+	if err != nil {
+		t.Fatalf("encode verified high output cap: %v", err)
+	}
+	var encoded struct {
+		MaxOutputTokens int `json:"max_output_tokens"`
+	}
+	if err := json.Unmarshal(payload, &encoded); err != nil {
+		t.Fatal(err)
+	}
+	if encoded.MaxOutputTokens != request.MaxOutputTokens {
+		t.Fatalf("encoded max_output_tokens = %d, want %d", encoded.MaxOutputTokens, request.MaxOutputTokens)
+	}
+
+	for _, test := range []struct {
+		name                   string
+		verifiedMax, requested int
+	}{
+		{name: "requested cap exceeds verified model limit", verifiedMax: 64_000, requested: 64_001},
+		{name: "high cap has no verified model limit", requested: 40_000},
+		{name: "verified limit exceeds supported capability range", verifiedMax: app.MaxModelOutputTokens + 1, requested: 40_000},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			invalid := base
+			invalid.Endpoint.VerifiedMaxOutputTokens = test.verifiedMax
+			invalid.MaxOutputTokens = test.requested
+			if _, err := encodeRequest(invalid, nil); err == nil {
+				t.Fatalf("encodeRequest(%+v) succeeded, want rejection", test)
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name      string
+		requested int
+	}{
+		{name: "legacy limit", requested: 32_768},
+		{name: "legacy request above limit", requested: 32_769},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			legacy := base
+			legacy.MaxOutputTokens = test.requested
+			_, err := encodeRequest(legacy, nil)
+			if (test.requested <= 32_768) != (err == nil) {
+				t.Fatalf("encodeRequest legacy cap %d error = %v", test.requested, err)
+			}
+		})
 	}
 }
 

@@ -221,9 +221,10 @@ func TestScheduleEnumsAndValidation(t *testing.T) {
 	base := Schedule{
 		ID: "j1234567", OwnerID: "u1234567", Version: 1, Status: StatusEnabled,
 		HostID: "h1234567", ModelID: "model", Title: "Daily update check", Objective: "check for updates",
-		Timing:        Timing{Kind: TimingOnce, RunAt: "2026-11-01T01:30:00-04:00", TimeZone: "America/New_York"},
-		Budget:        task.Budget{ActiveSeconds: 60, ToolCalls: 1, ModelTokens: 100},
-		Authorization: task.Authorization{Kind: "session"}, MisfirePolicy: MisfireSkip,
+		FileDeliveryIntent: task.FileDeliveryNone,
+		Timing:             Timing{Kind: TimingOnce, RunAt: "2026-11-01T01:30:00-04:00", TimeZone: "America/New_York"},
+		Budget:             task.Budget{ActiveSeconds: 60, ToolCalls: 1, ModelTokens: 100},
+		Authorization:      task.Authorization{Kind: "session"}, MisfirePolicy: MisfireSkip,
 		NotificationEvents: []NotificationEvent{NotifyCompleted}, NextOccurrenceKey: "once:2026-11-01T05:30:00Z",
 		NextCheckAt: &next, ExecutionEpoch: 1,
 	}
@@ -241,6 +242,8 @@ func TestScheduleEnumsAndValidation(t *testing.T) {
 		func(value *Schedule) { value.Title = strings.Repeat("t", 32769) },
 		func(value *Schedule) { value.Objective = strings.Repeat("o", 32769) },
 		func(value *Schedule) { value.Objective = "  " },
+		func(value *Schedule) { value.FileDeliveryIntent = "" },
+		func(value *Schedule) { value.FileDeliveryIntent = task.FileDeliveryIntent("invalid") },
 		func(value *Schedule) { value.Authorization.Kind = "" },
 		func(value *Schedule) { value.MisfirePolicy = "unknown" },
 		func(value *Schedule) { value.ExecutionEpoch = 0 },

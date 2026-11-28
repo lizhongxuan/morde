@@ -3,6 +3,7 @@ package httpserver
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -15,6 +16,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
 	"morde/server/internal/config"
@@ -24,7 +29,12 @@ import (
 const (
 	statusClientClosedRequest = 499
 	requestIDHeader           = "X-Request-Id"
+	traceIDHeader             = "X-Trace-Id"
 	requestIDKey              = "request_id"
+	traceIDKey                = "trace_id"
+	spanIDKey                 = "span_id"
+	traceStateKey             = "trace_export_state"
+	traceContextStateKey      = "trace_context_state"
 	authKindKey               = "auth_kind"
 	routeKey                  = "httpserver.route"
 	loggerKey                 = "httpserver.logger"
@@ -33,9 +43,10 @@ const (
 )
 
 type Options struct {
-	Server  string
-	Logger  *zap.Logger
-	Metrics prometheus.Registerer
+	Server         string
+	Logger         *zap.Logger
+	Metrics        prometheus.Registerer
+	TracerProvider trace.TracerProvider
 }
 
 type requestState struct {
@@ -60,6 +71,7 @@ func Base(o Options) ([]gin.HandlerFunc, error) {
 	return []gin.HandlerFunc{
 		recovery(o.Server, o.Logger),
 		requestID(o.Logger),
+		traceContext(o.TracerProvider, o.Logger),
 		accessLog(o.Server, o.Logger),
 		metrics(o.Server, counter, histogram),
 	}, nil
@@ -81,11 +93,13 @@ func WriteError(c *gin.Context, err error) {
 	if status >= http.StatusInternalServerError {
 		if logger, ok := c.Get(loggerKey); ok {
 			if l, ok := logger.(*zap.Logger); ok && l != nil {
-				l.Error("http request failed",
+				fields := []zap.Field{
 					zap.String("request_id", c.GetString(requestIDKey)),
 					zap.String("server", c.GetString(serverKey)),
 					zap.String("code", response.Error.Code),
-				)
+				}
+				fields = append(fields, traceLogFields(c)...)
+				l.Error("http request failed", fields...)
 			}
 		}
 	}
@@ -126,11 +140,13 @@ func recovery(server string, logger *zap.Logger) gin.HandlerFunc {
 					finalize(c, state)
 					panic(recovered)
 				}
-				logger.Error("http panic",
+				fields := []zap.Field{
 					zap.String("request_id", c.GetString(requestIDKey)),
 					zap.String("server", c.GetString(serverKey)),
 					zap.String("stack", string(debug.Stack())),
-				)
+				}
+				fields = append(fields, traceLogFields(c)...)
+				logger.Error("http panic", fields...)
 				c.Abort()
 				if !c.Writer.Written() {
 					writeErrorResponse(c, errorResponse{
@@ -161,6 +177,136 @@ func requestID(logger *zap.Logger) gin.HandlerFunc {
 	}
 }
 
+// traceContext extracts W3C context before application middleware and records a
+// server span when a provider is configured. The no-provider path still emits
+// a valid correlation ID for local tests and partial deployments, and marks it
+// as not exported in the access log.
+func traceContext(provider trace.TracerProvider, logger *zap.Logger) gin.HandlerFunc {
+	propagator := propagation.TraceContext{}
+	return func(c *gin.Context) {
+		started := time.Now()
+		parentCtx := propagator.Extract(c.Request.Context(), propagation.HeaderCarrier(c.Request.Header))
+		parentSC := trace.SpanContextFromContext(parentCtx)
+		contextState := "accepted"
+		if strings.TrimSpace(c.Request.Header.Get("traceparent")) == "" {
+			contextState = "missing"
+		} else if !parentSC.IsValid() {
+			contextState = "invalid"
+		}
+
+		ctx := parentCtx
+		span := trace.SpanFromContext(parentCtx)
+		exportState := "disabled"
+		if provider != nil {
+			ctx, span = provider.Tracer("morde/server/httpserver").Start(parentCtx,
+				"HTTP "+c.Request.Method, trace.WithSpanKind(trace.SpanKindServer))
+			if span.SpanContext().IsValid() {
+				if span.IsRecording() {
+					exportState = "recording"
+				} else {
+					exportState = "sampled_out"
+				}
+			} else {
+				// A noop provider cannot create an exportable span. Keep a legal
+				// correlation context and make the limitation visible.
+				exportState = "disabled"
+			}
+		}
+
+		spanContext := span.SpanContext()
+		if provider == nil || !spanContext.IsValid() || parentSC.IsValid() && spanContext.SpanID() == parentSC.SpanID() {
+			generatedTraceID, spanID, err := newTraceIDs(c.GetString(requestIDKey))
+			if err != nil && logger != nil {
+				logger.Error("generate trace context failed", zap.Error(err), zap.String("request_id", c.GetString(requestIDKey)))
+			}
+			traceID := parentSC.TraceID()
+			if !traceID.IsValid() {
+				traceID = generatedTraceID
+			}
+			spanContext = trace.NewSpanContext(trace.SpanContextConfig{
+				TraceID: traceID, SpanID: spanID, TraceFlags: parentSC.TraceFlags(), TraceState: parentSC.TraceState(),
+			})
+			ctx = trace.ContextWithSpanContext(ctx, spanContext)
+			if provider != nil {
+				exportState = "disabled"
+			}
+		}
+
+		traceID := spanContext.TraceID().String()
+		spanID := spanContext.SpanID().String()
+		c.Set(traceIDKey, traceID)
+		c.Set(spanIDKey, spanID)
+		c.Set(traceStateKey, exportState)
+		c.Set(traceContextStateKey, contextState)
+		c.Writer.Header().Set(traceIDHeader, traceID)
+		c.Request = c.Request.WithContext(ctx)
+
+		if state := getState(c); state != nil {
+			state.finalizers = append(state.finalizers, func(c *gin.Context) {
+				status := c.Writer.Status()
+				requestSpan := trace.SpanFromContext(c.Request.Context())
+				requestSpan.SetName(httpSpanName(c.Request.Method, route(c)))
+				requestSpan.SetAttributes(
+					attribute.String("http.request.method", c.Request.Method),
+					attribute.String("http.route", route(c)),
+					attribute.Int("http.response.status_code", status),
+					attribute.String("morde.server", c.GetString(serverKey)),
+					attribute.String("morde.request_id", c.GetString(requestIDKey)),
+					attribute.String("morde.trace.context_state", c.GetString(traceContextStateKey)),
+				)
+				requestSpan.SetAttributes(attribute.Int64("morde.http.duration_ms", time.Since(started).Milliseconds()))
+				if status >= http.StatusInternalServerError {
+					requestSpan.SetStatus(codes.Error, "http server error")
+				}
+				requestSpan.End()
+			})
+		}
+		c.Next()
+	}
+}
+
+func newTraceIDs(requestID string) (trace.TraceID, trace.SpanID, error) {
+	var traceID trace.TraceID
+	var spanID trace.SpanID
+	if _, err := rand.Read(traceID[:]); err != nil {
+		traceID, spanID := fallbackTraceIDs(requestID)
+		return traceID, spanID, fmt.Errorf("read trace id randomness: %w", err)
+	}
+	if _, err := rand.Read(spanID[:]); err != nil {
+		traceID, spanID := fallbackTraceIDs(requestID)
+		return traceID, spanID, fmt.Errorf("read span id randomness: %w", err)
+	}
+	if !traceID.IsValid() || !spanID.IsValid() {
+		traceID, spanID := fallbackTraceIDs(requestID)
+		return traceID, spanID, errors.New("generated trace identifiers are invalid")
+	}
+	return traceID, spanID, nil
+}
+
+func fallbackTraceIDs(requestID string) (trace.TraceID, trace.SpanID) {
+	digest := sha256.Sum256([]byte(requestID + ":" + strconv.FormatInt(time.Now().UnixNano(), 10)))
+	var traceID trace.TraceID
+	var spanID trace.SpanID
+	copy(traceID[:], digest[:len(traceID)])
+	copy(spanID[:], digest[len(traceID):len(traceID)+len(spanID)])
+	if !traceID.IsValid() {
+		traceID[len(traceID)-1] = 1
+	}
+	if !spanID.IsValid() {
+		spanID[len(spanID)-1] = 1
+	}
+	return traceID, spanID
+}
+
+func traceLogFields(c *gin.Context) []zap.Field {
+	return []zap.Field{
+		zap.String("trace_id", c.GetString(traceIDKey)),
+		zap.String("span_id", c.GetString(spanIDKey)),
+		zap.String("trace_export_state", c.GetString(traceStateKey)),
+		zap.String("trace_context_state", c.GetString(traceContextStateKey)),
+	}
+}
+
 func accessLog(server string, logger *zap.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		started := time.Now()
@@ -183,6 +329,7 @@ func accessLog(server string, logger *zap.Logger) gin.HandlerFunc {
 					zap.String("client_ip", clientIP(c.Request.RemoteAddr)),
 					zap.String("auth_kind", authKind(c)),
 				}
+				fields = append(fields, traceLogFields(c)...)
 				if hostID := c.GetString("gateway.host_id"); hostID != "" {
 					fields = append(fields, zap.String("host_id", hostID))
 				}
@@ -246,6 +393,32 @@ func route(c *gin.Context) string {
 		return label
 	}
 	return "unmatched"
+}
+
+func httpSpanName(method, routeName string) string {
+	method = metricMethod(method)
+	if routeName == "*" || safeHTTPRoute(routeName) {
+		candidate := method + " " + routeName
+		return candidate
+	}
+	if validLabel(routeName) {
+		return "http." + strings.ToLower(method) + "." + routeName
+	}
+	return "http." + strings.ToLower(method) + ".other"
+}
+
+func safeHTTPRoute(routeName string) bool {
+	if routeName == "" || routeName[0] != '/' {
+		return false
+	}
+	for i := 0; i < len(routeName); i++ {
+		ch := routeName[i]
+		isASCIIAlphaNumeric := ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9'
+		if !isASCIIAlphaNumeric && !strings.ContainsRune("._-/:{}*", rune(ch)) {
+			return false
+		}
+	}
+	return true
 }
 
 func authKind(c *gin.Context) string {

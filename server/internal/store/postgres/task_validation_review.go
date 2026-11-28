@@ -12,9 +12,11 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/task"
 	"morde/server/internal/store/postgres/sqlcgen"
 )
 
@@ -185,7 +187,7 @@ WHERE task.id=$1 AND task.owner_id=$2 AND task.status='completed'
 FOR UPDATE OF task`, claim.TaskID, claim.OwnerID, claim.TaskRevision, claim.ResultEventSequence, claim.ResultSHA256).
 			Scan(&result, &initiatorID, &conversationID)
 		if err != nil {
-			if err == pgx.ErrNoRows {
+			if errors.Is(err, pgx.ErrNoRows) {
 				return nil
 			}
 			return fmt.Errorf("lock current Task validation review result: %w", err)
@@ -230,11 +232,13 @@ FOR UPDATE OF task`, claim.TaskID, claim.OwnerID, claim.TaskRevision, claim.Resu
 		if err := app.ValidateTaskValidationReviewCompletion(completion, evidence); err != nil {
 			return err
 		}
-		facts, err := loadTaskValidationVerdictFacts(ctx, tx, claim, result, evidence, completion.Report, completion.ArtifactContentProofs)
+		facts, err := loadTaskValidationVerdictFacts(ctx, tx, claim, result, evidence, completion.Report,
+			completion.ArtifactContentProofs, completion.FinalWorkspaceSnapshotProof)
 		if err != nil {
 			return err
 		}
-		verdict := app.SummarizeTaskValidationEvaluations(app.EvaluateTaskValidationReview(completion.Report, facts))
+		evaluations := app.EvaluateTaskValidationReview(completion.Report, facts)
+		verdict := app.SummarizeTaskValidationEvaluations(evaluations)
 		if completion.SessionID != completion.ReviewerModel.SessionID {
 			return domain.NewError(domain.CodeConflict, "Task validation review session does not match its model response")
 		}
@@ -289,15 +293,132 @@ WHERE review.task_id=$1 AND review.task_revision=$3 AND review.owner_id=$2
 			return fmt.Errorf("complete Task validation review: %w", err)
 		}
 		completed = updated.RowsAffected() == 1
+		if !completed {
+			return nil
+		}
+		verdictDigest, err := taskValidationDeliveryVerdictDigest(claim, verdict, evaluations, report, artifactContentEvidence)
+		if err != nil {
+			return err
+		}
+		if err := enqueueLateTaskValidationDeliveryInTx(ctx, tx, claim, verdict, verdictDigest, report, artifactContentEvidence); err != nil {
+			return fmt.Errorf("enqueue late Task validation delivery: %w", err)
+		}
 		return nil
 	})
+	if err != nil {
+		completed = false
+	}
 	return completed, err
+}
+
+type taskValidationDeliveryVerdictCheck struct {
+	ID                  app.TaskHardCheckID                  `json:"id"`
+	Outcome             app.TaskValidationCheckOutcome       `json:"outcome"`
+	NotApplicableReason app.TaskHardCheckNotApplicableReason `json:"not_applicable_reason,omitempty"`
+	NonBlockingNote     string                               `json:"non_blocking_note,omitempty"`
+}
+
+// taskValidationDeliveryVerdictDigest binds the outbox identity to the
+// server-owned conclusion and its bounded review/evidence references.
+func taskValidationDeliveryVerdictDigest(claim app.TaskValidationReviewClaim, verdict app.TaskValidationSummary,
+	evaluations []app.TaskValidationCheckEvaluation, report, artifactContentEvidence []byte) ([]byte, error) {
+	if !app.ValidTaskValidationReviewClaim(claim) || !app.ValidTaskValidationState(verdict.State) ||
+		len(evaluations) != 7 || !json.Valid(report) || !json.Valid(artifactContentEvidence) {
+		return nil, domain.InvalidArgument("task_validation_delivery", "Task validation delivery facts are invalid")
+	}
+	checks := make([]taskValidationDeliveryVerdictCheck, len(evaluations))
+	for index, evaluation := range evaluations {
+		checks[index] = taskValidationDeliveryVerdictCheck{ID: evaluation.ID, Outcome: evaluation.Outcome,
+			NotApplicableReason: evaluation.NotApplicableReason, NonBlockingNote: evaluation.NonBlockingNote}
+	}
+	encoded, err := json.Marshal(struct {
+		Version                 int                                  `json:"version"`
+		TaskID                  string                               `json:"task_id"`
+		TaskRevision            int64                                `json:"task_revision"`
+		ResultEventSequence     int64                                `json:"result_event_sequence"`
+		ResultSHA256            []byte                               `json:"result_sha256"`
+		ClaimGeneration         int64                                `json:"claim_generation"`
+		State                   app.TaskValidationState              `json:"state"`
+		Checks                  []taskValidationDeliveryVerdictCheck `json:"checks"`
+		ReviewReport            json.RawMessage                      `json:"review_report"`
+		ArtifactContentEvidence json.RawMessage                      `json:"artifact_content_evidence"`
+	}{1, claim.TaskID, claim.TaskRevision, claim.ResultEventSequence, claim.ResultSHA256, claim.ClaimGeneration,
+		verdict.State, checks, report, artifactContentEvidence})
+	if err != nil {
+		return nil, fmt.Errorf("encode Task validation delivery verdict: %w", err)
+	}
+	digest := sha256.Sum256(encoded)
+	return digest[:], nil
+}
+
+// enqueueLateTaskValidationDeliveryInTx adds an independent source only after
+// the first result receipt has been published. The Task lock held by
+// CompleteTaskValidationReview serializes this check with result publication;
+// an unpublished receipt will observe the just-committed verdict instead.
+func enqueueLateTaskValidationDeliveryInTx(ctx context.Context, tx pgx.Tx, claim app.TaskValidationReviewClaim,
+	verdict app.TaskValidationSummary, verdictDigest, report, artifactContentEvidence []byte) error {
+	if ctx == nil || tx == nil || !app.ValidTaskValidationReviewClaim(claim) || !app.ValidTaskValidationState(verdict.State) || len(verdictDigest) != sha256.Size {
+		return domain.InvalidArgument("task_validation_delivery", "Task validation delivery source is invalid")
+	}
+	if !json.Valid(report) || !json.Valid(artifactContentEvidence) {
+		return domain.InvalidArgument("task_validation_delivery", "Task validation delivery evidence is invalid")
+	}
+	_, err := tx.Exec(ctx, `INSERT INTO task_terminal_delivery_outbox
+(task_id,owner_id,conversation_id,initiator_id,task_revision,authorization_version,source_kind,
+ source_event_sequence,source_event_type,source_sha256,result_sha256,validation_claim_generation,verdict_sha256)
+SELECT task.id,task.owner_id,task.conversation_id,task.initiator_id,task.current_revision,task.auth_version,'late_validation',
+       event.sequence,event.event_type,sha256(convert_to(event.payload::text,'UTF8')),
+       review.result_sha256,review.claim_generation,$7
+FROM task_validation_reviews review
+JOIN tasks task ON task.id=review.task_id AND task.owner_id=review.owner_id
+JOIN task_events event ON event.task_id=review.task_id AND event.sequence=review.result_event_sequence
+WHERE review.task_id=$1 AND review.owner_id=$2 AND review.task_revision=$5
+  AND review.result_event_sequence=$6 AND review.result_sha256=$8 AND review.claim_generation=$9
+  AND review.state='reviewed' AND review.validation_state=$10 AND review.review_report=$11::jsonb
+  AND review.artifact_content_evidence=$12::jsonb
+  AND task.initiator_id=$3 AND task.conversation_id=$4 AND task.status='completed'
+  AND task.current_revision=review.task_revision AND task.desired_revision=review.task_revision
+  AND event.task_revision=review.task_revision AND event.event_type='task.result'
+  AND event.result_content_sha256=review.result_sha256
+  AND task.result<>'' AND sha256(convert_to(task.result,'UTF8'))=review.result_sha256
+  AND (
+    EXISTS (
+    SELECT 1 FROM conversation_result_sources source
+    JOIN conversation_result_batches batch ON batch.message_id=source.batch_message_id
+    WHERE source.task_id=review.task_id AND source.task_revision=review.task_revision
+      AND source.event_sequence=review.result_event_sequence AND source.state='published'
+      AND batch.state='published' AND batch.published_message_id IS NOT NULL
+      AND batch.owner_id=task.owner_id AND batch.actor_id=task.initiator_id
+      AND batch.conversation_id=task.conversation_id
+    )
+    OR EXISTS (
+      SELECT 1 FROM conversation_messages message
+      WHERE message.task_id=task.id AND message.owner_id=task.owner_id
+        AND message.actor_id=task.initiator_id AND message.conversation_id=task.conversation_id
+        AND message.role='assistant' AND message.output_status='completed'
+        AND message.output_task_revision=review.task_revision
+        AND message.output_result_event_sequence=review.result_event_sequence
+        AND message.content=task.result
+    )
+  )
+ON CONFLICT DO NOTHING`, claim.TaskID, claim.OwnerID, claim.InitiatorID, claim.ConversationID,
+		claim.TaskRevision, claim.ResultEventSequence, verdictDigest, claim.ResultSHA256, claim.ClaimGeneration,
+		verdict.State, string(report), string(artifactContentEvidence))
+	if err != nil {
+		return fmt.Errorf("persist late Task validation source: %w", err)
+	}
+	return nil
 }
 
 func loadTaskValidationVerdictFacts(ctx context.Context, tx pgx.Tx, claim app.TaskValidationReviewClaim, result string,
 	evidence *app.TaskValidationEvidenceRecord, report app.TaskValidationReviewReport,
-	artifactProofs []app.TaskValidationReviewArtifactContentProof) (app.TaskValidationVerdictFacts, error) {
-	var hasExecution, hasClarifications bool
+	artifactProofs []app.TaskValidationReviewArtifactContentProof,
+	finalWorkspaceProofs ...*app.TaskValidationFinalWorkspaceSnapshotProof) (app.TaskValidationVerdictFacts, error) {
+	var finalWorkspaceProof *app.TaskValidationFinalWorkspaceSnapshotProof
+	if len(finalWorkspaceProofs) > 0 {
+		finalWorkspaceProof = finalWorkspaceProofs[0]
+	}
+	var hasExecution, hasPendingClarifications bool
 	if err := tx.QueryRow(ctx, `SELECT EXISTS (
   SELECT 1 FROM task_steps WHERE task_id=$1 AND (kind='tool' OR tool_name IS NOT NULL)
   UNION ALL SELECT 1 FROM task_operations WHERE task_id=$1
@@ -309,11 +430,15 @@ func loadTaskValidationVerdictFacts(ctx context.Context, tx pgx.Tx, claim app.Ta
   UNION ALL SELECT 1 FROM task_agent_request_reconciliations WHERE task_id=$1
   UNION ALL SELECT 1 FROM task_agent_sessions WHERE task_id=$1 AND parent_session_id IS NOT NULL
   UNION ALL SELECT 1 FROM task_artifacts WHERE task_id=$1
-), EXISTS (SELECT 1 FROM task_clarification_requests WHERE task_id=$1)`, claim.TaskID).
-		Scan(&hasExecution, &hasClarifications); err != nil {
+), EXISTS (SELECT 1 FROM task_clarification_requests WHERE task_id=$1 AND status='pending')`, claim.TaskID).
+		Scan(&hasExecution, &hasPendingClarifications); err != nil {
 		return app.TaskValidationVerdictFacts{}, fmt.Errorf("read Task validation facts: %w", err)
 	}
-	facts := app.TaskValidationVerdictFacts{ClarificationHistoryKnown: !hasClarifications}
+	// E09: the clarification history is known when no clarification is
+	// still unanswered. Answered and cancelled requests both have a
+	// terminal state with a timestamp, so the history is verifiable; a
+	// pending request means the history is not closed yet.
+	facts := app.TaskValidationVerdictFacts{ClarificationHistoryKnown: !hasPendingClarifications}
 	eligibleContent := make(map[app.TaskValidationEvidenceRefRecord]struct{})
 	if evidence != nil {
 		eligibleWeb := make(map[app.TaskValidationEvidenceRefRecord]struct{})
@@ -359,14 +484,228 @@ WHERE st.task_id=$1 AND st.task_revision=$2 AND st.status='succeeded' AND st.det
 	}
 	if hasExecution {
 		facts.TaskExecution = app.TaskValidationFactPresent
-		facts.IrreversibleAction = app.TaskValidationFactUnknown
-		facts.RepeatedError = app.TaskValidationFactUnknown
+		if err := loadTaskValidationExecutionFacts(ctx, tx, claim, &facts, finalWorkspaceProof); err != nil {
+			return app.TaskValidationVerdictFacts{}, err
+		}
 	} else {
 		facts.TaskExecution = app.TaskValidationFactAbsent
 		facts.IrreversibleAction = app.TaskValidationFactAbsent
 		facts.RepeatedError = app.TaskValidationFactAbsent
 	}
 	return facts, nil
+}
+
+// loadTaskValidationExecutionFacts derives the H05/H06/H07 server facts
+// (E09) from the durable ledger, independently of the execution broker
+// that recorded it and of the review model. Every load failure fails
+// closed: the review completion errors and the verdict stays pending
+// instead of passing on partial facts.
+//
+//   - H05: approval-requiring steps and Host, MCP and Workspace operation
+//     receipts must carry matching call identities and exact approved
+//     request ID, version, revision and hash bindings. Unknown or incomplete
+//     operation identities keep the fact pending. Hub and sandbox-specific
+//     receipts still need their own coverage before all histories can be
+//     considered independently verified.
+//   - H06: repeated errors and their correction records, from the step
+//     digests.
+//   - H07: fix-task replay remains pending without plan-revision, immutable
+//     Workspace-version, and coverage bindings; other tasks use the verified
+//     read-back compare.
+func loadTaskValidationExecutionFacts(ctx context.Context, tx pgx.Tx, claim app.TaskValidationReviewClaim,
+	facts *app.TaskValidationVerdictFacts, finalWorkspaceProofs ...*app.TaskValidationFinalWorkspaceSnapshotProof) error {
+	var finalWorkspaceProof *app.TaskValidationFinalWorkspaceSnapshotProof
+	if len(finalWorkspaceProofs) > 0 {
+		finalWorkspaceProof = finalWorkspaceProofs[0]
+	}
+	steps, err := listTaskStepsWithActivity(ctx, tx, claim.TaskID)
+	if err != nil {
+		return fmt.Errorf("read Task validation steps: %w", err)
+	}
+	actions, unclassifiable := taskValidationApprovalActions(steps)
+	ledgerActions, ledgerUnknown, err := listTaskValidationApprovalLedger(ctx, tx, claim.TaskID)
+	if err != nil {
+		return err
+	}
+	var uncovered bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (
+ SELECT 1 FROM task_sandbox_call_receipts WHERE task_id=$1 AND status IN ('dispatched','succeeded','failed','unknown')
+ UNION ALL SELECT 1 FROM task_hub_operations WHERE task_id=$1 AND action='command' AND status IN ('dispatched','succeeded','failed','unknown')
+ UNION ALL SELECT 1 FROM task_agent_request_reconciliations WHERE task_id=$1 AND phase='tool' AND state='pending'
+)`, claim.TaskID).Scan(&uncovered); err != nil {
+		return fmt.Errorf("read Task validation unclassified execution: %w", err)
+	}
+	// shortcut: Hub commands and sandbox receipts lack the same per-call
+	// approval binding; keep the fact unknown until they can be reconciled.
+	facts.IrreversibleAction, facts.ApprovalHistoryVerified = evaluateTaskValidationApprovalLedger(actions, ledgerActions, unclassifiable || ledgerUnknown || uncovered)
+	facts.RepeatedError, facts.CorrectionRecordVerified = app.EvaluateRepeatedErrorCorrections(steps)
+	plan, err := latestTaskPlan(ctx, tx, claim.TaskID, claim.TaskRevision)
+	if err != nil {
+		return fmt.Errorf("read Task validation plan: %w", err)
+	}
+	hasFixPlan := plan != nil && plan.FixPlan != nil
+	hasTypedCheck := false
+	if hasFixPlan {
+		for _, step := range plan.Steps {
+			if step.VerificationCheck != nil {
+				hasTypedCheck = true
+				break
+			}
+		}
+	}
+	if hasFixPlan && hasTypedCheck {
+		current, err := readTaskValidationReplayTask(ctx, tx, claim)
+		if err != nil {
+			return err
+		}
+		replay, err := loadTaskValidationPlanCheckReplay(ctx, tx, claim, *plan, current, finalWorkspaceProof)
+		if err != nil {
+			return err
+		}
+		if replay != nil {
+			facts.ReplayVerified = replay.State == app.TaskValidationReplayPass
+			facts.ReplayFailed = replay.State == app.TaskValidationReplayFail
+		}
+	} else {
+		facts.ReplayVerified = app.EvaluateTaskValidationReplay(false, app.TestGateResult{}, facts.EvidenceContentVerified)
+	}
+	return nil
+}
+
+type taskValidationLedgerAction struct {
+	action        app.TaskApprovalAction
+	status        string
+	approvalID    string
+	approvalHash  []byte
+	boundApproval bool
+}
+
+// Each approval-bearing operation must carry the exact approved request
+// binding. A succeeded step alone is not an operation receipt.
+func listTaskValidationApprovalLedger(ctx context.Context, tx pgx.Tx, taskID string) ([]taskValidationLedgerAction, bool, error) {
+	rows, err := tx.Query(ctx, `WITH operation AS (
+ SELECT task_id,status,task_revision,call_id,tool_name,request_hash,approval_id,approval_version,approval_request_hash
+ FROM task_operations WHERE task_id=$1
+ UNION ALL
+ SELECT task_id,status,task_revision,call_id,tool_name,request_hash,approval_id,approval_version,approval_request_hash
+ FROM task_mcp_connector_operations WHERE task_id=$1
+ UNION ALL
+ SELECT task_id,state,task_revision,call_id,tool_name,request_hash,approval_id,approval_version,approval_request_hash
+ FROM task_workspace_publish_receipts WHERE task_id=$1
+)
+SELECT COALESCE(o.call_id,''),COALESCE(o.tool_name,''),o.request_hash,o.approval_request_hash,o.task_revision,o.status,COALESCE(o.approval_id,''),
+ COALESCE(p.status='approved' AND p.decision='approve' AND p.responded_by_user_id IS NOT NULL
+   AND p.responded_at IS NOT NULL AND (p.expires_at IS NULL OR p.responded_at < p.expires_at)
+   AND p.task_revision=o.task_revision AND p.call_id=o.call_id AND p.tool_name=o.tool_name
+   AND p.request_hash=o.approval_request_hash,false)
+FROM operation o LEFT JOIN task_pending_requests p
+ ON p.task_id=o.task_id AND p.id=o.approval_id AND p.version=o.approval_version
+WHERE o.status IN ('succeeded','failed','dispatched','unknown','pending')`, taskID)
+	if err != nil {
+		return nil, false, fmt.Errorf("read Task validation operation bindings: %w", err)
+	}
+	defer rows.Close()
+	var result []taskValidationLedgerAction
+	unknown := false
+	for rows.Next() {
+		var item taskValidationLedgerAction
+		var revision pgtype.Int8
+		if err := rows.Scan(&item.action.CallID, &item.action.ToolName, &item.action.RequestDigest, &item.approvalHash,
+			&revision, &item.status, &item.approvalID, &item.boundApproval); err != nil {
+			return nil, false, fmt.Errorf("scan Task validation operation binding: %w", err)
+		}
+		if revision.Valid {
+			value := revision.Int64
+			item.action.TaskRevision = &value
+		}
+		if item.status == "unknown" || item.status == "dispatched" || item.status == "pending" ||
+			item.action.CallID == "" || item.action.ToolName == "" || item.action.TaskRevision == nil || len(item.action.RequestDigest) != 32 {
+			unknown = true
+		}
+		result = append(result, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, fmt.Errorf("iterate Task validation operation bindings: %w", err)
+	}
+	return result, unknown, nil
+}
+
+func evaluateTaskValidationApprovalLedger(steps []app.TaskApprovalAction, ledger []taskValidationLedgerAction,
+	unknown bool) (app.TaskValidationFactState, bool) {
+	if unknown {
+		return app.TaskValidationFactUnknown, false
+	}
+	present := len(steps) > 0
+	verifiedBindings := true
+	for _, item := range ledger {
+		if item.approvalID == "" && !app.TaskToolRequiresPerCallApproval(item.action.ToolName) {
+			continue
+		}
+		present = true
+		if !item.boundApproval {
+			verifiedBindings = false
+		}
+		matched := false
+		for _, step := range steps {
+			if taskValidationStepMatchesOperation(step, item) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			verifiedBindings = false
+		}
+	}
+	for _, step := range steps {
+		matched := false
+		for _, item := range ledger {
+			if taskValidationStepMatchesOperation(step, item) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			verifiedBindings = false
+		}
+	}
+	if !present {
+		return app.TaskValidationFactAbsent, false
+	}
+	return app.TaskValidationFactPresent, verifiedBindings
+}
+
+func taskValidationStepMatchesOperation(step app.TaskApprovalAction, item taskValidationLedgerAction) bool {
+	return item.status == "succeeded" && item.action.CallID == step.CallID && item.action.ToolName == step.ToolName &&
+		item.action.TaskRevision != nil && step.TaskRevision != nil && *item.action.TaskRevision == *step.TaskRevision &&
+		(bytes.Equal(item.action.RequestDigest, step.RequestDigest) || bytes.Equal(item.approvalHash, step.RequestDigest)) && item.boundApproval
+}
+
+// taskValidationApprovalActions collects the executed approval-requiring
+// actions from the step ledger. A succeeded step with no tool name cannot
+// be classified, so unclassifiable is reported and the approval fact
+// stays unknown instead of guessing.
+func taskValidationApprovalActions(steps []task.Step) ([]app.TaskApprovalAction, bool) {
+	actions := make([]app.TaskApprovalAction, 0)
+	unclassifiable := false
+	for _, step := range steps {
+		if step.Status != task.StepSucceeded {
+			continue
+		}
+		if step.ToolName == "" {
+			unclassifiable = true
+			continue
+		}
+		if !app.TaskToolRequiresPerCallApproval(step.ToolName) {
+			continue
+		}
+		actions = append(actions, app.TaskApprovalAction{
+			CallID:        step.ToolCallKey,
+			ToolName:      step.ToolName,
+			RequestDigest: step.RequestDigest,
+			TaskRevision:  step.TaskRevision,
+		})
+	}
+	return actions, unclassifiable
 }
 
 func currentTaskValidationReviewArtifactContentRefsInTx(ctx context.Context, tx pgx.Tx,
@@ -539,7 +878,7 @@ func enqueueTaskValidationReviewInTx(ctx context.Context, tx pgx.Tx, ownerID, ta
 		err := tx.QueryRow(ctx, `SELECT call_id FROM task_model_call_responses
 WHERE owner_id=$1 AND task_id=$2 AND agent_session_id=$3 AND agent_root_session_id=$3
 ORDER BY through_sequence DESC,created_at DESC,call_id DESC LIMIT 1`, ownerID, taskID, rootSessionID).Scan(&callID)
-		if err != nil && err != pgx.ErrNoRows {
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			return fmt.Errorf("read Task execution model response for review: %w", err)
 		}
 		if err == nil {

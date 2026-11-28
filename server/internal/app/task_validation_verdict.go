@@ -30,6 +30,7 @@ type TaskValidationVerdictFacts struct {
 	ApprovalHistoryVerified   bool
 	CorrectionRecordVerified  bool
 	ReplayVerified            bool
+	ReplayFailed              bool
 }
 
 // TaskValidationCheckEvaluation must be built from current server facts and a
@@ -133,6 +134,8 @@ func EvaluateTaskValidationReview(report TaskValidationReviewReport, facts TaskV
 			case TaskValidationFactPresent:
 				if id == TaskHardCheckIndependent {
 					evaluation = taskValidationReviewFindingEvaluation(finding)
+				} else if facts.ReplayFailed {
+					evaluation.Outcome = TaskValidationCheckFail
 				} else if facts.ReplayVerified {
 					evaluation = taskValidationReviewFindingEvaluation(finding)
 				}

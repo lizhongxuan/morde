@@ -80,6 +80,12 @@ func (s *ScheduleService) Create(ctx context.Context, principal identity.Princip
 		return schedule.Schedule{}, err
 	}
 	command.Objective = stringsTrim(command.Objective)
+	if command.FileDeliveryIntent == "" {
+		command.FileDeliveryIntent = task.FileDeliveryNone
+	}
+	if err := validateScheduleFileDeliveryIntent(command.FileDeliveryIntent); err != nil {
+		return schedule.Schedule{}, err
+	}
 	title := command.Objective
 	if command.Title != nil {
 		title = stringsTrim(*command.Title)
@@ -94,7 +100,7 @@ func (s *ScheduleService) Create(ctx context.Context, principal identity.Princip
 	if command.NotificationEvents == nil {
 		command.NotificationEvents = []schedule.NotificationEvent{schedule.NotifyCompleted, schedule.NotifyFailed, schedule.NotifyWaitingUser}
 	}
-	if err := validateScheduleResources(ctx, s.authorizer, principal, command.HostID, command.Objective, command.Observation); err != nil {
+	if err := validateScheduleResources(ctx, s.authorizer, principal, command.HostID, command.Observation); err != nil {
 		return schedule.Schedule{}, err
 	}
 	configured, err := s.models.IsConfiguredModel(ctx, principal.UserID, command.ModelID)
@@ -116,10 +122,16 @@ func (s *ScheduleService) Create(ctx context.Context, principal identity.Princip
 		ID: id, OwnerID: principal.UserID, Version: 1, Status: schedule.StatusEnabled,
 		ExecutionEpoch: 1, // CreateSchedule replaces this validation placeholder with the locked owner epoch.
 		HostID:         command.HostID, ModelID: command.ModelID, Title: title, Objective: command.Objective,
-		Timing: command.Timing, Budget: command.Budget, Authorization: scheduleAuthorization(principal),
+		FileDeliveryIntent: command.FileDeliveryIntent,
+		Timing:             command.Timing, Budget: command.Budget, Authorization: scheduleAuthorization(principal),
 		MisfirePolicy: command.MisfirePolicy, NotificationEvents: command.NotificationEvents,
 		Observation: command.Observation, ExecutionPolicy: command.executionPolicy, NextOccurrenceKey: first.Key, NextRunAt: first.ScheduledAt,
 		NextCheckAt: &first.CheckAt,
+	}
+	if command.PersonalRule != nil {
+		value.PersonalRule = &schedule.PersonalRuleBinding{
+			CandidateID: command.PersonalRule.CandidateID, CandidateRevision: command.PersonalRule.CandidateRevision,
+		}
 	}
 	if value.Observation != nil {
 		value.ObservationConfigHash = value.Observation.ConfigHash()
@@ -132,13 +144,16 @@ func (s *ScheduleService) Create(ctx context.Context, principal identity.Princip
 		ModelID            string
 		Title              string
 		Objective          string
+		FileDeliveryIntent task.FileDeliveryIntent
 		Timing             schedule.Timing
 		Budget             task.Budget
 		Observation        *schedule.ObservationSpec
 		MisfirePolicy      schedule.MisfirePolicy
 		NotificationEvents []schedule.NotificationEvent
+		PersonalRule       *schedule.PersonalRuleSelection
 		ExecutionPolicy    schedule.ExecutionPolicy
-	}{command.HostID, command.ModelID, value.Title, command.Objective, command.Timing, command.Budget, command.Observation, command.MisfirePolicy, command.NotificationEvents, command.executionPolicy})
+	}{command.HostID, command.ModelID, value.Title, command.Objective, command.FileDeliveryIntent, command.Timing, command.Budget,
+		command.Observation, command.MisfirePolicy, command.NotificationEvents, command.PersonalRule, command.executionPolicy})
 	if err != nil {
 		return schedule.Schedule{}, err
 	}
@@ -184,6 +199,12 @@ func (s *ScheduleService) Update(ctx context.Context, principal identity.Princip
 		command.Objective = &objective
 		current.Objective = objective
 	}
+	if command.FileDeliveryIntent != nil {
+		current.FileDeliveryIntent = *command.FileDeliveryIntent
+	}
+	if err := validateScheduleFileDeliveryIntent(current.FileDeliveryIntent); err != nil {
+		return schedule.Schedule{}, err
+	}
 	if command.Timing != nil {
 		current.Timing = *command.Timing
 		first, err := schedule.FirstOccurrence(current.Timing, time.Now().UTC())
@@ -209,12 +230,20 @@ func (s *ScheduleService) Update(ctx context.Context, principal identity.Princip
 	if command.NotificationEvents != nil {
 		current.NotificationEvents = append([]schedule.NotificationEvent(nil), (*command.NotificationEvents)...)
 	}
+	if command.PersonalRuleSet {
+		current.PersonalRule = nil
+		if command.PersonalRule != nil {
+			current.PersonalRule = &schedule.PersonalRuleBinding{
+				CandidateID: command.PersonalRule.CandidateID, CandidateRevision: command.PersonalRule.CandidateRevision,
+			}
+		}
+	}
 	if stringsTrim(current.Title) == "" || len(stringsTrim(current.Title)) > 32768 ||
 		stringsTrim(current.Objective) == "" || len(stringsTrim(current.Objective)) > 32768 {
 		return schedule.Schedule{}, domain.InvalidArgument("schedule", "schedule fields are invalid")
 	}
 	current.Authorization = scheduleAuthorization(principal)
-	if err := validateScheduleResources(ctx, s.authorizer, principal, current.HostID, current.Objective, current.Observation); err != nil {
+	if err := validateScheduleResources(ctx, s.authorizer, principal, current.HostID, current.Observation); err != nil {
 		return schedule.Schedule{}, err
 	}
 	configured, err := s.models.IsConfiguredModel(ctx, principal.UserID, current.ModelID)
@@ -255,7 +284,10 @@ func (s *ScheduleService) Action(ctx context.Context, principal identity.Princip
 	if err != nil {
 		return ScheduleActionResult{}, err
 	}
-	if err := validateScheduleResources(ctx, s.authorizer, principal, current.HostID, current.Objective, current.Observation); err != nil {
+	if err := validateScheduleFileDeliveryIntent(current.FileDeliveryIntent); err != nil {
+		return ScheduleActionResult{}, err
+	}
+	if err := validateScheduleResources(ctx, s.authorizer, principal, current.HostID, current.Observation); err != nil {
 		return ScheduleActionResult{}, err
 	}
 	if command.CurrentRunAction == schedule.CurrentRunCancel && current.CurrentRun != nil && current.CurrentRun.TaskID != nil {
@@ -466,14 +498,30 @@ func validateScheduleHost(ctx context.Context, authorizer TaskAuthorizer, princi
 	return nil
 }
 
-func validateScheduleResources(ctx context.Context, authorizer TaskAuthorizer, principal identity.Principal, hostID, objective string, observation *schedule.ObservationSpec) error {
+func validateScheduleResources(ctx context.Context, authorizer TaskAuthorizer, principal identity.Principal, hostID string, observation *schedule.ObservationSpec) error {
 	if hostID == "" {
-		if observation != nil || ClassifyFileDeliveryIntent(objective, false) != task.FileDeliveryNone {
+		if observation != nil {
 			return domain.InvalidArgument("schedule", "hostless schedule cannot request computer or workspace capabilities")
 		}
 		return nil
 	}
 	return validateScheduleHost(ctx, authorizer, principal, hostID)
+}
+
+func validateScheduleFileDeliveryIntent(intent task.FileDeliveryIntent) error {
+	if !intent.Valid() {
+		return domain.InvalidArgument("file_delivery_intent", "file delivery intent is invalid")
+	}
+	switch intent {
+	case task.FileDeliveryNone:
+		return nil
+	case task.FileDeliveryRequired:
+		return domain.InvalidArgument("file_delivery_intent", "scheduled tasks cannot require file delivery because they have no Workspace")
+	case task.FileDeliveryUnclear:
+		return domain.InvalidArgument("file_delivery_intent", "file delivery intent must be clarified before saving a schedule")
+	default:
+		return domain.InvalidArgument("file_delivery_intent", "file delivery intent is invalid")
+	}
 }
 
 func scheduleAuthorization(principal identity.Principal) task.Authorization {

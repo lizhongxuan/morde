@@ -14,9 +14,9 @@ import { MCPConnectorsPanel } from './MCPConnectorsPanel';
 import { FloatingError, FloatingNotice } from '../components/FloatingError';
 
 type ModelConnection = Awaited<ReturnType<typeof api.modelConnections>>['items'][number];
-type PersonalModelDraft = { name: string; baseURL: string; modelName: string; contextWindowOverrideTokens: string; clearContextWindowOverride: boolean; apiKey: string };
+type PersonalModelDraft = { name: string; baseURL: string; modelName: string; contextWindowOverrideTokens: string; clearContextWindowOverride: boolean; maxOutputOverrideTokens: string; clearMaxOutputOverride: boolean; apiKey: string };
 type ConnectionArea = 'personal' | 'mcp';
-const emptyDraft: PersonalModelDraft = { name: '', baseURL: '', modelName: '', contextWindowOverrideTokens: '', clearContextWindowOverride: false, apiKey: '' };
+const emptyDraft: PersonalModelDraft = { name: '', baseURL: '', modelName: '', contextWindowOverrideTokens: '', clearContextWindowOverride: false, maxOutputOverrideTokens: '', clearMaxOutputOverride: false, apiKey: '' };
 
 function presetForRoute(baseURL: string, modelName: string) {
   return modelConnectionPresets.find((preset) => preset.baseURL.replace(/\/+$/, '') === baseURL.replace(/\/+$/, '') && preset.modelName === modelName);
@@ -30,6 +30,24 @@ function contextWindowSourceLabel(source: ModelConnection['context_window_source
     case 'model_catalog': return 'Morde 模型目录';
     case 'provider_error': return '服务商错误响应';
     default: return '暂未识别';
+  }
+}
+
+function outputLimitSourceLabel(source: ModelConnection['max_output_source']) {
+  switch (source) {
+    case 'override': return '高级覆盖';
+    case 'model_catalog': return 'Morde 模型目录';
+    default: return '暂未识别';
+  }
+}
+
+function safeOutputSourceURL(value: string | null | undefined) {
+  if (!value) return undefined;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && !url.username && !url.password ? url.toString() : undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -110,6 +128,8 @@ export function Connections() {
         name: submittedDraft.name.trim(), base_url: submittedDraft.baseURL.trim(), model_name: submittedDraft.modelName.trim(),
         ...(submittedDraft.clearContextWindowOverride ? { context_window_override_tokens: null }
           : !isSystemPreset && submittedDraft.contextWindowOverrideTokens ? { context_window_override_tokens: Number(submittedDraft.contextWindowOverrideTokens) } : {}),
+        ...(submittedDraft.clearMaxOutputOverride ? { max_output_override_tokens: null }
+          : !isSystemPreset && submittedDraft.maxOutputOverrideTokens ? { max_output_override_tokens: Number(submittedDraft.maxOutputOverrideTokens) } : {}),
       };
       const saved = editingID
         ? await api.updateModelConnection(editingID, { ...connection, ...(apiKey ? { api_key: apiKey } : {}) })
@@ -157,7 +177,9 @@ export function Connections() {
     setEditingID(model.id);
     setDraft({ name: model.name, baseURL: model.base_url, modelName: model.model_name,
       contextWindowOverrideTokens: preset ? '' : model.context_window_override_tokens ? String(model.context_window_override_tokens) : '',
-      clearContextWindowOverride: false, apiKey: '' });
+      clearContextWindowOverride: false,
+      maxOutputOverrideTokens: preset || model.max_output_override_tokens == null ? '' : String(model.max_output_override_tokens),
+      clearMaxOutputOverride: false, apiKey: '' });
     setPresetID(preset?.id ?? 'custom');
     setAdvancedOpen(true);
     check.reset();
@@ -182,10 +204,12 @@ export function Connections() {
           <div className="connection-form-wide"><label htmlFor="personal-model-preset">选择服务和模型</label><select id="personal-model-preset" value={presetID} required onChange={(event) => {
             const preset = modelConnectionPresets.find((item) => item.id === event.target.value);
             setPresetID(event.target.value === 'custom' ? 'custom' : preset?.id ?? '');
-            if (preset) setDraft((current) => ({ ...current, name: preset.name, baseURL: preset.baseURL, modelName: preset.modelName, contextWindowOverrideTokens: '', clearContextWindowOverride: false }));
+            if (preset) setDraft((current) => ({ ...current, name: preset.name, baseURL: preset.baseURL, modelName: preset.modelName, contextWindowOverrideTokens: '', clearContextWindowOverride: false, maxOutputOverrideTokens: '', clearMaxOutputOverride: false }));
             else if (event.target.value === 'custom' && editingID) {
               const existing = personalModels.find((item) => item.id === editingID);
-              setDraft((current) => ({ ...current, contextWindowOverrideTokens: existing?.context_window_override_tokens ? String(existing.context_window_override_tokens) : '', clearContextWindowOverride: false }));
+              setDraft((current) => ({ ...current,
+                contextWindowOverrideTokens: existing?.context_window_override_tokens ? String(existing.context_window_override_tokens) : '', clearContextWindowOverride: false,
+                maxOutputOverrideTokens: existing?.max_output_override_tokens == null ? '' : String(existing.max_output_override_tokens), clearMaxOutputOverride: false }));
             }
             setAdvancedOpen(event.target.value === 'custom');
           }}>
@@ -201,7 +225,7 @@ export function Connections() {
               {modelConnectionPresets.filter((preset) => preset.id.startsWith('glm-')).map((preset) => <option key={preset.id} value={preset.id}>{preset.modelName}</option>)}
             </optgroup>
           </select></div>
-          {presetForRoute(draft.baseURL, draft.modelName) && <p className="muted connection-form-wide">上下文窗口由 Morde 自动识别；无需手动填写。</p>}
+          {presetForRoute(draft.baseURL, draft.modelName) && <p className="muted connection-form-wide">系统预设按服务端返回信息显示上下文窗口和单次生成上限；未知时保持未知，无需手动填写。</p>}
           <div className="connection-form-wide"><label htmlFor="personal-model-api-key">API 密钥</label><input id="personal-model-api-key" type="password" autoComplete="new-password" value={draft.apiKey} maxLength={4096} required={!editingID} onChange={(event) => setDraft({ ...draft, apiKey: event.target.value })} /></div>
           <details className="connection-form-advanced connection-form-wide" open={advancedOpen} onToggle={(event) => {
             const details = event.currentTarget;
@@ -211,9 +235,14 @@ export function Connections() {
             <summary>高级设置</summary>
             <div className="connection-form-grid connection-form-advanced-grid">
               <div><label htmlFor="personal-model-name">显示名称</label><input id="personal-model-name" value={draft.name} maxLength={80} required onChange={(event) => setDraft({ ...draft, name: event.target.value })} /></div>
-              <div><label htmlFor="personal-model-provider-name">模型名</label><input id="personal-model-provider-name" value={draft.modelName} maxLength={256} required readOnly={presetID !== 'custom'} onChange={(event) => { setPresetID('custom'); setDraft({ ...draft, modelName: event.target.value, contextWindowOverrideTokens: '', clearContextWindowOverride: false }); }} /></div>
-              <div className="connection-form-wide"><label htmlFor="personal-model-base-url">服务地址</label><input id="personal-model-base-url" type="url" pattern="https://.*" value={draft.baseURL} required readOnly={presetID !== 'custom'} onChange={(event) => { setPresetID('custom'); setDraft({ ...draft, baseURL: event.target.value, contextWindowOverrideTokens: '', clearContextWindowOverride: false }); }} /><small className="muted">使用 HTTPS，且服务域名须通过 Morde 服务端校验。</small></div>
+              <div><label htmlFor="personal-model-provider-name">模型名</label><input id="personal-model-provider-name" value={draft.modelName} maxLength={256} required readOnly={presetID !== 'custom'} onChange={(event) => { setPresetID('custom'); setDraft({ ...draft, modelName: event.target.value, contextWindowOverrideTokens: '', clearContextWindowOverride: false, maxOutputOverrideTokens: '', clearMaxOutputOverride: false }); }} /></div>
+              <div className="connection-form-wide"><label htmlFor="personal-model-base-url">服务地址</label><input id="personal-model-base-url" type="url" pattern="https://.*" value={draft.baseURL} required readOnly={presetID !== 'custom'} onChange={(event) => { setPresetID('custom'); setDraft({ ...draft, baseURL: event.target.value, contextWindowOverrideTokens: '', clearContextWindowOverride: false, maxOutputOverrideTokens: '', clearMaxOutputOverride: false }); }} /><small className="muted">使用 HTTPS，且服务域名须通过 Morde 服务端校验。</small></div>
               {!presetForRoute(draft.baseURL, draft.modelName) && <div className="connection-form-wide"><label htmlFor="personal-model-context-window">上下文窗口高级覆盖（tokens，可选）</label><input id="personal-model-context-window" type="number" min={4096} max={2000000} step={1} value={draft.contextWindowOverrideTokens} onChange={(event) => setDraft({ ...draft, contextWindowOverrideTokens: event.target.value, clearContextWindowOverride: false })} /><small className="muted">只用于自动发现不到容量的自定义服务；留空则保持未知，不使用通用默认值。</small></div>}
+              {!presetForRoute(draft.baseURL, draft.modelName) && <div className="connection-form-wide"><label htmlFor="personal-model-max-output">单次生成上限高级覆盖（tokens，可选）</label><input id="personal-model-max-output" type="number" min={1} max={Number.MAX_SAFE_INTEGER} step={1} value={draft.maxOutputOverrideTokens} onChange={(event) => setDraft({ ...draft, maxOutputOverrideTokens: event.target.value, clearMaxOutputOverride: false })} /><small className="muted">只为自定义服务明确设置上限；留空保持当前值或未知状态，不按模型名推断。</small></div>}
+              {!presetForRoute(draft.baseURL, draft.modelName) && editingID && personalModels.find((item) => item.id === editingID)?.max_output_override_tokens != null && <div className="connection-form-wide notice notice-info">
+                <p>此自定义模型当前的单次生成上限覆盖为 {personalModels.find((item) => item.id === editingID)?.max_output_override_tokens?.toLocaleString()} tokens。</p>
+                <button type="button" className="button button-secondary button-small" onClick={() => setDraft({ ...draft, clearMaxOutputOverride: true })} disabled={draft.clearMaxOutputOverride}>{draft.clearMaxOutputOverride ? '保存时将清除输出上限覆盖' : '清除覆盖，使用模型目录结果'}</button>
+              </div>}
               {presetForRoute(draft.baseURL, draft.modelName) && editingID && personalModels.find((item) => item.id === editingID)?.context_window_override_tokens != null && <div className="connection-form-wide notice notice-info">
                 <p>此系统预设保留了旧手工容量 {personalModels.find((item) => item.id === editingID)?.context_window_override_tokens?.toLocaleString()} tokens。</p>
                 <button type="button" className="button button-secondary button-small" onClick={() => setDraft({ ...draft, clearContextWindowOverride: true })} disabled={draft.clearContextWindowOverride}>{draft.clearContextWindowOverride ? '保存时将清除旧值' : '清除旧手工值，使用 Morde 目录容量'}</button>
@@ -268,6 +297,7 @@ function ModelCard({ model, shared, checked, check, streamCheck, onEdit }: {
         <div><span>服务商</span><strong>{modelHostLabel(model.base_url)}</strong></div>
         <div><span>API 密钥</span><strong>{shared ? '由管理员管理' : model.has_api_key ? '已保存' : '未配置'}</strong></div>
         <div><span>上下文窗口</span><strong>{model.context_window_tokens ? `${model.context_window_tokens.toLocaleString()} tokens` : '暂未识别'}</strong><small className="table-sub">来源：{contextWindowSourceLabel(model.context_window_source)}{model.context_window_catalog_version ? ` · 目录 ${model.context_window_catalog_version}` : ''}</small></div>
+        <div><span>单次生成上限</span><strong>{model.max_output_tokens == null ? '暂未识别' : `${model.max_output_tokens.toLocaleString()} tokens`}</strong><small className="table-sub">来源：{outputLimitSourceLabel(model.max_output_source)}{model.max_output_catalog_version ? ` · 目录版本 ${model.max_output_catalog_version}` : ''}{safeOutputSourceURL(model.max_output_source_url) && <> · <a href={safeOutputSourceURL(model.max_output_source_url)} target="_blank" rel="noopener noreferrer">查看来源</a></>}</small></div>
       </div>
       {model.checked_at ? <div className="model-capabilities">{capabilityLabel('文本', model.capabilities.text)}{capabilityLabel('工具调用', model.capabilities.tools)}{capabilityLabel('视觉', model.capabilities.vision)}{capabilityLabel('流式能力', model.capabilities.text_stream)}</div> : <p className="muted">能力尚未检查。</p>}
       {!shared && <p className="muted model-connection-cost-note">检查连接或流式回复会发起模型调用，可能产生用量。</p>}

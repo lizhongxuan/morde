@@ -148,21 +148,44 @@ func validBuiltinSearchArguments(name string, arguments json.RawMessage) bool {
 		return false
 	}
 	if key == "url" {
-		if len(input) != 1 {
-			return false
-		}
-	} else {
-		if len(input) < 1 || len(input) > 2 {
+		if len(input) < 1 || len(input) > 3 {
 			return false
 		}
 		for argument := range input {
-			if argument != "query" && argument != "time_range" {
+			if argument != "url" && argument != "startChar" && argument != "maxLength" {
+				return false
+			}
+		}
+		if rawStartChar, ok := input["startChar"]; ok {
+			var startChar int
+			if json.Unmarshal(rawStartChar, &startChar) != nil || startChar < 0 || startChar > 100000 {
+				return false
+			}
+		}
+		if rawMaxLength, ok := input["maxLength"]; ok {
+			var maxLength int
+			if json.Unmarshal(rawMaxLength, &maxLength) != nil || maxLength < 1 || maxLength > 2400 {
+				return false
+			}
+		}
+	} else {
+		if len(input) < 1 || len(input) > 3 {
+			return false
+		}
+		for argument := range input {
+			if argument != "query" && argument != "time_range" && argument != "categories" {
 				return false
 			}
 		}
 		if rawTimeRange, ok := input["time_range"]; ok {
 			var timeRange string
 			if json.Unmarshal(rawTimeRange, &timeRange) != nil || (timeRange != "day" && timeRange != "week" && timeRange != "month" && timeRange != "year") {
+				return false
+			}
+		}
+		if rawCategories, ok := input["categories"]; ok {
+			var categories string
+			if json.Unmarshal(rawCategories, &categories) != nil || categories != "news" {
 				return false
 			}
 		}

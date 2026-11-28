@@ -323,6 +323,52 @@ func TestTaskCgroupUsesExactPIDNamespaceMappingAndStopsOnlyOneTask(t *testing.T)
 	}
 }
 
+func TestHostProcessInspectorSnapshotsStableTaskSubtree(t *testing.T) {
+	procRoot := filepath.Join(t.TempDir(), "proc")
+	cgroupRoot := filepath.Join(t.TempDir(), "cgroup")
+	containerID := strings.Repeat("a", 64)
+	runtimePath := "/system.slice/docker-" + containerID + ".scope"
+	taskKey := strings.Repeat("1", 64)
+	taskPath := taskCgroupPath(runtimePath, taskKey)
+	childPath := taskPath + "/child"
+	runtimeDir := cgroupPathForRoot(cgroupRoot, runtimePath)
+	taskDir := cgroupPathForRoot(cgroupRoot, taskPath)
+	childDir := cgroupPathForRoot(cgroupRoot, childPath)
+	for _, dir := range []string{runtimeDir, taskDir, childDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeTestFile(t, filepath.Join(cgroupRoot, "cgroup.controllers"), "cpu memory")
+	writeTestFile(t, filepath.Join(runtimeDir, "cgroup.procs"), "100\n")
+	writeTaskCgroupFiles(t, taskDir, "101\n", "populated 1\n", "0")
+	writeTestFile(t, filepath.Join(childDir, "cgroup.procs"), "102\n")
+	writeFakeNamespaceProc(t, procRoot, 100, 1000, 77, []int{100, 1}, runtimePath)
+	writeFakeNamespaceProc(t, procRoot, 101, 1001, 77, []int{101, 2}, taskPath)
+	writeFakeNamespaceProc(t, procRoot, 102, 1002, 77, []int{102, 3}, childPath)
+	writeTestFile(t, filepath.Join(procRoot, "101", "stat"), string(fakeProcStatWithParent(101, 100, 1001)))
+	writeTestFile(t, filepath.Join(procRoot, "102", "stat"), string(fakeProcStatWithParent(102, 101, 1002)))
+
+	inspector := hostProcessInspector{procRoot: procRoot, cgroupRoot: cgroupRoot}
+	runtimeProof := processProof{PID: 100, StartTimeTick: 1000, CgroupPath: runtimePath}
+	taskProof := taskProcessProof{ContainerPID: 2, HostPID: 101, StartTimeTick: 1001,
+		CgroupPath: taskPath, NamespaceInode: 77}
+	processes, err := inspector.SnapshotTaskProcess(containerID, runtimeProof, taskProof, taskKey)
+	if err != nil {
+		t.Fatalf("snapshot exact Task cgroup subtree: %v", err)
+	}
+	if len(processes) != 2 || processes[0] != (TaskProcessSnapshotEntry{PID: 2, State: "S", StartTimeTick: 1001, ParentOutsideScope: true}) ||
+		processes[1] != (TaskProcessSnapshotEntry{PID: 3, ParentPID: 2, State: "S", StartTimeTick: 1002}) {
+		t.Fatalf("Task process snapshot = %+v; want the stable, container-PID-sorted parent tree", processes)
+	}
+
+	foreignTaskPath := "/system.slice/docker-" + strings.Repeat("b", 64) + ".scope/task/child"
+	writeTestFile(t, filepath.Join(procRoot, "102", "cgroup"), "0::"+foreignTaskPath+"\n")
+	if _, err := inspector.SnapshotTaskProcess(containerID, runtimeProof, taskProof, taskKey); err == nil {
+		t.Fatal("Task process snapshot accepted a process outside its exact Guardian cgroup subtree")
+	}
+}
+
 func TestTaskCgroupPIDWriteUsesExactHostPID(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "cgroup.procs")
 	writeTestFile(t, path, "000")
@@ -662,6 +708,15 @@ func writeTestFile(t *testing.T, path, value string) {
 
 func fakeProcStat(pid int, startTime uint64) []byte {
 	fields := []string{"S"}
+	for len(fields) < 19 {
+		fields = append(fields, "0")
+	}
+	fields = append(fields, fmt.Sprint(startTime))
+	return []byte(fmt.Sprintf("%d (fake dsh process) %s", pid, strings.Join(fields, " ")))
+}
+
+func fakeProcStatWithParent(pid, parentPID int, startTime uint64) []byte {
+	fields := []string{"S", fmt.Sprint(parentPID)}
 	for len(fields) < 19 {
 		fields = append(fields, "0")
 	}

@@ -382,6 +382,41 @@ test('Portal bridge requires the current trusted top-level route and returns onl
   }
 });
 
+test('project upload rejects path-escaping and reserved project names before remote requests', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  mockFetch(calls);
+  const h = harness();
+  const selectedRoot = mkdtempSync(join(process.cwd(), '.morde-project-name-guard-'));
+  const selectedDirectory = join(selectedRoot, 'local-project');
+  mkdirSync(selectedDirectory);
+  try {
+    await h.ready();
+    const portal = h.views[0];
+    portal.webContents.url = appURL(h, '/hosts/sync?host=h1234567');
+    h.dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [selectedDirectory] });
+    const selection = await h.invoke('morde:portal-project-select-directory', portal.webContents, ['h1234567', 'w1234567']);
+
+    calls.length = 0;
+    const invalidNames = ['../escape', 'nested/project', 'CON', 'trailing.', 'x'.repeat(121)];
+    for (const projectName of invalidNames) {
+      await assert.rejects(
+        h.invoke('morde:portal-project-upload', portal.webContents, [selection.selectionID, projectName]),
+        /项目名必须是一个有效的目录名|项目名是系统保留名称/,
+        `project name ${JSON.stringify(projectName)} must be rejected`,
+      );
+    }
+    assert.equal(calls.some((call) => call.method === 'POST' && new URL(call.url).pathname.endsWith('/sync-folders')), false,
+      'invalid names must not register a cloud folder');
+    assert.equal(calls.some((call) => call.method === 'POST' && new URL(call.url).pathname.includes('/sync-sessions')), false,
+      'invalid names must not create an upload session');
+  } finally {
+    globalThis.fetch = originalFetch;
+    h.cleanup();
+    rmSync(selectedRoot, { recursive: true, force: true });
+  }
+});
+
 test('cancelling the native project upload confirmation never registers or starts a sync session', async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];

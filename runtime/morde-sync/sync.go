@@ -195,10 +195,33 @@ func Scan(ctx context.Context, directory string, report func(ScanProgress)) (Man
 // ScanMatchingIdentity reads only the selected directory after confirming that
 // the opened root still has the device and inode recorded by the PC client.
 func ScanMatchingIdentity(ctx context.Context, directory, device, inode string) (Manifest, error) {
+	return ScanMatchingIdentityWithProgress(ctx, directory, device, inode, nil)
+}
+
+// ScanMatchingIdentityWithProgress scans only the selected directory after
+// confirming that the opened root still has the device and inode recorded by
+// the PC client, reporting the same inventory and hash progress as Scan.
+func ScanMatchingIdentityWithProgress(ctx context.Context, directory, device, inode string, report func(ScanProgress)) (Manifest, error) {
 	if device == "" || inode == "" {
 		return Manifest{}, errors.New("selected workspace identity is required")
 	}
-	return scanWithIdentity(ctx, directory, device, inode, nil)
+	return scanWithIdentity(ctx, directory, device, inode, report)
+}
+
+// ScanOpenedRoot inventories and hashes the tree reachable through root without
+// reopening its path. The caller retains ownership of root. Holding the opened
+// root prevents a path replacement from redirecting the scan outside the
+// caller's already-authorized directory; entries are still checked before and
+// after hashing so concurrent changes fail closed.
+func ScanOpenedRoot(ctx context.Context, root *os.Root, report func(ScanProgress)) (Manifest, error) {
+	if ctx == nil || root == nil {
+		return Manifest{}, errors.New("context and opened workspace root are required")
+	}
+	if err := acquireOperation(ctx); err != nil {
+		return Manifest{}, err
+	}
+	defer func() { <-operationSlots }()
+	return scanOpenedRoot(ctx, root, report)
 }
 
 func scanWithIdentity(ctx context.Context, directory, device, inode string, report func(ScanProgress)) (Manifest, error) {
@@ -217,7 +240,14 @@ func scanWithIdentity(ctx context.Context, directory, device, inode string, repo
 	if device != "" && !matchesSelectedRootIdentity(root, device, inode) {
 		return Manifest{}, errors.New("selected workspace root identity changed")
 	}
+	return scanOpenedRoot(ctx, root, report)
+}
 
+func scanOpenedRoot(ctx context.Context, root *os.Root, report func(ScanProgress)) (Manifest, error) {
+	rootInfo, err := root.Stat(".")
+	if err != nil || !rootInfo.IsDir() {
+		return Manifest{}, errors.New("opened workspace root must be a directory")
+	}
 	var progressMu sync.Mutex
 	progress := ScanProgress{Phase: PhaseInventory}
 	reportProgress := func() {
@@ -609,6 +639,7 @@ func verifyInventory(ctx context.Context, root *os.Root, original []scannedFile,
 		before, after := originalDirectories[index], currentDirectories[index]
 		if before.directory.Path != after.directory.Path || !os.SameFile(before.info, after.info) ||
 			before.directory.Mode != after.directory.Mode || before.directory.ModTimeNS != after.directory.ModTimeNS ||
+			!sameUnixOwnership(before.info, after.info) ||
 			before.directory.MetadataKnown != after.directory.MetadataKnown ||
 			!sameMetadata(before.directory.Xattrs, before.directory.ACL, after.directory.Xattrs, after.directory.ACL) {
 			return fmt.Errorf("directory %q changed during scan: %w", before.directory.Path, ErrRescanRequired)
@@ -689,13 +720,33 @@ func validRelativePath(value string) error {
 
 func sameSnapshot(original os.FileInfo, expected File, actual os.FileInfo) bool {
 	if original == nil || actual == nil || !os.SameFile(original, actual) || actual.Size() != expected.Size ||
-		(expected.ModTimeKnown && actual.ModTime().UnixNano() != expected.ModTimeNS) {
+		(expected.ModTimeKnown && actual.ModTime().UnixNano() != expected.ModTimeNS) || !sameUnixOwnership(original, actual) {
 		return false
 	}
 	if expected.Kind == FileKindSymlink {
 		return actual.Mode()&os.ModeSymlink != 0 && expected.Mode == 0
 	}
 	return (expected.Kind == "" || expected.Kind == FileKindRegular) && actual.Mode().IsRegular() && uint32(actual.Mode().Perm()) == expected.Mode
+}
+
+// sameUnixOwnership preserves the scanner's fail-closed race check for owner
+// changes on Unix filesystems. Ownership is intentionally excluded from the
+// portable content snapshot digest because it is not present in the Task
+// Workspace manifest contract; where the platform exposes UID/GID, the scan
+// still rejects a change between inventory and verification.
+func sameUnixOwnership(left, right os.FileInfo) bool {
+	if left == nil || right == nil {
+		return false
+	}
+	leftStat, rightStat := statValue(left), statValue(right)
+	leftUID, leftUIDOK := numericField(leftStat.FieldByName("Uid"))
+	leftGID, leftGIDOK := numericField(leftStat.FieldByName("Gid"))
+	rightUID, rightUIDOK := numericField(rightStat.FieldByName("Uid"))
+	rightGID, rightGIDOK := numericField(rightStat.FieldByName("Gid"))
+	if !leftUIDOK && !leftGIDOK && !rightUIDOK && !rightGIDOK {
+		return true
+	}
+	return leftUIDOK && leftGIDOK && rightUIDOK && rightGIDOK && leftUID == rightUID && leftGID == rightGID
 }
 
 func readSymlink(root *os.Root, name string, expected os.FileInfo) (string, error) {

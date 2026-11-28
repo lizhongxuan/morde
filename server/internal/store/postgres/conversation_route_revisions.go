@@ -245,15 +245,22 @@ WHERE id=$1 AND owner_id=$2 AND initiator_id=$3 AND conversation_id=$4 AND proje
 		}
 		rows, err := tx.Query(ctx, `SELECT i.message_id,i.message_sequence,i.expected_revision,m.content,r.request_metadata,r.authorization_snapshot,r.state,
 COALESCE(c.state,''),c.decision,
-EXISTS(SELECT 1 FROM conversation_route_model_calls any_call WHERE any_call.message_id=i.message_id AND any_call.phase='normal')
+EXISTS(SELECT 1 FROM conversation_route_model_calls any_call WHERE any_call.message_id=i.message_id AND any_call.phase='normal'),
+CASE WHEN clarification.id IS NOT NULL THEN COALESCE(route_clarification.file_delivery_intent,'') ELSE '' END
 FROM task_revision_intents i JOIN conversation_message_routes r ON r.message_id=i.message_id
 JOIN conversation_messages m ON m.id=i.message_id AND m.owner_id=i.owner_id AND m.actor_id=i.initiator_id AND m.conversation_id=i.conversation_id
 LEFT JOIN conversation_route_model_calls c ON c.message_id=i.message_id AND c.service_instance_id=r.service_instance_id
  AND c.owner_id=i.owner_id AND c.actor_id=i.initiator_id AND c.conversation_id=i.conversation_id
  AND c.phase='normal' AND c.attempt=r.route_attempt
+LEFT JOIN conversation_route_file_delivery_clarifications route_clarification ON route_clarification.message_id=i.message_id
+ AND route_clarification.task_id=i.task_id AND route_clarification.expected_revision=i.expected_revision
+ AND route_clarification.status='answered'
+LEFT JOIN task_clarification_requests clarification ON clarification.id=route_clarification.clarification_id
+ AND clarification.task_id=i.task_id AND clarification.version=route_clarification.clarification_version
+ AND clarification.call_id='morde-route-file-delivery-intent' AND clarification.status='answered'
 WHERE i.task_id=$1 AND i.owner_id=$2 AND i.initiator_id=$3 AND i.conversation_id=$4 AND i.state='stopping'
  AND r.service_instance_id=$5::uuid AND r.owner_id=i.owner_id AND r.actor_id=i.initiator_id AND r.conversation_id=i.conversation_id
- AND m.role='user' AND m.task_id IS NULL
+ AND m.role='user' AND (m.task_id IS NULL OR m.task_id=i.task_id)
 ORDER BY i.expected_revision FOR UPDATE OF i,r,m`, taskID, ownerID, initiatorID, conversationID, instanceID)
 		if err != nil {
 			return fmt.Errorf("lock pending task revisions: %w", err)
@@ -266,10 +273,11 @@ ORDER BY i.expected_revision FOR UPDATE OF i,r,m`, taskID, ownerID, initiatorID,
 			var callState string
 			var decisionJSON []byte
 			var hasNormalCall bool
+			var resolvedRouteFileIntent string
 			item.claim.ServiceInstanceID = instanceID
 			item.claim.Message.OwnerID, item.claim.Message.ActorID, item.claim.Message.ConversationID = ownerID, initiatorID, conversationID
 			if err := rows.Scan(&item.claim.Message.ID, &item.claim.Message.Sequence, &item.expected, &item.claim.Message.Content,
-				&metadata, &authorization, &routeState, &callState, &decisionJSON, &hasNormalCall); err != nil {
+				&metadata, &authorization, &routeState, &callState, &decisionJSON, &hasNormalCall, &resolvedRouteFileIntent); err != nil {
 				rows.Close()
 				return fmt.Errorf("scan pending task revision: %w", err)
 			}
@@ -292,6 +300,16 @@ ORDER BY i.expected_revision FOR UPDATE OF i,r,m`, taskID, ownerID, initiatorID,
 					return deferRetry()
 				}
 				item.fileIntent = decision.FileDeliveryIntent
+				if item.fileIntent == task.FileDeliveryUnclear {
+					if resolvedRouteFileIntent != string(task.FileDeliveryNone) && resolvedRouteFileIntent != string(task.FileDeliveryRequired) {
+						rows.Close()
+						return deferRetry()
+					}
+					item.fileIntent = task.FileDeliveryIntent(resolvedRouteFileIntent)
+				} else if resolvedRouteFileIntent != "" {
+					rows.Close()
+					return deferRetry()
+				}
 			}
 			revisions = append(revisions, item)
 		}
@@ -305,10 +323,17 @@ ORDER BY i.expected_revision FOR UPDATE OF i,r,m`, taskID, ownerID, initiatorID,
 		}
 		var pendingCount int
 		var unrelatedPending bool
-		if err := tx.QueryRow(ctx, `SELECT count(*),COALESCE(bool_or(NOT ((
+		if err := tx.QueryRow(ctx, `SELECT count(*) FILTER (WHERE NOT EXISTS (
+ SELECT 1 FROM task_revision_intents route_intent WHERE route_intent.message_id=m.id AND route_intent.task_id=m.task_id
+  AND route_intent.state='stopping')),
+COALESCE(bool_or(NOT ((
  NOT EXISTS(SELECT 1 FROM task_revision_intents prior WHERE prior.message_id=m.id AND prior.task_id=m.task_id)
  AND EXISTS(SELECT 1 FROM conversation_message_routes r WHERE r.message_id=m.id AND r.state='routed')) OR
- EXISTS(SELECT 1 FROM task_revision_intents prior WHERE prior.message_id=m.id AND prior.task_id=m.task_id AND prior.state='applied'))),false)
+ EXISTS(SELECT 1 FROM task_revision_intents prior WHERE prior.message_id=m.id AND prior.task_id=m.task_id AND prior.state='applied') OR
+ EXISTS(SELECT 1 FROM task_revision_intents prior
+   JOIN conversation_route_file_delivery_clarifications resolved ON resolved.message_id=prior.message_id
+    AND resolved.task_id=prior.task_id AND resolved.expected_revision=prior.expected_revision AND resolved.status='answered'
+   WHERE prior.message_id=m.id AND prior.task_id=m.task_id AND prior.state='stopping'))),false)
 FROM conversation_messages m WHERE m.task_id=$1 AND m.owner_id=$2 AND m.role='user' AND m.delivery_status='pending'`, taskID, ownerID).
 			Scan(&pendingCount, &unrelatedPending); err != nil {
 			return fmt.Errorf("verify pending task messages before revision: %w", err)
@@ -345,7 +370,7 @@ FROM conversation_messages m WHERE m.task_id=$1 AND m.owner_id=$2 AND m.role='us
 				deliveryMode = app.AgentMessageDeliveryFollowup
 			}
 			result, err := tx.Exec(ctx, `UPDATE conversation_messages SET task_id=$2,delivery_status='pending',delivery_mode=$6
-WHERE id=$1 AND task_id IS NULL AND owner_id=$3 AND actor_id=$4 AND conversation_id=$5`,
+WHERE id=$1 AND (task_id IS NULL OR task_id=$2) AND owner_id=$3 AND actor_id=$4 AND conversation_id=$5`,
 				revision.claim.Message.ID, taskID, ownerID, initiatorID, conversationID, string(deliveryMode))
 			if err != nil || result.RowsAffected() != 1 {
 				return domain.NewError(domain.CodeConflict, "revision message changed before delivery")
@@ -397,12 +422,15 @@ func revisionAuthorizationCurrent(ctx context.Context, tx pgx.Tx, claim app.Conv
 		(auth.Kind == string(identity.KindClient) && !domain.ValidClientInstallationID(auth.ClientInstallationID)) {
 		return false, nil
 	}
+	// Session and client credentials do not persist per-token Task scopes in
+	// tokens.scopes; those scopes are only valid for API keys. Keep the original
+	// authenticated receipt scopes above, then revalidate the live credential,
+	// account, and (for clients) installation here.
 	var active bool
-	var scopes []string
 	err := tx.QueryRow(ctx, `SELECT u.status='approved' AND t.revoked_at IS NULL AND t.expires_at>clock_timestamp()
- AND t.kind=$3 AND COALESCE(t.client_installation_id,'')=$4,t.scopes
+ AND t.kind=$3 AND COALESCE(t.client_installation_id,'')=$4
 FROM users u JOIN tokens t ON t.owner_id=u.id WHERE u.id=$1 AND t.id=$2 FOR SHARE OF u,t`,
-		claim.Message.ActorID, auth.TokenID, auth.Kind, auth.ClientInstallationID).Scan(&active, &scopes)
+		claim.Message.ActorID, auth.TokenID, auth.Kind, auth.ClientInstallationID).Scan(&active)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
 	}
@@ -410,13 +438,6 @@ FROM users u JOIN tokens t ON t.owner_id=u.id WHERE u.id=$1 AND t.id=$2 FOR SHAR
 		return false, fmt.Errorf("check revision credential: %w", err)
 	}
 	if !active {
-		return false, nil
-	}
-	current := identity.Principal{Kind: identity.Kind(auth.Kind)}
-	for _, scope := range scopes {
-		current.Scopes = append(current.Scopes, identity.Scope(scope))
-	}
-	if !current.HasScope(identity.ScopeTaskSubmit) || !current.HasScope(identity.ScopeTaskControl) {
 		return false, nil
 	}
 	if auth.ClientInstallationID != "" {

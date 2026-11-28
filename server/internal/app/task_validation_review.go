@@ -63,13 +63,14 @@ type TaskValidationReviewModel struct {
 }
 
 type TaskValidationReviewCompletion struct {
-	Claim                 TaskValidationReviewClaim
-	SessionID             string
-	ResponseText          string
-	ExecutionModel        TaskValidationReviewModel
-	ReviewerModel         TaskValidationReviewModel
-	Report                TaskValidationReviewReport
-	ArtifactContentProofs []TaskValidationReviewArtifactContentProof
+	Claim                       TaskValidationReviewClaim
+	SessionID                   string
+	ResponseText                string
+	ExecutionModel              TaskValidationReviewModel
+	ReviewerModel               TaskValidationReviewModel
+	Report                      TaskValidationReviewReport
+	ArtifactContentProofs       []TaskValidationReviewArtifactContentProof
+	FinalWorkspaceSnapshotProof *TaskValidationFinalWorkspaceSnapshotProof
 }
 
 type TaskValidationReviewInput struct {
@@ -78,6 +79,9 @@ type TaskValidationReviewInput struct {
 	Evidence              *TaskValidationEvidenceRecord              `json:"evidence"`
 	EvidenceDetails       []TaskValidationReviewEvidenceDetail       `json:"evidence_details"`
 	ArtifactContentProofs []TaskValidationReviewArtifactContentProof `json:"-"`
+	// Replay is the server-attested typed check ledger for a fix task, or
+	// nil for any other task. Missing or invalid check receipts remain pending.
+	Replay *TaskValidationReplayEvidence `json:"replay,omitempty"`
 }
 
 type TaskValidationReviewEvidenceDetail struct {
@@ -99,6 +103,7 @@ type TaskValidationReviewStepDetail struct {
 	Truncated       bool                            `json:"truncated"`
 	ShellExecution  *TaskStepShellExecutionEvidence `json:"shell_execution,omitempty"`
 	ContentEvidence *TaskStepContentEvidence        `json:"content_evidence,omitempty"`
+	SourceLocations []TaskStepSourceLocation        `json:"source_locations,omitempty"`
 }
 
 type TaskValidationReviewArtifact struct {
@@ -273,6 +278,13 @@ type TaskValidationReviewSnapshotReader interface {
 	GetTaskValidationReviewSnapshot(context.Context, TaskValidationReviewClaim) (TaskDetails, error)
 	GetTaskValidationReviewStepDetail(context.Context, TaskValidationReviewClaim, string) (TaskStepDetail, error)
 	OpenTaskValidationReviewArtifactContent(context.Context, TaskValidationReviewClaim, string) (TaskArtifactContent, error)
+}
+
+// TaskValidationReplayEvidenceReader returns the durable typed-check view for
+// an active review claim. Verdict completion independently reads the ledger
+// again and does not trust this model-input snapshot.
+type TaskValidationReplayEvidenceReader interface {
+	ReadTaskValidationReplayEvidence(context.Context, TaskValidationReviewClaim) (*TaskValidationReplayEvidence, error)
 }
 
 // TaskValidationReviewClaimVerifier checks that an internal review claim still

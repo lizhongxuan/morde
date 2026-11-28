@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"math/rand"
 	"strings"
 	"sync"
 	"time"
@@ -166,7 +167,7 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 		w.options.Logger.Warn("conversation route model capacity is unknown; using minimum supported window",
 			zap.String("job", "conversation_route"))
 	}
-	if snapshot.Context.ResultReview == nil {
+	if snapshot.Context.ResultReview == nil && claim.Input.ResponseMode != app.ConversationResponseLongForm {
 		compacted, err := w.compactConversationSummary(routeCtx, claim, modelID)
 		if err != nil {
 			if routeCtx.Err() != nil {
@@ -224,6 +225,17 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 		return true, w.failRoute(ctx, claim, "message_too_long",
 			conversationRouteBudgetDiagnostic(err, "worker_context_fit", contextWindow, capacityKnown, classifyContext))
 	}
+	if claim.Input.ResponseMode == app.ConversationResponseLongForm {
+		generator, ok := w.options.Models.(app.ConversationRouteLongReplyGenerator)
+		if !ok {
+			return true, w.failRoute(ctx, claim, "model_unavailable", errors.New("long-form conversation model path is unavailable"))
+		}
+		decision, err := w.generateLongConversationReply(routeCtx, claim, classifyContext, generator)
+		if err != nil {
+			return true, w.failRoute(ctx, claim, "model_unavailable", err)
+		}
+		return true, w.options.Actions.ApplyConversationRoute(routeCtx, claim, snapshot, decision)
+	}
 	decision := app.ConversationRouteDecision{Action: app.ConversationRouteNew}
 	if classifyContext.Content != "" || len(classifyContext.Candidates) != 0 || classifyContext.ReferenceTaskID != "" ||
 		classifyContext.PreviousUnresolved || classifyContext.SummaryVersion > 0 || classifyContext.ResultReview != nil {
@@ -246,6 +258,7 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 						return true, nil
 					}
 				}
+				return true, w.failRoute(ctx, claim, "routing_context_unavailable", err)
 			}
 			if !snapshot.PreviousMissing && claim.Input.ResultReviewID == "" && domain.CodeOf(err) == domain.CodeConflict && ctx.Err() == nil {
 				if recovery, ok := w.options.Actions.(app.ConversationRouteContextRecovery); ok {
@@ -278,13 +291,14 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 					}
 				}
 			}
-			// Classification failed after every model-side recovery. Use
-			// bounded fallbacks only where they do not execute task-control
-			// actions; ambiguous requests are clarified without execution.
-			w.options.Logger.Warn("conversation route classification failed; requesting safe clarification",
+			// Classification failure is an infrastructure outcome, not evidence
+			// that the user's goal is ambiguous. Keep the accepted source message
+			// retryable; the route ledger decides whether an unknown call must be
+			// reconciled before a new attempt can be dispatched.
+			w.options.Logger.Warn("conversation route classification failed; preserving source for retry",
 				zap.String("job", "conversation_route"), zap.String("message_id", claim.Message.ID),
 				zap.String("failure_code", string(domain.CodeOf(err))))
-			decision = conversationRouteClassifyFallback(classifyContext)
+			return true, w.failRoute(ctx, claim, "model_unavailable", err)
 		}
 	}
 	if decision.InvalidOutput {
@@ -305,7 +319,8 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 			zap.String("failure_code", "invalid_model_output"),
 			zap.Int("invalid_output_length_bytes", decision.InvalidOutputLengthBytes),
 			zap.Bool("invalid_output_utf8_valid", decision.InvalidOutputUTF8Valid))
-		decision = conversationRouteClassifyFallback(classifyContext)
+		return true, w.failRoute(ctx, claim, "routing_action_unavailable",
+			errors.New("conversation route model output remained invalid after repair"))
 	}
 	decision = safeConversationRouteDecision(classifyContext, decision)
 	if decision.InvalidOutput {
@@ -345,26 +360,125 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
+func (w *ConversationRouteWorker) generateLongConversationReply(ctx context.Context, claim app.ConversationRouteClaim,
+	value app.ConversationRouteContext, generator app.ConversationRouteLongReplyGenerator) (app.ConversationRouteDecision, error) {
+	checker, ok := w.options.Actions.(app.ConversationRouteCancellationChecker)
+	if !ok {
+		return app.ConversationRouteDecision{}, errors.New("long-form conversation cancellation check is unavailable")
+	}
+	cancelledDecision := app.ConversationRouteDecision{Action: app.ConversationRouteReply, LongReply: true, Cancelled: true}
+	requested, err := checker.ConversationRouteCancellationRequested(ctx, claim)
+	if err != nil {
+		return app.ConversationRouteDecision{}, err
+	}
+	if requested {
+		return cancelledDecision, nil
+	}
+	callCtx, cancelCall := context.WithTimeout(ctx, app.ConversationLongReplyTimeout)
+	watchCtx, stopWatch := context.WithCancel(ctx)
+	cancelled := make(chan struct{}, 1)
+	watchErrors := make(chan error, 1)
+	watchDone := make(chan struct{})
+	go func() {
+		defer close(watchDone)
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-watchCtx.Done():
+				return
+			case <-ticker.C:
+				requested, checkErr := checker.ConversationRouteCancellationRequested(watchCtx, claim)
+				if checkErr != nil {
+					select {
+					case watchErrors <- checkErr:
+					default:
+					}
+					cancelCall()
+					return
+				}
+				if requested {
+					select {
+					case cancelled <- struct{}{}:
+					default:
+					}
+					cancelCall()
+					return
+				}
+			}
+		}
+	}()
+	decision, callErr := generator.GenerateConversationLongReply(callCtx, claim, value)
+	stopWatch()
+	cancelCall()
+	<-watchDone
+	select {
+	case <-cancelled:
+		return cancelledDecision, nil
+	case watchErr := <-watchErrors:
+		return app.ConversationRouteDecision{}, watchErr
+	default:
+	}
+	// A cancellation can race with the final provider response and the watcher
+	// tick. Recheck before allowing a settled answer to become visible.
+	requested, checkErr := checker.ConversationRouteCancellationRequested(ctx, claim)
+	if checkErr != nil {
+		return app.ConversationRouteDecision{}, checkErr
+	}
+	if requested {
+		return cancelledDecision, nil
+	}
+	return decision, callErr
+}
+
+// conversationRouteRetryAfterHorizon is the durable route queue's horizon
+// for a provider-named wait (M09-02/M09-05). It is deliberately longer than
+// the E12 ladder's ModelRetryMaxRetryAfter (600s): a provider-named wait is
+// a scheduled resume persisted as available_after, not a ladder retry delay,
+// so it is honoured up to 24h and only ends the attempt beyond that.
+const conversationRouteRetryAfterHorizon = 24 * time.Hour
+
+// conversationRouteRateLimitDelay decides whether a confirmed provider 429
+// requeues the route and for how long. The delay is the E12 ladder: a
+// provider Retry-After wins (honoured up to the durable 24h horizon, never
+// truncated), otherwise the jittered backoff (base 5s / max 120s) indexed by
+// the persisted route attempt. Returning (0, true) ends the attempt: the
+// store then marks the route failed instead of requeueing it. The retry
+// count itself stays durable in the store (three rejected calls, counted
+// from the route ledger), so a worker restart cannot reset the ladder.
 func conversationRouteRateLimitDelay(claim app.ConversationRouteClaim, err error) (time.Duration, bool) {
 	var routeErr *domain.Error
 	if !errors.As(err, &routeErr) || routeErr.Code != domain.CodeRateLimited ||
 		routeErr.Details["reason"] != string(app.ModelErrorRateLimited) || routeErr.Details["stage"] != "provider_status" {
 		return 0, false
 	}
-	if routeErr.Details["retry_after_exceeds_durable_horizon"] == "true" || routeErr.RetryAfter > 24*time.Hour {
+	classification := app.ClassifyModelClientError(err)
+	if !classification.Known || classification.Reason != app.FailoverRateLimit {
+		return 0, false
+	}
+	if routeErr.Details["retry_after_exceeds_durable_horizon"] == "true" || routeErr.RetryAfter > conversationRouteRetryAfterHorizon {
 		// The durable route queue supports at most 24 hours; do not retry earlier than the provider requested.
 		return 0, true
 	}
-	if routeErr.RetryAfter > 0 {
-		retryAfter := routeErr.RetryAfter
-		delay := retryAfter / time.Second
-		if retryAfter%time.Second != 0 {
-			delay++
-		}
-		return delay * time.Second, true
+	// Use the shared failover decision for the same-provider retry budget and
+	// Retry-After handling. The route store remains authoritative for the
+	// durable rejected-attempt count and next-attempt schedule.
+	if claim.RouteAttempt < 0 || claim.RouteAttempt >= int64(app.ModelRetryMaxRetries) {
+		return 0, true
 	}
-	shift := min(max(claim.RouteAttempt-1, int64(0)), int64(2))
-	return time.Second << shift, true
+	decision := app.DecideModelRetry(classification, int(claim.RouteAttempt), routeErr.RetryAfter,
+		conversationRouteRetryAfterHorizon, rand.Float64)
+	if decision.Action != app.ModelRetryActionRetry {
+		return 0, true
+	}
+	delay := decision.Delay
+	// The store requires whole seconds; round up so the wait is never
+	// shorter than the ladder computed.
+	seconds := delay / time.Second
+	if delay%time.Second != 0 {
+		seconds++
+	}
+	return seconds * time.Second, true
 }
 
 // conversationRouteHistoryPreviewBytes bounds one history entry when the
@@ -653,6 +767,14 @@ func (w *ConversationRouteWorker) failRoute(ctx context.Context, claim app.Conve
 			fields = append(fields, zap.Int("history_bytes", historyBytes))
 		}
 	}
+	// The failover reason is a bounded 31-value label, never raw provider
+	// text, so the terminal state stays locatable from the log alone.
+	if classification := app.ClassifyModelClientError(cause); classification.Known {
+		fields = append(fields, zap.String("failover_reason", string(classification.Reason)))
+		if classification.Strategy.UserVisibleCase > 0 {
+			fields = append(fields, zap.Int("user_visible_case", classification.Strategy.UserVisibleCase))
+		}
+	}
 	w.options.Logger.Warn("conversation route failed", fields...)
 	if err := w.options.Actions.FailConversationRoute(ctx, claim, reason); err != nil {
 		return errors.Join(cause, err)
@@ -805,30 +927,4 @@ func safeConversationRouteDecision(value app.ConversationRouteContext, decision 
 		}
 	}
 	return clarify
-}
-
-// conversationRouteClassifyFallback safely handles a message whose model
-// classification failed. It never derives a task action from message text.
-func conversationRouteClassifyFallback(value app.ConversationRouteContext) app.ConversationRouteDecision {
-	if value.ReferenceUnavailable {
-		return app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: app.UnavailableRouteReferenceMessage}
-	}
-	if value.PreviousMissing {
-		return app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
-			Question: "我无法确认这条消息依赖的上下文。请补充相关内容，或把请求完整重发。"}
-	}
-	if value.PreviousUnresolved {
-		return app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
-			Question: "上一条请求还没有完成，这条消息尚未执行。请补充你希望完成的目标，以及它与上一项工作的关系。"}
-	}
-	if value.ContentTruncated || len(value.ContentSources) != 0 {
-		return app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
-			Question: "我还不能确认这条请求的完整目标，因此尚未执行。请补充完整需求或说明希望完成的工作。"}
-	}
-	if value.ResultReview != nil {
-		return app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
-			Question: "我无法确认这条结果反馈的处理意图，因此尚未修改任务结果。请补充希望调整的内容。"}
-	}
-	return app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
-		Question: "我还不能确认你希望完成什么，因此尚未执行任务操作。请补充具体目标。"}
 }

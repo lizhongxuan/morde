@@ -21,10 +21,10 @@ import (
 	"morde/server/internal/domain/task"
 )
 
-const scheduleColumns = `id, owner_id, version, status, execution_epoch, host_id, model_id, title, objective, timing,
+const scheduleColumns = `id, owner_id, version, status, execution_epoch, host_id, model_id, title, objective, file_delivery_intent, timing,
 budget_active_seconds, budget_tool_calls, budget_model_tokens, auth_kind, auth_token_id, auth_scopes, auth_client_installation_id,
 misfire_policy, notification_events, next_occurrence_key, next_run_at, next_check_at, observation_spec,
-observation_config_hash, baseline_fingerprint, created_at, updated_at, execution_policy`
+personal_rule_binding, observation_config_hash, baseline_fingerprint, created_at, updated_at, execution_policy`
 
 func storedScheduleExecutionPolicy(value schedule.ExecutionPolicy) schedule.ExecutionPolicy {
 	if value == "" {
@@ -38,6 +38,9 @@ type scheduleRowScanner interface {
 }
 
 func (s *Store) CreateSchedule(ctx context.Context, value schedule.Schedule, record app.IdempotencyRecord) (schedule.Schedule, bool, error) {
+	if value.FileDeliveryIntent == "" {
+		value.FileDeliveryIntent = task.FileDeliveryNone
+	}
 	if record.OwnerID != value.OwnerID || record.ResourceID != value.ID || !schedule.ValidID(value.ID) || !domain.ValidUserID(value.OwnerID) {
 		return schedule.Schedule{}, false, domain.InvalidArgument("schedule", "schedule owner or idempotency fields are invalid")
 	}
@@ -59,12 +62,19 @@ func (s *Store) CreateSchedule(ctx context.Context, value schedule.Schedule, rec
 		if err != nil {
 			return err
 		}
+		if err := lockSchedulePersonalRuleOwner(ctx, tx, value.OwnerID); err != nil {
+			return err
+		}
 		valid, err := validateScheduleAuthorizationInTx(ctx, tx, value.OwnerID, value.Authorization)
 		if err != nil {
 			return err
 		}
 		if !valid {
 			return domain.NewError(domain.CodeUnauthenticated, "schedule authorization is unavailable")
+		}
+		value.PersonalRule, err = resolveSchedulePersonalRuleBindingInTx(ctx, tx, value.OwnerID, value.PersonalRule)
+		if err != nil {
+			return err
 		}
 		value.ExecutionPolicy = storedScheduleExecutionPolicy(value.ExecutionPolicy)
 		value.ExecutionEpoch = gate.epoch
@@ -82,18 +92,23 @@ func (s *Store) CreateSchedule(ctx context.Context, value schedule.Schedule, rec
 		if err != nil {
 			return err
 		}
+		personalRuleBinding, err := marshalPersonalRuleBinding(value.PersonalRule)
+		if err != nil {
+			return err
+		}
 		_, err = tx.Exec(ctx, `INSERT INTO schedules (
-id, owner_id, version, status, execution_epoch, host_id, model_id, title, objective, timing,
+id, owner_id, version, status, execution_epoch, host_id, model_id, title, objective, file_delivery_intent, timing,
 budget_active_seconds, budget_tool_calls, budget_model_tokens, auth_kind, auth_token_id, auth_scopes,
 auth_client_installation_id, misfire_policy, notification_events, next_occurrence_key, next_run_at, next_check_at, observation_spec,
-observation_config_hash, baseline_fingerprint, execution_policy
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)`,
-			value.ID, value.OwnerID, value.Version, string(value.Status), value.ExecutionEpoch, nullableText(value.HostID), value.ModelID, value.Title, value.Objective, timing,
+personal_rule_binding, observation_config_hash, baseline_fingerprint, execution_policy
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28)`,
+			value.ID, value.OwnerID, value.Version, string(value.Status), value.ExecutionEpoch, nullableText(value.HostID), value.ModelID, value.Title, value.Objective,
+			string(value.FileDeliveryIntent), timing,
 			value.Budget.ActiveSeconds, value.Budget.ToolCalls, value.Budget.ModelTokens, value.Authorization.Kind,
 			value.Authorization.TokenID, nonNilStrings(value.Authorization.Scopes), nullableText(value.Authorization.ClientInstallationID), string(value.MisfirePolicy),
 			notificationEventStrings(value.NotificationEvents), value.NextOccurrenceKey,
 			nullableTimestamp(value.NextRunAt), nullableTimestamp(value.NextCheckAt), observation,
-			value.ObservationConfigHash, value.BaselineFingerprint, string(value.ExecutionPolicy))
+			personalRuleBinding, value.ObservationConfigHash, value.BaselineFingerprint, string(value.ExecutionPolicy))
 		if err != nil {
 			return fmt.Errorf("create schedule: %w", err)
 		}
@@ -175,6 +190,9 @@ func (s *Store) GetSchedule(ctx context.Context, ownerID, id string) (schedule.S
 }
 
 func (s *Store) UpdateSchedule(ctx context.Context, ownerID string, record app.IdempotencyRecord, value schedule.Schedule, expectedVersion int64) (schedule.Schedule, error) {
+	if value.FileDeliveryIntent == "" {
+		value.FileDeliveryIntent = task.FileDeliveryNone
+	}
 	if !domain.ValidUserID(ownerID) || value.OwnerID != ownerID || record.OwnerID != ownerID || record.Operation != "schedule.update" ||
 		record.ResourceID != value.ID || expectedVersion < 1 || !schedule.ValidID(value.ID) {
 		return schedule.Schedule{}, domain.InvalidArgument("schedule", "schedule update fields are invalid")
@@ -190,6 +208,9 @@ func (s *Store) UpdateSchedule(ctx context.Context, ownerID string, record app.I
 				return domain.NewError(domain.CodeIdempotencyConflict, "idempotency key was used for a different schedule")
 			}
 			result, err = loadSchedule(ctx, tx, ownerID, stored.ResourceID)
+			return err
+		}
+		if err := lockSchedulePersonalRuleOwner(ctx, tx, ownerID); err != nil {
 			return err
 		}
 		gate, err := lockOwnerExecutionControl(ctx, tx, ownerID, false)
@@ -209,6 +230,10 @@ func (s *Store) UpdateSchedule(ctx context.Context, ownerID string, record app.I
 		}
 		if !valid {
 			return domain.NewError(domain.CodeUnauthenticated, "schedule authorization is unavailable")
+		}
+		value.PersonalRule, err = resolveSchedulePersonalRuleBindingInTx(ctx, tx, ownerID, value.PersonalRule)
+		if err != nil {
+			return err
 		}
 		value.Version = current.Version + 1
 		value.ExecutionEpoch = gate.epoch
@@ -267,6 +292,9 @@ func (s *Store) SetScheduleStatus(ctx context.Context, record app.IdempotencyRec
 			result, err = loadSchedule(ctx, tx, record.OwnerID, stored.ResourceID)
 			return err
 		}
+		if err := lockSchedulePersonalRuleOwner(ctx, tx, record.OwnerID); err != nil {
+			return err
+		}
 		value, err := loadScheduleForUpdate(ctx, tx, record.OwnerID, id, true)
 		if err != nil {
 			return err
@@ -292,6 +320,13 @@ func (s *Store) SetScheduleStatus(ctx context.Context, record app.IdempotencyRec
 			}
 			if !valid {
 				return domain.NewError(domain.CodeUnauthenticated, "schedule authorization is unavailable")
+			}
+			bindingValid, err := schedulePersonalRuleBindingValidInTx(ctx, tx, record.OwnerID, value.PersonalRule)
+			if err != nil {
+				return err
+			}
+			if !bindingValid {
+				return domain.NewError(domain.CodeConflict, "the selected personal rule changed or is no longer available; edit the schedule before enabling it")
 			}
 		}
 		if changed {
@@ -382,6 +417,7 @@ func (s *Store) ListScheduleRuns(ctx context.Context, ownerID, scheduleID string
 	}
 	rows, err := s.pool.Query(ctx, `SELECT r.id,r.schedule_id,r.owner_id,r.schedule_version,r.occurrence_key,r.scheduled_at,
 r.coalesced_count,r.status,r.skip_reason,r.task_id,r.notification_events,r.observation_spec,r.observation_config_hash,
+r.personal_rule_binding,r.personal_rule_validation_status,r.personal_rule_validated_at,r.personal_rule_revoked_at,
 r.observation_outcome,r.observation_fingerprint,r.created_at,r.updated_at,r.finished_at,
 t.status,t.updated_at,t.finished_at
 FROM schedule_runs r JOIN schedules s ON s.id=r.schedule_id AND s.owner_id=r.owner_id
@@ -480,6 +516,9 @@ func (s *Store) CommitScheduleOccurrence(ctx context.Context, commit app.Schedul
 		if err != nil {
 			return err
 		}
+		if err := lockSchedulePersonalRuleOwner(ctx, tx, commit.OwnerID); err != nil {
+			return err
+		}
 		value, err := loadScheduleForOccurrence(ctx, tx, commit.OwnerID, commit.ScheduleID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
@@ -504,6 +543,17 @@ func (s *Store) CommitScheduleOccurrence(ctx context.Context, commit app.Schedul
 			return err
 		}
 		occurrence := commit.Occurrence
+		personalRuleRevoked := false
+		bindingValid, err := schedulePersonalRuleBindingValidInTx(ctx, tx, value.OwnerID, value.PersonalRule)
+		if err != nil {
+			return err
+		}
+		if !bindingValid {
+			reason := schedule.SkipPersonalRuleRevoked
+			occurrence.Status, occurrence.SkipReason, occurrence.CoalescedCount = schedule.RunSkipped, &reason, 0
+			taskID = ""
+			personalRuleRevoked = true
+		}
 		if !validAuthorization {
 			reason := schedule.SkipAuthorizationEnded
 			occurrence.Status, occurrence.SkipReason, occurrence.CoalescedCount = schedule.RunSkipped, &reason, 0
@@ -569,7 +619,7 @@ ORDER BY r.created_at DESC,r.id DESC LIMIT 1 FOR UPDATE OF t`, value.ID).Scan(&p
 			}
 			taskValue := normalizeNewTask(task.Task{
 				ID: taskID, OwnerID: value.OwnerID, InitiatorID: value.OwnerID, ConversationID: conversationID, HostID: value.HostID,
-				ExecutionLocation: "server", ModelID: value.ModelID, Objective: value.Objective, Status: task.StatusQueued,
+				ExecutionLocation: "server", ModelID: value.ModelID, Objective: value.Objective, FileDeliveryIntent: value.FileDeliveryIntent, Status: task.StatusQueued,
 				Authorization: internalAuthorization, Budget: value.Budget,
 			})
 			if err := validateTask(taskValue); err != nil {
@@ -616,17 +666,37 @@ ORDER BY r.created_at DESC,r.id DESC LIMIT 1 FOR UPDATE OF t`, value.ID).Scan(&p
 		if err != nil {
 			return err
 		}
+		personalRuleBinding, err := marshalPersonalRuleBinding(value.PersonalRule)
+		if err != nil {
+			return err
+		}
+		personalRuleValidationStatus := schedule.PersonalRuleNotBound
+		if value.PersonalRule != nil {
+			personalRuleValidationStatus = schedule.PersonalRuleValidated
+			if personalRuleRevoked {
+				personalRuleValidationStatus = schedule.PersonalRuleRevoked
+			}
+		}
 		_, err = tx.Exec(ctx, `INSERT INTO schedule_runs (
 id,schedule_id,owner_id,schedule_version,occurrence_key,scheduled_at,coalesced_count,status,skip_reason,task_id,notification_events,
-observation_spec,observation_config_hash,observation_outcome,observation_fingerprint,finished_at
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'unknown','',CASE WHEN $8 IN ('skipped','missed') THEN clock_timestamp() ELSE NULL END)`, runID, value.ID, value.OwnerID, value.Version,
+observation_spec,personal_rule_binding,personal_rule_validation_status,personal_rule_validated_at,personal_rule_revoked_at,
+observation_config_hash,observation_outcome,observation_fingerprint,finished_at
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,
+  CASE WHEN $14='validated' THEN clock_timestamp() ELSE NULL END,
+  CASE WHEN $14='revoked' THEN clock_timestamp() ELSE NULL END,
+  $15,'unknown','',CASE WHEN $8 IN ('skipped','missed') THEN clock_timestamp() ELSE NULL END)`, runID, value.ID, value.OwnerID, value.Version,
 			occurrence.Key, scheduledAt, occurrence.CoalescedCount, string(occurrence.Status), skipReason,
-			taskIDValue, notificationEventStrings(commit.NotificationEvents), observation, value.ObservationConfigHash)
+			taskIDValue, notificationEventStrings(commit.NotificationEvents), observation, personalRuleBinding,
+			string(personalRuleValidationStatus), value.ObservationConfigHash)
 		if err != nil {
 			return fmt.Errorf("record schedule occurrence: %w", err)
 		}
 		var completedDefinitionVersion int64
-		if value.Timing.Kind == schedule.TimingOnce {
+		if personalRuleRevoked {
+			_, err = tx.Exec(ctx, `UPDATE schedules SET status='disabled',version=version+1,next_occurrence_key='',next_run_at=NULL,next_check_at=NULL,updated_at=clock_timestamp()
+WHERE id=$1 AND owner_id=$2`, value.ID, value.OwnerID)
+			completedDefinitionVersion = value.Version + 1
+		} else if value.Timing.Kind == schedule.TimingOnce {
 			_, err = tx.Exec(ctx, `UPDATE schedules SET status='completed',version=version+1,next_occurrence_key='',next_run_at=NULL,next_check_at=NULL,updated_at=clock_timestamp()
 WHERE id=$1 AND owner_id=$2`, value.ID, value.OwnerID)
 			completedDefinitionVersion = value.Version + 1
@@ -655,16 +725,21 @@ WHERE id=$1 AND owner_id=$2`, value.ID, value.OwnerID, commit.NextOccurrence.Key
 			ID: runID, ScheduleID: value.ID, ScheduleVersion: value.Version, OccurrenceKey: occurrence.Key,
 			ScheduledAt: occurrence.ScheduledAt, CoalescedCount: occurrence.CoalescedCount, Status: occurrence.Status,
 			SkipReason: occurrence.SkipReason, NotificationEvents: append([]schedule.NotificationEvent(nil), commit.NotificationEvents...),
-			Observation: value.Observation, ObservationConfigHash: value.ObservationConfigHash, ObservationOutcome: schedule.ObservationUnknown,
+			Observation: value.Observation, PersonalRule: value.PersonalRule, ObservationConfigHash: value.ObservationConfigHash, ObservationOutcome: schedule.ObservationUnknown,
 		}
 		if taskID != "" {
 			result.TaskID = &taskID
 		}
-		var finishedAt pgtype.Timestamptz
-		if err := tx.QueryRow(ctx, `SELECT created_at,updated_at,finished_at FROM schedule_runs WHERE id=$1`, runID).
-			Scan(&result.CreatedAt, &result.UpdatedAt, &finishedAt); err != nil {
+		var finishedAt, ruleValidatedAt, ruleRevokedAt pgtype.Timestamptz
+		var storedRuleValidationStatus string
+		if err := tx.QueryRow(ctx, `SELECT created_at,updated_at,finished_at,personal_rule_validation_status,
+personal_rule_validated_at,personal_rule_revoked_at FROM schedule_runs WHERE id=$1`, runID).
+			Scan(&result.CreatedAt, &result.UpdatedAt, &finishedAt, &storedRuleValidationStatus, &ruleValidatedAt, &ruleRevokedAt); err != nil {
 			return fmt.Errorf("read created schedule run: %w", err)
 		}
+		result.PersonalRuleValidationStatus = schedule.PersonalRuleValidationStatus(storedRuleValidationStatus)
+		result.PersonalRuleValidatedAt = timePointer(ruleValidatedAt)
+		result.PersonalRuleRevokedAt = timePointer(ruleRevokedAt)
 		if finishedAt.Valid {
 			result.FinishedAt = &finishedAt.Time
 		}
@@ -725,6 +800,7 @@ func loadLastScheduleRun(ctx context.Context, queryer interface {
 }, id, ownerID string) (*schedule.Run, error) {
 	row, err := scanRunWithTask(queryer.QueryRow(ctx, `SELECT r.id,r.schedule_id,r.owner_id,r.schedule_version,r.occurrence_key,r.scheduled_at,
 r.coalesced_count,r.status,r.skip_reason,r.task_id,r.notification_events,r.observation_spec,r.observation_config_hash,
+r.personal_rule_binding,r.personal_rule_validation_status,r.personal_rule_validated_at,r.personal_rule_revoked_at,
 r.observation_outcome,r.observation_fingerprint,r.created_at,r.updated_at,r.finished_at,
 t.status,t.updated_at,t.finished_at
 FROM schedule_runs r LEFT JOIN tasks t ON t.id=r.task_id
@@ -743,6 +819,7 @@ func loadCurrentScheduleRun(ctx context.Context, queryer interface {
 }, id, ownerID string) (*schedule.Run, error) {
 	row, err := scanRunWithTask(queryer.QueryRow(ctx, `SELECT r.id,r.schedule_id,r.owner_id,r.schedule_version,r.occurrence_key,r.scheduled_at,
 r.coalesced_count,r.status,r.skip_reason,r.task_id,r.notification_events,r.observation_spec,r.observation_config_hash,
+r.personal_rule_binding,r.personal_rule_validation_status,r.personal_rule_validated_at,r.personal_rule_revoked_at,
 r.observation_outcome,r.observation_fingerprint,r.created_at,r.updated_at,r.finished_at,
 t.status,t.updated_at,t.finished_at
 FROM schedule_runs r JOIN tasks t ON t.id=r.task_id
@@ -761,14 +838,14 @@ func scanSchedule(row scheduleRowScanner) (schedule.Schedule, error) {
 	var value schedule.Schedule
 	var status, authKind, misfirePolicy, executionPolicy string
 	var authClientInstallationID pgtype.Text
-	var timingJSON, observationJSON []byte
+	var timingJSON, observationJSON, personalRuleBindingJSON []byte
 	var authScopes, notificationEvents []string
 	var nextRunAt, nextCheckAt, createdAt, updatedAt pgtype.Timestamptz
 	var hostID pgtype.Text
 	err := row.Scan(&value.ID, &value.OwnerID, &value.Version, &status, &value.ExecutionEpoch, &hostID, &value.ModelID,
-		&value.Title, &value.Objective, &timingJSON, &value.Budget.ActiveSeconds, &value.Budget.ToolCalls, &value.Budget.ModelTokens,
+		&value.Title, &value.Objective, &value.FileDeliveryIntent, &timingJSON, &value.Budget.ActiveSeconds, &value.Budget.ToolCalls, &value.Budget.ModelTokens,
 		&authKind, &value.Authorization.TokenID, &authScopes, &authClientInstallationID, &misfirePolicy, &notificationEvents, &value.NextOccurrenceKey,
-		&nextRunAt, &nextCheckAt, &observationJSON, &value.ObservationConfigHash, &value.BaselineFingerprint, &createdAt, &updatedAt, &executionPolicy)
+		&nextRunAt, &nextCheckAt, &observationJSON, &personalRuleBindingJSON, &value.ObservationConfigHash, &value.BaselineFingerprint, &createdAt, &updatedAt, &executionPolicy)
 	if err != nil {
 		return schedule.Schedule{}, err
 	}
@@ -781,6 +858,13 @@ func scanSchedule(row scheduleRowScanner) (schedule.Schedule, error) {
 			return schedule.Schedule{}, fmt.Errorf("decode schedule observation: %w", err)
 		}
 		value.Observation = &observation
+	}
+	if len(personalRuleBindingJSON) != 0 {
+		var binding schedule.PersonalRuleBinding
+		if err := json.Unmarshal(personalRuleBindingJSON, &binding); err != nil {
+			return schedule.Schedule{}, fmt.Errorf("decode schedule personal rule binding: %w", err)
+		}
+		value.PersonalRule = &binding
 	}
 	value.Status = schedule.Status(status)
 	value.HostID = hostID.String
@@ -797,13 +881,15 @@ func scanSchedule(row scheduleRowScanner) (schedule.Schedule, error) {
 
 func scanRunWithTask(row scheduleRowScanner) (schedule.Run, error) {
 	var value schedule.Run
-	var ownerID, status string
+	var ownerID, status, personalRuleValidationStatus string
 	var skipReason, taskID, taskStatus pgtype.Text
 	var scheduledAt, finishedAt, taskUpdatedAt, taskFinishedAt pgtype.Timestamptz
+	var personalRuleValidatedAt, personalRuleRevokedAt pgtype.Timestamptz
 	var notificationEvents []string
-	var observationJSON []byte
+	var observationJSON, personalRuleBindingJSON []byte
 	err := row.Scan(&value.ID, &value.ScheduleID, &ownerID, &value.ScheduleVersion, &value.OccurrenceKey, &scheduledAt,
 		&value.CoalescedCount, &status, &skipReason, &taskID, &notificationEvents, &observationJSON, &value.ObservationConfigHash,
+		&personalRuleBindingJSON, &personalRuleValidationStatus, &personalRuleValidatedAt, &personalRuleRevokedAt,
 		&value.ObservationOutcome, &value.ObservationFingerprint, &value.CreatedAt, &value.UpdatedAt, &finishedAt,
 		&taskStatus, &taskUpdatedAt, &taskFinishedAt)
 	if err != nil {
@@ -811,6 +897,9 @@ func scanRunWithTask(row scheduleRowScanner) (schedule.Run, error) {
 	}
 	value.ScheduledAt = timePointer(scheduledAt)
 	value.Status = schedule.RunStatus(status)
+	value.PersonalRuleValidationStatus = schedule.PersonalRuleValidationStatus(personalRuleValidationStatus)
+	value.PersonalRuleValidatedAt = timePointer(personalRuleValidatedAt)
+	value.PersonalRuleRevokedAt = timePointer(personalRuleRevokedAt)
 	value.NotificationEvents = scheduleNotificationEvents(notificationEvents)
 	if len(observationJSON) != 0 {
 		var observation schedule.ObservationSpec
@@ -818,6 +907,13 @@ func scanRunWithTask(row scheduleRowScanner) (schedule.Run, error) {
 			return schedule.Run{}, fmt.Errorf("decode schedule run observation: %w", err)
 		}
 		value.Observation = &observation
+	}
+	if len(personalRuleBindingJSON) != 0 {
+		var binding schedule.PersonalRuleBinding
+		if err := json.Unmarshal(personalRuleBindingJSON, &binding); err != nil {
+			return schedule.Run{}, fmt.Errorf("decode schedule run personal rule binding: %w", err)
+		}
+		value.PersonalRule = &binding
 	}
 	if skipReason.Valid {
 		reason := schedule.SkipReason(skipReason.String)
@@ -857,15 +953,19 @@ func updateScheduleRow(ctx context.Context, tx pgx.Tx, ownerID string, value sch
 	if err != nil {
 		return err
 	}
-	command, err := tx.Exec(ctx, `UPDATE schedules SET version=$3,status=$4,execution_epoch=$5,host_id=$6,model_id=$7,title=$8,objective=$9,timing=$10,
-budget_active_seconds=$11,budget_tool_calls=$12,budget_model_tokens=$13,auth_kind=$14,auth_token_id=$15,auth_scopes=$16,
-auth_client_installation_id=$17,misfire_policy=$18,notification_events=$19,next_occurrence_key=$20,next_run_at=$21,next_check_at=$22,observation_spec=$23,
-observation_config_hash=$24,baseline_fingerprint=$25,execution_policy=$26,updated_at=clock_timestamp()
+	personalRuleBinding, err := marshalPersonalRuleBinding(value.PersonalRule)
+	if err != nil {
+		return err
+	}
+	command, err := tx.Exec(ctx, `UPDATE schedules SET version=$3,status=$4,execution_epoch=$5,host_id=$6,model_id=$7,title=$8,objective=$9,file_delivery_intent=$10,timing=$11,
+budget_active_seconds=$12,budget_tool_calls=$13,budget_model_tokens=$14,auth_kind=$15,auth_token_id=$16,auth_scopes=$17,
+auth_client_installation_id=$18,misfire_policy=$19,notification_events=$20,next_occurrence_key=$21,next_run_at=$22,next_check_at=$23,observation_spec=$24,
+personal_rule_binding=$25,observation_config_hash=$26,baseline_fingerprint=$27,execution_policy=$28,updated_at=clock_timestamp()
 		WHERE id=$1 AND owner_id=$2`, value.ID, ownerID, value.Version, string(value.Status), value.ExecutionEpoch, nullableText(value.HostID), value.ModelID,
-		value.Title, value.Objective, timing, value.Budget.ActiveSeconds, value.Budget.ToolCalls, value.Budget.ModelTokens,
+		value.Title, value.Objective, string(value.FileDeliveryIntent), timing, value.Budget.ActiveSeconds, value.Budget.ToolCalls, value.Budget.ModelTokens,
 		value.Authorization.Kind, value.Authorization.TokenID, nonNilStrings(value.Authorization.Scopes), nullableText(value.Authorization.ClientInstallationID), string(value.MisfirePolicy),
 		notificationEventStrings(value.NotificationEvents), value.NextOccurrenceKey, nullableTimestamp(value.NextRunAt), nullableTimestamp(value.NextCheckAt),
-		observation, value.ObservationConfigHash, value.BaselineFingerprint, string(storedScheduleExecutionPolicy(value.ExecutionPolicy)))
+		observation, personalRuleBinding, value.ObservationConfigHash, value.BaselineFingerprint, string(storedScheduleExecutionPolicy(value.ExecutionPolicy)))
 	if err != nil {
 		return fmt.Errorf("update schedule: %w", err)
 	}
@@ -878,9 +978,10 @@ observation_config_hash=$24,baseline_fingerprint=$25,execution_policy=$26,update
 func personalScheduleContentBytesInTx(ctx context.Context, tx pgx.Tx, ownerID, scheduleID string) (int64, error) {
 	var contentBytes int64
 	err := tx.QueryRow(ctx, `SELECT octet_length(jsonb_build_object(
-  'title',title,'objective',objective,'model',model_id,'host',host_id,'timing',timing,
+  'title',title,'objective',objective,'file_delivery_intent',file_delivery_intent,'model',model_id,'host',host_id,'timing',timing,
   'budgets',jsonb_build_object('active_seconds',budget_active_seconds,'tool_calls',budget_tool_calls,'model_tokens',budget_model_tokens),
-  'misfire',misfire_policy,'notification',to_jsonb(notification_events),'observation',observation_spec,'execution_policy',execution_policy
+  'misfire',misfire_policy,'notification',to_jsonb(notification_events),'observation',observation_spec,
+  'personal_rule',personal_rule_binding,'execution_policy',execution_policy
 )::text) FROM schedules WHERE id=$1 AND owner_id=$2`, scheduleID, ownerID).Scan(&contentBytes)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, domain.NewError(domain.CodeNotFound, "schedule not found")
@@ -916,7 +1017,8 @@ func prefixScheduleColumns(alias string) string {
 func validateScheduleTaskFields(value schedule.Schedule) error {
 	if value.Authorization.Kind == "" || strings.TrimSpace(value.Objective) == "" || value.ModelID == "" ||
 		(value.HostID != "" && !domain.ValidHostID(value.HostID)) || !domain.ValidUserID(value.OwnerID) ||
-		(value.HostID == "" && (value.Observation != nil || app.ClassifyFileDeliveryIntent(value.Objective, false) != task.FileDeliveryNone)) {
+		!value.FileDeliveryIntent.Valid() || value.FileDeliveryIntent != task.FileDeliveryNone ||
+		(value.HostID == "" && value.Observation != nil) {
 		return domain.InvalidArgument("schedule", "scheduled task fields are invalid")
 	}
 	if err := value.Budget.Validate(); err != nil {

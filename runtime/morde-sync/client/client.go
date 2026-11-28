@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -76,6 +77,8 @@ type SyncOptions struct {
 	WorkspaceID           string
 	FolderID              string // Optional registered project folder for a manual upload.
 	SourceBindingID       string // Stable local source identity required for a project upload.
+	SourceDevice          string // Device captured when the project directory was selected.
+	SourceInode           string // Inode captured when the project directory was selected.
 	Directory             string
 	Direction             string // upload, download, or bidirectional; defaults to bidirectional.
 	Policy                string // fill_missing, compare_merge, or live; defaults to fill_missing.
@@ -207,10 +210,19 @@ func (c *Client) sync(ctx context.Context, options SyncOptions, lockDirectory, k
 		return Result{}, errors.New("sync direction must be upload, download, or bidirectional")
 	}
 
-	directory, err := canonicalDirectory(options.Directory)
+	directory, rootIdentity, rootDevice, rootInode, err := selectSyncRoot(options.Directory)
 	if err != nil {
-		return Result{}, fmt.Errorf("resolve local workspace directory: %w", err)
+		return Result{}, fmt.Errorf("select local workspace directory: %w", err)
 	}
+	if options.FolderID != "" {
+		if _, err := clientWorkspaceRootPath(directory); err != nil {
+			return Result{}, fmt.Errorf("select project workspace directory: %w", err)
+		}
+		if rootDevice != options.SourceDevice || rootInode != options.SourceInode {
+			return Result{}, errors.New("selected project directory identity changed")
+		}
+	}
+	options.Directory = directory
 	if lockDirectory {
 		releaseOperation, err := acquireOperationLock(ctx, directory)
 		if err != nil {
@@ -218,7 +230,7 @@ func (c *Client) sync(ctx context.Context, options SyncOptions, lockDirectory, k
 		}
 		defer releaseOperation()
 	}
-	local, localFiles, err := c.localManifest(ctx, options, directory, options.Progress)
+	local, localFiles, err := c.localManifest(ctx, options, directory, rootIdentity, rootDevice, rootInode, options.Progress)
 	if err != nil {
 		return Result{}, err
 	}
@@ -236,6 +248,9 @@ func (c *Client) sync(ctx context.Context, options SyncOptions, lockDirectory, k
 		saved, err = readResumeMetadata(directory, options.WorkspaceID)
 		if err == nil && !savedSessionMatchesRequest(saved, options, directory) {
 			err = errors.New("saved sync metadata does not match the requested workspace, directory, and session")
+		}
+		if err == nil && saved.RootIdentity != "" && saved.RootIdentity != rootIdentity {
+			err = errors.New("saved sync metadata belongs to a different local workspace root")
 		}
 		if err == nil && mordesync.ValidateManifest(saved.Baseline) != nil {
 			err = errors.New("saved sync baseline is invalid")
@@ -257,6 +272,12 @@ func (c *Client) sync(ctx context.Context, options SyncOptions, lockDirectory, k
 		}
 		if err != nil {
 			return Result{}, err
+		}
+		if saved.RootIdentity == "" {
+			saved.RootIdentity = rootIdentity
+			if err := writeResumeMetadata(directory, saved); err != nil {
+				return Result{}, fmt.Errorf("bind saved sync session to local workspace root: %w", err)
+			}
 		}
 		if options.RetryCommitAfterQuota {
 			if !saved.CommitQuotaRejected {
@@ -288,13 +309,24 @@ func (c *Client) sync(ctx context.Context, options SyncOptions, lockDirectory, k
 				return Result{}, err
 			}
 		}
-		session, err = c.getSession(ctx, options.WorkspaceID, options.SessionID)
+		if err = verifySyncRootIdentity(directory, rootIdentity); err == nil {
+			session, err = c.getSession(ctx, options.WorkspaceID, options.SessionID)
+		}
 	} else {
 		previous, previousErr := readResumeMetadata(directory, options.WorkspaceID)
 		if previousErr != nil && !errors.Is(previousErr, os.ErrNotExist) {
 			return Result{}, previousErr
 		}
 		if previousErr == nil {
+			previousProjectPending := previous.SessionID == "" && !previous.CreateQuotaRejected ||
+				previous.SessionID != "" && !isTerminal(previous.State)
+			if options.FolderID != "" && previous.FolderID == options.FolderID && previous.SourceBindingID == options.SourceBindingID &&
+				previous.RootIdentity == "" && previousProjectPending {
+				return Result{}, errors.New("a previous project upload checkpoint has no selected directory identity; it was preserved for manual resolution")
+			}
+			if previous.SessionID == "" && !previous.CreateQuotaRejected && previous.RootIdentity != "" && previous.RootIdentity != rootIdentity {
+				return Result{}, errors.New("a previous sync create belongs to a different local workspace root; resolve it before starting another operation")
+			}
 			if previous.FolderID != options.FolderID || previous.SourceBindingID != options.SourceBindingID {
 				return Result{}, errors.New("a previous sync operation belongs to another project folder; resolve it before starting a new operation")
 			}
@@ -348,15 +380,22 @@ func (c *Client) sync(ctx context.Context, options SyncOptions, lockDirectory, k
 			}
 			if err == nil {
 				saved = resumeMetadata{Version: 1, WorkspaceID: options.WorkspaceID, FolderID: options.FolderID, SourceBindingID: options.SourceBindingID, Directory: directory,
-					Direction: direction, Policy: policy, BaseRevision: baseRevision, Scope: append([]string(nil), options.Scope...),
+					RootIdentity: rootIdentity,
+					Direction:    direction, Policy: policy, BaseRevision: baseRevision, Scope: append([]string(nil), options.Scope...),
 					TaskID: options.TaskID, TaskHubOperationKey: options.TaskHubOperationKey,
 					DeletedPaths: append([]string(nil), options.DeletedPaths...), DeletedDirectories: append([]string(nil), options.DeletedDirectories...), AckCursor: cloneStringPointer(options.AckCursor),
 					Baseline: options.Baseline, IdempotencyKey: key, Manifest: local}
-				err = writeResumeMetadata(directory, saved)
+				err = verifySyncRootIdentity(directory, rootIdentity)
+				if err == nil {
+					err = writeResumeMetadata(directory, saved)
+				}
 			}
 			if err == nil {
-				session, err = c.createSession(ctx, options.WorkspaceID, options.FolderID, options.SourceBindingID, direction, policy, baseRevision, options.Scope, local, options.DeletedPaths, options.DeletedDirectories, options.AckCursor,
-					options.TaskID, options.TaskHubOperationKey, key)
+				err = verifySyncRootIdentity(directory, rootIdentity)
+				if err == nil {
+					session, err = c.createSession(ctx, options.WorkspaceID, options.FolderID, options.SourceBindingID, direction, policy, baseRevision, options.Scope, local, options.DeletedPaths, options.DeletedDirectories, options.AckCursor,
+						options.TaskID, options.TaskHubOperationKey, key)
+				}
 				if session.ID != "" {
 					saved.SessionID = session.ID
 					saved.State = session.State
@@ -366,7 +405,8 @@ func (c *Client) sync(ctx context.Context, options SyncOptions, lockDirectory, k
 				} else if isDefiniteQuotaRejection(err) {
 					// A durable server rejection makes this key terminal; retain only enough local state to rotate it.
 					saved = resumeMetadata{Version: 1, WorkspaceID: options.WorkspaceID, FolderID: saved.FolderID, SourceBindingID: saved.SourceBindingID, Directory: directory,
-						TaskID: saved.TaskID, TaskHubOperationKey: saved.TaskHubOperationKey,
+						RootIdentity: saved.RootIdentity,
+						TaskID:       saved.TaskID, TaskHubOperationKey: saved.TaskHubOperationKey,
 						IdempotencyKey: saved.IdempotencyKey, CreateQuotaRejected: true}
 					if saveErr := writeResumeMetadata(directory, saved); saveErr != nil {
 						err = errors.Join(err, fmt.Errorf("save rejected workspace sync create state: %w", saveErr))
@@ -412,6 +452,9 @@ func (c *Client) sync(ctx context.Context, options SyncOptions, lockDirectory, k
 	}
 	progress := progressReporter{callback: options.Progress, session: session, fileCount: local.FileCount, totalBytes: local.TotalBytes}
 	progress.report("")
+	if err := verifySyncRootIdentity(directory, rootIdentity); err != nil {
+		return result, err
+	}
 	if isTerminal(session.State) {
 		if session.State != "completed" || !keepCompletedMetadata {
 			_ = removeResumeMetadata(directory, options.WorkspaceID, session.ID)
@@ -484,7 +527,7 @@ func isDefiniteQuotaRejection(err error) bool {
 	return errors.As(err, &httpErr) && httpErr.Status == http.StatusConflict && httpErr.Code == "quota_exceeded"
 }
 
-func (c *Client) localManifest(ctx context.Context, options SyncOptions, directory string, report func(Progress)) (mordesync.Manifest, map[string]mordesync.File, error) {
+func (c *Client) localManifest(ctx context.Context, options SyncOptions, directory, rootIdentity, rootDevice, rootInode string, report func(Progress)) (mordesync.Manifest, map[string]mordesync.File, error) {
 	if options.SessionID != "" {
 		metadata, err := readResumeMetadata(directory, options.WorkspaceID)
 		if err != nil {
@@ -493,6 +536,12 @@ func (c *Client) localManifest(ctx context.Context, options SyncOptions, directo
 		if metadata.SessionID != options.SessionID || metadata.Directory != directory {
 			return mordesync.Manifest{}, nil, errors.New("saved sync metadata does not match the requested session and directory")
 		}
+		if options.FolderID != "" && metadata.RootIdentity == "" && !isTerminal(metadata.State) {
+			return mordesync.Manifest{}, nil, errors.New("saved project upload checkpoint has no selected directory identity; it was preserved for manual resolution")
+		}
+		if metadata.RootIdentity != "" && metadata.RootIdentity != rootIdentity {
+			return mordesync.Manifest{}, nil, errors.New("saved sync metadata belongs to a different local workspace root")
+		}
 		if err := mordesync.ValidateManifest(metadata.Manifest); err != nil {
 			return mordesync.Manifest{}, nil, fmt.Errorf("saved local manifest is invalid: %w", err)
 		}
@@ -500,21 +549,28 @@ func (c *Client) localManifest(ctx context.Context, options SyncOptions, directo
 			report(Progress{Stage: "planning", FileCount: metadata.Manifest.FileCount, FilesProcessed: metadata.Manifest.FileCount,
 				TotalBytes: metadata.Manifest.TotalBytes, BytesProcessed: metadata.Manifest.TotalBytes})
 		}
+		if err := verifySyncRootIdentity(directory, rootIdentity); err != nil {
+			return mordesync.Manifest{}, nil, err
+		}
 		return metadata.Manifest, manifestFileMap(metadata.Manifest), nil
+	}
+	if report != nil {
+		report(Progress{Stage: string(mordesync.PhaseInventory)})
 	}
 	var lastScanReport time.Time
 	lastScanPhase := mordesync.ScanPhase("")
-	manifest, err := mordesync.Scan(ctx, directory, func(scan mordesync.ScanProgress) {
-		if report != nil {
-			now := time.Now()
-			if scan.Phase == lastScanPhase && now.Sub(lastScanReport) < 100*time.Millisecond {
-				return
-			}
-			lastScanPhase = scan.Phase
-			lastScanReport = now
-			report(Progress{Stage: string(scan.Phase), FileCount: scan.FilesFound, FilesProcessed: scan.FilesHashed,
-				TotalBytes: scan.BytesFound, BytesProcessed: scan.BytesHashed, CurrentPath: scan.CurrentPath})
+	manifest, err := mordesync.ScanMatchingIdentityWithProgress(ctx, directory, rootDevice, rootInode, func(scan mordesync.ScanProgress) {
+		if report == nil {
+			return
 		}
+		now := time.Now()
+		if scan.Phase == lastScanPhase && now.Sub(lastScanReport) < 100*time.Millisecond {
+			return
+		}
+		lastScanPhase = scan.Phase
+		lastScanReport = now
+		report(Progress{Stage: string(scan.Phase), FileCount: scan.FilesFound, FilesProcessed: scan.FilesHashed,
+			TotalBytes: scan.BytesFound, BytesProcessed: scan.BytesHashed, CurrentPath: scan.CurrentPath})
 	})
 	if err != nil {
 		return mordesync.Manifest{}, nil, fmt.Errorf("scan local workspace: %w", err)
@@ -524,10 +580,68 @@ func (c *Client) localManifest(ctx context.Context, options SyncOptions, directo
 		return mordesync.Manifest{}, nil, fmt.Errorf("validate local workspace manifest: %w", err)
 	}
 	if report != nil {
+		report(Progress{Stage: string(mordesync.PhaseHash), FileCount: manifest.FileCount, FilesProcessed: manifest.FileCount,
+			TotalBytes: manifest.TotalBytes, BytesProcessed: manifest.TotalBytes})
 		report(Progress{Stage: "planning", FileCount: manifest.FileCount, FilesProcessed: manifest.FileCount,
 			TotalBytes: manifest.TotalBytes, BytesProcessed: manifest.TotalBytes})
 	}
+	if err := verifySyncRootIdentity(directory, rootIdentity); err != nil {
+		return mordesync.Manifest{}, nil, err
+	}
 	return manifest, manifestFileMap(manifest), nil
+}
+
+func selectSyncRoot(directory string) (string, string, string, string, error) {
+	if directory == "" {
+		return "", "", "", "", errors.New("workspace directory is required")
+	}
+	abs, err := filepath.Abs(directory)
+	if err != nil {
+		return "", "", "", "", err
+	}
+	root, canonical, identity, err := openHubInspectionRoot(filepath.Clean(abs), "")
+	if err != nil {
+		return "", "", "", "", err
+	}
+	defer root.Close()
+	fileIdentity, err := hubDirectoryFileIdentity(root)
+	if err != nil {
+		return "", "", "", "", err
+	}
+	device, inode, err := scanRootIdentityParts(fileIdentity)
+	if err != nil {
+		return "", "", "", "", err
+	}
+	return canonical, identity, device, inode, nil
+}
+
+func scanRootIdentityParts(identity string) (string, string, error) {
+	parts := strings.Split(identity, ":")
+	switch {
+	case len(parts) == 3 && parts[0] == "unix":
+		device, deviceErr := strconv.ParseUint(parts[1], 10, 64)
+		inode, inodeErr := strconv.ParseUint(parts[2], 10, 64)
+		if deviceErr != nil || inodeErr != nil || inode == 0 {
+			break
+		}
+		return strconv.FormatUint(device, 10), strconv.FormatUint(inode, 10), nil
+	case len(parts) == 3 && parts[0] == "windows":
+		device, deviceErr := strconv.ParseUint(parts[1], 16, 32)
+		inode, inodeErr := strconv.ParseUint(parts[2], 16, 64)
+		if deviceErr != nil || inodeErr != nil || device == 0 || inode == 0 {
+			break
+		}
+		return strconv.FormatUint(device, 10), strconv.FormatUint(inode, 10), nil
+	}
+	return "", "", errors.New("local workspace root identity is unavailable")
+}
+
+func verifySyncRootIdentity(directory, expectedIdentity string) error {
+	root, _, _, err := openHubInspectionRoot(directory, expectedIdentity)
+	if err != nil {
+		return errors.New("local workspace root disappeared or changed after scanning")
+	}
+	return root.Close()
 }
 
 func manifestFileMap(manifest mordesync.Manifest) map[string]mordesync.File {
@@ -573,11 +687,12 @@ func (c *Client) validateOptions(ctx context.Context, options SyncOptions) error
 	}
 	if options.FolderID != "" && (!syncFolderIDPattern.MatchString(options.FolderID) || !sourceBindingIDPattern.MatchString(options.SourceBindingID) || options.Direction != "upload" || options.Policy != "compare_merge" ||
 		options.BaseRevision == nil || *options.BaseRevision != 0 || len(options.Scope) != 0 || len(options.DeletedPaths) != 0 ||
-		len(options.DeletedDirectories) != 0 || options.AckCursor != nil || options.TaskID != "" || options.TaskHubOperationKey != "") {
-		return errors.New("project folder sync requires a source binding and unscoped compare-merge upload from revision zero")
+		len(options.DeletedDirectories) != 0 || options.AckCursor != nil || options.TaskID != "" || options.TaskHubOperationKey != "" ||
+		!validProjectRootIdentity(options.SourceDevice, options.SourceInode)) {
+		return errors.New("project folder sync requires a source binding, selected directory identity, and unscoped compare-merge upload from revision zero")
 	}
-	if options.FolderID == "" && options.SourceBindingID != "" {
-		return errors.New("source binding ID requires a project folder")
+	if options.FolderID == "" && (options.SourceBindingID != "" || options.SourceDevice != "" || options.SourceInode != "") {
+		return errors.New("project source identity requires a project folder")
 	}
 	if err := mordesync.ValidateManifest(options.Baseline); err != nil {
 		return fmt.Errorf("sync baseline is invalid: %w", err)
@@ -625,6 +740,17 @@ func validateTaskLinkedManifest(options SyncOptions, manifest mordesync.Manifest
 		}
 	}
 	return nil
+}
+
+func validProjectRootIdentity(device, inode string) bool {
+	if device == "" || inode == "" || len(device) > 32 || len(inode) > 32 {
+		return false
+	}
+	if _, err := strconv.ParseUint(device, 10, 64); err != nil {
+		return false
+	}
+	inodeValue, err := strconv.ParseUint(inode, 10, 64)
+	return err == nil && inodeValue != 0
 }
 
 func (c *Client) latestRevision(ctx context.Context, workspaceID string) (int64, error) {
@@ -2491,22 +2617,30 @@ func sameClientFile(info os.FileInfo, digest, target string, expected mordesync.
 	return info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0 && uint32(info.Mode().Perm()) == expected.Mode
 }
 
-func openClientWorkspaceRoot(directory string) (*os.Root, error) {
+func clientWorkspaceRootPath(directory string) (string, error) {
 	abs, err := filepath.Abs(directory)
 	if err != nil {
-		return nil, errors.New("resolve workspace root")
+		return "", errors.New("resolve workspace root")
 	}
 	abs = filepath.Clean(abs)
 	if filepath.Dir(abs) == abs {
-		return nil, errors.New("filesystem roots cannot be selected as a Workspace")
+		return "", errors.New("filesystem roots cannot be selected as a Workspace")
 	}
 	for current := abs; ; current = filepath.Dir(current) {
 		if filepath.Base(current) == preservedDirectory {
-			return nil, errors.New("recovery copies cannot be selected as a Workspace")
+			return "", errors.New("recovery copies cannot be selected as a Workspace")
 		}
 		if filepath.Dir(current) == current {
 			break
 		}
+	}
+	return abs, nil
+}
+
+func openClientWorkspaceRoot(directory string) (*os.Root, error) {
+	abs, err := clientWorkspaceRootPath(directory)
+	if err != nil {
+		return nil, err
 	}
 	info, err := os.Lstat(abs)
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
@@ -2663,6 +2797,7 @@ type resumeMetadata struct {
 	FolderID             string             `json:"folder_id,omitempty"`
 	SourceBindingID      string             `json:"source_binding_id,omitempty"`
 	Directory            string             `json:"directory"`
+	RootIdentity         string             `json:"root_identity,omitempty"`
 	SessionID            string             `json:"session_id,omitempty"`
 	Direction            string             `json:"direction"`
 	Policy               string             `json:"policy,omitempty"`

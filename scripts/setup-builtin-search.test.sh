@@ -72,7 +72,13 @@ case "$url" in
     if [[ "${MOCK_CURL_MODE:-}" == "version_mismatch" ]]; then
       printf '{"version":"old"}\n'
     else
-      printf '{"version":"2026.11.5+3e95f6cd2"}\n'
+      if [[ "${MOCK_CURL_MODE:-}" == "engine_missing" ]]; then
+        printf '{"version":"2026.11.5+3e95f6cd2","engines":[]}\n'
+      elif [[ "${MOCK_CURL_MODE:-}" == "source_engine_missing" ]]; then
+        printf '{"version":"2026.11.5+3e95f6cd2","engines":[{"name":"360search","shortcut":"360","categories":["general"]}]}\n'
+      else
+        printf '{"version":"2026.11.5+3e95f6cd2","engines":[{"name":"morde 360 news","shortcut":"mgn","categories":["news"]}]}\n'
+      fi
     fi
     ;;
   */search)
@@ -155,6 +161,22 @@ else
   assert_contains "$output" 'did not report the pinned version'
 fi
 printf 'PASS: unpinned SearXNG version is rejected\n'
+
+root="$(new_fixture engine_missing)"
+if output="$(MOCK_CURL_MODE=engine_missing run_setup "$root" 2>&1)"; then
+  fail 'missing Morde news engine unexpectedly succeeded'
+else
+  assert_contains "$output" 'required Morde 360 news engine is not loaded'
+fi
+printf 'PASS: Morde news engine must be loaded before readiness succeeds\n'
+
+root="$(new_fixture source_engine_missing)"
+if output="$(MOCK_CURL_MODE=source_engine_missing run_setup "$root" 2>&1)"; then
+  fail 'missing Morde news engine unexpectedly succeeded'
+else
+  assert_contains "$output" 'required Morde 360 news engine is not loaded'
+fi
+printf 'PASS: unrelated general engines do not satisfy Morde news readiness\n'
 
 root="$(new_fixture search_error)"
 if output="$(MOCK_CURL_MODE=search_unavailable run_setup "$root" 2>&1)"; then

@@ -1114,6 +1114,7 @@ components:
             input_manifest_sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
             view_id: { type: string, pattern: '^v[0-9a-f]{64}$' }
             manifest_sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+            workspace_snapshot_sha256: { type: string, pattern: '^[0-9a-f]{64}$', description: Versioned canonical Task Workspace snapshot digest for comparison with shell typed-check receipts; manifest_sha256 remains the paging and block-read identity. }
             files:
               type: array
               maxItems: 1000

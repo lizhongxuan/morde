@@ -417,6 +417,10 @@ const listTaskApprovals = `-- name: ListTaskApprovals :many
 SELECT pending.id, pending.task_id, pending.version, pending.kind, pending.title, pending.object,
        pending.content, pending.impact, COALESCE(pending.media_preview_operation_id, '') AS media_preview_operation_id,
        pending.status, pending.decision, pending.created_at, pending.expires_at, pending.responded_at,
+       COALESCE(pending.evidence_pointer, '') AS evidence_pointer,
+       pending.this_cost_micros, pending.total_cost_micros,
+       COALESCE(pending.trigger_rule, '') AS trigger_rule,
+       COALESCE(pending.rejection_consequence, '') AS rejection_consequence,
        tasks.conversation_id, COALESCE(tasks.project_id, '') AS project_id, COALESCE(tasks.host_id, '') AS host_id,
        tasks.status AS task_status, tasks.event_seq AS task_event_seq, tasks.updated_at AS task_updated_at
 FROM task_pending_requests pending
@@ -459,6 +463,11 @@ type ListTaskApprovalsRow struct {
 	CreatedAt               pgtype.Timestamptz `json:"created_at"`
 	ExpiresAt               pgtype.Timestamptz `json:"expires_at"`
 	RespondedAt             pgtype.Timestamptz `json:"responded_at"`
+	EvidencePointer         string             `json:"evidence_pointer"`
+	ThisCostMicros          pgtype.Int8        `json:"this_cost_micros"`
+	TotalCostMicros         pgtype.Int8        `json:"total_cost_micros"`
+	TriggerRule             string             `json:"trigger_rule"`
+	RejectionConsequence    string             `json:"rejection_consequence"`
 	ConversationID          string             `json:"conversation_id"`
 	ProjectID               string             `json:"project_id"`
 	HostID                  string             `json:"host_id"`
@@ -498,6 +507,11 @@ func (q *Queries) ListTaskApprovals(ctx context.Context, arg ListTaskApprovalsPa
 			&i.CreatedAt,
 			&i.ExpiresAt,
 			&i.RespondedAt,
+			&i.EvidencePointer,
+			&i.ThisCostMicros,
+			&i.TotalCostMicros,
+			&i.TriggerRule,
+			&i.RejectionConsequence,
 			&i.ConversationID,
 			&i.ProjectID,
 			&i.HostID,
@@ -556,7 +570,8 @@ func (q *Queries) ListTaskArtifacts(ctx context.Context, taskID string) ([]TaskA
 }
 
 const listTaskBatchItems = `-- name: ListTaskBatchItems :many
-SELECT id, task_id, item_key, input, status, result, error, created_at, updated_at, attempt FROM task_batch_items WHERE task_id = $1 ORDER BY created_at, id
+SELECT id, task_id, item_key, input, status, result, error, created_at, updated_at, attempt, file_delivery_intent
+FROM task_batch_items WHERE task_id = $1 ORDER BY created_at, id
 `
 
 func (q *Queries) ListTaskBatchItems(ctx context.Context, taskID string) ([]TaskBatchItem, error) {
@@ -579,6 +594,7 @@ func (q *Queries) ListTaskBatchItems(ctx context.Context, taskID string) ([]Task
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.Attempt,
+			&i.FileDeliveryIntent,
 		); err != nil {
 			return nil, err
 		}

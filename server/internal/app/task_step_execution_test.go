@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -99,6 +100,160 @@ func TestTaskStepExecutionIsSealedAndAvailableOnlyToTaskOwner(t *testing.T) {
 		cancelled.Execution.StdoutTotalBytes != nil || cancelled.Execution.StdoutTruncated != nil ||
 		cancelled.Execution.StdoutRuntimeTruncated != nil || cancelled.Execution.StdoutDetailTruncated != nil {
 		t.Fatalf("cancelled step retained an unconfirmed output: %+v, %v", cancelled, err)
+	}
+}
+
+func TestTaskToolExecutionDetailsSummarizeBrowserActionsWithoutSensitiveData(t *testing.T) {
+	tests := []struct {
+		name      string
+		arguments string
+		want      map[string]any
+		forbid    []string
+	}{
+		{name: runtimeToolBrowserOpenTab,
+			arguments: `{"url":"https://Example.test/private/path?access_token=synthetic-secret#frag"}`,
+			want:      map[string]any{"site": "https://example.test"},
+			forbid:    []string{"private", "access_token", "synthetic-secret", "frag"}},
+		{name: runtimeToolBrowserClick,
+			arguments: `{"target_id":"tab_private","role":"button","name":"Continue"}`,
+			want:      map[string]any{"role": "button", "element": "Continue"},
+			forbid:    []string{"tab_private"}},
+		{name: runtimeToolBrowserType,
+			arguments: `{"target_id":"tab_private","role":"textbox","name":"Search","text":"session_token=synthetic-secret"}`,
+			want:      map[string]any{"role": "textbox", "element": "Search", "text_omitted": true},
+			forbid:    []string{"tab_private", "session_token", "synthetic-secret"}},
+		{name: runtimeToolBrowserPressKey,
+			arguments: `{"target_id":"tab_private","key":"Enter"}`,
+			want:      map[string]any{"key": "Enter"},
+			forbid:    []string{"tab_private"}},
+		{name: runtimeToolBrowserNavigate,
+			arguments: `{"target_id":"tab_private","url":"https://user:password@example.test/path"}`,
+			want:      map[string]any{},
+			forbid:    []string{"user", "password", "example.test"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			detail, _ := taskToolExecutionDetails(cloudDSHToolActivity{
+				call:    ModelToolCall{Name: test.name, Arguments: test.arguments},
+				current: task.Task{HostID: "h1234567"},
+			})
+			if len(test.want) == 0 {
+				if detail == nil || detail.Parameters != nil {
+					t.Fatalf("browser URL with credentials was not omitted: %+v", detail)
+				}
+				return
+			}
+			if detail == nil || detail.Parameters == nil {
+				t.Fatalf("browser execution parameters were not recorded: name=%q direct=%q detail=%+v", test.name,
+					taskToolExecutionParameters(test.name, test.arguments), detail)
+			}
+			var got map[string]any
+			if err := json.Unmarshal([]byte(*detail.Parameters), &got); err != nil {
+				t.Fatalf("decode recorded parameters %q: %v", *detail.Parameters, err)
+			}
+			if !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("recorded browser parameters = %#v, want %#v", got, test.want)
+			}
+			for _, secret := range test.forbid {
+				if strings.Contains(*detail.Parameters, secret) {
+					t.Fatalf("browser execution parameters leaked %q: %s", secret, *detail.Parameters)
+				}
+			}
+			if !validTaskStepExecution(detail) {
+				t.Fatalf("browser execution parameters violate detail bounds: %+v", detail)
+			}
+			if !validTaskStepDetailDocument(TaskStepDetailDocument{Object: test.name, Execution: detail}) {
+				t.Fatalf("browser action detail required unrelated Workspace state: %+v", detail)
+			}
+		})
+	}
+}
+
+func TestWorkspaceSearchExecutionParametersPreserveQueryAndOmitCredentials(t *testing.T) {
+	const workspaceID = "w1234567"
+	const query = "authorization check"
+	activity := cloudDSHToolActivity{
+		call: ModelToolCall{Name: cloudDSHWorkspaceSearchToolName,
+			Arguments: `{"expected_revision":4,"query":"` + query + `"}`},
+		current: task.Task{WorkspaceID: workspaceID},
+	}
+	detail, _ := taskToolExecutionDetails(activity)
+	if detail == nil || detail.Parameters == nil {
+		t.Fatalf("Workspace search query missing from execution detail: %+v", detail)
+	}
+	var parameters map[string]any
+	if err := json.Unmarshal([]byte(*detail.Parameters), &parameters); err != nil {
+		t.Fatalf("decode execution parameters %q: %v", *detail.Parameters, err)
+	}
+	if parameters["query"] != query {
+		t.Fatalf("search query projection = %#v, want %q", parameters["query"], query)
+	}
+	if !taskStepExecutionRequiresWorkspace(cloudDSHWorkspaceSearchToolName, detail) {
+		t.Fatal("Workspace search parameters bypassed the Workspace evidence gate")
+	}
+	if !validTaskStepDetailDocument(TaskStepDetailDocument{Object: cloudDSHWorkspaceSearchToolName,
+		Execution: detail, ExecutionWorkspaceID: workspaceID}) {
+		t.Fatal("authorized Workspace search detail did not satisfy the evidence boundary")
+	}
+
+	for _, secretQuery := range []string{
+		"api_key=synthetic-secret-value",
+		"DB_PASSWORD=synthetic-secret-value",
+		"x-api-key=synthetic-secret-value",
+		"Bearer " + strings.Repeat("A", 24),
+		"https://user:password@example.test/private",
+		"https://example.test/search?api_key=synthetic-secret-value",
+	} {
+		encoded, err := json.Marshal(map[string]string{"query": secretQuery})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := taskToolExecutionParameters(cloudDSHWorkspaceSearchToolName, string(encoded)); got != "" {
+			t.Fatalf("credential-bearing Workspace query was recorded: %q", got)
+		}
+	}
+	for _, raw := range []string{
+		`{"query":"line1\nline2"}`,
+		`{"query":"` + strings.Repeat("q", 161) + `"}`,
+	} {
+		if got := taskToolExecutionParameters(cloudDSHWorkspaceSearchToolName, raw); got != "" {
+			t.Fatalf("unsafe or overlong Workspace query was recorded: %q", got)
+		}
+	}
+	boundary := strings.Repeat("q", 160)
+	boundaryJSON := `{"query":"` + boundary + `"}`
+	if got := taskToolExecutionParameters(cloudDSHWorkspaceSearchToolName, boundaryJSON); !strings.Contains(got, boundary) {
+		t.Fatalf("160-rune Workspace query should be retained: %q", got)
+	}
+}
+
+func TestBrowserExecutionParametersDoNotBypassWorkspaceEvidenceGate(t *testing.T) {
+	safeBrowserDetail := TaskStepDetailDocument{Object: runtimeToolBrowserOpenTab,
+		Execution: &TaskStepExecution{Parameters: stringPointer(`{"site":"https://example.test"}`)}}
+	if !validTaskStepDetailDocument(safeBrowserDetail) {
+		t.Fatal("sanitized browser parameters should not require an unrelated Workspace")
+	}
+	if !taskStepExecutionRequiresWorkspace(runtimeToolBrowserScreenshot,
+		&TaskStepExecution{Parameters: stringPointer(`{"site":"https://example.test"}`)}) {
+		t.Fatal("unprojected browser tool parameters unexpectedly bypassed Workspace visibility")
+	}
+
+	stdout := "unexpected output"
+	stdoutBytes := len(stdout)
+	outputFlags := false
+	unexpectedBrowserOutput := TaskStepDetailDocument{Object: runtimeToolBrowserOpenTab,
+		ShellExecution: &TaskStepShellExecutionEvidence{ExitCode: 0, StdoutBytes: stdoutBytes},
+		Execution: &TaskStepExecution{Stdout: &stdout, StdoutTotalBytes: &stdoutBytes,
+			StdoutTruncated: &outputFlags, StdoutRuntimeTruncated: &outputFlags, StdoutDetailTruncated: &outputFlags}}
+	if validTaskStepDetailDocument(unexpectedBrowserOutput) {
+		t.Fatal("browser output evidence must not bypass the Workspace evidence gate")
+	}
+	if !taskStepExecutionRequiresWorkspace(runtimeToolBrowserOpenTab, unexpectedBrowserOutput.Execution) {
+		t.Fatal("unexpected browser output evidence did not require Workspace visibility")
+	}
+	unexpectedBrowserOutput.ExecutionWorkspaceID = "w1234567"
+	if !validTaskStepDetailDocument(unexpectedBrowserOutput) {
+		t.Fatal("browser output evidence with an explicit Workspace binding should pass structural validation")
 	}
 }
 

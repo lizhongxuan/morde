@@ -159,10 +159,78 @@ describe('Workspaces', () => {
     render(<QueryClientProvider client={queryClient}><ToastProvider><ToastNoticeCenter /><MemoryRouter initialEntries={['/workspaces']}>
       <Workspaces /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
-    expect(await screen.findByText(/无法核对默认电脑的项目同步权限/)).toBeInTheDocument();
+    const permissionError = await screen.findByRole('alert');
+    expect(permissionError).toHaveTextContent(/无法核对默认电脑的项目同步权限/);
+    expect(permissionError).toHaveTextContent('permission check failed');
     expect(queryClient.getQueryData(targetKey)).toEqual([projectTarget]);
     expect(queryClient.getQueryState(targetKey)?.status).toBe('error');
     expect(screen.queryByRole('button', { name: '选择本机目录' })).not.toBeInTheDocument();
+    expect(selectProjectDirectory).not.toHaveBeenCalled();
+    expect(uploadProject).not.toHaveBeenCalled();
+  });
+
+  it('hides project actions when preference refresh fails with stale default-host data', async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    queryClient.setQueryData(['user-preferences'], { assistant_name: 'Morde', selected_model_id: null,
+      default_host_id: host.id, updated_at: null });
+    queryClient.setQueryData(['hosts'], { items: [defaultProjectHost] });
+    queryClient.setQueryData(['project-upload-targets', 'u1234567', host.id], [projectTarget]);
+    const selection = { selectionID: '11111111-1111-4111-8111-111111111112', hostId: host.id, workspaceId: workspace.id,
+      projectName: 'demo', directoryName: 'demo' };
+    const selectProjectDirectory = vi.fn();
+    const uploadProject = vi.fn();
+    setProjectBridge({ projectUploadTargets: vi.fn().mockResolvedValue([projectTarget]), selectProjectDirectory, uploadProject,
+      state: vi.fn().mockResolvedValue({ projectMappings: [selection], syncState: 'idle', syncRecovery: null,
+        syncCheckpoint: { mode: 'project_upload', workspaceId: workspace.id, projectSelectionID: selection.selectionID,
+          projectName: 'demo', sessionState: 'completed', hostApplicationStatus: 'unknown' } }) });
+    vi.spyOn(portalApi, 'capabilities').mockResolvedValue(projectCapabilities);
+    vi.mocked(portalApi.preferences).mockRejectedValue(new Error('preferences refresh failed'));
+    vi.mocked(portalApi.hosts).mockResolvedValue({ items: [defaultProjectHost] });
+    render(<QueryClientProvider client={queryClient}><ToastProvider><ToastNoticeCenter /><MemoryRouter initialEntries={['/workspaces']}>
+      <Workspaces /></MemoryRouter></ToastProvider></QueryClientProvider>);
+
+    expect(await screen.findByText(/无法读取默认电脑设置/)).toBeInTheDocument();
+    expect(queryClient.getQueryData(['user-preferences'])).toEqual({ assistant_name: 'Morde', selected_model_id: null,
+      default_host_id: host.id, updated_at: null });
+    expect(queryClient.getQueryState(['user-preferences'])?.status).toBe('error');
+    expect(await screen.findByText(/目标电脑应用状态未知/)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '选择本机目录' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '核对电脑应用状态' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '开始同步' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('textbox', { name: '项目名' })).not.toBeInTheDocument();
+    expect(selectProjectDirectory).not.toHaveBeenCalled();
+    expect(uploadProject).not.toHaveBeenCalled();
+  });
+
+  it('hides project actions when hosts refresh fails with a stale default-host record', async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
+    queryClient.setQueryData(['user-preferences'], { assistant_name: 'Morde', selected_model_id: null,
+      default_host_id: host.id, updated_at: null });
+    queryClient.setQueryData(['hosts'], { items: [defaultProjectHost] });
+    queryClient.setQueryData(['project-upload-targets', 'u1234567', host.id], [projectTarget]);
+    const selection = { selectionID: '11111111-1111-4111-8111-111111111112', hostId: host.id, workspaceId: workspace.id,
+      projectName: 'demo', directoryName: 'demo' };
+    const selectProjectDirectory = vi.fn();
+    const uploadProject = vi.fn();
+    setProjectBridge({ projectUploadTargets: vi.fn().mockResolvedValue([projectTarget]), selectProjectDirectory, uploadProject,
+      state: vi.fn().mockResolvedValue({ projectMappings: [selection], syncState: 'idle', syncRecovery: null,
+        syncCheckpoint: { mode: 'project_upload', workspaceId: workspace.id, projectSelectionID: selection.selectionID,
+          projectName: 'demo', sessionState: 'completed', hostApplicationStatus: 'unknown' } }) });
+    vi.spyOn(portalApi, 'capabilities').mockResolvedValue(projectCapabilities);
+    vi.mocked(portalApi.preferences).mockResolvedValue({ assistant_name: 'Morde', selected_model_id: null,
+      default_host_id: host.id, updated_at: null });
+    vi.mocked(portalApi.hosts).mockRejectedValue(new Error('hosts refresh failed'));
+    render(<QueryClientProvider client={queryClient}><ToastProvider><ToastNoticeCenter /><MemoryRouter initialEntries={['/workspaces']}>
+      <Workspaces /></MemoryRouter></ToastProvider></QueryClientProvider>);
+
+    expect(await screen.findByText(/无法核对默认云端电脑及其文件目录/)).toBeInTheDocument();
+    expect(queryClient.getQueryData(['hosts'])).toEqual({ items: [defaultProjectHost] });
+    expect(queryClient.getQueryState(['hosts'])?.status).toBe('error');
+    expect(await screen.findByText(/目标电脑应用状态未知/)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '选择本机目录' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '核对电脑应用状态' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '开始同步' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('textbox', { name: '项目名' })).not.toBeInTheDocument();
     expect(selectProjectDirectory).not.toHaveBeenCalled();
     expect(uploadProject).not.toHaveBeenCalled();
   });
@@ -186,6 +254,47 @@ describe('Workspaces', () => {
     expect(screen.queryByText('备用电脑')).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '选择本机目录' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '开始同步' })).not.toBeInTheDocument();
+    expect(selectProjectDirectory).not.toHaveBeenCalled();
+    expect(uploadProject).not.toHaveBeenCalled();
+  });
+
+  it('explains a failed default computer recovery and blocks project sync without a blind retry', async () => {
+    const failedHost = { ...defaultProjectHost, state: 'stopped' as const, state_reason: 'restore_failed' };
+    const blockedTarget = { ...projectTarget, hostState: 'stopped' as const,
+      blockedMessage: '默认云端电脑未运行，当前已暂停项目同步。启动后可重试；不会切换到其他电脑。' };
+    const selectProjectDirectory = vi.fn();
+    const uploadProject = vi.fn();
+    setProjectBridge({ projectUploadTargets: vi.fn().mockResolvedValue([blockedTarget]), selectProjectDirectory, uploadProject });
+    vi.spyOn(portalApi, 'capabilities').mockResolvedValue(projectCapabilities);
+    useDefaultProjectHost(failedHost);
+    renderWorkspaces();
+
+    expect(await screen.findByText(/默认云端电脑上次恢复失败，文件同步已暂停/)).toBeInTheDocument();
+    expect(screen.getByText(/确认修复后再恢复；不会自动重试或切换到其他电脑/)).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: '云端电脑页面' })).toHaveAttribute('href', '/hosts');
+    expect(screen.queryByText(/启动后可重试/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '选择本机目录' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '开始同步' })).not.toBeInTheDocument();
+    expect(selectProjectDirectory).not.toHaveBeenCalled();
+    expect(uploadProject).not.toHaveBeenCalled();
+  });
+
+  it('asks to reconcile an unknown default computer recovery before project sync', async () => {
+    const unknownHost = { ...defaultProjectHost, state: 'stopped' as const, state_reason: 'restore_unknown' };
+    const blockedTarget = { ...projectTarget, hostState: 'stopped' as const,
+      blockedMessage: '默认云端电脑未运行，当前已暂停项目同步。启动后可重试；不会切换到其他电脑。' };
+    const selectProjectDirectory = vi.fn();
+    const uploadProject = vi.fn();
+    setProjectBridge({ projectUploadTargets: vi.fn().mockResolvedValue([blockedTarget]), selectProjectDirectory, uploadProject });
+    vi.spyOn(portalApi, 'capabilities').mockResolvedValue(projectCapabilities);
+    useDefaultProjectHost(unknownHost);
+    renderWorkspaces();
+
+    expect(await screen.findByText(/默认云端电脑恢复结果待核对，文件同步已暂停/)).toBeInTheDocument();
+    expect(screen.getByText(/确认前不要重试；不会自动切换到其他电脑/)).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: '云端电脑页面' })).toHaveAttribute('href', '/hosts');
+    expect(screen.queryByText(/启动后可重试/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '选择本机目录' })).not.toBeInTheDocument();
     expect(selectProjectDirectory).not.toHaveBeenCalled();
     expect(uploadProject).not.toHaveBeenCalled();
   });
@@ -280,6 +389,37 @@ describe('Workspaces', () => {
     expect(uploadProject).toHaveBeenCalledOnce();
   });
 
+  it('requires an explicit choice when multiple saved project directories are restored', async () => {
+    const first = { selectionID: '11111111-1111-4111-8111-111111111112', hostId: host.id, workspaceId: workspace.id,
+      projectName: 'alpha', directoryName: 'alpha-folder' };
+    const second = { selectionID: '22222222-2222-4222-8222-222222222223', hostId: host.id, workspaceId: workspace.id,
+      projectName: 'beta', directoryName: 'beta-folder' };
+    const localState = { projectMappings: [first, second], syncState: 'idle' as const, syncCheckpoint: null, syncRecovery: null };
+    const uploadProject = vi.fn().mockResolvedValue({ session: { state: 'completed' }, cloudStatus: 'confirmed', hostStatus: 'applied', localSnapshotConfirmed: true,
+      hostApplication: { status: 'applied', targetRevision: 3, appliedRevision: 3, impacts: [] } });
+    setProjectBridge({ projectUploadTargets: vi.fn().mockResolvedValue([projectTarget]), selectProjectDirectory: vi.fn(), uploadProject,
+      state: vi.fn().mockResolvedValue(localState) });
+    vi.spyOn(portalApi, 'capabilities').mockResolvedValue(projectCapabilities);
+    useDefaultProjectHost();
+    const user = userEvent.setup();
+    renderWorkspaces();
+
+    const savedProjectSelector = await screen.findByRole('combobox', { name: '已保存的本机项目' });
+    expect(savedProjectSelector).toHaveValue('');
+    expect(within(savedProjectSelector).getAllByRole('option')).toHaveLength(3);
+    expect(screen.queryByRole('textbox', { name: '项目名' })).not.toBeInTheDocument();
+
+    await user.selectOptions(savedProjectSelector, second.selectionID);
+    expect(await screen.findByText('已选：beta-folder')).toBeInTheDocument();
+    const nameInput = screen.getByRole('textbox', { name: '项目名' });
+    expect(nameInput).toHaveValue('beta');
+    await user.click(screen.getByRole('button', { name: '确认项目名' }));
+    await user.click(screen.getByRole('button', { name: '开始同步' }));
+
+    expect(uploadProject).toHaveBeenCalledWith(second.selectionID, 'beta');
+    expect(uploadProject).not.toHaveBeenCalledWith(first.selectionID, 'alpha');
+  });
+
   it('shows local changes as pending without starting another upload', async () => {
     const selection = { selectionID: '11111111-1111-4111-8111-111111111112', hostId: host.id, workspaceId: workspace.id,
       projectName: 'demo', directoryName: 'demo' };
@@ -315,7 +455,7 @@ describe('Workspaces', () => {
     await user.click(await screen.findByRole('button', { name: '选择本机目录' }));
     await user.click(screen.getByRole('button', { name: '确认项目名' }));
     await user.click(screen.getByRole('button', { name: '开始同步' }));
-    expect(await screen.findByText('云端已确认，等待目标电脑应用。')).toBeInTheDocument();
+    expect(await screen.findByText('云端已确认，但目标电脑应用回执证据不足；状态待核验，恢复点已保留。')).toBeInTheDocument();
     expect(screen.queryByText('上次同步完成，目标电脑已应用本次项目；本机之后的更改需再次点击同步。')).not.toBeInTheDocument();
   });
 
@@ -334,6 +474,22 @@ describe('Workspaces', () => {
     await user.click(screen.getByRole('button', { name: '确认项目名' }));
     await user.click(screen.getByRole('button', { name: '开始同步' }));
     expect(await screen.findByText('目标电脑已应用本次项目，但本机状态基线未确认；请重新同步后核对。')).toBeInTheDocument();
+    expect(screen.queryByText('上次同步完成，目标电脑已应用本次项目；本机之后的更改需再次点击同步。')).not.toBeInTheDocument();
+  });
+
+  it('does not claim success when the selected local project root becomes inaccessible', async () => {
+    const selection = { selectionID: '11111111-1111-4111-8111-111111111112', hostId: host.id, workspaceId: workspace.id,
+      projectName: 'demo', directoryName: 'demo' };
+    setProjectBridge({ projectUploadTargets: vi.fn().mockResolvedValue([projectTarget]), selectProjectDirectory: vi.fn().mockResolvedValue(selection),
+      uploadProject: vi.fn().mockRejectedValue(new Error('项目根目录不可访问；同步已暂停，恢复点已保留。')) });
+    vi.spyOn(portalApi, 'capabilities').mockResolvedValue(projectCapabilities);
+    useDefaultProjectHost();
+    const user = userEvent.setup();
+    renderWorkspaces();
+    await user.click(await screen.findByRole('button', { name: '选择本机目录' }));
+    await user.click(screen.getByRole('button', { name: '确认项目名' }));
+    await user.click(screen.getByRole('button', { name: '开始同步' }));
+    expect(await screen.findByText('同步未确认：项目根目录不可访问；同步已暂停，恢复点已保留。')).toBeInTheDocument();
     expect(screen.queryByText('上次同步完成，目标电脑已应用本次项目；本机之后的更改需再次点击同步。')).not.toBeInTheDocument();
   });
 
@@ -385,7 +541,26 @@ describe('Workspaces', () => {
     renderWorkspaces();
     await user.click(await screen.findByRole('button', { name: '核对电脑应用状态' }));
     expect(uploadProject).toHaveBeenCalledWith(selection.selectionID, 'demo');
-    expect(await screen.findByText('云端已确认，等待目标电脑应用。')).toBeInTheDocument();
+    expect(await screen.findAllByText('云端已确认，等待目标电脑应用。')).toHaveLength(2);
+  });
+
+  it.each([
+    ['conflict', '目标电脑应用存在冲突；恢复点已保留。点击“核对电脑应用状态”查看最新回执。'],
+    ['unknown', '目标电脑应用状态未知；恢复点已保留。点击“核对电脑应用状态”重新核对。'],
+  ])('preserves completed recovery status %s after loading local state', async (hostApplicationStatus, message) => {
+    const selection = { selectionID: '11111111-1111-4111-8111-111111111112', hostId: host.id, workspaceId: workspace.id,
+      projectName: 'demo', directoryName: 'demo' };
+    setProjectBridge({ projectUploadTargets: vi.fn().mockResolvedValue([projectTarget]), selectProjectDirectory: vi.fn(), uploadProject: vi.fn(),
+      state: vi.fn().mockResolvedValue({ projectMappings: [selection], syncState: 'idle', syncRecovery: null,
+        syncCheckpoint: { mode: 'project_upload', workspaceId: workspace.id, projectSelectionID: selection.selectionID,
+          projectName: 'demo', sessionState: 'completed', hostApplicationStatus } }) });
+    vi.spyOn(portalApi, 'capabilities').mockResolvedValue(projectCapabilities);
+    useDefaultProjectHost();
+    renderWorkspaces();
+
+    expect(await screen.findByText(message)).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: '核对电脑应用状态' })).toBeInTheDocument();
+    expect(screen.queryByText('云端已确认，目标电脑应用状态待核对。')).not.toBeInTheDocument();
   });
 
   it('stops only the identified running project sync through the desktop bridge', async () => {
@@ -442,6 +617,24 @@ describe('Workspaces', () => {
     expect(screen.queryByRole('button', { name: '使用此目标' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '选择本机目录' })).not.toBeInTheDocument();
     expect(selectProjectDirectory).not.toHaveBeenCalled();
+  });
+
+  it('keeps project selection closed when a failed default Host conflicts with a cached running target', async () => {
+    const failedHost = { ...defaultProjectHost, state: 'failed' as const };
+    const projectUploadTargets = vi.fn().mockResolvedValue([projectTarget]);
+    const selectProjectDirectory = vi.fn();
+    const uploadProject = vi.fn();
+    setProjectBridge({ projectUploadTargets, selectProjectDirectory, uploadProject });
+    vi.spyOn(portalApi, 'capabilities').mockResolvedValue(projectCapabilities);
+    useDefaultProjectHost(failedHost);
+    renderWorkspaces([], [failedHost]);
+
+    expect(await screen.findByText(/默认云端电脑当前失败/)).toBeInTheDocument();
+    const target = await screen.findByRole('group', { name: '同步目标电脑' });
+    expect(target).toHaveTextContent('失败');
+    expect(screen.queryByRole('button', { name: '选择本机目录' })).not.toBeInTheDocument();
+    expect(selectProjectDirectory).not.toHaveBeenCalled();
+    expect(uploadProject).not.toHaveBeenCalled();
   });
 
   it('routes new cloud-file creation through cloud-computer creation', async () => {

@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"math"
 	"time"
 
 	"morde/server/internal/domain/conversation"
@@ -10,7 +11,14 @@ import (
 	"morde/server/internal/domain/task"
 )
 
+// MaxAssistantMessageBytes bounds each assistant text delta. A larger total
+// reply is persisted as a sequence of these bounded deltas.
 const MaxAssistantMessageBytes = 32 << 10
+
+// MaxAssistantReplyBytes bounds the complete assistant reply persisted in a
+// Task snapshot and conversation message. This remains a finite storage and
+// transfer limit independent of the provider token capability.
+const MaxAssistantReplyBytes = 2 << 20
 const maxEventPage = 100
 
 const (
@@ -106,32 +114,57 @@ type TaskK2Projection struct {
 }
 
 type TaskDetails struct {
-	Task                   task.Task
-	Dependencies           []Dependency
-	ChildJobs              []ChildJob
-	ResultReview           *ResultReview
-	Validation             TaskValidationSummary
-	ValidationEvidence     *TaskValidationEvidenceRecord
-	AssistantMessage       *AssistantMessageSnapshot
-	CurrentRevisionStarted *bool
-	ResultMessagePending   bool
-	ResultMessagePublished bool
-	ScheduleObservation    *schedule.ObservationSpec
-	Steps                  []task.Step
-	Agents                 []TaskAgentExecution
-	BatchItems             []task.BatchItem
-	Artifacts              []task.Artifact
-	PendingRequest         *task.PendingRequest
-	ClarificationRequests  []task.ClarificationRequest
-	StopRequest            *task.StopRequest
-	StopOperationIDs       []string
-	Plan                   *task.Plan
-	Billing                *TaskBilling
+	Task                            task.Task
+	Attention                       *TaskAttention
+	Dependencies                    []Dependency
+	ChildJobs                       []ChildJob
+	ResultReview                    *ResultReview
+	Validation                      TaskValidationSummary
+	ValidationEvidence              *TaskValidationEvidenceRecord
+	AssistantMessage                *AssistantMessageSnapshot
+	CurrentRevisionStarted          *bool
+	ResultMessagePending            bool
+	ResultMessagePublished          bool
+	ScheduleObservation             *schedule.ObservationSpec
+	Steps                           []task.Step
+	Agents                          []TaskAgentExecution
+	BatchItems                      []task.BatchItem
+	Artifacts                       []task.Artifact
+	PendingRequest                  *task.PendingRequest
+	ClarificationRequests           []task.ClarificationRequest
+	StopRequest                     *task.StopRequest
+	StopOperationIDs                []string
+	Plan                            *task.Plan
+	PlanEventSequence               *int64
+	RequirementManifestConfirmation *TaskRequirementManifestConfirmation
+	ValidationReplayEvidence        *TaskValidationReplayEvidence `json:"-"`
+	Billing                         *TaskBilling
 }
 
 type TaskBilling struct {
 	ModelCalls int64
 	Costs      []TaskCostSummary
+}
+
+// TaskBillingTotalActualMicros sums the settled actual cost of a task in
+// micro-units. It returns nil when the total is not trustworthy: no billing,
+// no cost entries, any entry without a settled actual amount, a negative
+// amount, or an overflowing sum. Callers render nil as unknown, never as 0.
+func TaskBillingTotalActualMicros(billing *TaskBilling) *int64 {
+	if billing == nil || len(billing.Costs) == 0 {
+		return nil
+	}
+	var total int64
+	for _, cost := range billing.Costs {
+		if cost.ActualMicros == nil || *cost.ActualMicros < 0 {
+			return nil
+		}
+		if total > math.MaxInt64-*cost.ActualMicros {
+			return nil
+		}
+		total += *cost.ActualMicros
+	}
+	return &total
 }
 
 type TaskCostSummary struct {
@@ -236,6 +269,24 @@ type TaskStepContentEvidence struct {
 	Truncated bool   `json:"truncated"`
 }
 
+// TaskStepSourceLocation is a server-derived source locator exposed with an
+// authorized Task step. Workspace entries may identify an immutable revision
+// or a live-directory read; the latter has no immutable manifest identity.
+// A requested_uri_only web entry records the submitted URL, not the redirect
+// target or an independently verified page version.
+type TaskStepSourceLocation struct {
+	ID             string `json:"id"`
+	Kind           string `json:"kind"`
+	URI            string `json:"uri,omitempty"`
+	WorkspaceID    string `json:"workspace_id,omitempty"`
+	Revision       *int64 `json:"revision,omitempty"`
+	Path           string `json:"path,omitempty"`
+	Line           *int   `json:"line,omitempty"`
+	ManifestSHA256 string `json:"manifest_sha256,omitempty"`
+	State          string `json:"state"`
+	ContentSHA256  string `json:"content_sha256"`
+}
+
 // TaskStepExecution contains only bounded, redacted details visible to the
 // authorized Task reader. Nil fields were not recorded or do not apply.
 type TaskStepExecution struct {
@@ -266,6 +317,7 @@ type TaskStepDetailDocument struct {
 	Result               string                          `json:"result"`
 	ShellExecution       *TaskStepShellExecutionEvidence `json:"shell_execution,omitempty"`
 	ContentEvidence      *TaskStepContentEvidence        `json:"content_evidence,omitempty"`
+	SourceLocations      []TaskStepSourceLocation        `json:"source_locations,omitempty"`
 	Execution            *TaskStepExecution              `json:"execution,omitempty"`
 	ExecutionWorkspaceID string                          `json:"execution_workspace_id,omitempty"`
 }
@@ -283,6 +335,7 @@ type TaskStepDetail struct {
 	Execution       *TaskStepExecution              `json:"execution,omitempty"`
 	ShellExecution  *TaskStepShellExecutionEvidence `json:"-"`
 	ContentEvidence *TaskStepContentEvidence        `json:"content_evidence,omitempty"`
+	SourceLocations []TaskStepSourceLocation        `json:"source_locations,omitempty"`
 }
 
 type TaskStepDetailReader interface {
@@ -448,6 +501,15 @@ type TaskProgress struct {
 	CloudDSHTaskPlan            *CloudDSHTaskPlanCommit
 }
 
+// CloudDSHPlanStepReadStore brackets a direct read-only tool call with a
+// persisted-plan admission and result settlement. Admission runs before the
+// tool reads data; settlement records the digest only after the successful
+// TaskStep call identity has been committed.
+type CloudDSHPlanStepReadStore interface {
+	AdmitCloudDSHTaskPlanStepRead(context.Context, task.Task, int64, string, TaskToolCallProgress) error
+	SettleCloudDSHTaskPlanStepRead(context.Context, task.Task, int64, string, TaskToolCallProgress, []byte) error
+}
+
 // CloudDSHPersonalHistoryReadCommit binds a personal-history tool result to
 // the consent revision and personal-data change watermark that authorized the
 // search. PostgreSQL rechecks both in the same transaction that records the
@@ -476,18 +538,19 @@ type CloudDSHTaskPlanCommit struct {
 // CloudDSHSkillReadCommit binds a fixed skill response to one durable dsh call.
 // The Task event stores source metadata and hashes; the skill text stays in the encrypted dsh checkpoint.
 type CloudDSHSkillReadCommit struct {
-	TaskID               string
-	OwnerID              string
-	AgentSessionID       string
-	AuthorizationVersion int64
-	CallID               string
-	SkillID              string
-	SkillVersion         string
-	BundleVersion        string
-	SourceRef            string
-	ContentSHA256        string
-	OutputSHA256         string
-	FingerprintSHA256    string
+	TaskID                string
+	OwnerID               string
+	AgentSessionID        string
+	AuthorizationVersion  int64
+	CallID                string
+	SkillID               string
+	SkillVersion          string
+	PersonalSkillRevision int64
+	BundleVersion         string
+	SourceRef             string
+	ContentSHA256         string
+	OutputSHA256          string
+	FingerprintSHA256     string
 }
 
 // CloudDSHPersonalMutationCommit binds a personal object update to one dsh
@@ -519,6 +582,10 @@ type AssistantTextDelta struct {
 type OperationUpdate struct {
 	TaskID              string
 	OperationKey        string
+	PlanRevision        int64
+	PlanStepID          string
+	InternalPurpose     InternalOperationDispatchPurpose
+	EvidenceSources     []OperationEvidenceSource
 	LeaseOwner          string
 	LeaseVersion        int64
 	RuntimeGeneration   int64
@@ -530,6 +597,26 @@ type OperationUpdate struct {
 	Status              task.OperationStatus
 	ExternalID          string
 	Result              string
+}
+
+// InternalOperationDispatchPurpose identifies a small set of trusted
+// read-only operations that are not model-selected plan steps.
+type InternalOperationDispatchPurpose string
+
+const InternalOperationDispatchPurposeFileEvidenceRead InternalOperationDispatchPurpose = "file_evidence_read"
+
+// OperationEvidenceSource binds an internal Workspace verification read to
+// the durable file_write call whose output produced the candidate evidence.
+type OperationEvidenceSource struct {
+	OperationKey   string `json:"operation_key"`
+	CallID         string `json:"call_id"`
+	WorkspaceID    string `json:"workspace_id"`
+	BindingVersion int64  `json:"binding_version"`
+	RequestHash    []byte `json:"request_hash"`
+	Result         string `json:"result"`
+	Path           string `json:"path"`
+	Size           int64  `json:"size"`
+	SHA256         string `json:"sha256"`
 }
 
 // TaskEventPage carries the task authorization and stream cursor state with a

@@ -2,12 +2,16 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+	"go.uber.org/zap"
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
@@ -24,6 +28,10 @@ type ConversationService interface {
 	GetMain(context.Context, identity.Principal) (conversation.MainConversation, error)
 	EnsureMain(context.Context, identity.Principal, app.EnsureMainConversationCommand) (conversation.MainConversation, bool, error)
 	SetMain(context.Context, identity.Principal, app.SetMainConversationCommand) (conversation.MainConversation, bool, error)
+}
+
+type conversationMessageCancellationService interface {
+	CancelConversationMessage(context.Context, identity.Principal, string, string, string, string) (conversation.Message, bool, error)
 }
 
 type conversationResponse struct {
@@ -69,6 +77,7 @@ type messageResponse struct {
 	RelatedTaskID             string                            `json:"related_task_id,omitempty"`
 	AttachmentIDs             []string                          `json:"attachment_ids,omitempty"`
 	ClientMessageID           string                            `json:"client_message_id,omitempty"`
+	ResponseMode              string                            `json:"response_mode,omitempty"`
 	RoutingStatus             conversation.RoutingStatus        `json:"routing_status,omitempty"`
 	RoutingFailureReason      conversation.RoutingFailureReason `json:"routing_failure_reason,omitempty"`
 	AgentAcknowledged         bool                              `json:"agent_acknowledged"`
@@ -101,6 +110,7 @@ type conversationMessageRequest struct {
 	ApplicationID           string             `json:"application_id,omitempty"`
 	ModelID                 string             `json:"model_id,omitempty"`
 	TimeZone                string             `json:"time_zone,omitempty"`
+	ResponseMode            json.RawMessage    `json:"response_mode,omitempty"`
 	Content                 string             `json:"content"`
 	Budget                  *taskBudgetRequest `json:"budget,omitempty"`
 }
@@ -190,12 +200,34 @@ func (h *api) registerConversations(group *gin.RouterGroup, conversations Conver
 		group.PUT("/conversations/:id/messages/:message_id/attachments/:client_attachment_id", h.associateConversationMessageAttachment(tasks))
 		group.POST("/conversations/:id/messages/:message_id/retry-processing", h.retryConversationMessageProcessing(tasks))
 		group.POST("/projects/:id/conversations/:conversation_id/messages/:message_id/retry-processing", h.retryConversationMessageProcessing(tasks))
+		if cancelService, ok := tasks.(conversationMessageCancellationService); ok {
+			group.POST("/conversations/:id/messages/:message_id/cancel", h.cancelConversationMessage(cancelService))
+			group.POST("/projects/:id/conversations/:conversation_id/messages/:message_id/cancel", h.cancelConversationMessage(cancelService))
+		}
+		group.GET("/conversations/:id/messages/:message_id/retry-eligibility", h.getConversationMessageRetryEligibility(tasks))
+		group.GET("/projects/:id/conversations/:conversation_id/messages/:message_id/retry-eligibility", h.getConversationMessageRetryEligibility(tasks))
 		if variants, ok := tasks.(ConversationMessageVariantService); ok {
 			group.POST("/conversations/:id/messages/:message_id/variants", h.createConversationMessageVariant(variants))
 			group.POST("/projects/:id/conversations/:conversation_id/messages/:message_id/variants", h.createConversationMessageVariant(variants))
 		}
 		group.GET("/conversations/:id/tasks", h.listConversationActiveTasks(tasks))
 		registerConversationMessageUploads(group, tasks)
+	}
+}
+
+func parseConversationResponseMode(raw json.RawMessage) (string, bool) {
+	if len(raw) == 0 {
+		return "short", true
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return "", false
+	}
+	switch value {
+	case "short", "long_form":
+		return value, true
+	default:
+		return "", false
 	}
 }
 
@@ -511,6 +543,11 @@ func (h *api) acceptConversationMessage(service TaskService) gin.HandlerFunc {
 		if !decodeStrictTaskJSON(c, &request) {
 			return
 		}
+		responseMode, ok := parseConversationResponseMode(request.ResponseMode)
+		if !ok {
+			writeError(c, domain.InvalidArgument("response_mode", "response_mode must be short or long_form"))
+			return
+		}
 		instanceID, ok := requiredMessageServiceInstance(c)
 		if !ok {
 			return
@@ -530,13 +567,19 @@ func (h *api) acceptConversationMessage(service TaskService) gin.HandlerFunc {
 			return
 		}
 		c.Request = c.Request.WithContext(app.WithExpectedServiceInstance(c.Request.Context(), instanceID))
+		spanContext := trace.SpanFromContext(c.Request.Context()).SpanContext()
+		traceID, traceSpanID := "", ""
+		if spanContext.IsValid() {
+			traceID, traceSpanID = spanContext.TraceID().String(), spanContext.SpanID().String()
+		}
 		message, replayed, err := service.AcceptConversationMessage(c.Request.Context(), principal, conversationID, app.AcceptConversationMessageCommand{
 			ServiceInstanceID: instanceID, ClientMessageID: request.ClientMessageID,
 			PreviousClientMessageID: request.PreviousClientMessageID, ReferenceTaskID: request.ReferenceTaskID,
 			HostID: request.HostID, WorkspaceID: request.WorkspaceID, ChangeTaskTarget: request.ChangeTaskTarget,
 			MCPConnectorIDs:     request.MCPConnectorIDs,
 			ClientAttachmentIDs: request.ClientAttachmentIDs, ApplicationID: request.ApplicationID,
-			ModelID: request.ModelID, TimeZone: request.TimeZone, Content: request.Content, Budget: budget, IdempotencyKey: key,
+			ModelID: request.ModelID, TimeZone: request.TimeZone, ResponseMode: responseMode,
+			Content: request.Content, Budget: budget, IdempotencyKey: key,
 		})
 		if err != nil {
 			writeError(c, err)
@@ -547,12 +590,85 @@ func (h *api) acceptConversationMessage(service TaskService) gin.HandlerFunc {
 			writeError(c, domain.NewError(domain.CodeInternal, "internal error"))
 			return
 		}
+		span := trace.SpanFromContext(c.Request.Context())
+		span.SetAttributes(
+			attribute.String("morde.user_id", principal.UserID),
+			attribute.String("morde.conversation_id", conversationID),
+			attribute.String("morde.message_id", message.ID),
+		)
+		if message.TaskID != "" {
+			span.SetAttributes(attribute.String("morde.task_id", message.TaskID))
+		}
+		if h.deps.Observability.LinkWriter != nil && traceID != "" && traceSpanID != "" {
+			if err := h.deps.Observability.LinkWriter.LinkAcceptedMessageTrace(c.Request.Context(), traceID, traceSpanID,
+				c.GetString("request_id"), message.ID); err != nil {
+				h.options.Logger.Warn("record conversation trace link failed", zap.Error(err),
+					zap.String("trace_id", traceID), zap.String("span_id", traceSpanID),
+					zap.String("request_id", c.GetString("request_id")), zap.String("message_id", message.ID))
+			}
+		}
 		view, err := toMessageResponse(message)
 		if err != nil {
 			writeError(c, err)
 			return
 		}
 		c.JSON(http.StatusAccepted, acceptedConversationMessageResponse{Message: view, Replayed: replayed})
+	}
+}
+
+func (h *api) cancelConversationMessage(service conversationMessageCancellationService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var principal identity.Principal
+		var projectID, conversationID string
+		var ok bool
+		if c.Param("conversation_id") != "" {
+			principal, projectID, conversationID, ok = projectConversationPrincipalAndConversationID(c)
+		} else {
+			principal, ok = principalFrom(c)
+			if !ok {
+				unauthenticated(c)
+				return
+			}
+			conversationID, ok = safeID(c, "id", domain.ValidConversationID)
+		}
+		if !ok {
+			return
+		}
+		if !requiredMessageActor(c, principal) {
+			return
+		}
+		instanceID, ok := requiredMessageServiceInstance(c)
+		if !ok || !personalAttachmentBodyIsEmpty(c) {
+			return
+		}
+		messageID, ok := safeIDParam(c, "message_id", "message_id", domain.ValidMessageID)
+		if !ok {
+			return
+		}
+		message, changed, err := service.CancelConversationMessage(c.Request.Context(), principal, projectID, conversationID, messageID, instanceID)
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		if message.ID != messageID || message.ConversationID != conversationID || message.Role != conversation.RoleUser || message.TaskID != "" {
+			writeError(c, domain.NewError(domain.CodeInternal, "internal error"))
+			return
+		}
+		if projectID == "" {
+			view, err := toMessageResponse(message)
+			if err != nil {
+				writeError(c, err)
+				return
+			}
+			c.JSON(http.StatusAccepted, acceptedConversationMessageResponse{Message: view, Replayed: !changed})
+			return
+		}
+		view, err := toProjectConversationMessageResponse(message)
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		c.JSON(http.StatusAccepted, acceptedProjectConversationMessageResponse{Message: view, Replayed: !changed})
 	}
 }
 
@@ -594,6 +710,10 @@ func toScopedMessageResponse(value conversation.Message, projectScope bool) (mes
 		(value.RoutingFailureReason != "" && !value.RoutingFailureReason.Valid()) {
 		return messageResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 	}
+	if value.ResponseMode != "" && (value.Role != conversation.RoleUser ||
+		(value.ResponseMode != app.ConversationResponseShort && value.ResponseMode != app.ConversationResponseLongForm)) {
+		return messageResponse{}, domain.NewError(domain.CodeInternal, "internal error")
+	}
 	if value.ToolActivity != nil && (value.Role != conversation.RoleUser || !value.ToolActivity.Valid()) {
 		return messageResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 	}
@@ -628,7 +748,8 @@ func toScopedMessageResponse(value conversation.Message, projectScope bool) (mes
 		Sequence: value.Sequence, Role: value.Role, Content: value.Content,
 		TaskID: value.TaskID, DuplicateOfMessageID: value.DuplicateOfMessageID, RelatedTaskID: value.RelatedTaskID,
 		AttachmentIDs:   append([]string(nil), value.AttachmentIDs...),
-		ClientMessageID: value.ClientMessageID, RoutingStatus: value.RoutingStatus, RoutingFailureReason: value.RoutingFailureReason,
+		ClientMessageID: value.ClientMessageID, ResponseMode: value.ResponseMode,
+		RoutingStatus: value.RoutingStatus, RoutingFailureReason: value.RoutingFailureReason,
 		AgentAcknowledged: value.AgentAcknowledged, ToolActivity: value.ToolActivity,
 		Sources:        append([]conversation.MessageSource(nil), value.Sources...),
 		DeliveryStatus: deliveryStatus, OutputStatus: value.OutputStatus, OutputTaskRevision: value.OutputTaskRevision,

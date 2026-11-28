@@ -40,6 +40,82 @@ type AgentHostFenceReader interface {
 
 const agentAskUserToolName = "ask_user"
 
+const cloudDSHPlanStepIDArgumentName = "morde_plan_step_id"
+const cloudDSHPlanRevisionArgumentName = "morde_plan_revision"
+
+// cloudDSHPlanStepArguments separates the plan association from the arguments
+// that are delivered to a business tool. The association is model-supplied
+// metadata and is only trusted after the Store validates it against the
+// current persisted plan and dependency evidence.
+type cloudDSHPlanStepArguments struct {
+	StepID       string
+	PlanRevision int64
+	BusinessArgs json.RawMessage
+	HasStepID    bool
+}
+
+func extractCloudDSHPlanStepArguments(raw string) (cloudDSHPlanStepArguments, error) {
+	arguments, err := validateAgentToolArguments(raw)
+	if err != nil {
+		return cloudDSHPlanStepArguments{}, err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(arguments, &fields); err != nil || fields == nil {
+		return cloudDSHPlanStepArguments{}, errors.New("tool arguments must be an object")
+	}
+	encodedStepID, hasStepID := fields[cloudDSHPlanStepIDArgumentName]
+	encodedRevision, hasPlanRevision := fields[cloudDSHPlanRevisionArgumentName]
+	if !hasStepID && !hasPlanRevision {
+		return cloudDSHPlanStepArguments{BusinessArgs: arguments}, nil
+	}
+	if !hasStepID || !hasPlanRevision {
+		return cloudDSHPlanStepArguments{}, errors.New("plan step metadata is incomplete")
+	}
+	var stepID string
+	if json.Unmarshal(encodedStepID, &stepID) != nil || !validCloudDSHPlanStepID(stepID) {
+		return cloudDSHPlanStepArguments{}, errors.New("plan step metadata is invalid")
+	}
+	var planRevision int64
+	if json.Unmarshal(encodedRevision, &planRevision) != nil || planRevision < 1 {
+		return cloudDSHPlanStepArguments{}, errors.New("plan revision metadata is invalid")
+	}
+	delete(fields, cloudDSHPlanStepIDArgumentName)
+	delete(fields, cloudDSHPlanRevisionArgumentName)
+	businessArgs, err := json.Marshal(fields)
+	if err != nil || !validAgentJSONObject(businessArgs, maxAgentToolArgsBytes) {
+		return cloudDSHPlanStepArguments{}, errors.New("business tool arguments are invalid")
+	}
+	return cloudDSHPlanStepArguments{StepID: stepID, PlanRevision: planRevision, BusinessArgs: businessArgs, HasStepID: true}, nil
+}
+
+func hasCloudDSHPlanStepMetadata(raw string) bool {
+	arguments, err := validateAgentToolArguments(raw)
+	if err != nil {
+		return false
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(arguments, &fields) != nil || fields == nil {
+		return false
+	}
+	_, hasStepID := fields[cloudDSHPlanStepIDArgumentName]
+	_, hasRevision := fields[cloudDSHPlanRevisionArgumentName]
+	return hasStepID || hasRevision
+}
+
+func validCloudDSHPlanStepID(value string) bool {
+	if len(value) == 0 || len(value) > 40 {
+		return false
+	}
+	for index, char := range value {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') ||
+			(index > 0 && (char == '-' || char == '_')) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
 var agentAskUserTool = AgentToolDefinition{
 	ModelTool: ModelTool{
 		Name:        agentAskUserToolName,
@@ -59,15 +135,19 @@ func sameAgentControlFence(left, right AgentHostFence) bool {
 }
 
 type AgentToolRequest struct {
-	Task          task.Task
-	Call          ModelToolCall
-	Arguments     json.RawMessage
-	OperationKey  string
-	OperationID   string
-	RequiredScope identity.Scope
-	Fence         AgentHostFence
-	WorkspaceID   string
-	Approval      *AgentToolApprovalDecision
+	Task      task.Task
+	Call      ModelToolCall
+	Arguments json.RawMessage
+	// OperationRequestHash preserves the exact durable DSH call identity when
+	// Business arguments have had reserved execution metadata removed. It is
+	// consumed only by Host operation reconciliation.
+	OperationRequestHash []byte
+	OperationKey         string
+	OperationID          string
+	RequiredScope        identity.Scope
+	Fence                AgentHostFence
+	WorkspaceID          string
+	Approval             *AgentToolApprovalDecision
 }
 
 // AgentToolApprovalDecision is supplied only after the authenticated task
@@ -98,10 +178,17 @@ type AgentApprovalRequest struct {
 	Object  string `json:"object"`
 	Content string `json:"content"`
 	Impact  string `json:"impact"`
+	// RejectionConsequence states in plain text what happens if the user
+	// rejects the action. It may be blank for approvals created before E05.
+	RejectionConsequence string `json:"rejection_consequence,omitempty"`
 }
 
 type AgentToolPreparation struct {
-	Status         AgentToolPreparationStatus
+	Status AgentToolPreparationStatus
+	// TriggerRule names the action-matrix category that required approval
+	// (task.ApprovalTrigger*). Empty when the preparation does not require
+	// approval or the rule is unknown.
+	TriggerRule    string
 	Approval       AgentApprovalRequest
 	Fence          AgentHostFence
 	WorkspaceID    string
@@ -140,7 +227,28 @@ type AgentModelFailureDiagnostic struct {
 	ReasonCode string
 	ToolName   string
 	ToolCallID string
+	// LadderExhausted marks a terminal state where the E12 retry ladder
+	// spent its budget (Attempts retries). pauseRecovery then records the
+	// ladder-exhausted terminal instead of the generic recovery pause.
+	LadderExhausted bool
+	// Attempts is the number of retries spent before exhaustion.
+	Attempts int
+	// Reason is the FailoverReason the ladder exhausted on; it selects the
+	// §4.3 user-visible case for the terminal text.
+	Reason FailoverReason
 }
+
+// AgentRecoveryDiagnostic contains only allowlisted facts about an unresolved
+// restored DSH run. It must never carry the underlying runtime error.
+type AgentRecoveryDiagnostic struct {
+	Stage      string
+	ReasonCode string
+}
+
+const (
+	AgentRecoveryStageCloudDSHRun          = "cloud_dsh_run"
+	AgentRecoveryReasonUnclassifiedRuntime = "unclassified_recovery_error"
+)
 
 // AgentToolTerminalAttemptFinisher durably closes a Task after the worker has
 // resolved the DSH request that produced a terminal tool result.
@@ -161,14 +269,54 @@ type AgentVerificationRequest struct {
 // call/output pair. Runtime verification independently computes the same
 // metadata from the current Workspace file before an artifact is persisted.
 type AgentFileEvidence struct {
-	Path         string `json:"path"`
-	Size         int64  `json:"size"`
-	SHA256       string `json:"sha256"`
-	CallID       string `json:"-"`
-	WorkspaceID  string `json:"-"`
-	OperationKey string `json:"-"`
-	RequestHash  []byte `json:"-"`
-	Result       string `json:"-"`
+	Path          string `json:"path"`
+	Size          int64  `json:"size"`
+	SHA256        string `json:"sha256"`
+	CallID        string `json:"-"`
+	DurableCallID string `json:"-"`
+	WorkspaceID   string `json:"-"`
+	OperationKey  string `json:"-"`
+	RequestHash   []byte `json:"-"`
+	Result        string `json:"-"`
+}
+
+// FileEvidenceReadRequestHash identifies an internal read-only verification
+// operation by its exact durable file_write sources. The operation key is
+// versioned so rows created before this proof was part of the identity cannot
+// be replayed with weaker evidence.
+func FileEvidenceReadRequestHash(operationKey string, sources []OperationEvidenceSource) ([32]byte, error) {
+	if !strings.HasPrefix(operationKey, "agent:verify:v2:") || len(operationKey) > 255 ||
+		len(sources) == 0 || len(sources) > maxAgentVerifyFiles {
+		return [32]byte{}, errors.New("file evidence read identity is invalid")
+	}
+	seen := make(map[string]struct{}, len(sources))
+	for _, source := range sources {
+		if source.CallID == "" || len(source.CallID) > 256 || !utf8.ValidString(source.CallID) || strings.ContainsRune(source.CallID, '\x00') ||
+			source.OperationKey != AgentOperationKey(source.CallID) || !domain.ValidWorkspaceID(source.WorkspaceID) ||
+			source.BindingVersion < 1 || len(source.RequestHash) != sha256.Size ||
+			!validWorkspaceRelativePath(source.Path) || source.Size < 0 || source.Size > maxAgentVerifyFileBytes ||
+			len(source.SHA256) != sha256.Size*2 || source.SHA256 != strings.ToLower(source.SHA256) ||
+			len(source.Result) == 0 || !validAgentJSONObject([]byte(source.Result), maxAgentToolOutputBytes) {
+			return [32]byte{}, errors.New("file evidence source is invalid")
+		}
+		if _, err := hex.DecodeString(source.SHA256); err != nil {
+			return [32]byte{}, errors.New("file evidence source digest is invalid")
+		}
+		key := source.OperationKey + "\x00" + source.Path
+		if _, exists := seen[key]; exists {
+			return [32]byte{}, errors.New("file evidence source is duplicated")
+		}
+		seen[key] = struct{}{}
+	}
+	encoded, err := json.Marshal(struct {
+		Version      int                       `json:"version"`
+		OperationKey string                    `json:"operation_key"`
+		Sources      []OperationEvidenceSource `json:"sources"`
+	}{Version: 1, OperationKey: operationKey, Sources: sources})
+	if err != nil {
+		return [32]byte{}, fmt.Errorf("encode file evidence read identity: %w", err)
+	}
+	return sha256.Sum256(encoded), nil
 }
 
 const (
@@ -337,7 +485,7 @@ func agentFileWriteEvidence(inputs []ModelInput) ([]AgentFileEvidence, error) {
 		}
 		latest[evidenceKey] = AgentFileEvidence{
 			Path: args.Path, Size: int64(len(content)), SHA256: fmt.Sprintf("%x", digest[:]),
-			CallID: SafeTaskValidationCallID(outputItem.CallID), WorkspaceID: args.WorkspaceID,
+			CallID: SafeTaskValidationCallID(outputItem.CallID), DurableCallID: outputItem.CallID, WorkspaceID: args.WorkspaceID,
 			OperationKey: operationKey, RequestHash: append([]byte(nil), requestHash[:]...), Result: outputItem.Output,
 		}
 	}

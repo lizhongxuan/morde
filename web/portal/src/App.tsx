@@ -31,6 +31,7 @@ import { AdminUsers } from './routes/admin/AdminUsers';
 import { AdminOverview } from './routes/admin/AdminOverview';
 import { AdminModels } from './routes/admin/AdminModels';
 import { AdminUsage } from './routes/admin/AdminUsage';
+import { AdminObservability } from './routes/admin/AdminObservability';
 import { AdminQuality } from './routes/admin/AdminQuality';
 import { AdminControls } from './routes/admin/AdminControls';
 import { AdminRecords } from './routes/admin/AdminRecords';
@@ -141,6 +142,7 @@ function AdminRoutes() {
           <Route path="settings" element={<AdminSettings />} />
           <Route path="models" element={<AdminModels />} />
           <Route path="usage" element={<AdminUsage />} />
+          <Route path="observability" element={<AdminObservability />} />
           <Route path="quality" element={<AdminQuality />} />
           <Route path="evaluations" element={<AdminEvaluationBatches />} />
           <Route path="controls" element={<AdminControls />} />

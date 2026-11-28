@@ -75,6 +75,7 @@ private final class MordeAuthURLProtocol: URLProtocol {
     static let taskPagesOtherWaitReasonFixtureLaunchArgument = "-morde.localTaskPagesOtherWaitReasonFixture"
     static let taskPagesApprovalLoadFailureFixtureLaunchArgument = "-morde.localTaskPagesApprovalLoadFailureFixture"
     static let taskPagesTaskDetailRequestsFixtureLaunchArgument = "-morde.localTaskPagesTaskDetailRequestsFixture"
+    static let taskPagesRouteClarificationFixtureLaunchArgument = "-morde.localTaskPagesRouteClarificationFixture"
     static let taskPagesPermissionRecoveryFixtureLaunchArgument = "-morde.localTaskPagesPermissionRecoveryFixture"
     static let conversationFailureFixtureLaunchArgument = "-morde.localConversationFailureFixture"
     static let conversationDrawerRetryFixtureLaunchArgument = "-morde.localConversationDrawerRetryFixture"
@@ -207,6 +208,7 @@ private final class MordeAuthURLProtocol: URLProtocol {
     private static var taskPagesTimelineUnconfirmedDetailRequestCount = 0
     private static var taskPagesPermissionRecoveryFailed = false
     private static var taskPagesClarificationAnswered = false
+    private static var taskPagesRouteClarificationIntents: [String: String] = [:]
     private static var taskPagesApprovalRetryIdempotencyKey: String?
     private static var taskPagesTaskActionStatus = "running"
     private static var taskPagesTaskActionIdempotencyKey: String?
@@ -514,6 +516,16 @@ private final class MordeAuthURLProtocol: URLProtocol {
     private static func setTaskPagesClarificationAnswered() {
         taskFixtureLock.lock(); defer { taskFixtureLock.unlock() }
         taskPagesClarificationAnswered = true
+    }
+
+    private static func setTaskPagesRouteClarificationIntent(_ intent: String, taskID: String) {
+        taskFixtureLock.lock(); defer { taskFixtureLock.unlock() }
+        taskPagesRouteClarificationIntents[taskID] = intent
+    }
+
+    private static func taskPagesRouteClarificationIntent(taskID: String) -> String? {
+        taskFixtureLock.lock(); defer { taskFixtureLock.unlock() }
+        return taskPagesRouteClarificationIntents[taskID]
     }
 
     private static func setTaskPagesCreatedConversation() {
@@ -876,6 +888,7 @@ private final class MordeAuthURLProtocol: URLProtocol {
         taskPagesTimelineUnconfirmedDetailRequestCount = 0
         taskPagesPermissionRecoveryFailed = false
         taskPagesClarificationAnswered = false
+        taskPagesRouteClarificationIntents = [:]
         taskPagesApprovalRetryIdempotencyKey = nil
         taskPagesTaskActionStatus = "running"
         taskPagesTaskActionIdempotencyKey = nil
@@ -1876,6 +1889,45 @@ private final class MordeAuthURLProtocol: URLProtocol {
             }
             return task
         }
+        if ProcessInfo.processInfo.arguments.contains(Self.taskPagesRouteClarificationFixtureLaunchArgument) {
+            let fixture: (status: String, callID: String, requestID: String, workspaceID: String?)
+            switch id {
+            case "q0000103":
+                fixture = ("waiting_user", MordeTask.Clarification.fileDeliveryIntentCallID,
+                           "r0000003", "wabc1234")
+            case "q0000104":
+                fixture = ("running", MordeTask.Clarification.routeFileDeliveryIntentCallID,
+                           "r0000004", "wabc1234")
+            case "q0000105":
+                fixture = ("pausing", MordeTask.Clarification.routeFileDeliveryIntentCallID,
+                           "r0000005", nil)
+            case "q0000106":
+                fixture = ("paused", MordeTask.Clarification.routeFileDeliveryIntentCallID,
+                           "r0000006", "wabc1234")
+            default:
+                return nil
+            }
+            let acceptedIntent = taskPagesRouteClarificationIntent(taskID: id)
+            let answered = acceptedIntent != nil
+            var task = taskPagesSummary(id: id, status: answered ? "completed" : fixture.status,
+                                        objective: "Local file delivery clarification fixture")
+            task["event_sequence"] = answered ? 2 : 1
+            task["workspace_id"] = fixture.workspaceID as Any? ?? NSNull()
+            task["result"] = acceptedIntent.map { "Local file delivery intent: \($0)" } as Any? ?? NSNull()
+            task["current_step"] = answered ? NSNull() : "Waiting for file delivery intent"
+            task["waiting_reason"] = fixture.status == "waiting_user" && !answered
+                ? "clarification_required" as Any : NSNull()
+            task["stop_request"] = NSNull()
+            task["pending_request"] = NSNull()
+            task["clarification_request"] = answered ? NSNull() : [
+                "id": fixture.requestID, "version": 1, "call_id": fixture.callID,
+                "question": "Do you need a file delivered, or only a chat answer?",
+            ]
+            task["batch_items"] = []
+            task["steps"] = []
+            task["artifacts"] = []
+            return task
+        }
         if id == "q0000101" {
             if ProcessInfo.processInfo.arguments.contains(Self.taskPagesUnresolvedRecoveryFixtureLaunchArgument) {
                 var task = taskPagesSummary(id: id, status: "waiting_user",
@@ -2000,6 +2052,7 @@ private final class MordeAuthURLProtocol: URLProtocol {
             task["stop_request"] = NSNull()
             task["pending_request"] = NSNull()
             task["clarification_request"] = answered ? NSNull() : ["id": "r0000002", "version": 1,
+                                                                    "call_id": "local-clarification",
                                                                     "question": "A synthetic clarification, not an approval."]
             task["batch_items"] = []
             task["steps"] = []
@@ -3548,6 +3601,29 @@ private final class MordeAuthURLProtocol: URLProtocol {
                 statusCode = 202
                 body = Data(#"{"task_id":"q0000101","action":"approval_response","status":"completed","unsettled_operation_ids":[]}"#.utf8)
             }
+        } else if isFixtureOrigin, request.httpMethod == "POST",
+                  ["/api/tasks/q0000103/inputs", "/api/tasks/q0000104/inputs",
+                   "/api/tasks/q0000105/inputs", "/api/tasks/q0000106/inputs"].contains(request.url?.path ?? ""),
+                  ProcessInfo.processInfo.arguments.contains(Self.taskPagesRouteClarificationFixtureLaunchArgument) {
+            let path = request.url?.path ?? ""
+            let taskID = String(path.split(separator: "/").dropLast().last ?? "")
+            let requestID = "r000000\(taskID.suffix(1))"
+            let expectedIntent = taskID == "q0000104" ? "required" : "none"
+            let payload = Self.jsonPayload(request)
+            let answer = (payload?["answer"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if request.value(forHTTPHeaderField: "Idempotency-Key")?.isEmpty != false ||
+                payload?["clarification_id"] as? String != requestID ||
+                payload?["clarification_version"] as? Int != 1 ||
+                payload?["call_id"] != nil || payload?["file_delivery_intent"] as? String != expectedIntent || answer.isEmpty ||
+                !ProcessInfo.processInfo.arguments.contains(Self.taskPagesFixtureLaunchArgument) {
+                statusCode = 409
+                body = Data(#"{"error":{"code":"conflict","message":"Invalid local structured clarification response"}}"#.utf8)
+            } else {
+                Self.setTaskPagesRouteClarificationIntent(expectedIntent, taskID: taskID)
+                statusCode = 202
+                body = Self.fixtureJSON(["task_id": taskID, "action": "answer_input", "status": "completed",
+                                         "unsettled_operation_ids": []])
+            }
         } else if isFixtureOrigin, request.url?.path == "/api/tasks/q0000102/inputs", request.httpMethod == "POST",
                   ProcessInfo.processInfo.arguments.contains(Self.taskPagesFixtureLaunchArgument) {
             // nanoMuse: Validate the local clarification fixture exactly like the task input contract.
@@ -3555,7 +3631,8 @@ private final class MordeAuthURLProtocol: URLProtocol {
             let answer = (payload?["answer"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             if request.value(forHTTPHeaderField: "Idempotency-Key")?.isEmpty != false ||
                 payload?["clarification_id"] as? String != "r0000002" ||
-                payload?["clarification_version"] as? Int != 1 || answer.isEmpty {
+                payload?["clarification_version"] as? Int != 1 || answer.isEmpty ||
+                payload?["file_delivery_intent"] != nil {
                 statusCode = 409
                 body = Data(#"{"error":{"code":"conflict","message":"Invalid local clarification response"}}"#.utf8)
             } else {
@@ -4308,6 +4385,19 @@ private final class MordeAuthURLProtocol: URLProtocol {
                 Self.taskPagesSummary(id: "q0000101", status: "waiting_user", objective: "Local approval fixture"),
                 Self.taskPagesSummary(id: "q0000102", status: "waiting_user", objective: "Local clarification fixture"),
             ]
+            statusCode = 200
+            body = (try? JSONSerialization.data(withJSONObject: ["items": items, "next_cursor": NSNull()])) ?? Data()
+        } else if isFixtureOrigin, request.url?.path == "/api/tasks", request.httpMethod == "GET",
+                  ProcessInfo.processInfo.arguments.contains(Self.taskPagesRouteClarificationFixtureLaunchArgument) {
+            let query = request.url.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false) }?.queryItems ?? []
+            let status = query.first(where: { $0.name == "status" })?.value
+            let allItems = [
+                Self.taskPagesSummary(id: "q0000103", status: "waiting_user", objective: "Initial file delivery intent"),
+                Self.taskPagesSummary(id: "q0000104", status: "running", objective: "Active route file delivery intent"),
+                Self.taskPagesSummary(id: "q0000105", status: "pausing", objective: "Paused route file delivery intent"),
+                Self.taskPagesSummary(id: "q0000106", status: "paused", objective: "Paused route file delivery intent"),
+            ]
+            let items = status.map { expected in allItems.filter { $0["status"] as? String == expected } } ?? allItems
             statusCode = 200
             body = (try? JSONSerialization.data(withJSONObject: ["items": items, "next_cursor": NSNull()])) ?? Data()
         } else if isFixtureOrigin, request.url?.path == "/api/tasks", request.httpMethod == "GET",
@@ -5202,7 +5292,16 @@ struct MordeTask: Decodable, Identifiable {
             return expirationDate <= now
         }
     }
-    struct Clarification: Decodable { let id: String; let version: Int; let question: String }
+    struct Clarification: Decodable {
+        static let fileDeliveryIntentCallID = "morde-file-delivery-intent"
+        static let routeFileDeliveryIntentCallID = "morde-route-file-delivery-intent"
+        static let fileDeliveryIntentCallIDs: Set<String> = [
+            fileDeliveryIntentCallID, routeFileDeliveryIntentCallID,
+        ]
+        let id: String; let version: Int; let question: String; let call_id: String?
+        var isFileDeliveryIntent: Bool { call_id.map(Self.fileDeliveryIntentCallIDs.contains) ?? false }
+        var isRouteFileDeliveryIntent: Bool { call_id == Self.routeFileDeliveryIntentCallID }
+    }
     struct StopRequest: Decodable { let status: String; let unsettled_operation_ids: [String] }
     struct Step: Decodable, Identifiable {
         let id: String; let sequence: Int; let kind: String; let status: String
@@ -7438,20 +7537,24 @@ private struct MordeIndependentSendTarget {
     // nanoMuse: Task pages can answer requests even when the task is not selected in chat.
     @discardableResult
     func answerTaskPageClarification(taskID: String, clarificationID: String, version: Int,
-                                     answer: String) async -> Bool {
+                                     answer: String, fileDeliveryIntent: String? = nil) async -> Bool {
         let text = answer.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let task = taskPageDetails[taskID],
               let clarification = task.clarification_request,
               clarification.id == clarificationID, clarification.version == version,
               version > 0, MordeTaskResponsePolicy.hasValidRequestID(clarificationID),
               MordeTaskResponsePolicy.hasValidAnswer(text),
+              Self.validClarificationFileDeliveryIntent(task: task, clarification: clarification,
+                                                        value: fileDeliveryIntent),
               let path = MordeTaskResponsePolicy.inputPath(taskID: taskID) else {
             taskPageActionErrors[taskID] = "请检查补充信息内容，并刷新 Task 状态后重试。"
             return false
         }
+        var body: [String: Any] = ["clarification_id": clarificationID,
+                                   "clarification_version": version, "answer": text]
+        if let fileDeliveryIntent { body["file_delivery_intent"] = fileDeliveryIntent }
         return await submitTaskAction(taskID: taskID, path: path,
-                                      body: ["clarification_id": clarificationID,
-                                             "clarification_version": version, "answer": text],
+                                      body: body,
                                       updateCurrentTask: currentTask?.id == taskID)
     }
 
@@ -9395,6 +9498,8 @@ private struct MordeIndependentSendTarget {
         request.cachePolicy = .reloadIgnoringLocalCacheData
         request.setValue("no-store", forHTTPHeaderField: "Cache-Control")
         request.setValue(UUID().uuidString, forHTTPHeaderField: "X-Request-Id")
+        let traceContext = MordeTraceContext()
+        traceContext.inject(into: &request)
         if let credential { request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization") }
         if let key { request.setValue(key, forHTTPHeaderField: "Idempotency-Key") }
         for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
@@ -9439,6 +9544,7 @@ private struct MordeIndependentSendTarget {
 #endif
         (data, response) = try await urlSession.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        traceContext.recordResponse(for: request, response: http)
         var recordedUnconfirmedLogout = false
         if http.statusCode == 401 && scheduleAuthorized, let credential,
            let currentInstallation = installation,
@@ -9501,6 +9607,8 @@ private struct MordeIndependentSendTarget {
         request.cachePolicy = .reloadIgnoringLocalCacheData
         request.setValue("no-store", forHTTPHeaderField: "Cache-Control")
         request.setValue(UUID().uuidString, forHTTPHeaderField: "X-Request-Id")
+        let traceContext = MordeTraceContext()
+        traceContext.inject(into: &request)
         request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization")
         for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
         let temporaryURL: URL
@@ -9524,6 +9632,7 @@ private struct MordeIndependentSendTarget {
             MIFLibraryTemporaryFileCleanup.discard(temporaryURL)
             throw URLError(.badServerResponse)
         }
+        traceContext.recordResponse(for: request, response: http)
         var recordedUnconfirmedLogout = false
         if http.statusCode == 401, let currentInstallation = installation,
            let currentScope = authorizationScope(for: currentInstallation), let requestScope,
@@ -10101,6 +10210,8 @@ private struct MordeIndependentSendTarget {
         request.cachePolicy = .reloadIgnoringLocalCacheData
         request.setValue("no-store", forHTTPHeaderField: "Cache-Control")
         request.setValue(UUID().uuidString, forHTTPHeaderField: "X-Request-Id")
+        let traceContext = MordeTraceContext()
+        traceContext.inject(into: &request)
         if method != "GET", let origin = URLComponents(string: normalizedOrigin)?.string {
             request.setValue(origin, forHTTPHeaderField: "Origin")
         }
@@ -10111,6 +10222,7 @@ private struct MordeIndependentSendTarget {
         }
         let (data, response) = try await sensitiveURLSession.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        traceContext.recordResponse(for: request, response: http)
         guard self.response(http, matchesOrigin: normalizedOrigin) else { throw URLError(.badServerResponse) }
         return (data, http)
     }
@@ -10270,6 +10382,8 @@ private struct MordeIndependentSendTarget {
         request.cachePolicy = .reloadIgnoringLocalCacheData
         request.setValue("no-store", forHTTPHeaderField: "Cache-Control")
         request.setValue(UUID().uuidString, forHTTPHeaderField: "X-Request-Id")
+        let traceContext = MordeTraceContext()
+        traceContext.inject(into: &request)
         request.setValue("ch_portal=\(ownerSession.credential)", forHTTPHeaderField: "Cookie")
         var origin = URLComponents()
         origin.scheme = base.scheme
@@ -10281,6 +10395,7 @@ private struct MordeIndependentSendTarget {
         if let body { request.httpBody = body }
         let (data, response) = try await sensitiveURLSession.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        traceContext.recordResponse(for: request, response: http)
         guard self.response(http, matchesOrigin: requestScope.serviceOrigin) else { throw URLError(.badServerResponse) }
         guard requestScope == currentDataScope,
               ownerPortalSessionScope == ownerSession.installationScope else { throw CancellationError() }
@@ -10337,6 +10452,8 @@ private struct MordeIndependentSendTarget {
         request.cachePolicy = .reloadIgnoringLocalCacheData
         request.setValue("no-store", forHTTPHeaderField: "Cache-Control")
         request.setValue(UUID().uuidString, forHTTPHeaderField: "X-Request-Id")
+        let traceContext = MordeTraceContext()
+        traceContext.inject(into: &request)
         request.setValue("ch_portal=\(portalSession.credential)", forHTTPHeaderField: "Cookie")
         var origin = URLComponents()
         origin.scheme = base.scheme
@@ -10349,6 +10466,7 @@ private struct MordeIndependentSendTarget {
         if let body { request.httpBody = body }
         let (data, response) = try await urlSession.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        traceContext.recordResponse(for: request, response: http)
         if http.statusCode == 401, renewalAttempt == 0 {
             guard requestScope == currentDataScope, portalSessionScope == requestScope else { throw CancellationError() }
             portalSessionCredential = nil
@@ -11121,20 +11239,36 @@ private struct MordeIndependentSendTarget {
     }
 
     func answerProjectConversationClarification(taskID: String, clarificationID: String,
-                                                version: Int, answer: String) async -> Bool {
+                                                version: Int, answer: String,
+                                                fileDeliveryIntent: String? = nil) async -> Bool {
         let answer = answer.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let task = projectConversationTask, task.id == taskID,
-              task.clarification_request?.id == clarificationID,
-              task.clarification_request?.version == version,
+              let clarification = task.clarification_request,
+              clarification.id == clarificationID, clarification.version == version,
               MordeTaskResponsePolicy.hasValidRequestID(clarificationID),
               MordeTaskResponsePolicy.hasValidAnswer(answer),
+              Self.validClarificationFileDeliveryIntent(task: task, clarification: clarification,
+                                                        value: fileDeliveryIntent),
               let path = MordeTaskResponsePolicy.inputPath(taskID: taskID) else {
             projectConversationError = "请检查补充信息，并刷新 Task 后重试。"
             return false
         }
+        var body: [String: Any] = ["clarification_id": clarificationID,
+                                   "clarification_version": version, "answer": answer]
+        if let fileDeliveryIntent { body["file_delivery_intent"] = fileDeliveryIntent }
         return await submitProjectConversationTaskAction(
             taskID: taskID, path: path,
-            body: ["clarification_id": clarificationID, "clarification_version": version, "answer": answer])
+            body: body)
+    }
+
+    private static func validClarificationFileDeliveryIntent(
+        task: MordeTask, clarification: MordeTask.Clarification, value: String?
+    ) -> Bool {
+        if clarification.isFileDeliveryIntent {
+            guard value == "none" || value == "required" else { return false }
+            return value != "required" || task.workspace_id.map { !$0.isEmpty } == true
+        }
+        return value == nil
     }
 
     private func submitProjectConversationTaskAction(taskID: String, path: String,
@@ -12632,8 +12766,11 @@ private struct MordeIndependentSendTarget {
         request.setValue("no-store", forHTTPHeaderField: "Cache-Control")
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization")
+        let traceContext = MordeTraceContext()
+        traceContext.inject(into: &request)
         let (bytes, response) = try await urlSession.bytes(for: request)
         guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        traceContext.recordResponse(for: request, response: http)
         guard !Task.isCancelled, signedIn, requestScope == currentDataScope else { throw CancellationError() }
         if http.statusCode == 401 {
             if MordeUnauthorizedResponsePolicy.shouldClearAuthorization(
@@ -13630,18 +13767,24 @@ private struct MordeIndependentSendTarget {
     }
 
     @discardableResult func answerClarification(taskID: String, clarificationID: String, version: Int,
-                                                answer: String) async -> Bool {
+                                                answer: String, fileDeliveryIntent: String? = nil) async -> Bool {
         let text = answer.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard taskID == currentTask?.id,
+        guard let task = currentTask, taskID == task.id,
+              let clarification = task.clarification_request,
+              clarification.id == clarificationID, clarification.version == version,
               let path = MordeTaskResponsePolicy.inputPath(taskID: taskID),
               MordeTaskResponsePolicy.hasValidRequestID(clarificationID), version > 0,
-              MordeTaskResponsePolicy.hasValidAnswer(text) else {
+              MordeTaskResponsePolicy.hasValidAnswer(text),
+              Self.validClarificationFileDeliveryIntent(task: task, clarification: clarification,
+                                                        value: fileDeliveryIntent) else {
             error = "请检查补充信息内容，并刷新 Task 状态后重试。"
             return false
         }
+        var body: [String: Any] = ["clarification_id": clarificationID,
+                                   "clarification_version": version, "answer": text]
+        if let fileDeliveryIntent { body["file_delivery_intent"] = fileDeliveryIntent }
         return await submitTaskAction(taskID: taskID, path: path,
-                                      body: ["clarification_id": clarificationID,
-                                             "clarification_version": version, "answer": text])
+                                      body: body)
     }
 
     private func reportTaskPageActionError(_ message: String, taskID: String, updateCurrentTask: Bool) {
@@ -14005,8 +14148,11 @@ private struct MordeIndependentSendTarget {
                 var request = URLRequest(url: url)
                 request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization")
                 request.cachePolicy = .reloadIgnoringLocalCacheData
+                let traceContext = MordeTraceContext()
+                traceContext.inject(into: &request)
                 let (bytes, response) = try await urlSession.bytes(for: request)
                 guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+                traceContext.recordResponse(for: request, response: http)
                 guard !Task.isCancelled, taskScope == currentDataScope else { return }
                 if http.statusCode == 401 {
                     if MordeUnauthorizedResponsePolicy.shouldClearAuthorization(
@@ -14418,9 +14564,10 @@ private struct MordeIndependentSendTarget {
                                                version: version, decision: decision)
     }
     func answerClarification(taskID: String, clarificationID: String, version: Int,
-                             answer: String) async -> Bool {
+                             answer: String, fileDeliveryIntent: String? = nil) async -> Bool {
         await client.answerTaskPageClarification(taskID: taskID, clarificationID: clarificationID,
-                                                 version: version, answer: answer)
+                                                 version: version, answer: answer,
+                                                 fileDeliveryIntent: fileDeliveryIntent)
     }
     // nanoMuse: Reuse the guarded media preview and cleanup path on standalone task pages.
     func mediaApprovalControls(task: MordeTask, pending: MordeTask.Pending) -> some View {
@@ -21125,6 +21272,7 @@ private struct MordeProjectsRoom: View {
     @State private var projectConversationTitle = ""
     @State private var projectConversationDraft = ""
     @State private var projectConversationAnswer = ""
+    @State private var projectConversationFileDeliveryIntents: [String: String] = [:]
     @State private var projectConversationModelID = ""
     @State private var projectConversationHostID = ""
     @State private var projectConversationWorkspaceID = ""
@@ -22367,22 +22515,54 @@ private struct MordeProjectsRoom: View {
     private func projectConversationClarificationControls(
         _ task: MordeTask, clarification: MordeTask.Clarification
     ) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
+        let isFileDeliveryClarification = clarification.isFileDeliveryIntent
+        let hasBoundWorkspace = task.workspace_id.map { !$0.isEmpty } == true
+        let clarificationKey = "\(task.id):\(clarification.id):\(clarification.version)"
+        let selectedFileDeliveryIntent = projectConversationFileDeliveryIntents[clarificationKey] ?? ""
+        return VStack(alignment: .leading, spacing: 4) {
             Text(clarification.question)
             if canManageProjectConversationTask {
                 TextField("补充信息", text: $projectConversationAnswer, axis: .vertical)
+                if isFileDeliveryClarification {
+                    Picker(AppLocalized("File delivery"), selection: Binding(
+                        get: { selectedFileDeliveryIntent == "required" && !hasBoundWorkspace
+                            ? "" : selectedFileDeliveryIntent },
+                        set: { projectConversationFileDeliveryIntents[clarificationKey] = $0.isEmpty ? nil : $0 }
+                    )) {
+                        Text(AppLocalized("Choose one")).tag("")
+                        Text(AppLocalized("Chat answer only")).tag("none")
+                            .accessibilityIdentifier("morde.projectConversation.clarification.fileDeliveryIntent.none")
+                        if hasBoundWorkspace {
+                            Text(AppLocalized("Deliver a file")).tag("required")
+                                .accessibilityIdentifier("morde.projectConversation.clarification.fileDeliveryIntent.required")
+                        }
+                    }
+                    .disabled(client.projectActionInFlight)
+                    .accessibilityIdentifier("morde.projectConversation.clarification.fileDeliveryIntent")
+                    if !hasBoundWorkspace {
+                        Text("需要交付文件时，请先绑定 Workspace，再重新提交此澄清。")
+                            .font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
+                            .accessibilityIdentifier("morde.projectConversation.clarification.workspaceGuidance")
+                    }
+                }
                 Button("提交补充信息") {
                     Task {
                         client.projectConversationTask = task
                         if await client.answerProjectConversationClarification(
                             taskID: task.id, clarificationID: clarification.id,
-                            version: clarification.version, answer: projectConversationAnswer) {
+                            version: clarification.version, answer: projectConversationAnswer,
+                            fileDeliveryIntent: isFileDeliveryClarification ? selectedFileDeliveryIntent : nil) {
                             projectConversationAnswer = ""
+                            projectConversationFileDeliveryIntents[clarificationKey] = nil
                         }
                     }
                 }
                 .disabled(client.projectActionInFlight ||
-                          !MordeTaskResponsePolicy.hasValidAnswer(projectConversationAnswer))
+                          !MordeTaskResponsePolicy.hasValidAnswer(projectConversationAnswer) ||
+                          (isFileDeliveryClarification && (![
+                            "none", "required",
+                          ].contains(selectedFileDeliveryIntent) ||
+                            (selectedFileDeliveryIntent == "required" && !hasBoundWorkspace))))
             }
         }
     }

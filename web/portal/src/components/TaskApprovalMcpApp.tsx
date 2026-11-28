@@ -35,10 +35,10 @@ function randomNonce(): string {
   return Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('');
 }
 
-function mcpAppDocument(nonce: string, parentOrigin: string): string {
+function mcpAppDocument(nonce: string, parentOrigin: string, reviewInbox: boolean): string {
   const safeOrigin = parentOrigin.replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;');
   const safeNonce = nonce.replace(/[^a-f0-9]/gu, '');
-  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src ${safeOrigin}; style-src ${safeOrigin}; img-src 'none'; connect-src 'none'; font-src 'none'; object-src 'none'; form-action 'none'; base-uri 'none'"><link rel="stylesheet" href="${safeOrigin}/mcp-app/task-approval.css"><title>Morde 操作审批</title></head><body data-nonce="${safeNonce}"><main id="app" aria-live="polite"></main><script src="${safeOrigin}/mcp-app/task-approval.js" defer></script></body></html>`;
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src ${safeOrigin}; style-src ${safeOrigin}; img-src 'none'; connect-src 'none'; font-src 'none'; object-src 'none'; form-action 'none'; base-uri 'none'"><link rel="stylesheet" href="${safeOrigin}/mcp-app/task-approval.css"><title>Morde 操作审批</title></head><body data-nonce="${safeNonce}" data-layout="${reviewInbox ? 'review' : 'conversation'}"><main id="app" aria-live="polite"></main><script src="${safeOrigin}/mcp-app/task-approval.js" defer></script></body></html>`;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -49,9 +49,10 @@ function isRpcID(value: unknown): value is JsonRpcId {
   return typeof value === 'string' || (typeof value === 'number' && Number.isSafeInteger(value));
 }
 
-export function TaskApprovalMcpApp({ approval, onDecision }: {
+export function TaskApprovalMcpApp({ approval, onDecision, reviewInbox = false }: {
   approval: McpApprovalAppData;
   onDecision: (decision: McpApprovalDecision) => void | Promise<unknown>;
+  reviewInbox?: boolean;
 }) {
   const frameRef = useRef<HTMLIFrameElement>(null);
   const latestRef = useRef({ approval, onDecision });
@@ -60,7 +61,7 @@ export function TaskApprovalMcpApp({ approval, onDecision }: {
   }, [approval, onDecision]);
   const [attempt, setAttempt] = useState(0);
   const [phase, setPhase] = useState({ attempt: 0, ready: false, failed: false });
-  const [frameHeight, setFrameHeight] = useState(310);
+  const [frameHeight, setFrameHeight] = useState(reviewInbox ? 170 : 310);
   const ready = phase.attempt === attempt && phase.ready;
   const failed = phase.attempt === attempt && phase.failed;
   const [nonce, setNonce] = useState(() => randomNonce());
@@ -68,7 +69,7 @@ export function TaskApprovalMcpApp({ approval, onDecision }: {
   const inFlightRef = useRef(false);
   const decisionRef = useRef<{ decision: McpApprovalDecision; confirmed: boolean } | null>(null);
   const hostRequestsRef = useRef(new Set<JsonRpcId>());
-  const srcDoc = useMemo(() => mcpAppDocument(nonce, window.location.origin), [nonce]);
+  const srcDoc = useMemo(() => mcpAppDocument(nonce, window.location.origin, reviewInbox), [nonce, reviewInbox]);
 
   useEffect(() => {
     initializedRef.current = false;
@@ -116,7 +117,7 @@ export function TaskApprovalMcpApp({ approval, onDecision }: {
       if (message.method === 'ui/notifications/size-changed') {
         const height = isRecord(message.params) ? message.params.height : undefined;
         if (initializedRef.current && typeof height === 'number' && Number.isFinite(height)) {
-          setFrameHeight(Math.max(310, Math.min(640, Math.ceil(height))));
+          setFrameHeight(Math.max(reviewInbox ? 120 : 310, Math.min(640, Math.ceil(height))));
         }
         return;
       }
@@ -193,7 +194,7 @@ export function TaskApprovalMcpApp({ approval, onDecision }: {
       window.clearTimeout(timer);
       window.removeEventListener('message', handleMessage);
     };
-  }, [attempt]);
+  }, [attempt, reviewInbox]);
 
   const reload = () => {
     initializedRef.current = false;

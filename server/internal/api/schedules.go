@@ -39,15 +39,17 @@ type scheduleBudgetRequest struct {
 }
 
 type scheduleCreateRequest struct {
-	HostID             string                       `json:"host_id"`
-	ModelID            string                       `json:"model_id"`
-	Title              json.RawMessage              `json:"title"`
-	Objective          string                       `json:"objective"`
-	Timing             schedule.Timing              `json:"timing"`
-	Budget             *scheduleBudgetRequest       `json:"budget"`
-	MisfirePolicy      schedule.MisfirePolicy       `json:"misfire_policy"`
-	NotificationEvents []schedule.NotificationEvent `json:"notification_events"`
-	Observation        *schedule.ObservationSpec    `json:"observation"`
+	HostID             string                          `json:"host_id"`
+	ModelID            string                          `json:"model_id"`
+	Title              json.RawMessage                 `json:"title"`
+	Objective          string                          `json:"objective"`
+	FileDeliveryIntent json.RawMessage                 `json:"file_delivery_intent"`
+	Timing             schedule.Timing                 `json:"timing"`
+	Budget             *scheduleBudgetRequest          `json:"budget"`
+	MisfirePolicy      schedule.MisfirePolicy          `json:"misfire_policy"`
+	NotificationEvents []schedule.NotificationEvent    `json:"notification_events"`
+	Observation        *schedule.ObservationSpec       `json:"observation"`
+	PersonalRule       *schedule.PersonalRuleSelection `json:"personal_rule"`
 }
 
 type scheduleUpdateRequest struct {
@@ -56,11 +58,13 @@ type scheduleUpdateRequest struct {
 	ModelID            *string                       `json:"model_id"`
 	Title              json.RawMessage               `json:"title"`
 	Objective          *string                       `json:"objective"`
+	FileDeliveryIntent json.RawMessage               `json:"file_delivery_intent"`
 	Timing             *schedule.Timing              `json:"timing"`
 	Budget             *scheduleBudgetRequest        `json:"budget"`
 	MisfirePolicy      *schedule.MisfirePolicy       `json:"misfire_policy"`
 	NotificationEvents *[]schedule.NotificationEvent `json:"notification_events"`
 	Observation        json.RawMessage               `json:"observation"`
+	PersonalRule       json.RawMessage               `json:"personal_rule"`
 }
 
 type scheduleActionRequest struct {
@@ -76,43 +80,49 @@ type scheduleBudgetResponse struct {
 }
 
 type scheduleRunResponse struct {
-	ID                 string                       `json:"id"`
-	ScheduleID         string                       `json:"schedule_id"`
-	ScheduleVersion    int64                        `json:"schedule_version"`
-	OccurrenceKey      string                       `json:"occurrence_key"`
-	ScheduledAt        *time.Time                   `json:"scheduled_at"`
-	CoalescedCount     int64                        `json:"coalesced_count"`
-	Status             schedule.RunStatus           `json:"status"`
-	SkipReason         *schedule.SkipReason         `json:"skip_reason"`
-	TaskID             *string                      `json:"task_id"`
-	NotificationEvents []schedule.NotificationEvent `json:"notification_events"`
-	Observation        *schedule.ObservationSpec    `json:"observation"`
-	ObservationOutcome schedule.ObservationOutcome  `json:"observation_outcome"`
-	CreatedAt          time.Time                    `json:"created_at"`
-	UpdatedAt          time.Time                    `json:"updated_at"`
-	FinishedAt         *time.Time                   `json:"finished_at"`
+	ID                           string                                `json:"id"`
+	ScheduleID                   string                                `json:"schedule_id"`
+	ScheduleVersion              int64                                 `json:"schedule_version"`
+	OccurrenceKey                string                                `json:"occurrence_key"`
+	ScheduledAt                  *time.Time                            `json:"scheduled_at"`
+	CoalescedCount               int64                                 `json:"coalesced_count"`
+	Status                       schedule.RunStatus                    `json:"status"`
+	SkipReason                   *schedule.SkipReason                  `json:"skip_reason"`
+	TaskID                       *string                               `json:"task_id"`
+	NotificationEvents           []schedule.NotificationEvent          `json:"notification_events"`
+	Observation                  *schedule.ObservationSpec             `json:"observation"`
+	PersonalRule                 *schedule.PersonalRuleBinding         `json:"personal_rule"`
+	PersonalRuleValidationStatus schedule.PersonalRuleValidationStatus `json:"personal_rule_validation_status"`
+	PersonalRuleValidatedAt      *time.Time                            `json:"personal_rule_validated_at"`
+	PersonalRuleRevokedAt        *time.Time                            `json:"personal_rule_revoked_at"`
+	ObservationOutcome           schedule.ObservationOutcome           `json:"observation_outcome"`
+	CreatedAt                    time.Time                             `json:"created_at"`
+	UpdatedAt                    time.Time                             `json:"updated_at"`
+	FinishedAt                   *time.Time                            `json:"finished_at"`
 }
 
 // Keep this response explicit: the domain Schedule also contains owner and
 // authorization credentials, which are not part of the public API shape.
 type scheduleResponse struct {
-	ID                 string                       `json:"id"`
-	Version            int64                        `json:"version"`
-	Status             schedule.Status              `json:"status"`
-	HostID             *string                      `json:"host_id"`
-	ModelID            string                       `json:"model_id"`
-	Title              string                       `json:"title"`
-	Objective          string                       `json:"objective"`
-	Timing             schedule.Timing              `json:"timing"`
-	Budget             scheduleBudgetResponse       `json:"budget"`
-	MisfirePolicy      schedule.MisfirePolicy       `json:"misfire_policy"`
-	NotificationEvents []schedule.NotificationEvent `json:"notification_events"`
-	Observation        *schedule.ObservationSpec    `json:"observation"`
-	NextRunAt          *time.Time                   `json:"next_run_at"`
-	LastRun            *scheduleRunResponse         `json:"last_run"`
-	CurrentRun         *scheduleRunResponse         `json:"current_run"`
-	CreatedAt          time.Time                    `json:"created_at"`
-	UpdatedAt          time.Time                    `json:"updated_at"`
+	ID                 string                        `json:"id"`
+	Version            int64                         `json:"version"`
+	Status             schedule.Status               `json:"status"`
+	HostID             *string                       `json:"host_id"`
+	ModelID            string                        `json:"model_id"`
+	Title              string                        `json:"title"`
+	Objective          string                        `json:"objective"`
+	FileDeliveryIntent task.FileDeliveryIntent       `json:"file_delivery_intent"`
+	Timing             schedule.Timing               `json:"timing"`
+	Budget             scheduleBudgetResponse        `json:"budget"`
+	MisfirePolicy      schedule.MisfirePolicy        `json:"misfire_policy"`
+	NotificationEvents []schedule.NotificationEvent  `json:"notification_events"`
+	Observation        *schedule.ObservationSpec     `json:"observation"`
+	PersonalRule       *schedule.PersonalRuleBinding `json:"personal_rule"`
+	NextRunAt          *time.Time                    `json:"next_run_at"`
+	LastRun            *scheduleRunResponse          `json:"last_run"`
+	CurrentRun         *scheduleRunResponse          `json:"current_run"`
+	CreatedAt          time.Time                     `json:"created_at"`
+	UpdatedAt          time.Time                     `json:"updated_at"`
 }
 
 type scheduleListResponse struct {
@@ -185,14 +195,24 @@ func (h *api) registerSchedules(group *gin.RouterGroup, service ScheduleService)
 			writeError(c, invalidScheduleBody())
 			return
 		}
+		fileDeliveryIntent, err := parseOptionalScheduleFileDeliveryIntent(request.FileDeliveryIntent)
+		if err != nil {
+			writeError(c, invalidScheduleBody())
+			return
+		}
+		if fileDeliveryIntent == nil {
+			intent := task.FileDeliveryNone
+			fileDeliveryIntent = &intent
+		}
 		key, ok := scheduleIdempotencyKey(c)
 		if !ok {
 			return
 		}
 		command := app.CreateScheduleCommand{
 			HostID: request.HostID, ModelID: request.ModelID, Title: title, Objective: request.Objective,
-			Timing: request.Timing, MisfirePolicy: request.MisfirePolicy,
-			NotificationEvents: request.NotificationEvents, Observation: request.Observation,
+			FileDeliveryIntent: *fileDeliveryIntent,
+			Timing:             request.Timing, MisfirePolicy: request.MisfirePolicy,
+			NotificationEvents: request.NotificationEvents, Observation: request.Observation, PersonalRule: request.PersonalRule,
 		}
 		if request.Budget != nil {
 			command.Budget = task.Budget{
@@ -267,10 +287,26 @@ func (h *api) registerSchedules(group *gin.RouterGroup, service ScheduleService)
 			writeError(c, invalidScheduleBody())
 			return
 		}
+		fileDeliveryIntent, err := parseOptionalScheduleFileDeliveryIntent(request.FileDeliveryIntent)
+		if err != nil {
+			writeError(c, invalidScheduleBody())
+			return
+		}
 		command := app.UpdateScheduleCommand{
 			ExpectedVersion: *request.ExpectedVersion, HostID: hostID, ModelID: request.ModelID, Title: title,
-			Objective: request.Objective, Timing: request.Timing, MisfirePolicy: request.MisfirePolicy,
+			Objective: request.Objective, FileDeliveryIntent: fileDeliveryIntent, Timing: request.Timing, MisfirePolicy: request.MisfirePolicy,
 			NotificationEvents: request.NotificationEvents,
+		}
+		if len(request.PersonalRule) != 0 {
+			command.PersonalRuleSet = true
+			if !bytes.Equal(bytes.TrimSpace(request.PersonalRule), []byte("null")) {
+				var selection schedule.PersonalRuleSelection
+				if err := decodeStrictJSONBytes(request.PersonalRule, &selection); err != nil {
+					writeError(c, invalidScheduleBody())
+					return
+				}
+				command.PersonalRule = &selection
+			}
 		}
 		if request.Budget != nil {
 			budget := task.Budget{
@@ -414,20 +450,24 @@ func scheduleIdempotencyKey(c *gin.Context) (string, bool) {
 }
 
 func toScheduleResponse(value schedule.Schedule) scheduleResponse {
+	fileDeliveryIntent := value.FileDeliveryIntent
+	if fileDeliveryIntent == "" {
+		fileDeliveryIntent = task.FileDeliveryNone
+	}
 	var hostID *string
 	if value.HostID != "" {
 		hostID = &value.HostID
 	}
 	result := scheduleResponse{
 		ID: value.ID, Version: value.Version, Status: value.Status, HostID: hostID, ModelID: value.ModelID, Title: value.Title,
-		Objective: value.Objective, Timing: value.Timing,
+		Objective: value.Objective, FileDeliveryIntent: fileDeliveryIntent, Timing: value.Timing,
 		Budget: scheduleBudgetResponse{
 			ActiveSeconds: value.Budget.ActiveSeconds,
 			ToolCalls:     value.Budget.ToolCalls,
 			ModelTokens:   value.Budget.ModelTokens,
 		},
 		MisfirePolicy: value.MisfirePolicy, NotificationEvents: value.NotificationEvents,
-		Observation: value.Observation, NextRunAt: value.NextRunAt,
+		Observation: value.Observation, PersonalRule: value.PersonalRule, NextRunAt: value.NextRunAt,
 		CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt,
 	}
 	if result.NotificationEvents == nil {
@@ -458,6 +498,24 @@ func parseOptionalScheduleTitle(raw json.RawMessage) (*string, error) {
 	return title, nil
 }
 
+func parseOptionalScheduleFileDeliveryIntent(raw json.RawMessage) (*task.FileDeliveryIntent, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil, errors.New("schedule file delivery intent cannot be null")
+	}
+	var value string
+	if err := decodeStrictJSONBytes(raw, &value); err != nil {
+		return nil, err
+	}
+	intent := task.FileDeliveryIntent(value)
+	if !intent.Valid() {
+		return nil, errors.New("schedule file delivery intent is invalid")
+	}
+	return &intent, nil
+}
+
 func parseScheduleHostID(raw json.RawMessage) (*string, error) {
 	if len(raw) == 0 {
 		return nil, nil
@@ -482,8 +540,11 @@ func toScheduleRunResponse(value schedule.Run) scheduleRunResponse {
 		ID: value.ID, ScheduleID: value.ScheduleID, ScheduleVersion: value.ScheduleVersion,
 		OccurrenceKey: value.OccurrenceKey, ScheduledAt: value.ScheduledAt, CoalescedCount: value.CoalescedCount,
 		Status: value.Status, SkipReason: value.SkipReason, TaskID: value.TaskID,
-		NotificationEvents: events, Observation: value.Observation, ObservationOutcome: value.ObservationOutcome,
-		CreatedAt: value.CreatedAt, UpdatedAt: value.UpdatedAt, FinishedAt: value.FinishedAt,
+		NotificationEvents: events, Observation: value.Observation, PersonalRule: value.PersonalRule,
+		PersonalRuleValidationStatus: value.PersonalRuleValidationStatus,
+		PersonalRuleValidatedAt:      value.PersonalRuleValidatedAt, PersonalRuleRevokedAt: value.PersonalRuleRevokedAt,
+		ObservationOutcome: value.ObservationOutcome,
+		CreatedAt:          value.CreatedAt, UpdatedAt: value.UpdatedAt, FinishedAt: value.FinishedAt,
 	}
 }
 

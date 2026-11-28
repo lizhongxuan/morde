@@ -24,9 +24,10 @@ export function deliveryStatusText(status: ConversationMessage['delivery_status'
 }
 
 export function routingFailureText(reason: ConversationMessage['routing_failure_reason']): string {
-  if (reason === 'model_unavailable') return '模型暂时不可用或用量待核对';
-  if (reason === 'routing_context_unavailable') return '消息上下文暂时无法读取';
-  if (reason === 'routing_action_unavailable') return '处理状态暂时无法更新';
+  // This route category also covers provider errors and timeouts; it does not
+  // establish that the model is unavailable or that the user is out of quota.
+  if (reason === 'model_unavailable') return '暂时无法确定具体原因';
+  if (reason === 'routing_context_unavailable') return '暂时无法获取完整的会话上下文';
   if (reason === 'message_too_long') return '消息及上下文超过当前模型输入上限，原文已保留；请缩短后重新发送。';
-  return '处理暂时不可用';
+  return '暂时无法完成消息处理';
 }

@@ -28,11 +28,13 @@ type CreateScheduleCommand struct {
 	ModelID            string
 	Title              *string
 	Objective          string
+	FileDeliveryIntent task.FileDeliveryIntent
 	Timing             schedule.Timing
 	Budget             task.Budget
 	Observation        *schedule.ObservationSpec
 	MisfirePolicy      schedule.MisfirePolicy
 	NotificationEvents []schedule.NotificationEvent
+	PersonalRule       *schedule.PersonalRuleSelection
 	executionPolicy    schedule.ExecutionPolicy
 }
 
@@ -42,12 +44,15 @@ type UpdateScheduleCommand struct {
 	ModelID            *string
 	Title              *string
 	Objective          *string
+	FileDeliveryIntent *task.FileDeliveryIntent
 	Timing             *schedule.Timing
 	Budget             *task.Budget
 	ObservationSet     bool
 	Observation        *schedule.ObservationSpec
 	MisfirePolicy      *schedule.MisfirePolicy
 	NotificationEvents *[]schedule.NotificationEvent
+	PersonalRuleSet    bool
+	PersonalRule       *schedule.PersonalRuleSelection
 }
 
 type ScheduleActionCommand struct {

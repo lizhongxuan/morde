@@ -4,6 +4,8 @@ services:
   postgres:
     image: docker.io/library/postgres:16.15-bookworm@sha256:efedf3595f1d6f415c08568ba171029bf54052e754cc9f030e3f2412b21f3d67
     restart: unless-stopped
+    mem_limit: 2g
+    memswap_limit: 2g
     environment:
       POSTGRES_DB: cloudhost
       POSTGRES_USER: cloudhost

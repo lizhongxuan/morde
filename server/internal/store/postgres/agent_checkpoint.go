@@ -3,6 +3,7 @@ package postgres
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 
@@ -119,7 +120,10 @@ WHERE task_id=$1 AND agent_session_id=$2 AND (from_seq=$3 OR through_seq=$4)`,
 		}
 		pendingMessageIDs := make([]string, 0, len(value.ConversationMessages))
 		claimedSequences := make(map[string]int64, len(value.ConversationMessages))
+		messageReceipts := make(map[string]agentMessageDeliveryReceipt, len(value.ConversationMessages))
+		alreadyAppliedMessages := make(map[string]bool, len(value.ConversationMessages))
 		splicedSequences := make(map[string]int64, len(value.InboxSplices))
+		splicedMessageReceipts := make(map[string]agentMessageDeliveryReceipt, len(value.InboxSplices))
 		if fence.AgentSessionID == rootSessionID {
 			serviceInstanceID, err := serviceInstanceIDInTx(ctx, tx)
 			if err != nil {
@@ -146,7 +150,8 @@ WHERE task_id=$1 AND agent_session_id=$2 AND (from_seq=$3 OR through_seq=$4)`,
 						(splice.Target == "next-turn" && message.Mode != app.AgentMessageDeliveryFollowup) {
 						return domain.NewError(domain.CodeInvalidState, "checkpoint inbox delivery mode is invalid")
 					}
-					if err := validateCheckpointTaskMessage(ctx, tx, serviceInstanceID, current.ProjectID, fence, message); err != nil {
+					receipt, err := validateCheckpointTaskMessage(ctx, tx, serviceInstanceID, current.ProjectID, fence, message)
+					if err != nil {
 						if domain.CodeOf(err) != domain.CodeInvalidState && domain.CodeOf(err) != domain.CodeUnauthenticated {
 							return err
 						}
@@ -156,6 +161,8 @@ WHERE task_id=$1 AND agent_session_id=$2 AND (from_seq=$3 OR through_seq=$4)`,
 						deliveryErr = domain.NewError(domain.CodeInvalidState, "checkpoint inbox message could not be matched safely")
 						return nil
 					}
+					splicedMessageReceipts[message.ID] = receipt
+					applyAgentMessageDeliveryReceipt(&message, receipt)
 					enqueued, mismatched, err := bindTaskAgentMessageDelivery(ctx, tx, fence, message)
 					if err != nil {
 						return err
@@ -172,11 +179,14 @@ WHERE task_id=$1 AND agent_session_id=$2 AND (from_seq=$3 OR through_seq=$4)`,
 			}
 			for _, message := range value.ConversationMessages {
 				var role, content, deliveryStatus, conversationID, mode string
-				err := tx.QueryRow(ctx, `SELECT message.role,message.content,message.delivery_status,message.conversation_id,message.delivery_mode FROM conversation_messages AS message JOIN tasks AS task
+				var sourceSequence, currentTaskRevision int64
+				err := tx.QueryRow(ctx, `SELECT message.role,message.content,message.delivery_status,message.conversation_id,message.delivery_mode,
+ message.sequence,task.current_revision FROM conversation_messages AS message JOIN tasks AS task
 ON task.id=message.task_id AND task.owner_id=message.owner_id AND task.conversation_id=message.conversation_id
 WHERE message.id=$1 AND message.owner_id=$2 AND message.task_id=$3 AND message.actor_id=task.initiator_id
  AND message.source_kind<>'task_result_review'
-FOR UPDATE OF message`, message.ID, fence.OwnerID, fence.TaskID).Scan(&role, &content, &deliveryStatus, &conversationID, &mode)
+FOR UPDATE OF message`, message.ID, fence.OwnerID, fence.TaskID).Scan(&role, &content, &deliveryStatus, &conversationID, &mode,
+					&sourceSequence, &currentTaskRevision)
 				if errors.Is(err, pgx.ErrNoRows) {
 					if err := markPendingConversationMessagesUnknown(ctx, tx, fence.TaskID, fence.OwnerID); err != nil {
 						return err
@@ -187,7 +197,16 @@ FOR UPDATE OF message`, message.ID, fence.OwnerID, fence.TaskID).Scan(&role, &co
 				if err != nil {
 					return fmt.Errorf("lock checkpoint user message: %w", err)
 				}
-				if role != "user" || content != message.Content ||
+				if message.Sequence < value.From || message.Sequence > value.Through {
+					if deliveryStatus == "pending" {
+						if err := markConversationMessageUnknown(ctx, tx, fence.TaskID, fence.OwnerID, message.ID); err != nil {
+							return err
+						}
+					}
+					deliveryErr = domain.NewError(domain.CodeInvalidState, "checkpoint task message sequence is outside the committed segment")
+					return nil
+				}
+				if role != "user" ||
 					(mode != string(app.AgentMessageDeliverySteer) && mode != string(app.AgentMessageDeliveryFollowup)) {
 					if err := markPendingConversationMessagesUnknown(ctx, tx, fence.TaskID, fence.OwnerID); err != nil {
 						return err
@@ -214,6 +233,28 @@ FOR UPDATE OF message`, message.ID, fence.OwnerID, fence.TaskID).Scan(&role, &co
 					deliveryErr = domain.NewError(domain.CodeInvalidState, "checkpoint user message attachments could not be matched safely")
 					return nil
 				}
+				message.Mode = app.AgentMessageDeliveryMode(mode)
+				var sourceAgentGeneration pgtype.Int8
+				err = tx.QueryRow(ctx, `SELECT receipt_agent_generation FROM task_agent_message_deliveries WHERE message_id=$1`, message.ID).
+					Scan(&sourceAgentGeneration)
+				if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+					return fmt.Errorf("read prior task message receipt generation: %w", err)
+				}
+				if sourceAgentGeneration.Valid {
+					message.SourceAgentGeneration = sourceAgentGeneration.Int64
+				}
+				receipt, err := prepareAgentMessageDeliveryReceipt(fence, conversationID, message,
+					sourceSequence, currentTaskRevision, storedAttachmentIDs, content)
+				if err != nil {
+					if deliveryStatus == "pending" {
+						if markErr := markConversationMessageUnknown(ctx, tx, fence.TaskID, fence.OwnerID, message.ID); markErr != nil {
+							return markErr
+						}
+					}
+					deliveryErr = domain.NewError(domain.CodeInvalidState, "checkpoint task message representation could not be matched safely")
+					return nil
+				}
+				applyAgentMessageDeliveryReceipt(&message, receipt)
 				if deliveryStatus == "applied" {
 					var hasDelivery bool
 					if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM task_agent_message_deliveries WHERE message_id=$1)`, message.ID).Scan(&hasDelivery); err != nil {
@@ -223,13 +264,28 @@ FOR UPDATE OF message`, message.ID, fence.OwnerID, fence.TaskID).Scan(&role, &co
 						deliveryErr = domain.NewError(domain.CodeIdempotencyConflict, "checkpoint repeated an already claimed task message")
 						return nil
 					}
+					// The initial Task message is already marked applied by route
+					// admission. Bind its first Agent receipt to this exact root
+					// checkpoint instead of treating that status as proof of receipt.
+					message.Mode = app.AgentMessageDeliveryMode(mode)
+					enqueued, mismatched, err := bindTaskAgentMessageDelivery(ctx, tx, fence, message)
+					if err != nil {
+						return err
+					}
+					if mismatched || enqueued || message.Mode == app.AgentMessageDeliverySteer {
+						deliveryErr = domain.NewError(domain.CodeInvalidState, "initial checkpoint message delivery identity changed")
+						return nil
+					}
+					messageReceipts[message.ID] = receipt
+					pendingMessageIDs = append(pendingMessageIDs, message.ID)
+					claimedSequences[message.ID] = message.Sequence
+					alreadyAppliedMessages[message.ID] = true
 					continue
 				}
 				if deliveryStatus != "pending" {
 					deliveryErr = domain.NewError(domain.CodeInvalidState, "checkpoint task message delivery is unknown")
 					return nil
 				}
-				message.Mode = app.AgentMessageDeliveryMode(mode)
 				enqueued, mismatched, err := bindTaskAgentMessageDelivery(ctx, tx, fence, message)
 				if err != nil {
 					return err
@@ -245,16 +301,7 @@ FOR UPDATE OF message`, message.ID, fence.OwnerID, fence.TaskID).Scan(&role, &co
 				}
 				pendingMessageIDs = append(pendingMessageIDs, message.ID)
 				claimedSequences[message.ID] = message.Sequence
-			}
-			for messageID, sequence := range splicedSequences {
-				result, err := tx.Exec(ctx, `UPDATE task_agent_message_deliveries SET enqueued_through_seq=$2,updated_at=clock_timestamp()
-WHERE message_id=$1 AND enqueued_through_seq IS NULL AND claimed_through_seq IS NULL`, messageID, sequence)
-				if err != nil {
-					return fmt.Errorf("record checkpointed task message enqueue: %w", err)
-				}
-				if result.RowsAffected() != 1 {
-					return domain.NewError(domain.CodeConflict, "checkpoint task message enqueue changed before commit")
-				}
+				messageReceipts[message.ID] = receipt
 			}
 		}
 		_, err = tx.Exec(ctx, `INSERT INTO task_agent_checkpoints
@@ -276,6 +323,16 @@ WHERE task_id=$1 AND owner_id=$2 AND session_id=$3`, fence.TaskID, fence.OwnerID
 WHERE id=$1`, fence.TaskID, value.Through, value.Digest); err != nil {
 				return fmt.Errorf("advance task checkpoint: %w", err)
 			}
+			if _, err := tx.Exec(ctx, `UPDATE task_model_recovery_schedules
+SET state='completed',updated_at=clock_timestamp()
+WHERE task_id=$1 AND owner_id=$2 AND task_revision=(SELECT current_revision FROM tasks WHERE id=$1 AND owner_id=$2)
+  AND task_revision=(SELECT desired_revision FROM tasks WHERE id=$1 AND owner_id=$2)
+  AND authorization_version=$3 AND agent_instance_id=$4 AND agent_generation=$5 AND agent_session_id=$6
+  AND engine_version=$7 AND profile_version=$8 AND state='attempting'
+  AND checkpoint_through_seq < $9`, fence.TaskID, fence.OwnerID, fence.AuthorizationVersion, fence.AgentInstanceID,
+				fence.AgentGeneration, fence.AgentSessionID, fence.EngineVersion, fence.ProfileVersion, value.Through); err != nil {
+				return fmt.Errorf("complete Task model recovery after checkpoint: %w", err)
+			}
 			if _, err := tx.Exec(ctx, `UPDATE task_agent_sessions SET root_checkpoint_through_seq=$3,root_checkpoint_baseline_known=true
 WHERE task_id=$1 AND owner_id=$2 AND session_id=$4 AND parent_session_id IS NULL`,
 				fence.TaskID, fence.OwnerID, value.Through, rootSessionID); err != nil {
@@ -286,15 +343,16 @@ WHERE task_id=$1 AND owner_id=$2 AND session_id=$4 AND parent_session_id IS NULL
 				if !ok {
 					return domain.NewError(domain.CodeInvalidState, "checkpoint user message sequence is unavailable")
 				}
-				deliveryResult, err := tx.Exec(ctx, `UPDATE task_agent_message_deliveries SET claimed_through_seq=$2,
-claimed_checkpoint_through_seq=$3,updated_at=clock_timestamp()
-WHERE message_id=$1 AND claimed_through_seq IS NULL AND (enqueued_through_seq IS NULL OR enqueued_through_seq<$2)`,
-					messageID, sequence, value.Through)
-				if err != nil {
-					return fmt.Errorf("record checkpointed task message claim: %w", err)
+				receipt, ok := messageReceipts[messageID]
+				if !ok {
+					return domain.NewError(domain.CodeInvalidState, "checkpoint user message receipt is unavailable")
 				}
-				if deliveryResult.RowsAffected() != 1 {
-					return domain.NewError(domain.CodeInvalidState, "checkpoint user message was already claimed")
+				if err := persistAgentMessageDeliveryReceipt(ctx, tx, fence, app.AgentConversationMessage{ID: messageID,
+					Mode: app.AgentMessageDeliveryMode(receipt.Source.Envelope.Mode)}, receipt, sequence, value.Through); err != nil {
+					return err
+				}
+				if alreadyAppliedMessages[messageID] {
+					continue
 				}
 				result, err := tx.Exec(ctx, `UPDATE conversation_messages SET delivery_status='applied'
 WHERE id=$1 AND owner_id=$2 AND task_id=$3 AND role='user' AND delivery_status='pending'`,
@@ -320,6 +378,23 @@ WHERE message_id=$1 AND owner_id=$2 AND state='waiting_adjustment' AND EXISTS (
 					return fmt.Errorf("confirm checkpointed task revision: %w", err)
 				}
 			}
+			for messageID, sequence := range splicedSequences {
+				receipt, ok := splicedMessageReceipts[messageID]
+				if !ok {
+					return domain.NewError(domain.CodeInvalidState, "checkpoint inbox message receipt is unavailable")
+				}
+				if _, claimedInSegment := messageReceipts[messageID]; claimedInSegment {
+					if err := recordAgentMessageEnqueueEvidence(ctx, tx, fence, messageID, sequence, value.Through); err != nil {
+						return err
+					}
+					continue
+				}
+				if err := persistAgentMessageEnqueuedReceipt(ctx, tx, fence, app.AgentConversationMessage{
+					ID: messageID, Mode: receipt.Source.Envelope.Mode,
+				}, receipt, sequence, value.Through); err != nil {
+					return err
+				}
+			}
 			if value.RootTurnStarted {
 				if err := recordTaskRevisionStartedInTx(ctx, tx, fence.TaskID); err != nil {
 					return err
@@ -335,22 +410,24 @@ WHERE message_id=$1 AND owner_id=$2 AND state='waiting_adjustment' AND EXISTS (
 }
 
 func validateCheckpointTaskMessage(ctx context.Context, tx pgx.Tx, serviceInstanceID, projectID string,
-	fence app.AgentCheckpointFence, message app.AgentConversationMessage) error {
+	fence app.AgentCheckpointFence, message app.AgentConversationMessage) (agentMessageDeliveryReceipt, error) {
 	var role, content, deliveryStatus, conversationID, actorID, mode string
-	err := tx.QueryRow(ctx, `SELECT message.role,message.content,message.delivery_status,message.conversation_id,message.actor_id,message.delivery_mode
+	var sourceSequence, taskRevision int64
+	err := tx.QueryRow(ctx, `SELECT message.role,message.content,message.delivery_status,message.conversation_id,message.actor_id,message.delivery_mode,
+ message.sequence,task.current_revision
 FROM conversation_messages message JOIN tasks task
 ON task.id=message.task_id AND task.owner_id=message.owner_id AND task.conversation_id=message.conversation_id
 WHERE message.id=$1 AND message.owner_id=$2 AND message.task_id=$3 AND message.actor_id=task.initiator_id
  AND message.source_kind<>'task_result_review' FOR UPDATE OF message`, message.ID, fence.OwnerID, fence.TaskID).
-		Scan(&role, &content, &deliveryStatus, &conversationID, &actorID, &mode)
+		Scan(&role, &content, &deliveryStatus, &conversationID, &actorID, &mode, &sourceSequence, &taskRevision)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.NewError(domain.CodeInvalidState, "checkpoint task message does not match its durable delivery")
+			return agentMessageDeliveryReceipt{}, domain.NewError(domain.CodeInvalidState, "checkpoint task message does not match its durable delivery")
 		}
-		return fmt.Errorf("read checkpoint task message: %w", err)
+		return agentMessageDeliveryReceipt{}, fmt.Errorf("read checkpoint task message: %w", err)
 	}
-	if role != "user" || content != message.Content || actorID != fence.InitiatorID || deliveryStatus != "pending" || mode != string(message.Mode) {
-		return domain.NewError(domain.CodeInvalidState, "checkpoint task message does not match its durable delivery")
+	if role != "user" || actorID != fence.InitiatorID || deliveryStatus != "pending" || mode != string(message.Mode) {
+		return agentMessageDeliveryReceipt{}, domain.NewError(domain.CodeInvalidState, "checkpoint task message does not match its durable delivery")
 	}
 	var attachmentIDs []string
 	if projectID != "" {
@@ -360,12 +437,16 @@ WHERE message.id=$1 AND message.owner_id=$2 AND message.task_id=$3 AND message.a
 		attachmentIDs, err = loadConversationMessageAttachmentIDs(ctx, tx, serviceInstanceID, fence.OwnerID, conversationID, message.ID)
 	}
 	if err != nil {
-		return err
+		return agentMessageDeliveryReceipt{}, err
 	}
 	if !sameCheckpointPostgresAttachmentIDs(attachmentIDs, message.AttachmentIDs) {
-		return domain.NewError(domain.CodeInvalidState, "checkpoint task message attachments changed")
+		return agentMessageDeliveryReceipt{}, domain.NewError(domain.CodeInvalidState, "checkpoint task message attachments changed")
 	}
-	return nil
+	receipt, err := prepareAgentMessageDeliveryReceipt(fence, conversationID, message, sourceSequence, taskRevision, attachmentIDs, content)
+	if err != nil {
+		return agentMessageDeliveryReceipt{}, domain.NewError(domain.CodeInvalidState, "checkpoint task message representation changed")
+	}
+	return receipt, nil
 }
 
 func (s *Store) PendingMessages(ctx context.Context, fence app.AgentCheckpointFence) ([]app.AgentConversationMessage, error) {
@@ -415,7 +496,9 @@ FROM task_agent_sessions WHERE task_id=$1 AND owner_id=$2 AND session_id=$3 FOR 
  (revision.message_id IS NULL AND EXISTS (SELECT 1 FROM conversation_message_routes route
    WHERE route.message_id=message.id AND route.state='routed')),
  (revision.message_id IS NOT NULL AND revision.state='applied')
+ ,message.sequence,task.current_revision
 FROM conversation_messages AS message
+JOIN tasks task ON task.id=message.task_id AND task.owner_id=message.owner_id
 LEFT JOIN task_revision_intents revision ON revision.message_id=message.id
  AND revision.task_id=message.task_id AND revision.owner_id=message.owner_id
 WHERE message.task_id=$1 AND message.owner_id=$2 AND message.conversation_id=(SELECT conversation_id FROM tasks WHERE id=$1 AND owner_id=$2)
@@ -430,7 +513,8 @@ ORDER BY (revision.message_id IS NOT NULL),revision.expected_revision,message.se
 		for rows.Next() {
 			var message app.AgentConversationMessage
 			var conversationID, actorID, mode string
-			if err := rows.Scan(&message.ID, &message.Content, &conversationID, &actorID, &mode, &message.Initial, &message.RevisionUpdate); err != nil {
+			if err := rows.Scan(&message.ID, &message.Content, &conversationID, &actorID, &mode, &message.Initial, &message.RevisionUpdate,
+				&message.SourceSequence, &message.TaskRevision); err != nil {
 				return fmt.Errorf("scan pending task message: %w", err)
 			}
 			if actorID != fence.InitiatorID {
@@ -494,6 +578,37 @@ ORDER BY link.message_id,link.attachment_id`, serviceInstanceID, fence.OwnerID, 
 				return fmt.Errorf("iterate pending task message attachments: %w", err)
 			}
 		}
+		for index := range messages {
+			message := &messages[index]
+			envelope, _, err := buildAgentMessageReference(fence, messageConversations[message.ID], message.ID,
+				message.SourceSequence, message.TaskRevision, message.Mode, message.AttachmentIDs, message.Content)
+			if err != nil {
+				return domain.NewError(domain.CodeInvalidState, "pending message source manifest is unavailable")
+			}
+			message.SourceContentBytes = envelope.ContentBytes
+			message.SourceSHA256 = mustDecodeAgentMessageDigest(envelope.SourceSHA256)
+			message.ManifestVersion = envelope.ManifestVersion
+			message.ManifestSHA256 = mustDecodeAgentMessageDigest(envelope.ManifestSHA256)
+			message.RepresentationVersion = app.AgentMessageReferenceEnvelopeVersion
+			message.SourceAgentGeneration = envelope.AgentGeneration
+			if envelope.ContentBytes > app.MaxConversationAgentInputBytes {
+				message.RepresentationKind = "reference"
+				representationDigest, err := app.ComputeAgentMessageReferenceRepresentationSHA256(envelope)
+				if err != nil {
+					return domain.NewError(domain.CodeInvalidState, "pending message representation is invalid")
+				}
+				envelope.RepresentationSHA256 = hex.EncodeToString(representationDigest)
+				message.RepresentationSHA256 = append([]byte(nil), representationDigest...)
+				message.Reference = &envelope
+			} else {
+				message.RepresentationKind = "inline"
+				representationDigest, err := app.ComputeAgentMessageInlineRepresentationSHA256(envelope)
+				if err != nil {
+					return domain.NewError(domain.CodeInvalidState, "pending message representation is invalid")
+				}
+				message.RepresentationSHA256 = append([]byte(nil), representationDigest...)
+			}
+		}
 		eligible := messages[:0]
 		for _, message := range messages {
 			enqueued, mismatched, err := bindTaskAgentMessageDelivery(ctx, tx, fence, message)
@@ -535,12 +650,25 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (message_id) DO NOTHING`,
 	}
 	var taskID, ownerID, initiatorID, agentID, sessionID, mode string
 	var generation, authorizationVersion int64
+	var conversationID, representationKind pgtype.Text
+	var sourceContentBytes, receiptTaskRevision pgtype.Int8
+	var manifestVersion pgtype.Int4
+	var sourceSHA256, manifestSHA256, representationSHA256 []byte
+	var attachmentIDsSHA256 []byte
 	var enqueuedThrough, claimedThrough pgtype.Int8
+	var receiptGeneration, appliedAgentGeneration, enqueuedCheckpoint, claimedCheckpoint, appliedCheckpoint pgtype.Int8
+	var representationVersion pgtype.Int4
 	err = tx.QueryRow(ctx, `SELECT task_id,owner_id,initiator_id,agent_instance_id,agent_generation,authorization_version,
-session_id,mode,enqueued_through_seq,claimed_through_seq
+session_id,mode,enqueued_through_seq,claimed_through_seq,receipt_agent_generation,enqueued_checkpoint_through_seq,
+claimed_checkpoint_through_seq,applied_checkpoint_through_seq,applied_agent_generation,COALESCE(conversation_id,''),COALESCE(task_revision,0),
+COALESCE(source_content_bytes,0),COALESCE(source_sha256,''::bytea),COALESCE(manifest_version,0),
+COALESCE(manifest_sha256,''::bytea),COALESCE(representation_kind,''),COALESCE(representation_version,0),
+COALESCE(representation_sha256,''::bytea),COALESCE(attachment_ids_sha256,''::bytea)
 FROM task_agent_message_deliveries WHERE message_id=$1 FOR UPDATE`, message.ID).Scan(
 		&taskID, &ownerID, &initiatorID, &agentID, &generation, &authorizationVersion, &sessionID, &mode,
-		&enqueuedThrough, &claimedThrough)
+		&enqueuedThrough, &claimedThrough, &receiptGeneration, &enqueuedCheckpoint, &claimedCheckpoint, &appliedCheckpoint,
+		&appliedAgentGeneration, &conversationID, &receiptTaskRevision, &sourceContentBytes, &sourceSHA256, &manifestVersion,
+		&manifestSHA256, &representationKind, &representationVersion, &representationSHA256, &attachmentIDsSHA256)
 	if err != nil {
 		return false, false, fmt.Errorf("read task message delivery identity: %w", err)
 	}
@@ -549,6 +677,56 @@ FROM task_agent_message_deliveries WHERE message_id=$1 FOR UPDATE`, message.ID).
 		mode != string(message.Mode) || claimedThrough.Valid {
 		return false, true, nil
 	}
+	receiptProof := false
+	if (agentID != fence.AgentInstanceID || generation != fence.AgentGeneration) && enqueuedThrough.Valid && len(sourceSHA256) == 32 {
+		if !receiptGeneration.Valid || receiptGeneration.Int64 > generation || !appliedCheckpoint.Valid || appliedCheckpoint.Int64 < 0 ||
+			(!enqueuedCheckpoint.Valid || enqueuedCheckpoint.Int64 != appliedCheckpoint.Int64) &&
+				(!claimedCheckpoint.Valid || claimedCheckpoint.Int64 != appliedCheckpoint.Int64) ||
+			!appliedAgentGeneration.Valid || appliedAgentGeneration.Int64 != receiptGeneration.Int64 ||
+			!conversationID.Valid || !sourceContentBytes.Valid || !receiptTaskRevision.Valid || !manifestVersion.Valid ||
+			!representationKind.Valid || !representationVersion.Valid {
+			return false, true, nil
+		}
+		historicalFence := fence
+		historicalFence.AgentGeneration = receiptGeneration.Int64
+		expected, attachmentDigest, err := buildAgentMessageReference(historicalFence, conversationID.String, message.ID,
+			message.SourceSequence, message.TaskRevision, message.Mode, message.AttachmentIDs, message.Content)
+		if err != nil || expected.ContentBytes != sourceContentBytes.Int64 || expected.TaskRevision != receiptTaskRevision.Int64 ||
+			expected.ManifestVersion != int(manifestVersion.Int32) ||
+			!bytes.Equal(mustDecodeAgentMessageDigest(expected.SourceSHA256), sourceSHA256) ||
+			!bytes.Equal(mustDecodeAgentMessageDigest(expected.ManifestSHA256), manifestSHA256) ||
+			!bytes.Equal(attachmentDigest, attachmentIDsSHA256) {
+			return false, true, nil
+		}
+		var expectedRepresentation []byte
+		switch representationKind.String {
+		case "inline":
+			expectedRepresentation, err = app.ComputeAgentMessageInlineRepresentationSHA256(expected)
+		case "reference":
+			expectedRepresentation, err = app.ComputeAgentMessageReferenceRepresentationSHA256(expected)
+		default:
+			return false, true, nil
+		}
+		if err != nil || int(representationVersion.Int32) != app.AgentMessageReferenceEnvelopeVersion ||
+			!bytes.Equal(expectedRepresentation, representationSHA256) {
+			return false, true, nil
+		}
+		proofEventSequence := int64(-1)
+		if enqueuedCheckpoint.Valid && enqueuedCheckpoint.Int64 == appliedCheckpoint.Int64 && enqueuedThrough.Valid {
+			proofEventSequence = enqueuedThrough.Int64
+		} else if claimedCheckpoint.Valid && claimedCheckpoint.Int64 == appliedCheckpoint.Int64 && claimedThrough.Valid {
+			proofEventSequence = claimedThrough.Int64
+		}
+		var checkpointed bool
+		if proofEventSequence < 0 || tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM task_agent_checkpoints
+WHERE task_id=$1 AND owner_id=$2 AND agent_session_id=$3 AND agent_root_session_id=$3
+ AND agent_generation=$4 AND auth_version=$5 AND from_seq<=$6 AND through_seq=$7 AND through_seq>=$6)`,
+			fence.TaskID, fence.OwnerID, fence.AgentRootSessionID, appliedAgentGeneration.Int64,
+			authorizationVersion, proofEventSequence, appliedCheckpoint.Int64).Scan(&checkpointed) != nil || !checkpointed {
+			return false, true, nil
+		}
+		receiptProof = true
+	}
 	if agentID != fence.AgentInstanceID || generation != fence.AgentGeneration {
 		if generation >= fence.AgentGeneration || !enqueuedThrough.Valid && !message.Initial {
 			return false, true, nil
@@ -556,12 +734,16 @@ FROM task_agent_message_deliveries WHERE message_id=$1 FOR UPDATE`, message.ID).
 		if enqueuedThrough.Valid {
 			var checkpointed bool
 			if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM task_agent_checkpoints
-WHERE task_id=$1 AND owner_id=$2 AND agent_session_id=$3 AND from_seq<=$4 AND through_seq>=$4)`,
-				fence.TaskID, fence.OwnerID, fence.AgentSessionID, enqueuedThrough.Int64).Scan(&checkpointed); err != nil {
+WHERE task_id=$1 AND owner_id=$2 AND agent_session_id=$3 AND agent_root_session_id=$3
+ AND agent_generation=$4 AND auth_version=$5 AND from_seq<=$6 AND through_seq>=$6)`,
+				fence.TaskID, fence.OwnerID, fence.AgentSessionID, generation, authorizationVersion, enqueuedThrough.Int64).Scan(&checkpointed); err != nil {
 				return false, false, fmt.Errorf("verify recovered task message enqueue checkpoint: %w", err)
 			}
 			if !checkpointed {
 				return false, true, nil
+			}
+			if !message.CheckpointEvidence && !receiptProof {
+				return true, false, nil
 			}
 		}
 		if _, err := tx.Exec(ctx, `UPDATE task_agent_message_deliveries SET agent_instance_id=$2,agent_generation=$3,updated_at=clock_timestamp()

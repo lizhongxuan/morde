@@ -174,7 +174,7 @@ func validCloudDSHTaskValidationReviewModelFence(fence app.TaskValidationReviewM
 func (m *CloudDSHAccountRuntimeManager) StartTaskValidationReview(ctx context.Context,
 	fence app.TaskValidationReviewModelFence, start map[string]any) (*cloudDSHTaskValidationReview, error) {
 	if m == nil || ctx == nil || !validCloudDSHTaskValidationReviewModelFence(fence) {
-		return nil, errors.New("Task validation review identity is invalid")
+		return nil, errors.New("task validation review identity is invalid")
 	}
 	session, err := m.Acquire(ctx, fence.Claim.OwnerID, fence.Claim.ConversationID)
 	if err != nil {
@@ -198,12 +198,12 @@ func decodeCloudDSHTaskValidationReviewIdentity(frame map[string]json.RawMessage
 	}
 	encoded, err := json.Marshal(identityFrame)
 	if err != nil {
-		return cloudDSHTaskValidationReviewIdentityWire{}, errors.New("Task validation review identity is invalid")
+		return cloudDSHTaskValidationReviewIdentityWire{}, errors.New("task validation review identity is invalid")
 	}
 	decoder := json.NewDecoder(bytes.NewReader(encoded))
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&identity) != nil || decoder.Decode(new(any)) != io.EOF || !identity.valid() {
-		return cloudDSHTaskValidationReviewIdentityWire{}, errors.New("Task validation review identity is invalid")
+		return cloudDSHTaskValidationReviewIdentityWire{}, errors.New("task validation review identity is invalid")
 	}
 	return identity, nil
 }
@@ -429,7 +429,7 @@ func (s *cloudDSHAccountRuntimeSession) StartTaskValidationReview(ctx context.Co
 	fence app.TaskValidationReviewModelFence, start map[string]any) (*cloudDSHTaskValidationReview, error) {
 	if ctx == nil || !validCloudDSHTaskValidationReviewModelFence(fence) || start == nil ||
 		fence.Claim.OwnerID != s.runtime.Fence.OwnerID || fence.Claim.ConversationID != s.runtime.Fence.ConversationID || s.closed() {
-		return nil, errors.New("Task validation review AccountRuntime identity is invalid")
+		return nil, errors.New("task validation review account runtime identity is invalid")
 	}
 	startCopy := make(map[string]any, len(start)+4)
 	for key, value := range start {
@@ -437,7 +437,7 @@ func (s *cloudDSHAccountRuntimeSession) StartTaskValidationReview(ctx context.Co
 	}
 	startRaw, err := json.Marshal(startCopy)
 	if err != nil || !validCloudDSHTaskValidationReviewStart(startRaw, fence) {
-		return nil, errors.New("Task validation review start frame is invalid")
+		return nil, errors.New("task validation review start frame is invalid")
 	}
 	s.mu.Lock()
 	if s.reviewSlots == nil {
@@ -469,7 +469,7 @@ func (s *cloudDSHAccountRuntimeSession) StartTaskValidationReview(ctx context.Co
 	if s.reviewSequence >= 1<<53-1 {
 		s.mu.Unlock()
 		review.releaseSlot()
-		return nil, errors.New("Task validation review sequence is exhausted")
+		return nil, errors.New("task validation review sequence is exhausted")
 	}
 	s.reviewSequence++
 	review.sequence = s.reviewSequence
@@ -505,7 +505,7 @@ func (s *cloudDSHAccountRuntimeSession) StartTaskValidationReview(ctx context.Co
 		if err != nil {
 			return nil, err
 		}
-		return nil, errors.New("Task validation review ended before readiness")
+		return nil, errors.New("task validation review ended before readiness")
 	case <-ctx.Done():
 		cancelCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
 		_ = review.writeFrame(cancelCtx, map[string]any{"type": "task_validation_review_cancel"})
@@ -537,7 +537,7 @@ func (s *cloudDSHAccountRuntimeSession) routeTaskValidationReviewFrame(kind stri
 		review.mu.Lock()
 		if review.admitted || review.started || review.terminal {
 			review.mu.Unlock()
-			return errors.New("Task validation review process was admitted twice")
+			return errors.New("task validation review process was admitted twice")
 		}
 		review.admitted = true
 		review.mu.Unlock()
@@ -548,7 +548,7 @@ func (s *cloudDSHAccountRuntimeSession) routeTaskValidationReviewFrame(kind stri
 		review.mu.Lock()
 		if !review.admitted || review.started || review.terminal {
 			review.mu.Unlock()
-			return errors.New("Task validation review start response is invalid")
+			return errors.New("task validation review start response is invalid")
 		}
 		review.started = true
 		review.mu.Unlock()
@@ -558,7 +558,7 @@ func (s *cloudDSHAccountRuntimeSession) routeTaskValidationReviewFrame(kind stri
 	review.mu.Lock()
 	if review.terminal || (kind != "task_validation_review_failed" && kind != "task_validation_review_terminated" && !review.started) {
 		review.mu.Unlock()
-		return errors.New("Task validation review frame arrived outside its active session")
+		return errors.New("task validation review frame arrived outside its active session")
 	}
 	review.mu.Unlock()
 	for _, key := range []string{"server_instance_id", "runtime_id", "runtime_generation", "runtime_sequence"} {
@@ -566,21 +566,21 @@ func (s *cloudDSHAccountRuntimeSession) routeTaskValidationReviewFrame(kind stri
 	}
 	encoded, err := marshalCloudDSHRawFrame(frame)
 	if err != nil {
-		return errors.New("Task validation review frame could not be decoded")
+		return errors.New("task validation review frame could not be decoded")
 	}
 	select {
 	case review.events <- cloudDSHRead{frame: encoded}:
 	case <-review.ctx.Done():
 		return nil
 	default:
-		review.fail(errors.New("Task validation review event queue is full"))
+		review.fail(errors.New("task validation review event queue is full"))
 		s.removeTaskValidationReview(review)
 		return nil
 	}
 	if kind == "task_validation_review_settled" || kind == "task_validation_review_cancelled" ||
 		kind == "task_validation_review_failed" || kind == "task_validation_review_terminated" {
 		if kind == "task_validation_review_failed" {
-			review.startOnce.Do(func() { review.startedResult <- errors.New("Task validation review process failed") })
+			review.startOnce.Do(func() { review.startedResult <- errors.New("task validation review process failed") })
 		}
 		review.markTerminal()
 		s.removeTaskValidationReview(review)
@@ -617,7 +617,7 @@ func (s *cloudDSHAccountRuntimeSession) removeTaskValidationReview(review *cloud
 
 func (r *cloudDSHTaskValidationReview) read(ctx context.Context) (cloudDSHTaskValidationReviewFrame, error) {
 	if ctx == nil {
-		return cloudDSHTaskValidationReviewFrame{}, errors.New("Task validation review read context is required")
+		return cloudDSHTaskValidationReviewFrame{}, errors.New("task validation review read context is required")
 	}
 	for {
 		select {
@@ -627,7 +627,7 @@ func (r *cloudDSHTaskValidationReview) read(ctx context.Context) (cloudDSHTaskVa
 			}
 			frame, err := decodeCloudDSHTaskValidationReviewFrame(item.frame)
 			if err != nil || !cloudDSHTaskValidationReviewIdentityMatches(cloudDSHTaskValidationReviewIdentityFromFrame(frame), r.fence) {
-				return cloudDSHTaskValidationReviewFrame{}, errors.New("Task validation review frame identity is invalid")
+				return cloudDSHTaskValidationReviewFrame{}, errors.New("task validation review frame identity is invalid")
 			}
 			return frame, nil
 		default:
@@ -639,7 +639,7 @@ func (r *cloudDSHTaskValidationReview) read(ctx context.Context) (cloudDSHTaskVa
 			}
 			frame, err := decodeCloudDSHTaskValidationReviewFrame(item.frame)
 			if err != nil || !cloudDSHTaskValidationReviewIdentityMatches(cloudDSHTaskValidationReviewIdentityFromFrame(frame), r.fence) {
-				return cloudDSHTaskValidationReviewFrame{}, errors.New("Task validation review frame identity is invalid")
+				return cloudDSHTaskValidationReviewFrame{}, errors.New("task validation review frame identity is invalid")
 			}
 			return frame, nil
 		case <-ctx.Done():
@@ -651,7 +651,7 @@ func (r *cloudDSHTaskValidationReview) read(ctx context.Context) (cloudDSHTaskVa
 			if failure != nil {
 				return cloudDSHTaskValidationReviewFrame{}, failure
 			}
-			return cloudDSHTaskValidationReviewFrame{}, errors.New("Task validation review ended without a terminal frame")
+			return cloudDSHTaskValidationReviewFrame{}, errors.New("task validation review ended without a terminal frame")
 		}
 	}
 }
@@ -666,48 +666,48 @@ func cloudDSHTaskValidationReviewIdentityFromFrame(frame cloudDSHTaskValidationR
 func decodeCloudDSHTaskValidationReviewFrame(raw []byte) (cloudDSHTaskValidationReviewFrame, error) {
 	var frame cloudDSHTaskValidationReviewFrame
 	if len(raw) == 0 || len(raw) > cloudDSHMaxFrame || !utf8.Valid(raw) || !uniqueCloudDSHJSON(raw) {
-		return frame, errors.New("Task validation review JSON frame is invalid")
+		return frame, errors.New("task validation review JSON frame is invalid")
 	}
 	var keys map[string]json.RawMessage
 	if json.Unmarshal(raw, &keys) != nil || keys == nil {
-		return frame, errors.New("Task validation review frame is not an object")
+		return frame, errors.New("task validation review frame is not an object")
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&frame) != nil || decoder.Decode(new(any)) != io.EOF || !validCloudDSHTaskValidationReviewEventFrame(frame.Type, keys) {
-		return cloudDSHTaskValidationReviewFrame{}, errors.New("Task validation review frame fields are invalid")
+		return cloudDSHTaskValidationReviewFrame{}, errors.New("task validation review frame fields are invalid")
 	}
 	return frame, nil
 }
 
 func (r *cloudDSHTaskValidationReview) writeFrame(ctx context.Context, frame map[string]any) error {
 	if ctx == nil || frame == nil {
-		return errors.New("Task validation review frame context and payload are required")
+		return errors.New("task validation review frame context and payload are required")
 	}
 	frame = cloudDSHTaskValidationReviewResponseForIdentity(r.identity, frame)
 	encoded, err := json.Marshal(frame)
 	if err != nil || len(encoded) > cloudDSHMaxFrame || !utf8.Valid(encoded) || !uniqueCloudDSHJSON(encoded) {
-		return errors.New("Task validation review response frame is invalid")
+		return errors.New("task validation review response frame is invalid")
 	}
 	var raw map[string]json.RawMessage
 	if json.Unmarshal(encoded, &raw) != nil || raw == nil {
-		return errors.New("Task validation review response frame is invalid")
+		return errors.New("task validation review response frame is invalid")
 	}
 	var kind string
 	if json.Unmarshal(raw["type"], &kind) != nil || !validCloudDSHTaskValidationReviewResponseFrame(kind, raw, r.fence) {
-		return fmt.Errorf("Task validation review response frame %q identity or fields are invalid", kind)
+		return fmt.Errorf("task validation review response frame %q identity or fields are invalid", kind)
 	}
 	r.session.mu.Lock()
 	registered := r.session.reviews[r.identity.SessionID] == r
 	r.session.mu.Unlock()
 	if !registered {
-		return errors.New("Task validation review session is no longer registered")
+		return errors.New("task validation review session is no longer registered")
 	}
 	r.mu.Lock()
 	terminal, started := r.terminal, r.started
 	r.mu.Unlock()
 	if terminal || (kind != "task_validation_review_cancel" && !started) {
-		return errors.New("Task validation review response is not allowed in its current state")
+		return errors.New("task validation review response is not allowed in its current state")
 	}
 	return r.session.input.WriteFrame(ctx, cloudDSHTaskValidationReviewAccountFrame(r.session.runtime.Fence,
 		r.sequence, r.identity, frame))
@@ -732,7 +732,7 @@ func cloudDSHTaskValidationReviewResponseForIdentity(identity cloudDSHTaskValida
 
 func (r *cloudDSHTaskValidationReview) stop(ctx context.Context) error {
 	if ctx == nil {
-		return errors.New("Task validation review stop context is required")
+		return errors.New("task validation review stop context is required")
 	}
 	r.mu.Lock()
 	terminal := r.terminal
@@ -765,7 +765,7 @@ func (r *cloudDSHTaskValidationReview) markTerminal() {
 
 func (r *cloudDSHTaskValidationReview) fail(err error) {
 	if err == nil {
-		err = errors.New("Task validation review AccountRuntime failed")
+		err = errors.New("task validation review account runtime failed")
 	}
 	r.mu.Lock()
 	if r.failure == nil {

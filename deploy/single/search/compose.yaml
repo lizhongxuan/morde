@@ -16,6 +16,7 @@ services:
       - "127.0.0.1:8189:8080"
     volumes:
       - ./settings.yml:/etc/searxng/settings.yml:ro
+      - ./morde_360_news.py:/usr/local/searxng/searx/engines/morde_360_news.py:ro
     tmpfs:
       - /tmp:mode=1777
       - /var/cache/searxng:uid=977,gid=977,mode=0700

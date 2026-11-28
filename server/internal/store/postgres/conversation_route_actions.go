@@ -15,12 +15,15 @@ import (
 	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/conversation"
 	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/project"
 	"morde/server/internal/domain/task"
+	"morde/server/internal/domain/workspace"
 )
 
 // lockConversationRouteClaim makes the persisted receipt, current service
@@ -879,6 +882,21 @@ func (s *Store) ApplyConversationRoute(ctx context.Context, claim app.Conversati
 		if err := lockConversationRouteClaim(ctx, tx, claim); err != nil {
 			return err
 		}
+		var cancelRequested bool
+		if err := tx.QueryRow(ctx, `SELECT cancel_requested_at IS NOT NULL FROM conversation_message_routes
+WHERE service_instance_id=$1::uuid AND message_id=$2 AND owner_id=$3 AND actor_id=$4 AND conversation_id=$5 FOR UPDATE`,
+			claim.ServiceInstanceID, claim.Message.ID, claim.Message.OwnerID, claim.Message.ActorID, claim.Message.ConversationID).Scan(&cancelRequested); err != nil {
+			return fmt.Errorf("read long-form conversation cancellation: %w", err)
+		}
+		if cancelRequested {
+			if claim.Input.ResponseMode != app.ConversationResponseLongForm {
+				return domain.NewError(domain.CodeInvalidState, "a short conversation route cannot be cancelled as a long reply")
+			}
+			return finishConversationRoute(ctx, tx, claim, "cancelled", "", "", true)
+		}
+		if decision.Cancelled {
+			return domain.NewError(domain.CodeConflict, "long-form cancellation has not been recorded")
+		}
 		current, err := loadConversationRouteSnapshotInTx(ctx, tx, claim, true)
 		if err != nil {
 			return err
@@ -900,14 +918,39 @@ func (s *Store) ApplyConversationRoute(ctx context.Context, claim app.Conversati
 		if decision.Action != app.ConversationRouteNew && len(decision.AggregateMessageIDs) != 0 {
 			return domain.InvalidArgument("route_decision", "aggregation candidates are only valid for a new Task")
 		}
-		if decision.Action == app.ConversationRouteReply {
-			if decision.TaskID != "" || decision.ExpectedRevision != 0 || decision.Question != "" ||
-				!app.ValidConversationRouteReply(decision.Reply) {
-				return domain.InvalidArgument("route_decision", "direct conversation reply is invalid")
+		if claim.Input.ResponseMode == app.ConversationResponseLongForm {
+			if decision.ModelOutput != "" || decision.InvalidOutput || decision.TaskID != "" || decision.TargetMessageID != "" ||
+				decision.Acknowledge || decision.ExplicitNew || decision.ExpectedRevision != 0 || len(decision.DependencyTaskIDs) != 0 ||
+				len(decision.AggregateMessageIDs) != 0 || decision.ToolName != "" || decision.ToolArguments != "" {
+				return domain.InvalidArgument("route_decision", "long-form conversation decision contains unsupported fields")
 			}
-			decision.Reply = strings.TrimSpace(decision.Reply)
-		} else if decision.Reply != "" {
-			return domain.InvalidArgument("route_decision", "reply text is only valid for a direct reply")
+			switch decision.Action {
+			case app.ConversationRouteReply:
+				if !decision.LongReply || decision.Question != "" || !app.ValidConversationLongReply(decision.Reply) {
+					return domain.InvalidArgument("route_decision", "long-form conversation reply is invalid")
+				}
+				decision.Reply = strings.TrimSpace(decision.Reply)
+			case app.ConversationRouteClarify:
+				if !decision.LongReply || decision.Partial || decision.Reply != "" || strings.TrimSpace(decision.Question) == "" ||
+					!utf8.ValidString(decision.Question) || strings.ContainsRune(decision.Question, '\x00') || utf8.RuneCountInString(decision.Question) > 200 {
+					return domain.InvalidArgument("route_decision", "long-form clarification is invalid")
+				}
+				decision.Question = strings.TrimSpace(decision.Question)
+			default:
+				return domain.InvalidArgument("route_decision", "long-form replies cannot route Tasks or tools")
+			}
+		} else {
+			if decision.LongReply || decision.Partial {
+				return domain.InvalidArgument("route_decision", "long-form reply fields are unavailable for this route")
+			}
+			if decision.Action == app.ConversationRouteReply {
+				if decision.TaskID != "" || decision.ExpectedRevision != 0 || decision.Question != "" || !app.ValidConversationRouteReply(decision.Reply) {
+					return domain.InvalidArgument("route_decision", "direct conversation reply is invalid")
+				}
+				decision.Reply = strings.TrimSpace(decision.Reply)
+			} else if decision.Reply != "" {
+				return domain.InvalidArgument("route_decision", "reply text is only valid for a direct reply")
+			}
 		}
 		if decision.Action == app.ConversationRouteTool {
 			if decision.Acknowledge || decision.TaskID != "" || decision.TargetMessageID != "" || decision.ExplicitNew ||
@@ -1039,7 +1082,11 @@ WHERE id=$1 AND owner_id=$2 AND actor_id=$3 AND conversation_id=$4 AND role='use
 			if result.RowsAffected() != 1 {
 				return domain.NewError(domain.CodeConflict, "conversation message is no longer awaiting a direct reply")
 			}
-			return finishConversationRoute(ctx, tx, claim, "routed", decision.Reply, "", true)
+			routeState := "routed"
+			if decision.Partial {
+				routeState = "partial"
+			}
+			return finishConversationRoute(ctx, tx, claim, routeState, decision.Reply, "", true)
 		case app.ConversationRouteSteer:
 			if candidate == nil || candidate.Status != task.StatusRunning {
 				return domain.NewError(domain.CodeConflict, "conversation supplement Task is no longer running")
@@ -1061,6 +1108,14 @@ WHERE id=$1 AND owner_id=$2 AND actor_id=$3 AND conversation_id=$4 AND role='use
 		case app.ConversationRouteUpdate:
 			if err := requireConversationRouteScope(ctx, tx, claim, identity.ScopeTaskControl); err != nil {
 				return err
+			}
+			pendingClarification, err := conversationRouteHasPendingFileDeliveryClarification(ctx, tx, candidate.TaskID)
+			if err != nil {
+				return err
+			}
+			if pendingClarification {
+				return finishConversationRoute(ctx, tx, claim, "waiting_user",
+					"上一条修改仍在等待文件交付确认，请先处理该确认。 / The previous update is still waiting for a file delivery answer; resolve it first.", "", false)
 			}
 			var waitingReason string
 			var ownStop bool
@@ -1088,6 +1143,16 @@ COALESCE((SELECT expected_revision FROM task_revision_intents WHERE task_id=$1 O
 				return finishConversationRoute(ctx, tx, claim, "waiting_user", "另一条较新的修改已收到，请确认这条修改是否仍要执行。", "", false)
 			}
 			if err := validateInitialRouteAttachments(ctx, tx, claim); err != nil {
+				return err
+			}
+			if decision.FileDeliveryIntent == task.FileDeliveryUnclear {
+				question, err := beginConversationRouteFileDeliveryClarification(ctx, tx, claim, *candidate)
+				if err != nil {
+					return err
+				}
+				return finishConversationRoute(ctx, tx, claim, "waiting_user", question, candidate.TaskID, false)
+			}
+			if err := validateConversationRouteTaskFileDeliverySnapshot(ctx, tx, claim, candidate.TaskID, decision.FileDeliveryIntent); err != nil {
 				return err
 			}
 			if err := beginConversationTaskRevision(ctx, tx, claim, *candidate); err != nil {
@@ -1834,10 +1899,15 @@ FOR UPDATE OF r,m`, claim.ServiceInstanceID, claim.Message.OwnerID, claim.Messag
 	if err != nil || !bytes.Equal(rootDigest, snapshot.Context.ExecutionScopeDigest) {
 		return domain.NewError(domain.CodeConflict, "conversation join execution scope changed")
 	}
+	var rootAuthorizationValue task.Authorization
+	if json.Unmarshal(rootAuthorization, &rootAuthorizationValue) != nil ||
+		!reflect.DeepEqual(rootAuthorizationValue, candidate.Authorization) ||
+		!reflect.DeepEqual(rootAuthorizationValue, claim.Authorization) {
+		return requeueConversationRouteForReclassification(ctx, tx, claim)
+	}
 	if rootAggregationState == "open" || rootAggregationState == "waiting" {
-		var rootAuthorizationValue task.Authorization
-		if json.Unmarshal(rootAuthorization, &rootAuthorizationValue) != nil || (!rootAggregationEligible && !sameConversationRouteContent(rootContent, claim.Message.Content)) ||
-			len(rootInput.ClientAttachmentIDs) != 0 || !reflect.DeepEqual(rootAuthorizationValue, claim.Authorization) {
+		if (!rootAggregationEligible && !sameConversationRouteContent(rootContent, claim.Message.Content)) ||
+			len(rootInput.ClientAttachmentIDs) != 0 {
 			return requeueConversationRouteForReclassification(ctx, tx, claim)
 		}
 	}
@@ -1905,6 +1975,14 @@ WHERE message_id=$1 AND actor_id=$2 AND phase='normal' AND attempt=$3 AND state=
 		// still use the stricter causal-order check in the update path.
 		if err := validateInitialRouteAttachments(ctx, tx, claim); err != nil {
 			return err
+		}
+		pendingClarification, err := conversationRouteHasPendingFileDeliveryClarification(ctx, tx, rootTaskID)
+		if err != nil {
+			return err
+		}
+		if pendingClarification {
+			return finishConversationRoute(ctx, tx, claim, "waiting_user",
+				"目标任务仍在等待文件交付确认，请先处理该确认。 / The target Task is still waiting for a file delivery answer; resolve it first.", "", false)
 		}
 		if err := beginConversationTaskRevision(ctx, tx, claim, *revisionTaskCandidate); err != nil {
 			return err
@@ -2070,9 +2148,56 @@ FROM model_connections WHERE id=$1 FOR SHARE`, modelID, claim.Message.ActorID).S
 	if !fileIntent.Valid() {
 		return domain.InvalidArgument("route_decision", "file delivery intent is invalid")
 	}
+	var workspaceOwnerID string
+	var workspaceProjectResourceVersion *int64
+	if fileIntent == task.FileDeliveryRequired {
+		workspaceOwnerID, workspaceProjectResourceVersion, err = validateConversationRouteWorkspaceInputSnapshot(ctx, tx, claim)
+		if err != nil {
+			return err
+		}
+	}
+	initialStatus, initialEventType := task.StatusQueued, "task.status"
+	initialWaitingReason, initialCurrentStep := "", ""
+	var initialSteps []task.Step
+	var initialClarification *task.ClarificationRequest
+	if fileIntent == task.FileDeliveryUnclear {
+		workspaceSnapshotAvailable := false
+		if claim.Input.WorkspaceID != "" && (claim.Input.WorkspaceInputRevision != nil || len(claim.Input.WorkspaceContextDigest) != 0) {
+			workspaceOwnerID, workspaceProjectResourceVersion, err = validateConversationRouteWorkspaceInputSnapshot(ctx, tx, claim)
+			if err != nil {
+				return err
+			}
+			workspaceSnapshotAvailable = true
+		}
+		initialSteps, initialClarification, err = newConversationRouteFileDeliveryClarification(taskID, workspaceSnapshotAvailable)
+		if err != nil {
+			return err
+		}
+		initialStatus, initialEventType = task.StatusWaitingUser, "task.waiting_user"
+		initialWaitingReason, initialCurrentStep = "clarification_required", initialSteps[1].ID
+	}
+	var workspaceID string
+	var inputRevision, workspaceCheckpointRevision *int64
+	var contextDigest []byte
+	if fileIntent == task.FileDeliveryRequired || (fileIntent == task.FileDeliveryUnclear && claim.Input.WorkspaceID != "" &&
+		claim.Input.WorkspaceInputRevision != nil && len(claim.Input.WorkspaceContextDigest) == 32) {
+		workspaceID = claim.Input.WorkspaceID
+		if workspaceOwnerID == "" {
+			workspaceOwnerID = claim.Message.ActorID
+		}
+		revision := *claim.Input.WorkspaceInputRevision
+		inputRevision = &revision
+		checkpointRevision := revision
+		workspaceCheckpointRevision = &checkpointRevision
+		contextDigest = append([]byte(nil), claim.Input.WorkspaceContextDigest...)
+	}
 	value := task.Task{ID: taskID, OwnerID: claim.Message.OwnerID, InitiatorID: claim.Message.ActorID,
 		ProjectID: claim.Input.ProjectID, ConversationID: claim.Message.ConversationID, ModelID: modelID,
-		Objective: objective, Status: task.StatusQueued, Authorization: claim.Authorization, Budget: claim.Input.Budget,
+		WorkspaceID: workspaceID, WorkspaceOwnerID: workspaceOwnerID, InputRevision: inputRevision,
+		WorkspaceProjectResourceVersion: workspaceProjectResourceVersion,
+		WorkspaceCheckpointRevision:     workspaceCheckpointRevision, ContextDigest: contextDigest,
+		Objective: objective, Status: initialStatus, WaitingReason: initialWaitingReason, CurrentStep: initialCurrentStep,
+		Authorization: claim.Authorization, Budget: claim.Input.Budget,
 		ExecutionLocation: "server", FileDeliveryIntent: fileIntent, CheckpointThroughSequence: -1}
 	value = normalizeNewTask(value)
 	if err := validateTaskConversationScope(value, value.ProjectID); err != nil {
@@ -2126,11 +2251,29 @@ FROM model_connections WHERE id=$1 FOR SHARE`, modelID, claim.Message.ActorID).S
 			return err
 		}
 	}
-	payload, err := attachTaskConversationContextManifest([]byte(`{"status":"queued"}`), manifest)
+	eventPayload := map[string]string{"status": string(initialStatus)}
+	if initialClarification != nil {
+		eventPayload["reason"] = initialWaitingReason
+		eventPayload["clarification_id"] = initialClarification.ID
+		eventPayload["clarification_version"] = "1"
+	}
+	encodedEventPayload, err := json.Marshal(eventPayload)
+	if err != nil {
+		return fmt.Errorf("encode initial routed task event: %w", err)
+	}
+	payload, err := attachTaskConversationContextManifest(encodedEventPayload, manifest)
 	if err != nil {
 		return err
 	}
+	initialSubmission := app.TaskSubmission{Task: value, InitialEvent: task.Event{TaskID: taskID, Sequence: 1, Type: initialEventType, Payload: payload},
+		InitialSteps: initialSteps, InitialClarificationRequest: initialClarification}
+	if err := validateInitialFileDeliveryClarification(initialSubmission); err != nil {
+		return err
+	}
 	if err := insertTask(ctx, tx, value, 1, gate.epoch); err != nil {
+		return err
+	}
+	if err := insertInitialFileDeliveryClarification(ctx, tx, initialSubmission); err != nil {
 		return err
 	}
 	if internalTool != nil {
@@ -2166,7 +2309,7 @@ WHERE id=$1 AND owner_id=$2 AND conversation_id=$3 AND initiator_id=$4
 			return fmt.Errorf("persist task dependency: %w", err)
 		}
 	}
-	if err := insertTaskEvent(ctx, tx, task.Event{TaskID: value.ID, Sequence: 1, Type: "task.status", Payload: payload}); err != nil {
+	if err := insertTaskEvent(ctx, tx, task.Event{TaskID: value.ID, Sequence: 1, Type: initialEventType, Payload: payload}); err != nil {
 		return err
 	}
 	var reclassifyingDirectReply bool
@@ -2180,6 +2323,298 @@ FROM conversation_message_routes WHERE message_id=$1 AND owner_id=$2 AND actor_i
 	}
 	return finishConversationRoute(ctx, tx, claim, "routed", "", taskID,
 		len(claim.Input.ClientAttachmentIDs) == 0 && !reclassifyingDirectReply)
+}
+
+func validateConversationRouteWorkspaceInputSnapshot(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim) (string, *int64, error) {
+	input := claim.Input
+	if !domain.ValidWorkspaceID(input.WorkspaceID) || input.WorkspaceInputRevision == nil || *input.WorkspaceInputRevision < 0 ||
+		len(input.WorkspaceContextDigest) != 32 {
+		if input.ProjectID != "" {
+			return "", nil, domain.InvalidArgument("workspace_id", "a project Workspace requires an authorized project selection")
+		}
+		return "", nil, domain.InvalidArgument("workspace_id", "file delivery requires a valid Workspace input revision and context digest")
+	}
+	workspaceOwnerID := claim.Message.ActorID
+	var projectResourceVersion *int64
+	if input.ProjectID != "" {
+		if !domain.ValidUserID(input.WorkspaceOwnerID) || input.WorkspaceProjectResourceVersion == nil || *input.WorkspaceProjectResourceVersion < 1 {
+			return "", nil, domain.NewError(domain.CodeWorkspaceConflict, "project Workspace receipt is missing its accepted authorization snapshot")
+		}
+		ownerID, version, err := lockProjectTaskWorkspaceAccess(contextWithoutProjectWorkspacePermit(ctx), tx,
+			input.ProjectID, claim.Message.ActorID, input.WorkspaceID, false)
+		if err != nil {
+			return "", nil, err
+		}
+		if ownerID != input.WorkspaceOwnerID || version != *input.WorkspaceProjectResourceVersion {
+			return "", nil, domain.NewError(domain.CodeWorkspaceConflict, "project Workspace owner or resource changed after the conversation receipt")
+		}
+		workspaceOwnerID = ownerID
+		projectResourceVersion = &version
+	} else if claim.Message.ActorID != claim.Message.OwnerID {
+		return "", nil, domain.InvalidArgument("workspace_id", "a personal Workspace must belong to the message owner")
+	}
+	var ownerID, state string
+	var revision int64
+	var deleted bool
+	err := tx.QueryRow(ctx, `SELECT owner_id,state,revision,deleted_at IS NOT NULL FROM workspaces WHERE id=$1 FOR SHARE`,
+		input.WorkspaceID).Scan(&ownerID, &state, &revision, &deleted)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil, domain.NewError(domain.CodeNotFound, "workspace not found")
+	}
+	if err != nil {
+		return "", nil, fmt.Errorf("lock selected conversation Workspace: %w", err)
+	}
+	if ownerID != workspaceOwnerID {
+		return "", nil, domain.NewError(domain.CodeNotFound, "workspace not found")
+	}
+	if state != string(workspace.StateReady) || deleted {
+		return "", nil, domain.NewError(domain.CodeWorkspaceConflict, "selected Workspace is not ready for a file delivery Task")
+	}
+	if revision != *input.WorkspaceInputRevision {
+		return "", nil, domain.NewError(domain.CodeWorkspaceConflict, "selected Workspace changed after the conversation receipt")
+	}
+	actualDigest, err := conversationRouteWorkspaceManifestDigest(ctx, tx, input.WorkspaceID, revision)
+	if err != nil {
+		return "", nil, domain.NewError(domain.CodeWorkspaceConflict, "selected Workspace input manifest is unavailable or stale")
+	}
+	if !bytes.Equal(actualDigest, input.WorkspaceContextDigest) {
+		return "", nil, domain.NewError(domain.CodeWorkspaceConflict, "selected Workspace context digest is stale")
+	}
+	return workspaceOwnerID, projectResourceVersion, nil
+}
+
+func conversationRouteWorkspaceManifestDigest(ctx context.Context, tx pgx.Tx, workspaceID string, revision int64) ([]byte, error) {
+	files := make([]workspace.File, 0)
+	emptyDirectories := make([]string, 0)
+	directoriesByPath := make(map[string]workspace.Directory)
+	afterPath := ""
+	for {
+		page, err := getWorkspaceManifestPageTx(ctx, tx, workspaceID, revision, "", afterPath, maxWorkspaceSyncPage)
+		if err != nil {
+			return nil, err
+		}
+		if page.WorkspaceID != workspaceID || page.Revision != revision {
+			return nil, errors.New("selected Workspace manifest page changed revision")
+		}
+		if len(files)+len(emptyDirectories)+len(page.Files)+len(page.EmptyDirectories) > workspace.MaxSyncFiles {
+			return nil, errors.New("selected Workspace manifest exceeds item limit")
+		}
+		files = append(files, page.Files...)
+		emptyDirectories = append(emptyDirectories, page.EmptyDirectories...)
+		pagePaths := make([]string, 0, len(page.Files)+len(page.EmptyDirectories))
+		for _, directory := range page.Directories {
+			if err := workspace.ValidateDirectory(directory, false); err != nil {
+				return nil, err
+			}
+			key := strings.ToLower(directory.Path)
+			if previous, exists := directoriesByPath[key]; exists {
+				if !workspace.SameDirectoryMetadata(previous, directory) {
+					return nil, errors.New("selected Workspace directory metadata changed between pages")
+				}
+				continue
+			}
+			directoriesByPath[key] = directory
+		}
+		for _, file := range page.Files {
+			pagePaths = append(pagePaths, file.Path)
+		}
+		pagePaths = append(pagePaths, page.EmptyDirectories...)
+		sort.Strings(pagePaths)
+		previousPath := afterPath
+		for _, path := range pagePaths {
+			if path <= previousPath || strings.EqualFold(path, previousPath) {
+				return nil, errors.New("selected Workspace manifest paths are not in cursor order")
+			}
+			previousPath = path
+		}
+		if page.NextCursor == nil {
+			break
+		}
+		cursor, err := workspace.DecodeManifestCursor(*page.NextCursor)
+		if err != nil || cursor.Revision != revision || cursor.Prefix != "" || len(pagePaths) == 0 ||
+			cursor.After != pagePaths[len(pagePaths)-1] || cursor.After <= afterPath {
+			return nil, errors.New("selected Workspace manifest cursor is invalid")
+		}
+		afterPath = cursor.After
+	}
+	directories := make([]workspace.Directory, 0, len(directoriesByPath))
+	for _, directory := range directoriesByPath {
+		directories = append(directories, directory)
+	}
+	sort.Slice(directories, func(i, j int) bool { return directories[i].Path < directories[j].Path })
+	digest, err := workspace.ManifestTreeWithMetadataSHA256(files, emptyDirectories, directories)
+	if err != nil {
+		return nil, err
+	}
+	decoded, err := hex.DecodeString(digest)
+	if err != nil || len(decoded) != 32 {
+		return nil, errors.New("selected Workspace manifest digest is invalid")
+	}
+	return decoded, nil
+}
+
+func newConversationRouteFileDeliveryClarification(taskID string, workspaceSnapshotAvailable bool) ([]task.Step, *task.ClarificationRequest, error) {
+	classificationStepID, err := domain.NewStepID()
+	if err != nil {
+		return nil, nil, fmt.Errorf("generate routed file intent classification step ID: %w", err)
+	}
+	clarificationStepID, err := domain.NewStepID()
+	if err != nil {
+		return nil, nil, fmt.Errorf("generate routed file intent clarification step ID: %w", err)
+	}
+	requestID, err := domain.NewPendingRequestID()
+	if err != nil {
+		return nil, nil, fmt.Errorf("generate routed file intent clarification ID: %w", err)
+	}
+	question := "当前任务尚未绑定工作区。你需要交付文件，还是只要在聊天中回答？如需文件，请重新提交并选择工作区。 / This Task has no bound Workspace. Do you need a file, or is a chat answer enough? For file delivery, resubmit with a Workspace selected."
+	if workspaceSnapshotAvailable {
+		question = "你需要交付文件，还是只要在聊天中回答？如需文件，将使用本任务已绑定的工作区。 / Do you need a file, or is a chat answer enough? If you need a file, this Task will use its bound Workspace."
+	}
+	steps := []task.Step{
+		{ID: classificationStepID, TaskID: taskID, Sequence: 1, Kind: "verification", Status: task.StepSucceeded,
+			Title: "Check file delivery intent", Summary: "The router could not determine whether a file is required."},
+		{ID: clarificationStepID, TaskID: taskID, Sequence: 2, Kind: "clarification", Status: task.StepWaitingUser,
+			Title: "Confirm file delivery", Summary: question},
+	}
+	request := &task.ClarificationRequest{ID: requestID, TaskID: taskID, Version: 1, ModelStepID: classificationStepID,
+		CallID: app.FileDeliveryIntentClarificationCallID, Question: question, Status: task.ClarificationPending}
+	return steps, request, nil
+}
+
+func conversationRouteHasPendingFileDeliveryClarification(ctx context.Context, tx pgx.Tx, taskID string) (bool, error) {
+	var pending bool
+	err := tx.QueryRow(ctx, `SELECT EXISTS (
+ SELECT 1 FROM conversation_route_file_delivery_clarifications
+ WHERE task_id=$1 AND status='pending'
+)`, taskID).Scan(&pending)
+	if err != nil {
+		return false, fmt.Errorf("check pending route file delivery clarification: %w", err)
+	}
+	return pending, nil
+}
+
+func beginConversationRouteFileDeliveryClarification(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim,
+	candidate app.ConversationRouteCandidate) (string, error) {
+	if err := beginConversationTaskRevision(ctx, tx, claim, candidate); err != nil {
+		return "", err
+	}
+	var nextSequence, version int64
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(sequence),0)+1 FROM task_steps WHERE task_id=$1`, candidate.TaskID).Scan(&nextSequence); err != nil {
+		return "", fmt.Errorf("read next Task clarification step sequence: %w", err)
+	}
+	if nextSequence < 1 || nextSequence == int64(^uint64(0)>>1) {
+		return "", domain.NewError(domain.CodeInvalidState, "Task step sequence is exhausted")
+	}
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(version),0)+1 FROM task_clarification_requests WHERE task_id=$1`, candidate.TaskID).Scan(&version); err != nil {
+		return "", fmt.Errorf("read next Task clarification version: %w", err)
+	}
+	if version < 1 || version == int64(^uint64(0)>>1) {
+		return "", domain.NewError(domain.CodeInvalidState, "Task clarification version is exhausted")
+	}
+	classificationStepID, err := domain.NewStepID()
+	if err != nil {
+		return "", fmt.Errorf("generate route file intent classification step ID: %w", err)
+	}
+	clarificationStepID, err := domain.NewStepID()
+	if err != nil {
+		return "", fmt.Errorf("generate route file intent clarification step ID: %w", err)
+	}
+	requestID, err := domain.NewPendingRequestID()
+	if err != nil {
+		return "", fmt.Errorf("generate route file intent clarification ID: %w", err)
+	}
+	question := "这次修改需要交付文件，还是只需在聊天中回答？文件交付将使用当前任务绑定的工作区；如果任务没有可用工作区，无法选择文件交付。 / Does this update need a file, or is a chat answer enough? File delivery uses the Workspace already bound to this Task; it cannot be selected if no usable Workspace is bound."
+	steps := []task.Step{
+		{ID: classificationStepID, TaskID: candidate.TaskID, Sequence: nextSequence, Kind: "verification", Status: task.StepSucceeded,
+			Title: "Check file delivery intent", Summary: "The route could not determine whether this Task update needs a file."},
+		{ID: clarificationStepID, TaskID: candidate.TaskID, Sequence: nextSequence + 1, Kind: "clarification", Status: task.StepWaitingUser,
+			Title: "Confirm file delivery", Summary: question},
+	}
+	for _, step := range steps {
+		if _, err := tx.Exec(ctx, `INSERT INTO task_steps (id,task_id,sequence,kind,status,title,summary)
+VALUES ($1,$2,$3,$4,$5,$6,$7)`, step.ID, step.TaskID, step.Sequence, step.Kind, string(step.Status), step.Title, step.Summary); err != nil {
+			return "", fmt.Errorf("persist route file delivery clarification step: %w", err)
+		}
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO task_clarification_requests
+(id,task_id,version,model_step_id,call_id,question,status)
+VALUES ($1,$2,$3,$4,$5,$6,'pending')`, requestID, candidate.TaskID, version, classificationStepID,
+		task.RouteFileDeliveryIntentClarificationCallID, question); err != nil {
+		return "", fmt.Errorf("persist route file delivery clarification request: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO conversation_route_file_delivery_clarifications
+(message_id,task_id,owner_id,initiator_id,conversation_id,expected_revision,clarification_id,clarification_version,status)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending')`, claim.Message.ID, candidate.TaskID, claim.Message.OwnerID,
+		claim.Message.ActorID, claim.Message.ConversationID, candidate.Revision, requestID, version); err != nil {
+		return "", fmt.Errorf("persist route file delivery clarification binding: %w", err)
+	}
+	return question, nil
+}
+
+func validateConversationRouteTaskFileDeliverySnapshot(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim,
+	taskID string, decisionIntent task.FileDeliveryIntent) error {
+	var storedIntent, workspaceID, workspaceOwnerID, initiatorID string
+	var hasWorkspaceInputSnapshot bool
+	var inputRevision, checkpointRevision pgtype.Int8
+	var contextDigest []byte
+	err := tx.QueryRow(ctx, `SELECT file_delivery_intent,COALESCE(workspace_id,''),COALESCE(workspace_owner_id,''),initiator_id,
+input_revision,workspace_checkpoint_revision,context_digest,
+input_revision IS NOT NULL AND workspace_checkpoint_revision IS NOT NULL
+AND workspace_checkpoint_revision=input_revision AND COALESCE(octet_length(context_digest)=32,false)
+FROM tasks WHERE id=$1 AND owner_id=$2 AND initiator_id=$3 AND conversation_id=$4 FOR UPDATE`,
+		taskID, claim.Message.OwnerID, claim.Message.ActorID, claim.Message.ConversationID).
+		Scan(&storedIntent, &workspaceID, &workspaceOwnerID, &initiatorID, &inputRevision, &checkpointRevision, &contextDigest, &hasWorkspaceInputSnapshot)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.NewError(domain.CodeNotFound, "task not found")
+	}
+	if err != nil {
+		return fmt.Errorf("read task Workspace snapshot for route update: %w", err)
+	}
+	currentIntent := task.FileDeliveryIntent(storedIntent)
+	if !currentIntent.Valid() {
+		return domain.NewError(domain.CodeInvalidState, "task file delivery intent is invalid")
+	}
+	effectiveIntent := decisionIntent
+	if effectiveIntent == "" {
+		effectiveIntent = currentIntent
+	}
+	if effectiveIntent == task.FileDeliveryUnclear {
+		return domain.NewError(domain.CodeConflict, "file delivery intent must be clarified before updating this Task")
+	}
+	if effectiveIntent == task.FileDeliveryRequired && (workspaceID == "" || !hasWorkspaceInputSnapshot) {
+		return domain.InvalidArgument("workspace_id", "file delivery requires a Workspace input snapshot bound to the Task")
+	}
+	if effectiveIntent == task.FileDeliveryRequired {
+		if !domain.ValidWorkspaceID(workspaceID) || !inputRevision.Valid || !checkpointRevision.Valid ||
+			inputRevision.Int64 < 0 || checkpointRevision.Int64 != inputRevision.Int64 || len(contextDigest) != 32 || workspaceOwnerID == "" {
+			return domain.InvalidArgument("workspace_id", "file delivery requires a complete Workspace input snapshot bound to the Task")
+		}
+		var ownerID, state string
+		var revision int64
+		var deleted bool
+		err := tx.QueryRow(ctx, `SELECT owner_id,state,revision,deleted_at IS NOT NULL FROM workspaces WHERE id=$1 FOR SHARE`, workspaceID).
+			Scan(&ownerID, &state, &revision, &deleted)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.NewError(domain.CodeNotFound, "workspace not found")
+		}
+		if err != nil {
+			return fmt.Errorf("check Task Workspace snapshot for file delivery: %w", err)
+		}
+		if ownerID != workspaceOwnerID {
+			return domain.NewError(domain.CodeNotFound, "workspace not found")
+		}
+		if state != string(workspace.StateReady) || deleted || revision != checkpointRevision.Int64 {
+			return domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace snapshot is no longer current and ready for file delivery")
+		}
+		actualDigest, err := conversationRouteWorkspaceManifestDigest(ctx, tx, workspaceID, revision)
+		if err != nil || !bytes.Equal(actualDigest, contextDigest) {
+			return domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace input manifest is unavailable or stale")
+		}
+		if workspaceOwnerID != initiatorID {
+			return domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace owner is no longer authorized for this file delivery")
+		}
+	}
+	return nil
 }
 
 func validateInitialRouteAttachments(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim) error {
@@ -2522,39 +2957,18 @@ WHERE r.service_instance_id=$1::uuid AND r.message_id=$2 AND r.actor_id=$3 AND r
 		if err := lockConversationReceiptScopeInTx(ctx, tx, receipt); err != nil {
 			return err
 		}
-		var active bool
-		var expiresAt time.Time
-		var tokenScopes []string
-		err = tx.QueryRow(ctx, `SELECT u.status='approved' AND t.revoked_at IS NULL AND t.expires_at>clock_timestamp()
- AND t.kind=$3 AND COALESCE(t.client_installation_id,'')=$4,t.expires_at,t.scopes
-FROM users u JOIN tokens t ON t.owner_id=u.id WHERE u.id=$1 AND t.id=$2 FOR SHARE OF u,t`,
-			principal.UserID, principal.TokenID, string(principal.Kind), principal.ClientInstallationID).Scan(&active, &expiresAt, &tokenScopes)
-		if err != nil || !active {
-			return domain.NewError(domain.CodeUnauthenticated, "conversation route retry credential is unavailable")
-		}
-		if principal.Kind == identity.KindClient && !domain.ValidClientInstallationID(principal.ClientInstallationID) {
-			return domain.NewError(domain.CodeUnauthenticated, "conversation route retry installation is unavailable")
-		}
-		if principal.ClientInstallationID != "" {
-			if err := checkModelInstallation(ctx, tx, principal.ClientInstallationID, principal.UserID); err != nil {
-				return err
-			}
-		}
-		current := identity.Principal{Kind: principal.Kind}
-		for _, value := range tokenScopes {
-			current.Scopes = append(current.Scopes, identity.Scope(value))
-		}
-		if !current.HasScope(identity.ScopeTaskSubmit) {
-			return domain.NewError(domain.CodeForbidden, "conversation route retry is not authorized")
+		expiresAt, tokenScopes, err := authorizeConversationRouteRetryInTx(ctx, tx, principal)
+		if err != nil {
+			return err
 		}
 		var requestHash []byte
-		var state, sourceKind, resultReviewID string
+		var state, failureReason, sourceKind, resultReviewID string
 		var routeAttempt int64
 		var taskID *string
-		err = tx.QueryRow(ctx, `SELECT r.request_hash,r.state,m.task_id,m.source_kind,COALESCE(r.request_metadata->>'result_review_id',''),r.route_attempt FROM conversation_message_routes r
+		err = tx.QueryRow(ctx, `SELECT r.request_hash,r.state,r.failure_reason,m.task_id,m.source_kind,COALESCE(r.request_metadata->>'result_review_id',''),r.route_attempt FROM conversation_message_routes r
 JOIN conversation_messages m ON m.id=r.message_id AND m.actor_id=r.actor_id AND m.conversation_id=r.conversation_id AND m.owner_id=r.owner_id
 WHERE r.service_instance_id=$1::uuid AND r.message_id=$2 AND r.actor_id=$3 AND r.conversation_id=$4
-FOR UPDATE OF r,m`, instanceID, messageID, principal.UserID, conversationID).Scan(&requestHash, &state, &taskID, &sourceKind, &resultReviewID, &routeAttempt)
+FOR UPDATE OF r,m`, instanceID, messageID, principal.UserID, conversationID).Scan(&requestHash, &state, &failureReason, &taskID, &sourceKind, &resultReviewID, &routeAttempt)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.NewError(domain.CodeNotFound, "conversation message not found")
 		}
@@ -2584,37 +2998,18 @@ FOR UPDATE OF r,m`, instanceID, messageID, principal.UserID, conversationID).Sca
 			}
 			return nil
 		}
-		var unknownSharedUsage bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM conversation_route_model_calls c
-JOIN model_call_ledger l ON l.owner_id=c.actor_id AND l.source=c.source AND l.call_id=c.call_id
-WHERE c.message_id=$1 AND c.actor_id=$2 AND c.state='unknown' AND l.state='unknown' AND NOT l.personal_model)`,
-			messageID, principal.UserID).Scan(&unknownSharedUsage); err != nil {
-			return fmt.Errorf("check unknown shared model usage before retry: %w", err)
+		eligibility, err := conversationRouteRetryEligibilityInTx(ctx, tx, messageID, principal.UserID,
+			state, failureReason, taskID, sourceKind, resultReviewID, routeAttempt)
+		if err != nil {
+			return err
 		}
-		if unknownSharedUsage {
-			return domain.NewError(domain.CodeInvalidState, "shared model usage is unknown and must be reconciled before retry")
-		}
-		var unresolved bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM conversation_route_model_calls
-WHERE message_id=$1 AND actor_id=$2 AND (state='dispatched' OR (state='unknown' AND $3::boolean)))`,
-			messageID, principal.UserID, sourceKind == "task_result_review").Scan(&unresolved); err != nil {
-			return fmt.Errorf("check unresolved route call before retry: %w", err)
-		}
-		if unresolved {
-			return domain.NewError(domain.CodeConflict, "conversation route is still processing and cannot be retried")
-		}
-		if state != "failed" || taskID != nil {
-			return domain.NewError(domain.CodeConflict, "only a failed message without a Task can be retried")
+		if !eligibility.Eligible {
+			return conversationRouteRetryEligibilityError(eligibility.Reason)
 		}
 		auth := task.Authorization{Kind: string(principal.Kind), TokenID: principal.TokenID,
 			ClientInstallationID: principal.ClientInstallationID, Version: 1, ExpiresAt: &expiresAt}
-		for _, scope := range principal.Scopes {
-			auth.Scopes = append(auth.Scopes, string(scope))
-		}
+		auth.Scopes = append(auth.Scopes, tokenScopes...)
 		if sourceKind == "task_result_review" {
-			if !domain.ValidMessageID(resultReviewID) {
-				return domain.NewError(domain.CodeConflict, "task result review route is no longer retryable")
-			}
 			var authorizationVersion int64
 			err := tx.QueryRow(ctx, `UPDATE conversation_result_batches SET state='processing',retry_attempt=retry_attempt+1,updated_at=clock_timestamp()
 WHERE message_id=$1 AND trigger_message_id=$2 AND state='failed' AND retry_attempt<9223372036854775807
@@ -2627,9 +3022,6 @@ RETURNING authorization_version`, resultReviewID, messageID).Scan(&authorization
 			}
 			auth = task.Authorization{Kind: string(identity.KindSession), Version: authorizationVersion,
 				Scopes: []string{string(identity.ScopeTaskSubmit)}}
-		}
-		if sourceKind != "task_result_review" && routeAttempt == int64(^uint64(0)>>1) {
-			return domain.NewError(domain.CodeInvalidState, "conversation route retry limit has been exhausted")
 		}
 		authorization, err := json.Marshal(auth)
 		if err != nil {
@@ -2665,4 +3057,200 @@ authorization_snapshot=$2::jsonb,available_after=clock_timestamp(),updated_at=cl
 		}
 		return nil
 	})
+}
+
+func authorizeConversationRouteRetryInTx(ctx context.Context, tx pgx.Tx, principal identity.Principal) (time.Time, []string, error) {
+	var active bool
+	var expiresAt time.Time
+	var tokenScopes []string
+	err := tx.QueryRow(ctx, `SELECT u.status='approved' AND t.revoked_at IS NULL AND t.expires_at>clock_timestamp()
+ AND t.kind=$3 AND COALESCE(t.client_installation_id,'')=$4,t.expires_at,t.scopes
+FROM users u JOIN tokens t ON t.owner_id=u.id WHERE u.id=$1 AND t.id=$2 FOR SHARE OF u,t`,
+		principal.UserID, principal.TokenID, string(principal.Kind), principal.ClientInstallationID).Scan(&active, &expiresAt, &tokenScopes)
+	if err != nil || !active {
+		return time.Time{}, nil, domain.NewError(domain.CodeUnauthenticated, "conversation route retry credential is unavailable")
+	}
+	if principal.Kind == identity.KindClient && !domain.ValidClientInstallationID(principal.ClientInstallationID) {
+		return time.Time{}, nil, domain.NewError(domain.CodeUnauthenticated, "conversation route retry installation is unavailable")
+	}
+	if principal.ClientInstallationID != "" {
+		if err := checkModelInstallation(ctx, tx, principal.ClientInstallationID, principal.UserID); err != nil {
+			return time.Time{}, nil, err
+		}
+	}
+	current := identity.Principal{Kind: principal.Kind}
+	for _, value := range tokenScopes {
+		current.Scopes = append(current.Scopes, identity.Scope(value))
+	}
+	if !current.HasScope(identity.ScopeTaskSubmit) {
+		return time.Time{}, nil, domain.NewError(domain.CodeForbidden, "conversation route retry is not authorized")
+	}
+	return expiresAt, tokenScopes, nil
+}
+
+func conversationRouteRetryEligibilityInTx(ctx context.Context, tx pgx.Tx, messageID, actorID, state, failureReason string,
+	taskID *string, sourceKind, resultReviewID string, routeAttempt int64) (app.ConversationMessageRetryEligibility, error) {
+	ineligible := func(reason string) app.ConversationMessageRetryEligibility {
+		return app.ConversationMessageRetryEligibility{Eligible: false, Reason: reason}
+	}
+	if failureReason == "message_too_long" {
+		return ineligible(app.ConversationMessageRetryReasonMessageTooLong), nil
+	}
+	var unknownSharedUsage bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM conversation_route_model_calls c
+JOIN model_call_ledger l ON l.owner_id=c.actor_id AND l.source=c.source AND l.call_id=c.call_id
+WHERE c.message_id=$1 AND c.actor_id=$2 AND c.state='unknown' AND l.state='unknown' AND NOT l.personal_model)`,
+		messageID, actorID).Scan(&unknownSharedUsage); err != nil {
+		return app.ConversationMessageRetryEligibility{}, fmt.Errorf("check unknown shared model usage before retry: %w", err)
+	}
+	if unknownSharedUsage {
+		return ineligible(app.ConversationMessageRetryReasonReconciliationRequired), nil
+	}
+	var dispatched bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM conversation_route_model_calls
+WHERE message_id=$1 AND actor_id=$2 AND state='dispatched')`, messageID, actorID).Scan(&dispatched); err != nil {
+		return app.ConversationMessageRetryEligibility{}, fmt.Errorf("check dispatched route call before retry: %w", err)
+	}
+	if dispatched {
+		return ineligible(app.ConversationMessageRetryReasonProcessing), nil
+	}
+	if sourceKind == "task_result_review" {
+		var unknownReviewCall bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM conversation_route_model_calls
+WHERE message_id=$1 AND actor_id=$2 AND state='unknown')`, messageID, actorID).Scan(&unknownReviewCall); err != nil {
+			return app.ConversationMessageRetryEligibility{}, fmt.Errorf("check unknown result review call before retry: %w", err)
+		}
+		if unknownReviewCall {
+			return ineligible(app.ConversationMessageRetryReasonReviewOutcomeUnknown), nil
+		}
+	}
+	if state != "failed" {
+		return ineligible(app.ConversationMessageRetryReasonNotFailed), nil
+	}
+	if taskID != nil {
+		return ineligible(app.ConversationMessageRetryReasonTaskAttached), nil
+	}
+	if sourceKind == "task_result_review" {
+		if !domain.ValidMessageID(resultReviewID) {
+			return ineligible(app.ConversationMessageRetryReasonReviewNotRetryable), nil
+		}
+		var reviewState string
+		var retryAttempt int64
+		err := tx.QueryRow(ctx, `SELECT state,retry_attempt FROM conversation_result_batches
+WHERE message_id=$1 AND trigger_message_id=$2`, resultReviewID, messageID).Scan(&reviewState, &retryAttempt)
+		if errors.Is(err, pgx.ErrNoRows) || err == nil && reviewState != "failed" {
+			return ineligible(app.ConversationMessageRetryReasonReviewNotRetryable), nil
+		}
+		if err != nil {
+			return app.ConversationMessageRetryEligibility{}, fmt.Errorf("check task result review retry eligibility: %w", err)
+		}
+		if retryAttempt == int64(^uint64(0)>>1) {
+			return ineligible(app.ConversationMessageRetryReasonLimitReached), nil
+		}
+	} else if routeAttempt == int64(^uint64(0)>>1) {
+		return ineligible(app.ConversationMessageRetryReasonLimitReached), nil
+	}
+	var unknownPersonalUsage bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM conversation_route_model_calls c
+JOIN model_call_ledger l ON l.owner_id=c.actor_id AND l.source=c.source AND l.call_id=c.call_id
+WHERE c.message_id=$1 AND c.actor_id=$2 AND c.state='unknown' AND l.state='unknown' AND l.personal_model)`,
+		messageID, actorID).Scan(&unknownPersonalUsage); err != nil {
+		return app.ConversationMessageRetryEligibility{}, fmt.Errorf("check unknown personal model usage before retry: %w", err)
+	}
+	result := app.ConversationMessageRetryEligibility{Eligible: true, Reason: app.ConversationMessageRetryReasonAvailable}
+	if unknownPersonalUsage {
+		result.Warning = app.ConversationMessageRetryWarningPersonalOutcomeUnknown
+	}
+	return result, nil
+}
+
+func conversationRouteRetryEligibilityError(reason string) error {
+	switch reason {
+	case app.ConversationMessageRetryReasonMessageTooLong:
+		return domain.NewError(domain.CodeInvalidState, "conversation message exceeded processing limits and cannot be retried unchanged")
+	case app.ConversationMessageRetryReasonReconciliationRequired:
+		return domain.NewError(domain.CodeInvalidState, "model call outcome or shared usage must be reconciled before retry")
+	case app.ConversationMessageRetryReasonReviewOutcomeUnknown:
+		return domain.NewError(domain.CodeConflict, "conversation route is still processing and cannot be retried")
+	case app.ConversationMessageRetryReasonProcessing:
+		return domain.NewError(domain.CodeConflict, "conversation route is still processing and cannot be retried")
+	case app.ConversationMessageRetryReasonLimitReached:
+		return domain.NewError(domain.CodeInvalidState, "conversation route retry limit has been exhausted")
+	case app.ConversationMessageRetryReasonNotFailed, app.ConversationMessageRetryReasonTaskAttached,
+		app.ConversationMessageRetryReasonReviewNotRetryable:
+		return domain.NewError(domain.CodeConflict, "only a retryable failed message without a Task can be retried")
+	default:
+		return domain.NewError(domain.CodeInvalidState, "conversation route retry eligibility is unavailable")
+	}
+}
+
+// GetConversationMessageRetryEligibility reports the current retry gate for a
+// persisted message. RetryConversationRoute re-evaluates the same gate while
+// holding its write transaction, so this result is advisory under races.
+func (s *Store) GetConversationMessageRetryEligibility(ctx context.Context, principal identity.Principal,
+	projectID, conversationID, messageID, instanceID string) (app.ConversationMessageRetryEligibility, error) {
+	if ctx == nil || !domain.ValidUserID(principal.UserID) || !domain.ValidTokenID(principal.TokenID) ||
+		(principal.Kind != identity.KindSession && principal.Kind != identity.KindClient) || !principal.HasScope(identity.ScopeTaskSubmit) ||
+		!domain.ValidConversationID(conversationID) || !domain.ValidMessageID(messageID) || !domain.ValidServiceInstanceID(instanceID) ||
+		(projectID != "" && !project.ValidID(projectID)) {
+		return app.ConversationMessageRetryEligibility{}, domain.InvalidArgument("route_retry", "conversation route retry identity is invalid")
+	}
+	var eligibility app.ConversationMessageRetryEligibility
+	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		if err := requireConversationServiceInstance(ctx, tx, instanceID); err != nil {
+			return err
+		}
+		requestedMessageID := messageID
+		var ownerID, duplicateOf string
+		err := tx.QueryRow(ctx, `SELECT r.owner_id,COALESCE(r.duplicate_of_message_id,'') FROM conversation_message_routes r
+JOIN conversations c ON c.id=r.conversation_id AND c.owner_id=r.owner_id
+WHERE r.service_instance_id=$1::uuid AND r.message_id=$2 AND r.actor_id=$3 AND r.conversation_id=$4
+ AND c.project_id IS NOT DISTINCT FROM NULLIF($5,'')`, instanceID, requestedMessageID, principal.UserID, conversationID, projectID).
+			Scan(&ownerID, &duplicateOf)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.NewError(domain.CodeNotFound, "conversation message not found")
+		}
+		if err != nil {
+			return fmt.Errorf("find conversation route retry eligibility: %w", err)
+		}
+		if duplicateOf != "" {
+			messageID = duplicateOf
+		}
+		receipt := app.ConversationMessageReceipt{ServiceInstanceID: instanceID,
+			Message: conversation.Message{ID: messageID, OwnerID: ownerID, ActorID: principal.UserID, ConversationID: conversationID},
+			Input:   app.ConversationRoutingInput{ProjectID: projectID}}
+		if err := lockConversationReceiptScopeInTx(ctx, tx, receipt); err != nil {
+			return err
+		}
+		if _, _, err := authorizeConversationRouteRetryInTx(ctx, tx, principal); err != nil {
+			return err
+		}
+		var state, failureReason, sourceKind, resultReviewID string
+		var routeAttempt int64
+		var taskID *string
+		err = tx.QueryRow(ctx, `SELECT r.state,r.failure_reason,m.task_id,m.source_kind,
+COALESCE(r.request_metadata->>'result_review_id',''),r.route_attempt
+FROM conversation_message_routes r
+JOIN conversation_messages m ON m.id=r.message_id AND m.actor_id=r.actor_id AND m.conversation_id=r.conversation_id AND m.owner_id=r.owner_id
+WHERE r.service_instance_id=$1::uuid AND r.message_id=$2 AND r.actor_id=$3 AND r.conversation_id=$4
+FOR SHARE OF r,m`, instanceID, messageID, principal.UserID, conversationID).
+			Scan(&state, &failureReason, &taskID, &sourceKind, &resultReviewID, &routeAttempt)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.NewError(domain.CodeNotFound, "conversation message not found")
+		}
+		if err != nil {
+			return fmt.Errorf("read conversation route retry eligibility: %w", err)
+		}
+		currentEligibility, err := conversationRouteRetryEligibilityInTx(ctx, tx, messageID, principal.UserID,
+			state, failureReason, taskID, sourceKind, resultReviewID, routeAttempt)
+		if err != nil {
+			return err
+		}
+		eligibility = currentEligibility
+		return nil
+	})
+	if err != nil {
+		return app.ConversationMessageRetryEligibility{}, err
+	}
+	return eligibility, nil
 }

@@ -24,6 +24,8 @@ test('Host embed exchange posts the exact Portal origin and returns only a stric
     assert.equal(call.options.redirect, 'manual');
     assert.equal(call.options.headers.origin, portalOrigin);
     assert.equal(call.options.headers.authorization, undefined);
+    assert.match(call.options.headers.traceparent, /^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/);
+    assert.ok(call.options.headers['X-Request-Id']);
     assert.deepEqual(Object.fromEntries(call.options.body.entries()), { ticket, embed_nonce: nonce });
     assert.equal(result.url, location);
     assert.equal(result.cookie.value, 'opaque.signed.value');
@@ -40,9 +42,9 @@ test('Host embed exchange rejects off-host redirects, ticket replay responses an
     await assert.rejects(() => exchangeHostEmbedTicket(`${hostOrigin}/__ch/embed-auth`, hostOrigin, portalOrigin,
       ticket, nonce, 'browser', ['browser']), /invalid Workbench location/);
 
-    globalThis.fetch = async () => new Response(null, { status: 404 });
+    globalThis.fetch = async () => new Response(null, { status: 404, headers: { 'X-Trace-Id': 'b'.repeat(32) } });
     await assert.rejects(() => exchangeHostEmbedTicket(`${hostOrigin}/__ch/embed-auth`, hostOrigin, portalOrigin,
-      ticket, nonce, 'browser', ['browser']), /HTTP 404/);
+      ticket, nonce, 'browser', ['browser']), /HTTP 404.*trace ID b{32}/);
 
     globalThis.fetch = async () => new Response(null, { status: 303,
       headers: { location, 'set-cookie': 'ch_embed=opaque; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=600' } });

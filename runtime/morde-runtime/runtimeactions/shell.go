@@ -7,11 +7,14 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+
+	mordesync "morde-sync"
 )
 
 const (
@@ -30,6 +33,157 @@ var (
 	ErrProcessDomainUnavailable = errors.New("verified process control unavailable")
 	ErrShellOperationCancelled  = errors.New("shell operation cancelled")
 )
+
+func taskWorkspaceSnapshotSHA256(ctx context.Context, root *os.Root) (string, error) {
+	return taskWorkspaceSnapshotSHA256WithScanner(ctx, root, func(ctx context.Context, root *os.Root) (mordesync.Manifest, error) {
+		return mordesync.ScanOpenedRoot(ctx, root, nil)
+	})
+}
+
+func taskWorkspaceSnapshotSHA256WithScanner(ctx context.Context, root *os.Root,
+	scan func(context.Context, *os.Root) (mordesync.Manifest, error)) (string, error) {
+	if scan == nil {
+		return "", errors.New("Task Workspace snapshot scanner is required")
+	}
+	manifest, err := scan(ctx, root)
+	if err != nil {
+		return "", err
+	}
+	digest, err := mordesync.TaskWorkspaceSnapshotSHA256(manifest)
+	if err != nil {
+		return "", err
+	}
+	return digest, nil
+}
+
+// shellTaskWorkspaceResult carries the shared v2 digest of the exact private
+// Task Workspace before and after shell execution. It intentionally contains
+// no file names or contents. Legacy manifest fields remain decodable below,
+// but new results leave them empty so they are omitted from JSON.
+type shellTaskWorkspaceResult struct {
+	ExitCode                      int                         `json:"exit_code"`
+	Stdout                        string                      `json:"stdout"`
+	Stderr                        string                      `json:"stderr"`
+	StdoutTruncated               bool                        `json:"stdout_truncated"`
+	StderrTruncated               bool                        `json:"stderr_truncated"`
+	TimedOut                      bool                        `json:"timed_out"`
+	TaskID                        string                      `json:"task_id"`
+	WorkspaceID                   string                      `json:"workspace_id"`
+	BindingVersion                int64                       `json:"binding_version"`
+	WorkspaceViewID               string                      `json:"workspace_view_id"`
+	WorkspaceCheckpointRevision   *int64                      `json:"workspace_checkpoint_revision"`
+	WorkspaceManifestSHA256Before string                      `json:"workspace_manifest_sha256_before,omitempty"`
+	WorkspaceManifestSHA256After  string                      `json:"workspace_manifest_sha256_after,omitempty"`
+	WorkspaceSnapshotSHA256Before string                      `json:"workspace_snapshot_sha256_before"`
+	WorkspaceSnapshotSHA256After  string                      `json:"workspace_snapshot_sha256_after"`
+	CoverageReceipt               *shellRunnerCoverageReceipt `json:"coverage_receipt,omitempty"`
+}
+
+// shellRunnerCoverageReceipt is emitted only for the Runtime's direct, bounded
+// Go test adapter. It is evidence about the runner's discovered and executed
+// test roots and package terminals; it is not inferred from a command string,
+// exit code, or ordinary shell output. Consumers must independently validate
+// every fence and inventory field.
+type shellRunnerCoverageReceipt struct {
+	Version                          int    `json:"version"`
+	Runner                           string `json:"runner"`
+	RunnerVersion                    string `json:"runner_version"`
+	ScopeMode                        string `json:"scope_mode"`
+	ScopeContract                    string `json:"scope_contract"`
+	PackageSelector                  string `json:"package_selector"`
+	TestSelector                     string `json:"test_selector,omitempty"`
+	ExactCommandSHA256               string `json:"exact_command_sha256"`
+	OperationID                      string `json:"operation_id"`
+	TaskID                           string `json:"task_id"`
+	WorkspaceID                      string `json:"workspace_id"`
+	WorkspaceDirectory               string `json:"workspace_directory"`
+	BindingVersion                   int64  `json:"binding_version"`
+	WorkspaceViewID                  string `json:"workspace_view_id"`
+	WorkspaceCheckpointRevision      int64  `json:"workspace_checkpoint_revision"`
+	WorkspaceCWD                     string `json:"workspace_cwd"`
+	WorkspaceSnapshotSHA256Before    string `json:"workspace_snapshot_sha256_before"`
+	WorkspaceSnapshotSHA256After     string `json:"workspace_snapshot_sha256_after"`
+	DiscoveredSourceInventorySHA256  string `json:"discovered_source_inventory_sha256"`
+	DiscoveredSourceInventoryCount   int    `json:"discovered_source_inventory_count"`
+	DiscoveredPackageInventorySHA256 string `json:"discovered_package_inventory_sha256"`
+	DiscoveredPackageInventoryCount  int    `json:"discovered_package_inventory_count"`
+	ExecutedPackageInventorySHA256   string `json:"executed_package_inventory_sha256"`
+	ExecutedPackageInventoryCount    int    `json:"executed_package_inventory_count"`
+	DiscoveredTestInventorySHA256    string `json:"discovered_test_inventory_sha256"`
+	DiscoveredTestInventoryCount     int    `json:"discovered_test_inventory_count"`
+	ExecutedTestInventorySHA256      string `json:"executed_test_inventory_sha256"`
+	ExecutedTestInventoryCount       int    `json:"executed_test_inventory_count"`
+	PassedTestCount                  int    `json:"passed_test_count"`
+	FailedTestCount                  int    `json:"failed_test_count"`
+	SkippedTestCount                 int    `json:"skipped_test_count"`
+	ParserComplete                   bool   `json:"parser_complete"`
+}
+
+type shellGoTestSpec struct {
+	ScopeMode       string
+	PackageSelector string
+	TestSelector    string
+}
+
+// parseShellGoTestSpec recognizes only the adapter's exact command grammar.
+// Everything else stays on the general shell path and can never receive a
+// runner coverage receipt.
+func parseShellGoTestSpec(command string) (shellGoTestSpec, bool) {
+	if command == "go test ./..." {
+		return shellGoTestSpec{ScopeMode: "full_suite", PackageSelector: "./..."}, true
+	}
+	fields := strings.Fields(command)
+	testSelector := ""
+	if len(fields) == 4 {
+		testSelector = strings.TrimPrefix(fields[2], "-run=")
+	}
+	if len(fields) != 4 || strings.Join(fields, " ") != command || fields[0] != "go" || fields[1] != "test" ||
+		!validGoTestPackageSelector(fields[3]) || !strings.HasPrefix(fields[2], "-run=^") || !strings.HasSuffix(fields[2], "$") {
+		return shellGoTestSpec{}, false
+	}
+	testName := strings.TrimSuffix(strings.TrimPrefix(testSelector, "^"), "$")
+	if !validGoTestName(testName) || !strings.HasPrefix(testName, "Test") || len(testName) == len("Test") {
+		return shellGoTestSpec{}, false
+	}
+	if testName[len("Test")] < 'A' || testName[len("Test")] > 'Z' {
+		return shellGoTestSpec{}, false
+	}
+	return shellGoTestSpec{ScopeMode: "targeted", PackageSelector: fields[3], TestSelector: testSelector}, true
+}
+
+func validGoTestPackageSelector(value string) bool {
+	if value == "." {
+		return true
+	}
+	if !strings.HasPrefix(value, "./") || strings.HasSuffix(value, "/") || strings.Contains(value, "//") || strings.Contains(value, "...") {
+		return false
+	}
+	for _, component := range strings.Split(strings.TrimPrefix(value, "./"), "/") {
+		if component == "" || component == "." || component == ".." {
+			return false
+		}
+		for _, character := range component {
+			if !(character >= 'a' && character <= 'z') && !(character >= 'A' && character <= 'Z') &&
+				!(character >= '0' && character <= '9') && character != '_' && character != '-' && character != '.' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func validGoTestName(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, character := range value {
+		if !(character >= 'a' && character <= 'z') && !(character >= 'A' && character <= 'Z') &&
+			!(character >= '0' && character <= '9') && character != '_' {
+			return false
+		}
+	}
+	return true
+}
 
 type ShellFailureCategory string
 

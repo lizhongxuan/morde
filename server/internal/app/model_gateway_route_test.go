@@ -13,29 +13,48 @@ import (
 
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/conversation"
+	"morde/server/internal/domain/project"
 	"morde/server/internal/domain/task"
 )
 
 type routeGatewayStoreTest struct {
 	*modelGatewayStoreTest
-	reservation ModelCallReservation
-	project     *ProjectModelReservation
-	prepareErr  error
-	decision    *ConversationRouteDecision
-	usage       ModelUsage
-	unknown     bool
-	begins      int
+	reservation    ModelCallReservation
+	project        *ProjectModelReservation
+	prepareErr     error
+	prepareErrOnce bool
+	decision       *ConversationRouteDecision
+	usage          ModelUsage
+	unknown        bool
+	prepareN       int
+	limits         ConversationRouteOutputBudgetLimits
+	limitErr       error
+	limitN         int
+	begins         int
 }
 
 func (s *routeGatewayStoreTest) ResolveConversationRouteModel(_ context.Context, _ ConversationRouteClaim) (string, error) {
 	return "p1234567", nil
 }
 func (s *routeGatewayStoreTest) PrepareConversationRouteModelCall(_ context.Context, call ModelCallReservation, project *ProjectModelReservation) (*ConversationRouteDecision, error) {
+	s.prepareN++
 	s.reservation, s.project = call, project
-	if s.prepareErr != nil {
+	if s.prepareErr != nil && (!s.prepareErrOnce || s.prepareN == 1) {
 		return nil, s.prepareErr
 	}
 	return s.decision, nil
+}
+func (s *routeGatewayStoreTest) LimitConversationRouteOutputBudget(_ context.Context, call ModelCallReservation,
+	_ *project.RateSnapshot) (ConversationRouteOutputBudgetLimits, error) {
+	s.limitN++
+	if s.limitErr != nil {
+		return ConversationRouteOutputBudgetLimits{}, s.limitErr
+	}
+	if s.limits.AccountSafeTokens == 0 && s.limits.ProjectSafeTokens == 0 {
+		return ConversationRouteOutputBudgetLimits{AccountSafeTokens: call.RouteOutputBudget.AccountSafeTokens,
+			ProjectSafeTokens: call.RouteOutputBudget.ProjectSafeTokens}, nil
+	}
+	return s.limits, nil
 }
 func (s *routeGatewayStoreTest) BeginConversationRouteModelCall(_ context.Context, _ ModelCallReservation) error {
 	s.begins++
@@ -51,6 +70,154 @@ func routeGatewayFixture() (ConversationRouteClaim, ConversationRouteContext) {
 		ActorID: "u1234567", Role: conversation.RoleUser, Sequence: 1, Content: "开始一项新任务"}, RouteAttempt: 1,
 		ServiceInstanceID: "00000000-0000-4000-8000-000000000001", LeaseOwner: "worker-1", LeaseVersion: 1}
 	return claim, ConversationRouteContext{ActorID: claim.Message.ActorID, RouteAttempt: 1, ModelID: "p1234567", Content: claim.Message.Content}
+}
+
+func longReplyGatewayFixture(t *testing.T, store *routeGatewayStoreTest, client *modelGatewayClientTest, contextWindow, outputLimit int,
+	goal, minimum int64, installStrategy bool) (*ModelGatewayService, *modelGatewayResolverTest) {
+	t.Helper()
+	resolver := &modelGatewayResolverTest{contextWindow: &contextWindow, contextWindowSource: ModelContextWindowOverride,
+		maxOutputTokens: &outputLimit, endpoint: ModelEndpoint{
+			BaseURL: testModelBudgetBaseURL, APIKey: "test-key", ModelID: testModelBudgetModel,
+		}}
+	service, err := NewModelGatewayService(store, resolver, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if installStrategy {
+		strategy := syntheticModelOutputBudgetStrategy()
+		for index := range strategy.Models[0].Stages {
+			if strategy.Models[0].Stages[index].Stage == string(modelOutputBudgetStageLongForm) {
+				strategy.Models[0].Stages[index].GoalTokens = goal
+				strategy.Models[0].Stages[index].MinimumTokens = minimum
+			}
+		}
+		if err := service.SetModelOutputBudgetStrategy(strategy); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return service, resolver
+}
+
+func TestGenerateConversationLongReplyUsesVersionedStageGoalAndSettlesOneTextOnlyCall(t *testing.T) {
+	claim, value := routeGatewayFixture()
+	claim.Input.ResponseMode = ConversationResponseLongForm
+	value.ModelID = "p1234567"
+	store := &routeGatewayStoreTest{modelGatewayStoreTest: &modelGatewayStoreTest{}}
+	partial := strings.Repeat("A useful answer. ", 200)
+	client := &modelGatewayClientTest{response: ModelResponse{Text: partial, StopReason: "length",
+		Usage: ModelUsage{Known: true, InputTokens: 100, OutputTokens: 800}}}
+	window, outputLimit := 32_768, 8192
+	service, resolver := longReplyGatewayFixture(t, store, client, window, outputLimit, 4096, 2048, true)
+	decision, err := service.GenerateConversationLongReply(context.Background(), claim, value)
+	if err != nil || decision.Action != ConversationRouteReply || !decision.LongReply || !decision.Partial || decision.Reply != partial ||
+		client.calls != 1 || store.begins != 1 || store.unknown || store.decision == nil || !store.decision.Partial ||
+		client.request.MaxOutputTokens != 4096 || len(client.request.Tools) != 0 || client.request.JSONMode ||
+		resolver.tools || resolver.image || store.reservation.RouteOutputBudget == nil {
+		t.Fatalf("long-form call missed its verified text-only contract: decision=%+v stored=%+v reserved=%d request=%+v calls=%d begins=%d err=%v",
+			decision, store.decision, store.reservation.ReservedTokens, client.request, client.calls, store.begins, err)
+	}
+	budget := store.reservation.RouteOutputBudget
+	inputReserved := modelRequestInputTokenReservation(client.request)
+	if budget.Stage != string(modelOutputBudgetStageLongForm) || budget.StrategyVersion != "test-policy-v1" || budget.CapabilityVersion == "" ||
+		budget.ModelMaxOutputTokens != int64(outputLimit) || budget.ContextWindowTokens != int64(window) ||
+		budget.ContextInputUpperBoundTokens <= 0 || budget.ContextSafetyMarginTokens <= 0 || budget.ContextSafeTokens != int64(outputLimit) ||
+		budget.AccountSafeTokens != 4096 || budget.ProjectSafeTokens != 4096 || budget.GoalTokens != 4096 ||
+		budget.MinimumTokens != 2048 || budget.SafeTokens != 4096 || budget.SendTokens != min(budget.GoalTokens, budget.SafeTokens) ||
+		budget.SendTokens != int64(client.request.MaxOutputTokens) ||
+		budget.InputReservedTokens != inputReserved || store.reservation.ReservedTokens != inputReserved+budget.SendTokens {
+		t.Fatalf("long-form route budget did not bind the exact policy and ledger hold: plan=%+v reserved=%d input=%d request=%+v",
+			budget, store.reservation.ReservedTokens, inputReserved, client.request)
+	}
+	deadline, ok := client.ctx.Deadline()
+	if !ok || time.Until(deadline) > ConversationLongReplyTimeout {
+		t.Fatalf("long-form call deadline was not bounded to four minutes: %v %t", deadline, ok)
+	}
+	replayed, err := service.GenerateConversationLongReply(context.Background(), claim, value)
+	if err != nil || !replayed.Partial || replayed.Reply != partial || client.calls != 1 || store.begins != 1 || store.prepareN != 2 {
+		t.Fatalf("settled long reply was not recovered without a second provider call: decision=%+v calls=%d begins=%d err=%v",
+			replayed, client.calls, store.begins, err)
+	}
+}
+
+func TestGenerateConversationLongReplyShrinksToAvailableAccountBudget(t *testing.T) {
+	claim, value := routeGatewayFixture()
+	claim.Input.ResponseMode = ConversationResponseLongForm
+	value.ModelID = "p1234567"
+	store := &routeGatewayStoreTest{modelGatewayStoreTest: &modelGatewayStoreTest{},
+		prepareErr: domain.NewError(domain.CodeQuotaExceeded, "model token budget exceeded"), prepareErrOnce: true,
+		limits: ConversationRouteOutputBudgetLimits{AccountSafeTokens: 3072, ProjectSafeTokens: MaxModelOutputTokens}}
+	client := &modelGatewayClientTest{response: ModelResponse{Text: "A complete answer.", StopReason: "stop",
+		Usage: ModelUsage{Known: true, InputTokens: 100, OutputTokens: 20}}}
+	service, _ := longReplyGatewayFixture(t, store, client, 32_768, 8192, 4096, 2048, true)
+	decision, err := service.GenerateConversationLongReply(context.Background(), claim, value)
+	plan := store.reservation.RouteOutputBudget
+	if err != nil || decision.Action != ConversationRouteReply || client.calls != 1 || store.prepareN != 2 || store.limitN != 1 ||
+		client.request.MaxOutputTokens != 3072 || plan == nil || plan.AccountSafeTokens != 3072 ||
+		plan.ProjectSafeTokens != MaxModelOutputTokens || plan.SafeTokens != 3072 || plan.SendTokens != 3072 ||
+		store.reservation.ReservedTokens != plan.InputReservedTokens+3072 {
+		t.Fatalf("long-form reply did not shrink to account headroom: decision=%+v plan=%+v request=%+v reserved=%d prepares=%d limits=%d calls=%d err=%v",
+			decision, plan, client.request, store.reservation.ReservedTokens, store.prepareN, store.limitN, client.calls, err)
+	}
+}
+
+func TestGenerateConversationLongReplyStopsWhenBudgetCannotMeetMinimum(t *testing.T) {
+	claim, value := routeGatewayFixture()
+	claim.Input.ResponseMode = ConversationResponseLongForm
+	store := &routeGatewayStoreTest{modelGatewayStoreTest: &modelGatewayStoreTest{},
+		prepareErr: domain.NewError(domain.CodeQuotaExceeded, "model token budget exceeded"), prepareErrOnce: true,
+		limits: ConversationRouteOutputBudgetLimits{AccountSafeTokens: 1024, ProjectSafeTokens: MaxModelOutputTokens}}
+	client := &modelGatewayClientTest{}
+	service, _ := longReplyGatewayFixture(t, store, client, 32_768, 8192, 4096, 2048, true)
+	if _, err := service.GenerateConversationLongReply(context.Background(), claim, value); domain.CodeOf(err) != domain.CodeQuotaExceeded ||
+		store.prepareN != 1 || store.limitN != 1 || client.calls != 0 || store.begins != 0 {
+		t.Fatalf("budget below long-form minimum did not fail before provider: prepare=%d limit=%d calls=%d begins=%d err=%v",
+			store.prepareN, store.limitN, client.calls, store.begins, err)
+	}
+}
+
+func TestGenerateConversationLongReplyRequiresExactLongFormStrategyBeforePrepare(t *testing.T) {
+	claim, value := routeGatewayFixture()
+	claim.Input.ResponseMode = ConversationResponseLongForm
+	store := &routeGatewayStoreTest{modelGatewayStoreTest: &modelGatewayStoreTest{}}
+	client := &modelGatewayClientTest{response: ModelResponse{Text: "unexpected dispatch", StopReason: "stop",
+		Usage: ModelUsage{Known: true, InputTokens: 1, OutputTokens: 1}}}
+	service, _ := longReplyGatewayFixture(t, store, client, 32_768, 8192, 4096, 2048, false)
+	if _, err := service.GenerateConversationLongReply(context.Background(), claim, value); domain.CodeOf(err) != domain.CodeUnsupported ||
+		store.prepareN != 0 || store.begins != 0 || client.calls != 0 {
+		t.Fatalf("missing exact long_form strategy reached prepare/provider: err=%v prepare=%d begin=%d calls=%d",
+			err, store.prepareN, store.begins, client.calls)
+	}
+}
+
+func TestGenerateConversationLongReplyFailsClosedWhenContextCannotMeetMinimum(t *testing.T) {
+	claim, value := routeGatewayFixture()
+	claim.Input.ResponseMode = ConversationResponseLongForm
+	store := &routeGatewayStoreTest{modelGatewayStoreTest: &modelGatewayStoreTest{}}
+	client := &modelGatewayClientTest{response: ModelResponse{Text: "unexpected dispatch", StopReason: "stop",
+		Usage: ModelUsage{Known: true, InputTokens: 1, OutputTokens: 1}}}
+	service, _ := longReplyGatewayFixture(t, store, client, 4096, 8192, 4096, 3500, true)
+	if _, err := service.GenerateConversationLongReply(context.Background(), claim, value); domain.CodeOf(err) != domain.CodeQuotaExceeded ||
+		store.prepareN != 0 || store.begins != 0 || client.calls != 0 {
+		t.Fatalf("context-limited long_form request did not fail closed before prepare/provider: err=%v prepare=%d begin=%d calls=%d",
+			err, store.prepareN, store.begins, client.calls)
+	}
+}
+
+func TestGenerateConversationLongReplyRequiresVerifiedCapacityBeforeReservation(t *testing.T) {
+	claim, value := routeGatewayFixture()
+	claim.Input.ResponseMode = ConversationResponseLongForm
+	store := &routeGatewayStoreTest{modelGatewayStoreTest: &modelGatewayStoreTest{}}
+	client := &modelGatewayClientTest{response: ModelResponse{Text: "no dispatch", StopReason: "stop",
+		Usage: ModelUsage{Known: true, InputTokens: 1, OutputTokens: 1}}}
+	service, err := NewModelGatewayService(store, &modelGatewayResolverTest{}, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.GenerateConversationLongReply(context.Background(), claim, value); domain.CodeOf(err) != domain.CodeUnsupported ||
+		store.prepareN != 0 || store.reserveN != 0 || store.begins != 0 || client.calls != 0 {
+		t.Fatalf("unverified model capacity reached reservation or provider: err=%v reserve=%d begin=%d calls=%d",
+			err, store.reserveN, store.begins, client.calls)
+	}
 }
 
 func TestLegacyRouteModelRequestAddsDirectToolContractForStructurallyEligibleContexts(t *testing.T) {
@@ -157,7 +324,7 @@ func TestConversationRouteInitialAttemptIncludesJoinCandidates(t *testing.T) {
 	value.History = []ConversationRouteHistory{{MessageID: "m7654321", Sequence: 1, Role: conversation.RoleAssistant,
 		Content: "1. 继续任务 A；2. 开始新任务"}}
 	value.RequestCandidates = []ConversationRouteRequestCandidate{{MessageID: "m8765432", Sequence: 2, Content: "继续任务 A",
-		RoutingStatus: conversation.RoutingProcessing, SameExecutionScope: true, ExecutionScopeDigest: scopeDigest}}
+		RoutingStatus: conversation.RoutingProcessing, SameExecutionScope: true, SameAuthorization: true, ExecutionScopeDigest: scopeDigest}}
 	initial, err := ConversationRouteModelRequest(value)
 	if err != nil || !strings.Contains(initial.Instructions, `"target_message_id"`) ||
 		!strings.Contains(initial.Instructions, "same_execution_scope") || !strings.Contains(initial.Instructions, "joinable field is true") ||
@@ -203,7 +370,7 @@ func TestConversationRouteGatewayJoinsFollowupToSameDeliverable(t *testing.T) {
 	value.ExecutionScopeDigest = digest
 	value.RequestCandidates = []ConversationRouteRequestCandidate{{MessageID: targetMessageID, Sequence: 1,
 		Content: "为五子棋应用写一份设计方案并保存为 Markdown", RoutingStatus: conversation.RoutingRouted,
-		TaskID: "q1234567", TaskStatus: task.StatusRunning, SameExecutionScope: true, ExecutionScopeDigest: digest}}
+		TaskID: "q1234567", TaskStatus: task.StatusRunning, SameExecutionScope: true, SameAuthorization: true, ExecutionScopeDigest: digest}}
 	output := `{"action":"join","task_id":"","target_message_id":"` + targetMessageID + `","explicit_new":false,"question":"","reply":"","dependency_task_ids":[]}`
 	store := &routeGatewayStoreTest{modelGatewayStoreTest: &modelGatewayStoreTest{}}
 	client := &modelGatewayClientTest{response: ModelResponse{Text: output, StopReason: "stop",

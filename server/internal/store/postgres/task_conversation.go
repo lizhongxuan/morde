@@ -572,7 +572,7 @@ COALESCE(r.client_message_id,''),COALESCE(r.duplicate_of_message_id,''),
 CASE WHEN r.duplicate_of_message_id IS NOT NULL AND NOT EXISTS (
  SELECT 1 FROM conversation_route_internal_tool_calls hidden WHERE hidden.task_id=original_message.task_id
 ) THEN COALESCE(original_message.task_id,'') ELSE '' END,
-COALESCE(original_route.state,r.state,''),COALESCE(original_route.failure_reason,r.failure_reason,''),
+CASE WHEN COALESCE(original_route.state,r.state)='processing' AND COALESCE(original_route.cancel_requested_at,r.cancel_requested_at) IS NOT NULL THEN 'cancel_requested' ELSE COALESCE(original_route.state,r.state,'') END,COALESCE(original_route.failure_reason,r.failure_reason,''),COALESCE(r.request_metadata->>'response_mode',''),
 COALESCE(r.agent_acknowledged,false),
 CASE WHEN m.output_status='streaming' AND NOT EXISTS (
  SELECT 1 FROM tasks live WHERE live.id=m.task_id AND live.status='running' AND live.lease_expires_at>clock_timestamp()
@@ -616,7 +616,7 @@ ORDER BY m.sequence DESC LIMIT $4`, ownerID, conversationID, before, limit+1)
 	items := make([]conversation.Message, 0)
 	for rows.Next() {
 		var row sqlcgen.ConversationMessage
-		var deliveryStatus, clientID, duplicateID, relatedTaskID, routingStatus, routingFailure string
+		var deliveryStatus, clientID, duplicateID, relatedTaskID, routingStatus, routingFailure, responseMode string
 		var agentAcknowledged bool
 		var outputStatus string
 		var outputRevision, outputEvent pgtype.Int8
@@ -626,7 +626,7 @@ ORDER BY m.sequence DESC LIMIT $4`, ownerID, conversationID, before, limit+1)
 		var internalDispatched, internalUnknown bool
 		if err := rows.Scan(&row.ID, &row.ConversationID, &row.OwnerID, &row.Role, &row.Content, &row.TaskID,
 			&row.CreatedAt, &row.ModelID, &row.SourceKind, &row.SourceExchangeID, &row.RequestedConversationID,
-			&row.Sequence, &deliveryStatus, &row.ActorID, &clientID, &duplicateID, &relatedTaskID, &routingStatus, &routingFailure,
+			&row.Sequence, &deliveryStatus, &row.ActorID, &clientID, &duplicateID, &relatedTaskID, &routingStatus, &routingFailure, &responseMode,
 			&agentAcknowledged, &outputStatus, &outputRevision, &outputEvent, &variantGroupID, &variantVersion, &variantAction,
 			&internalToolName, &internalTaskStatus, &internalStepStatus, &internalDispatched, &internalUnknown); err != nil {
 			rows.Close()
@@ -639,6 +639,7 @@ ORDER BY m.sequence DESC LIMIT $4`, ownerID, conversationID, before, limit+1)
 		message.RelatedTaskID = relatedTaskID
 		message.RoutingStatus = conversation.RoutingStatus(routingStatus)
 		message.RoutingFailureReason = conversation.RoutingFailureReason(routingFailure)
+		message.ResponseMode = responseMode
 		message.AgentAcknowledged = agentAcknowledged
 		message.ToolActivity = conversationToolActivity(internalToolName, internalTaskStatus, internalStepStatus, internalDispatched, internalUnknown)
 		applyConversationOutputProjection(&message, outputStatus, outputRevision, outputEvent)
@@ -693,7 +694,7 @@ CASE WHEN r.actor_id=$2 THEN COALESCE(r.duplicate_of_message_id,'') ELSE '' END,
 CASE WHEN r.actor_id=$2 AND r.duplicate_of_message_id IS NOT NULL AND NOT EXISTS (
  SELECT 1 FROM conversation_route_internal_tool_calls hidden WHERE hidden.task_id=original_message.task_id
 ) THEN COALESCE(original_message.task_id,'') ELSE '' END,
-COALESCE(original_route.state,r.state,''),COALESCE(original_route.failure_reason,r.failure_reason,''),
+CASE WHEN COALESCE(original_route.state,r.state)='processing' AND COALESCE(original_route.cancel_requested_at,r.cancel_requested_at) IS NOT NULL THEN 'cancel_requested' ELSE COALESCE(original_route.state,r.state,'') END,COALESCE(original_route.failure_reason,r.failure_reason,''),COALESCE(r.request_metadata->>'response_mode',''),
 CASE WHEN r.actor_id=$2 THEN COALESCE(r.agent_acknowledged,false) ELSE false END,
 CASE WHEN m.output_status='streaming' AND NOT EXISTS (
  SELECT 1 FROM tasks live WHERE live.id=m.task_id AND live.status='running' AND live.lease_expires_at>clock_timestamp()
@@ -739,7 +740,7 @@ ORDER BY m.sequence DESC LIMIT $5`, projectID, actorID, conversationID, before, 
 	items := make([]conversation.Message, 0)
 	for rows.Next() {
 		var row sqlcgen.ConversationMessage
-		var clientID, duplicateID, relatedTaskID, routingStatus, routingFailure string
+		var clientID, duplicateID, relatedTaskID, routingStatus, routingFailure, responseMode string
 		var agentAcknowledged bool
 		var outputStatus string
 		var outputRevision, outputEvent pgtype.Int8
@@ -749,7 +750,7 @@ ORDER BY m.sequence DESC LIMIT $5`, projectID, actorID, conversationID, before, 
 		var internalDispatched, internalUnknown bool
 		if err := rows.Scan(&row.ID, &row.ConversationID, &row.OwnerID, &row.Role, &row.Content, &row.TaskID,
 			&row.CreatedAt, &row.ModelID, &row.SourceKind, &row.SourceExchangeID, &row.RequestedConversationID,
-			&row.Sequence, &row.DeliveryStatus, &row.ActorID, &clientID, &duplicateID, &relatedTaskID, &routingStatus, &routingFailure,
+			&row.Sequence, &row.DeliveryStatus, &row.ActorID, &clientID, &duplicateID, &relatedTaskID, &routingStatus, &routingFailure, &responseMode,
 			&agentAcknowledged, &outputStatus, &outputRevision, &outputEvent, &variantGroupID, &variantVersion, &variantAction,
 			&internalToolName, &internalTaskStatus, &internalStepStatus, &internalDispatched, &internalUnknown); err != nil {
 			rows.Close()
@@ -762,6 +763,7 @@ ORDER BY m.sequence DESC LIMIT $5`, projectID, actorID, conversationID, before, 
 		message.RelatedTaskID = relatedTaskID
 		message.RoutingStatus = conversation.RoutingStatus(routingStatus)
 		message.RoutingFailureReason = conversation.RoutingFailureReason(routingFailure)
+		message.ResponseMode = responseMode
 		message.AgentAcknowledged = agentAcknowledged
 		message.ToolActivity = conversationToolActivity(internalToolName, internalTaskStatus, internalStepStatus, internalDispatched, internalUnknown)
 		applyConversationOutputProjection(&message, outputStatus, outputRevision, outputEvent)
@@ -936,6 +938,9 @@ func (s *Store) ListConversationTasks(ctx context.Context, actorID, projectID, c
 		if err := populateTaskRevisionProjection(ctx, tx, items); err != nil {
 			return err
 		}
+		if err := loadTaskModelRecoveryIntents(ctx, tx, items); err != nil {
+			return err
+		}
 		projectionItems := items
 		if int32(len(projectionItems)) > limit {
 			projectionItems = projectionItems[:limit]
@@ -1026,6 +1031,20 @@ ORDER BY requested.message_id,link.attachment_id`, instanceID, ownerID, conversa
 }
 
 func (s *Store) SubmitTask(ctx context.Context, submission app.TaskSubmission) (app.TaskSubmissionResult, error) {
+	if submission.Task.FileDeliveryIntent == "" {
+		submission.Task.FileDeliveryIntent = task.FileDeliveryNone
+	}
+	if !submission.Task.FileDeliveryIntent.Valid() {
+		return app.TaskSubmissionResult{}, domain.InvalidArgument("file_delivery_intent", "file delivery intent is invalid")
+	}
+	for index := range submission.BatchItems {
+		if submission.BatchItems[index].FileDeliveryIntent == "" {
+			submission.BatchItems[index].FileDeliveryIntent = task.FileDeliveryNone
+		}
+		if !submission.BatchItems[index].FileDeliveryIntent.Valid() {
+			return app.TaskSubmissionResult{}, domain.InvalidArgument("batch_items.file_delivery_intent", "batch item file delivery intent is invalid")
+		}
+	}
 	submission.Task = normalizeNewTask(submission.Task)
 	if submission.Task.InitiatorID == "" {
 		submission.Task.InitiatorID = submission.Task.OwnerID
@@ -1194,9 +1213,6 @@ func (s *Store) SubmitTask(ctx context.Context, submission app.TaskSubmission) (
 		if err := insertTask(ctx, tx, submission.Task, 1, gate.epoch); err != nil {
 			return err
 		}
-		if err := insertInitialFileDeliveryClarification(ctx, tx, submission); err != nil {
-			return err
-		}
 		if err := insertTaskMCPConnectorGrants(ctx, tx, submission.Task, submission.MCPConnectorIDs); err != nil {
 			return err
 		}
@@ -1218,6 +1234,9 @@ func (s *Store) SubmitTask(ctx context.Context, submission app.TaskSubmission) (
 			return err
 		}
 		if err := insertBatchItems(ctx, tx, submission.Task.ID, submission.BatchItems); err != nil {
+			return err
+		}
+		if err := insertInitialFileDeliveryClarification(ctx, tx, submission); err != nil {
 			return err
 		}
 		conversationHostID := nullableText(submission.Task.HostID)
@@ -1276,14 +1295,39 @@ func validateInitialFileDeliveryClarification(submission app.TaskSubmission) err
 		if len(submission.InitialSteps) != 0 || submission.Task.Status != task.StatusQueued {
 			return domain.InvalidArgument("clarification", "initial file delivery clarification is incomplete")
 		}
+		if submission.Task.FileDeliveryIntent == task.FileDeliveryUnclear {
+			return domain.InvalidArgument("clarification", "unclear Task file delivery intent requires an initial clarification")
+		}
+		for _, item := range submission.BatchItems {
+			if item.FileDeliveryIntent == task.FileDeliveryUnclear {
+				return domain.InvalidArgument("clarification", "unclear batch item file delivery intent requires an initial clarification")
+			}
+		}
 		return nil
 	}
 	if len(submission.InitialSteps) != 2 || submission.Task.Status != task.StatusWaitingUser ||
-		submission.Task.WaitingReason != "clarification_required" || submission.Task.FileDeliveryIntent != task.FileDeliveryUnclear ||
+		submission.Task.WaitingReason != "clarification_required" ||
 		request.TaskID != submission.Task.ID || request.Version != 1 || request.CallID != app.FileDeliveryIntentClarificationCallID ||
 		request.Status != task.ClarificationPending || !domain.ValidPendingRequestID(request.ID) ||
 		!validClarificationQuestion(request.Question) || request.Answer != "" || request.RespondedAt != nil {
 		return domain.InvalidArgument("clarification", "initial file delivery clarification is invalid")
+	}
+	unclearItems := make([]task.BatchItem, 0, 1)
+	for _, item := range submission.BatchItems {
+		if item.FileDeliveryIntent == task.FileDeliveryUnclear {
+			unclearItems = append(unclearItems, item)
+		}
+	}
+	if request.BatchItemID == "" {
+		if request.BatchAttempt != 0 || submission.Task.FileDeliveryIntent != task.FileDeliveryUnclear || len(unclearItems) != 0 {
+			return domain.InvalidArgument("clarification", "initial Task file delivery clarification target is ambiguous")
+		}
+	} else {
+		if !domain.ValidBatchItemID(request.BatchItemID) || request.BatchAttempt != 1 ||
+			submission.Task.FileDeliveryIntent == task.FileDeliveryUnclear || len(unclearItems) != 1 ||
+			unclearItems[0].ID != request.BatchItemID || unclearItems[0].Attempt != request.BatchAttempt {
+			return domain.InvalidArgument("clarification", "initial batch item file delivery clarification target is invalid")
+		}
 	}
 	classification, clarification := submission.InitialSteps[0], submission.InitialSteps[1]
 	if !domain.ValidStepID(classification.ID) || !domain.ValidStepID(clarification.ID) ||
@@ -1309,8 +1353,10 @@ func insertInitialFileDeliveryClarification(ctx context.Context, tx pgx.Tx, subm
 		}
 	}
 	request := submission.InitialClarificationRequest
-	if _, err := tx.Exec(ctx, `INSERT INTO task_clarification_requests (id, task_id, version, model_step_id, call_id, question, status)
-VALUES ($1,$2,$3,$4,$5,$6,'pending')`, request.ID, request.TaskID, request.Version, request.ModelStepID, request.CallID, request.Question); err != nil {
+	if _, err := tx.Exec(ctx, `INSERT INTO task_clarification_requests
+(id, task_id, version, model_step_id, call_id, question, batch_item_id, batch_attempt, status)
+VALUES ($1,$2,$3,$4,$5,$6,NULLIF($7,''),NULLIF($8,0),'pending')`, request.ID, request.TaskID, request.Version,
+		request.ModelStepID, request.CallID, request.Question, request.BatchItemID, request.BatchAttempt); err != nil {
 		return fmt.Errorf("persist initial task clarification: %w", err)
 	}
 	return nil
@@ -1594,7 +1640,8 @@ func insertTaskEvent(ctx context.Context, tx pgx.Tx, value task.Event) error {
 func validateBatchItems(taskID string, values []task.BatchItem) error {
 	seen := make(map[string]struct{}, len(values))
 	for _, value := range values {
-		if !domain.ValidBatchItemID(value.ID) || (value.TaskID != "" && value.TaskID != taskID) || value.Key == "" || len(value.Key) > 255 || value.Input == "" || !validBatchStatus(value.Status) {
+		if !domain.ValidBatchItemID(value.ID) || (value.TaskID != "" && value.TaskID != taskID) || value.Key == "" || len(value.Key) > 255 ||
+			value.Input == "" || !value.FileDeliveryIntent.Valid() || !validBatchStatus(value.Status) {
 			return domain.InvalidArgument("batch_items", "batch item fields are invalid")
 		}
 		if _, exists := seen[value.Key]; exists {
@@ -1616,8 +1663,9 @@ func validBatchStatus(value task.BatchItemStatus) bool {
 
 func insertBatchItems(ctx context.Context, tx pgx.Tx, taskID string, values []task.BatchItem) error {
 	for _, value := range values {
-		_, err := tx.Exec(ctx, `INSERT INTO task_batch_items (id, task_id, item_key, input, status, result, error) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-			value.ID, taskID, value.Key, value.Input, stringOrDefault(string(value.Status), string(task.BatchItemQueued)), value.Result, value.Error)
+		_, err := tx.Exec(ctx, `INSERT INTO task_batch_items (id, task_id, item_key, input, file_delivery_intent, status, result, error)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`, value.ID, taskID, value.Key, value.Input, string(value.FileDeliveryIntent),
+			stringOrDefault(string(value.Status), string(task.BatchItemQueued)), value.Result, value.Error)
 		if err != nil {
 			return fmt.Errorf("insert task batch item: %w", err)
 		}

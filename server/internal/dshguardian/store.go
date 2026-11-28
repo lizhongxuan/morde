@@ -285,6 +285,23 @@ func (s *leaseStore) findTask(runtimeFence app.AccountAgentRuntimeFence, taskFen
 	return found, count == 1, nil
 }
 
+func (s *leaseStore) findTaskByFences(runtimeFence app.AccountAgentRuntimeFence,
+	taskFence app.AgentInstanceFence) (taskProcessLease, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var found taskProcessLease
+	count := 0
+	for _, value := range s.taskProcess {
+		if value.Guard.RuntimeFence == runtimeFence && value.Guard.TaskFence == taskFence {
+			found, count = value, count+1
+		}
+	}
+	if count > 1 {
+		return taskProcessLease{}, false, errors.New("multiple Task process leases match one exact pair of Runtime and Agent fences")
+	}
+	return found, count == 1, nil
+}
+
 func (s *leaseStore) createTask(value taskProcessLease) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -14,6 +14,7 @@ type MCPConnector = Awaited<ReturnType<typeof portalApi.mcpConnectors>>['items']
 const model: ModelConnection = {
   id: 'p1234567', name: '团队模型', base_url: 'https://models.example.test/v1', model_name: 'morde-test', shared: true, has_api_key: true,
   context_window_tokens: null, context_window_override_tokens: null, context_window_source: 'unknown', context_window_resolved_at: null, context_window_catalog_version: null,
+  max_output_tokens: null, max_output_override_tokens: null, max_output_source: 'unknown', max_output_resolved_at: null, max_output_catalog_version: null, max_output_source_url: null,
   capabilities: { text: true, tools: true, vision: false, text_stream: false }, checked_at: timestamp, created_at: timestamp, updated_at: timestamp,
 };
 const mcpConnector: MCPConnector = {
@@ -582,7 +583,7 @@ describe('Connections', () => {
     await user.click(await screen.findByRole('button', { name: /添加个人模型/ }));
     await user.selectOptions(screen.getByLabelText('选择服务和模型'), 'deepseek-flash');
     expect(screen.queryByLabelText('上下文窗口高级覆盖（tokens，可选）')).not.toBeInTheDocument();
-    expect(screen.getByText('上下文窗口由 Morde 自动识别；无需手动填写。')).toBeInTheDocument();
+    expect(screen.getByText('系统预设按服务端返回信息显示上下文窗口和单次生成上限；未知时保持未知，无需手动填写。')).toBeInTheDocument();
     await user.type(screen.getByLabelText('API 密钥'), 'private-test-secret');
     await user.click(screen.getByRole('button', { name: '保存并检查连接' }));
 
@@ -703,5 +704,71 @@ describe('Connections', () => {
     await user.click(screen.getByRole('button', { name: '保存并检查连接' }));
     expect(create).not.toHaveBeenCalled();
     expect(await within(screen.getByRole('dialog', { name: '添加个人模型' })).findByText('API 密钥不能为空。')).toBeInTheDocument();
+  });
+
+  it('shows only server-reported output limits, source, catalog version, and an optional safe source link', async () => {
+    const known = { ...model, id: 'p8765432', name: '目录模型', model_name: 'gpt-name-does-not-set-a-cap',
+      max_output_tokens: 8192, max_output_source: 'model_catalog' as const, max_output_catalog_version: 'catalog-2026-11', max_output_source_url: 'https://catalog.example.test/models/entry' };
+    const unknown = { ...model, id: 'p7654321', name: '未知模型', model_name: 'deepseek-name-does-not-set-a-cap' };
+    vi.spyOn(portalApi, 'modelConnections').mockResolvedValue({ items: [{ ...known, shared: false }, { ...unknown, shared: false }], configuration_status: 'configured' });
+    renderPage();
+
+    const knownCard = (await screen.findByRole('heading', { name: '目录模型', level: 3 })).closest('article')!;
+    await userEvent.setup().click(within(knownCard).getByText('查看连接详情'));
+    expect(within(knownCard).getByText('8,192 tokens')).toBeInTheDocument();
+    expect(within(knownCard).getByText(/来源：Morde 模型目录 · 目录版本 catalog-2026-11/)).toBeInTheDocument();
+    expect(within(knownCard).getByRole('link', { name: '查看来源' })).toHaveAttribute('href', known.max_output_source_url);
+
+    await userEvent.setup().click(screen.getByRole('button', { name: '第 2 页' }));
+    const unknownCard = (await screen.findByRole('heading', { name: '未知模型', level: 3 })).closest('article')!;
+    await userEvent.setup().click(within(unknownCard).getByText('查看连接详情'));
+    const unknownOutput = within(unknownCard).getByText('单次生成上限').parentElement!;
+    expect(within(unknownOutput).getByText('暂未识别')).toBeInTheDocument();
+    expect(within(unknownOutput).getByText('来源：暂未识别')).toBeInTheDocument();
+    expect(within(unknownCard).queryByRole('link', { name: '查看来源' })).not.toBeInTheDocument();
+  });
+
+  it('submits a custom output override and preserves or clears it explicitly when editing', async () => {
+    const user = userEvent.setup();
+    const personal: ModelConnection = { ...model, id: 'p7654321', name: '我的自定义模型', model_name: 'vendor-model', shared: false,
+      max_output_tokens: 4096, max_output_override_tokens: 4096, max_output_source: 'override' };
+    let rows: ModelConnection[] = [];
+    vi.spyOn(portalApi, 'modelConnections').mockImplementation(async () => ({ items: [...rows], configuration_status: rows.length ? 'configured' : 'not_configured' }));
+    const create = vi.spyOn(portalApi, 'createModelConnection').mockImplementation(async (body) => {
+      rows = [{ ...personal, name: body.name, base_url: body.base_url, model_name: body.model_name, max_output_override_tokens: body.max_output_override_tokens ?? null }];
+      return rows[0]!;
+    });
+    vi.spyOn(portalApi, 'checkModelConnection').mockResolvedValue({ text: true, tools: false, vision: false, text_stream: false });
+    const update = vi.spyOn(portalApi, 'updateModelConnection').mockImplementation(async (id, body) => {
+      rows = rows.map((item) => item.id === id ? { ...item, ...body, max_output_override_tokens: body.max_output_override_tokens === undefined ? item.max_output_override_tokens : body.max_output_override_tokens } : item);
+      return rows.find((item) => item.id === id)!;
+    });
+    renderPage();
+
+    await user.click(await screen.findByRole('button', { name: /添加个人模型/ }));
+    await user.selectOptions(screen.getByLabelText('选择服务和模型'), 'custom');
+    await user.type(screen.getByLabelText('显示名称'), '我的自定义模型');
+    await user.type(screen.getByLabelText('模型名'), 'vendor-model');
+    await user.type(screen.getByLabelText('服务地址'), 'https://api.example.test/v1');
+    await user.type(screen.getByLabelText('单次生成上限高级覆盖（tokens，可选）'), '4096');
+    await user.type(screen.getByLabelText('API 密钥'), 'private-test-secret');
+    await user.click(screen.getByRole('button', { name: '保存并检查连接' }));
+
+    expect(create).toHaveBeenCalledWith(expect.objectContaining({ max_output_override_tokens: 4096 }));
+    const card = (await screen.findByRole('heading', { name: '我的自定义模型', level: 3 })).closest('article')!;
+    await user.click(within(card).getByRole('button', { name: '编辑' }));
+    const outputInput = screen.getByLabelText('单次生成上限高级覆盖（tokens，可选）');
+    expect(outputInput).toHaveValue(4096);
+    await user.clear(outputInput);
+    await user.clear(screen.getByLabelText('显示名称'));
+    await user.type(screen.getByLabelText('显示名称'), '保留覆盖');
+    await user.click(screen.getByRole('button', { name: '保存修改' }));
+    expect(update.mock.calls.at(-1)?.[1]).not.toHaveProperty('max_output_override_tokens');
+
+    const updatedCard = (await screen.findByRole('heading', { name: '保留覆盖', level: 3 })).closest('article')!;
+    await user.click(within(updatedCard).getByRole('button', { name: '编辑' }));
+    await user.click(screen.getByRole('button', { name: '清除覆盖，使用模型目录结果' }));
+    await user.click(screen.getByRole('button', { name: '保存修改' }));
+    expect(update).toHaveBeenLastCalledWith(personal.id, expect.objectContaining({ max_output_override_tokens: null }));
   });
 });

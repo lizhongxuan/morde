@@ -92,19 +92,7 @@ func conversationRouteProviderError(err error) error {
 		routeErr.Details["provider_code"] = "context_length_exceeded"
 		return routeErr
 	}
-	result := modelConnectionCheckError(err)
-	if errors.As(err, &clientErr) && clientErr.Kind == ModelErrorRateLimited && clientErr.Stage == "provider_status" {
-		var routeErr *domain.Error
-		if errors.As(result, &routeErr) && routeErr.Code == domain.CodeRateLimited {
-			if clientErr.RetryAfter > 0 {
-				routeErr.RetryAfter = clientErr.RetryAfter
-			}
-			if clientErr.RetryAfterExceedsDurableHorizon {
-				routeErr.Details["retry_after_exceeds_durable_horizon"] = "true"
-			}
-		}
-	}
-	return result
+	return modelConnectionCheckError(err)
 }
 
 func confirmedConversationRouteRejection(err error) bool {
@@ -449,14 +437,33 @@ func (s *ModelGatewayService) routeProjectReservation(ctx context.Context, call 
 	if call.ProjectID == "" || call.PersonalModel {
 		return nil, nil
 	}
+	rate, err := s.routeProjectRateSnapshot(ctx, call)
+	if err != nil {
+		return nil, err
+	}
+	return s.routeProjectReservationWithRate(call, request, *rate)
+}
+
+func (s *ModelGatewayService) routeProjectRateSnapshot(ctx context.Context, call ModelCallReservation) (*project.RateSnapshot, error) {
+	if call.ProjectID == "" || call.PersonalModel {
+		return nil, nil
+	}
 	if s.projectBudget == nil {
 		return nil, domain.NewError(domain.CodeUnsupported, "project model budget is unavailable")
 	}
-	usage := projectUsageReservation(request, call.ReservedTokens)
 	rate, err := s.projectBudget.rates.ProjectRateSnapshot(ctx, call.ModelID)
 	if err != nil || rate.Validate() != nil || rate.ModelID != call.ModelID || rate.Model != call.ProviderModel {
 		return nil, domain.NewError(domain.CodeInvalidState, "project model rate is unavailable")
 	}
+	return &rate, nil
+}
+
+func (s *ModelGatewayService) routeProjectReservationWithRate(call ModelCallReservation, request ModelRequest,
+	rate project.RateSnapshot) (*ProjectModelReservation, error) {
+	if call.ProjectID == "" || call.PersonalModel || rate.Validate() != nil || rate.ModelID != call.ModelID || rate.Model != call.ProviderModel {
+		return nil, domain.NewError(domain.CodeInvalidState, "project model rate is unavailable")
+	}
+	usage := projectUsageReservation(request, call.ReservedTokens)
 	cost, err := rate.EstimateTokenCost(usage)
 	if err != nil || cost < 1 {
 		return nil, domain.NewError(domain.CodeInvalidState, "project model rate is unavailable")
@@ -613,6 +620,7 @@ func (s *ModelGatewayService) CompleteConversationCoordinatorModel(ctx context.C
 		return ModelResponse{}, domain.InvalidArgument("model_call", "coordinator model request must be text-only and have no tools")
 	}
 	request.JSONMode = true
+	request.DisableThinking = true
 	for _, item := range request.Input {
 		if len(item.Images) != 0 {
 			return ModelResponse{}, domain.NewError(domain.CodeUnsupported, "coordinator model request cannot include images")

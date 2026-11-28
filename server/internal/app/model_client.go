@@ -9,13 +9,21 @@ import (
 	"unicode/utf8"
 )
 
-// ModelCallTimeout bounds both dispatch authorization and the provider request.
+// ModelCallTimeout bounds short non-Task model calls.
 const ModelCallTimeout = 45 * time.Second
+
+// TaskModelCallTimeout bounds a single Task model request, including long
+// visible replies. It remains finite; cancellation and Task lifecycle fences
+// can still stop the request earlier.
+const TaskModelCallTimeout = 10 * time.Minute
 
 type ModelEndpoint struct {
 	BaseURL string
 	APIKey  string
 	ModelID string
+	// VerifiedMaxOutputTokens is populated only by the Gateway after an
+	// adaptive Task plan is validated against the current model capability.
+	VerifiedMaxOutputTokens int
 }
 
 type ModelInput struct {
@@ -49,23 +57,27 @@ type ModelTool struct {
 }
 
 type ModelRequest struct {
-	Endpoint        ModelEndpoint
-	Instructions    string
-	Input           []ModelInput
-	Tools           []ModelTool
-	RequiredTool    string
-	MaxOutputTokens int
-	Temperature     *float64
-	ReasoningEffort string
-	DisableThinking bool
-	JSONMode        bool
-	OnTextDelta     func(string) error
+	Endpoint     ModelEndpoint
+	Instructions string
+	Input        []ModelInput
+	Tools        []ModelTool
+	// CurrentTaskTurnMessageID is trusted DSH request metadata. It is never sent to a model provider.
+	CurrentTaskTurnMessageID string `json:"-"`
+	RequiredTool             string
+	MaxOutputTokens          int
+	Temperature              *float64
+	ReasoningEffort          string
+	DisableThinking          bool
+	JSONMode                 bool
+	OnTextDelta              func(string) error `json:"-"`
 }
 
 type ModelToolCall struct {
 	CallID    string
 	Name      string
 	Arguments string
+	// CurrentTaskTurnMessageID is attached by the Task ModelGateway and consumed by the tool broker.
+	CurrentTaskTurnMessageID string `json:"-"`
 	// TaskFence is attached at broker dispatch; its checkpoint head may advance past the model request.
 	TaskFence *ModelTaskFence `json:"-"`
 }
@@ -89,11 +101,15 @@ func ValidProviderReportedModel(value string) bool {
 }
 
 type ModelResponse struct {
-	Reasoning             string `json:"-"`
-	Text                  string
-	ToolCalls             []ModelToolCall
-	Usage                 ModelUsage
-	StopReason            string
+	Reasoning  string `json:"-"`
+	Text       string
+	ToolCalls  []ModelToolCall
+	Usage      ModelUsage
+	StopReason string
+	// KnownTextTruncation is set only by ModelGateway after validating a signed
+	// Task call and a known-usage, pure-text provider truncation. Worker may map
+	// that result to DSH's max-tokens finish; provider adapters cannot assert it.
+	KnownTextTruncation   bool                       `json:"-"`
 	ProviderReportedModel string                     `json:"-"`
 	TaskValidationReview  *TaskValidationReviewModel `json:"-"`
 }
@@ -146,12 +162,16 @@ const (
 	ModelErrorInvalidResponse   ModelClientErrorKind = "invalid_response"
 	ModelErrorEmptyResponse     ModelClientErrorKind = "empty_response"
 	ModelErrorTruncatedResponse ModelClientErrorKind = "truncated_response"
+	ModelErrorContentFiltered   ModelClientErrorKind = "content_filtered"
 )
 
 type ModelClientError struct {
-	Kind                            ModelClientErrorKind
-	Stage                           string
-	ProviderCode                    string
+	Kind         ModelClientErrorKind
+	Stage        string
+	ProviderCode string
+	// ConfirmedNoUsage is set only when an explicit provider status rejects
+	// the request before model execution (currently HTTP 429 or 503).
+	ConfirmedNoUsage                bool
 	RetryAfter                      time.Duration
 	RetryAfterExceedsDurableHorizon bool
 }

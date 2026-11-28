@@ -556,7 +556,7 @@ paths:
       tags: [Auth]
       operationId: login
       summary: Log in to the portal
-      description: Sets the ch_portal session cookie only for approved accounts. Login attempts are rate limited. Correct credentials for pending, rejected, or disabled accounts return the matching account status without a session. The default admin/admin credential is accepted only from a loopback client and receives a restricted password-change session.
+      description: Sets the ch_portal session cookie only for approved accounts. Login attempts are rate limited. Correct credentials for pending, rejected, or disabled accounts return the matching account status without a session. Initial or reset passwords do not require a loopback connection; an account marked for a password change receives a restricted session until it changes its password, with no access to other APIs or onboarding side effects.
       security: []
       requestBody:
         required: true
@@ -4332,6 +4332,35 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
         default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/conversations/{conversation_id}/messages/{message_id}/cancel:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+      - { $ref: '#/components/parameters/ProjectConversationId' }
+      - name: message_id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/MessageId' }
+    post:
+      tags: [Projects]
+      operationId: cancelProjectConversationMessage
+      summary: Cancel processing of an accepted project conversation message
+      description: Only the original message actor may cancel. Cancellation is idempotent and is bound to this project, conversation, message, service instance, and authenticated actor. The response uses the accepted-message envelope and returns the current source message state.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/ServiceInstanceID' }
+        - { $ref: '#/components/parameters/MessageActor' }
+      responses:
+        '202':
+          description: Cancellation was accepted or had already been applied.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AcceptedProjectConversationMessageResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
   /api/projects/{id}/conversations/{conversation_id}/messages/{message_id}/retry-processing:
     parameters:
       - { $ref: '#/components/parameters/ProjectId' }
@@ -4355,6 +4384,33 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/conversations/{conversation_id}/messages/{message_id}/retry-eligibility:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+      - { $ref: '#/components/parameters/ProjectConversationId' }
+      - name: message_id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/MessageId' }
+      - { $ref: '#/components/parameters/ServiceInstanceID' }
+      - { $ref: '#/components/parameters/MessageActor' }
+    get:
+      tags: [Projects]
+      operationId: getProjectConversationMessageRetryEligibility
+      summary: Check whether an accepted message can be retried
+      description: Returns the current advisory eligibility for retrying this message. The retry-processing POST rechecks authorization and route state transactionally, so eligibility may change before it is called.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      responses:
+        '200':
+          description: Current advisory retry eligibility
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConversationMessageRetryEligibility' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
         default: { $ref: '#/components/responses/Error' }
   /api/projects/{id}/conversations/{conversation_id}/messages/{message_id}/attachments/{client_attachment_id}:
     parameters:
@@ -5328,6 +5384,37 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
         default: { $ref: '#/components/responses/Error' }
+  /api/conversations/{id}/messages/{message_id}/cancel:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/ConversationId' }
+      - name: message_id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/MessageId' }
+    post:
+      tags: [Tasks]
+      operationId: cancelConversationMessage
+      summary: Cancel processing of an accepted conversation message
+      description: Only the original message actor may cancel. Cancellation is idempotent and is bound to this conversation, message, service instance, and authenticated actor. The response uses the accepted-message envelope and returns the current source message state.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/ServiceInstanceID' }
+        - { $ref: '#/components/parameters/MessageActor' }
+      responses:
+        '202':
+          description: Cancellation was accepted or had already been applied.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AcceptedConversationMessageResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
   /api/conversations/{id}/messages/{message_id}/retry-processing:
     parameters:
       - name: id
@@ -5353,6 +5440,35 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/conversations/{id}/messages/{message_id}/retry-eligibility:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/ConversationId' }
+      - name: message_id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/MessageId' }
+      - { $ref: '#/components/parameters/ServiceInstanceID' }
+      - { $ref: '#/components/parameters/MessageActor' }
+    get:
+      tags: [Tasks]
+      operationId: getConversationMessageRetryEligibility
+      summary: Check whether an accepted message can be retried
+      description: Returns the current advisory eligibility for retrying this message. The retry-processing POST rechecks authorization and route state transactionally, so eligibility may change before it is called.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      responses:
+        '200':
+          description: Current advisory retry eligibility
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConversationMessageRetryEligibility' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
         default: { $ref: '#/components/responses/Error' }
   /api/conversations/{id}/messages/{message_id}/variants:
     parameters:
@@ -5603,6 +5719,43 @@ paths:
               schema: { $ref: '#/components/schemas/Task' }
         '404': { $ref: '#/components/responses/NotFound' }
         default: { $ref: '#/components/responses/Error' }
+  /api/tasks/{id}/requirement-manifest/confirm:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/TaskId' }
+    post:
+      tags: [Tasks]
+      operationId: confirmTaskRequirementManifest
+      summary: Confirm the exact current Task verification requirement manifest
+      description: Requires an authenticated Task reader and an Idempotency-Key. The user attests that the reviewed candidate manifest is complete and accurately represents the applicable Task requirements. The server separately rechecks each source identity and digest before using this attestation for H07. Task revision, plan revision, plan event sequence, digest, and current authorization are rechecked transactionally. Stale, cancelled, unauthorized, or changed plans are rejected.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+        - name: If-Match
+          in: header
+          required: true
+          description: Strong quoted lowercase SHA-256 ETag of the candidate manifest, for example "<64 lowercase hex characters>". The server recomputes this digest from the current Plan event.
+          schema: { type: string, pattern: '^"[0-9a-f]{64}"$' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TaskRequirementManifestConfirmationRequest' }
+      responses:
+        '200':
+          description: Persisted user completeness attestation for the exact current manifest.
+          headers:
+            Cache-Control: { schema: { type: string, const: no-store } }
+            ETag: { schema: { type: string, pattern: '^"[0-9a-f]{64}"$' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskRequirementManifestConfirmation' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
   /api/tasks/{id}/artifacts/{artifact_id}/content:
     parameters:
       - { name: id, in: path, required: true, schema: { $ref: '#/components/schemas/TaskId' } }
@@ -5686,6 +5839,39 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/TaskStepRetryResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/tasks/{id}/model-recovery-retries:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/TaskId' }
+    post:
+      tags: [Tasks]
+      operationId: retryTaskModelRecovery
+      summary: Queue one persisted safe model recovery for the current Task revision
+      description: Available only when the server has persisted a retry_available intent from gateway-confirmed zero-dispatch evidence. The server rechecks the initiator, current authorization version, Task revision, event sequence, checkpoint and one-attempt schedule atomically. External writes and unknown outcomes are never retried by this action.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TaskModelRecoveryRetryRequest' }
+      responses:
+        '202':
+          description: The exact Task recovery was queued or returned for an idempotent replay.
+          headers:
+            Cache-Control: { schema: { type: string, const: no-store } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Task' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -5949,6 +6135,29 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/TaskWorkbenchObservationTicket' }
         '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/tasks/{id}/pc-delivery-observations:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/TaskId' }
+    post:
+      tags: [Tasks]
+      operationId: observeTaskReplyInPC
+      summary: Record a desktop client-visible Task reply
+      description: Accepts only the Task initiator's client web session bound to an active desktop installation, with current access to the conversation, and a completed assistant message bound to the exact persisted task.result event for this Task and revision. The server records its own observation time and installation identity; request bodies contain no message content.
+      security: [{ portalSession: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TaskPCDeliveryObservationRequest' }
+      responses:
+        '204': { description: The PC-visible observation was recorded idempotently. }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         default: { $ref: '#/components/responses/Error' }
   /api/tasks/{id}/workspace-view-deletions:
@@ -6358,7 +6567,7 @@ paths:
       tags: [Schedules]
       operationId: createSchedule
       summary: Create and enable a schedule
-      description: Requires an enabled Owner execution gate and an Idempotency-Key. Omit host_id or set it to null to create a hostless schedule. Browser observation requires a Host. Authorization is derived from the current session or a separate schedule grant; credentials are never included in responses or sync snapshots.
+      description: Requires an enabled Owner execution gate and an Idempotency-Key. Omit host_id or set it to null to create a hostless schedule. Browser observation requires a Host. `file_delivery_intent` is structured and defaults to `none`; schedules currently cannot require file delivery because they do not bind a Workspace, and `unclear` must be clarified before saving. Authorization is derived from the current session or a separate schedule grant; credentials are never included in responses or sync snapshots.
       security: [{ portalSession: [] }, { clientCredential: [] }]
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -6402,7 +6611,7 @@ paths:
       tags: [Schedules]
       operationId: updateSchedule
       summary: Update a schedule definition at the expected version
-      description: Omit host_id to keep the current Host, or set it to null to remove the Host association. When removing a Host from a schedule with browser observation, also set observation to null. Browser observation requires a Host.
+      description: Omit host_id to keep the current Host, or set it to null to remove the Host association. When removing a Host from a schedule with browser observation, also set observation to null. Browser observation requires a Host. Omitted `file_delivery_intent` preserves the current structured intent; schedules currently support `none` only.
       security: [{ portalSession: [] }, { clientCredential: [] }]
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -6505,7 +6714,8 @@ paths:
           Identifier rules depend on type. profile and feed_preferences use default;
           memory uses global, user, or m_<8 lowercase hex characters; skill_setting
           uses builtin_<non-empty id>; connector_setting uses catalogue_<non-empty id>.
-          Other enabled types use a path-free opaque identifier. The server also rejects
+          skill_candidate uses sk_<8 lowercase hexadecimal characters. Other enabled
+          types use a path-free opaque identifier. The server also rejects
           . and ..; schedule uses its dedicated API rather than this mutation route.
     get:
       tags: [Personal Data]
@@ -7538,8 +7748,8 @@ paths:
     post:
       tags: [Admin]
       operationId: recoverAdminHost
-      summary: Safely recover an uncertain Host restore
-      description: Rechecks remote sandbox state. Existing sandboxes are adopted; a new create is queued only after an administrator confirms the external issue is fixed and no matching sandbox exists.
+      summary: Safely recover a failed or uncertain Host restore
+      description: Rechecks remote sandbox state for the expected runtime generation. A single matching running or pending sandbox is adopted. For a failed Host with reason lost, replacement requires a complete successful sandbox listing with no active candidate and the saved sandbox confirmed not found or terminated; a failed or ambiguous candidate in this state requires manual review. For other recoverable failure reasons, a failed sandbox may be replaced after explicit confirmation. Recovery keeps the same Host and Workspace/Profile volumes and advances the runtime generation when creating a replacement.
       security: [{ portalSession: [] }]
       requestBody:
         required: true
@@ -7666,6 +7876,32 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/AdminUser' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/admin/users/{id}/password:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/UserId' }
+    post:
+      tags: [Admin]
+      operationId: resetAdminUserPassword
+      summary: Reset an account password
+      description: Requires a super administrator's approved Portal session. The new password takes effect immediately, invalidates the target account's existing sessions and client credentials, and requires the user to change it in the Portal before using a client application.
+      security:
+        - portalSession: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AdminResetUserPasswordRequest' }
+      responses:
+        '204': { description: Password reset and account credentials revoked }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -7954,6 +8190,121 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         default: { $ref: '#/components/responses/Error' }
+  /api/admin/observability/overview:
+    get:
+      tags: [Admin]
+      operationId: getAdminObservabilityOverview
+      summary: Read independent Harness observability source health and request spans
+      description: Administrators only. Each source reports its own coverage state; unavailable DSH checkpoints do not hide span data.
+      security: [{ portalSession: [] }]
+      responses:
+        '200':
+          description: Source health and 24-hour request aggregates
+          headers:
+            Cache-Control: { schema: { type: string, const: no-store } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminObservabilityOverview' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/admin/observability/traces:
+    get:
+      tags: [Admin]
+      operationId: listAdminObservabilityTraces
+      summary: Search distributed traces and linked conversation Tasks
+      description: Administrators only. Search is bounded and cursors are opaque.
+      security: [{ portalSession: [] }]
+      parameters:
+        - { name: trace_id, in: query, schema: { type: string, pattern: '^[0-9a-f]{32}$' } }
+        - { name: request_id, in: query, schema: { type: string, maxLength: 255 } }
+        - { name: task_id, in: query, schema: { type: string, maxLength: 128 } }
+        - { name: q, in: query, schema: { type: string, maxLength: 256 } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+        - { name: cursor, in: query, schema: { type: string, maxLength: 512 } }
+      responses:
+        '200':
+          description: Trace summaries and span coverage
+          headers:
+            Cache-Control: { schema: { type: string, const: no-store } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminObservabilityTracePage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/admin/observability/traces/{trace_id}:
+    get:
+      tags: [Admin]
+      operationId: getAdminObservabilityTrace
+      summary: Read the bounded spans for one trace
+      description: Administrators only. Span attributes use an allowlist and details are not cacheable.
+      security: [{ portalSession: [] }]
+      parameters:
+        - { name: trace_id, in: path, required: true, schema: { type: string, pattern: '^[0-9a-f]{32}$' } }
+      responses:
+        '200':
+          description: Span tree and coverage state
+          headers:
+            Cache-Control: { schema: { type: string, const: no-store } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminObservabilityTrace' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/admin/observability/traces/{trace_id}/events:
+    get:
+      tags: [Admin]
+      operationId: listAdminObservabilityTraceEvents
+      summary: Read a committed DSH checkpoint event page for a trace-linked Task
+      description: Administrators only. Only digest-verified committed events are returned; checkpoint content is redacted and never modified.
+      security: [{ portalSession: [] }]
+      parameters:
+        - { name: trace_id, in: path, required: true, schema: { type: string, pattern: '^[0-9a-f]{32}$' } }
+        - { name: agent_session_id, in: query, schema: { type: string, maxLength: 128 } }
+        - { name: from_sequence, in: query, schema: { type: integer, format: int64, minimum: 0 } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 100 } }
+      responses:
+        '200':
+          description: Session tree, committed event page, and explicit coverage state
+          headers:
+            Cache-Control: { schema: { type: string, const: no-store } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminObservabilityTraceEvents' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/admin/observability/traces/{trace_id}/logs:
+    get:
+      tags: [Admin]
+      operationId: listAdminObservabilityTraceLogs
+      summary: Read trace-correlated structured Portal logs
+      description: Administrators only. Results contain allowlisted fields, are bounded and are never cacheable.
+      security: [{ portalSession: [] }]
+      parameters:
+        - { name: trace_id, in: path, required: true, schema: { type: string, pattern: '^[0-9a-f]{32}$' } }
+        - { name: request_id, in: query, schema: { type: string, maxLength: 255 } }
+        - { name: task_id, in: query, schema: { type: string, maxLength: 128 } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+        - { name: cursor, in: query, schema: { type: string, maxLength: 512 } }
+      responses:
+        '200':
+          description: Correlated log page and explicit capture coverage
+          headers:
+            Cache-Control: { schema: { type: string, const: no-store } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminObservabilityLogPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        default: { $ref: '#/components/responses/Error' }
   /api/admin/model-connections:
     get:
       tags: [Admin]
@@ -8006,6 +8357,29 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/admin/users/{id}/tasks/{task_id}/workflow-trace:
+    get:
+      tags: [Admin]
+      operationId: getAdminTaskWorkflowTrace
+      summary: Read a source-bound workflow trace for a Task
+      description: Reads Task, route, Agent, model-call, operation, approval, validation, conversation-delivery and Host ledger facts from one database snapshot. It exposes only ledger metadata and hashes, preserves unavailable relationships as gaps, and does not infer Task success or a quality score. PC-side observation remains unavailable until its adapter is provided. Administrators only.
+      security: [{ portalSession: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, minLength: 1, maxLength: 128 } }
+        - { name: task_id, in: path, required: true, schema: { type: string, minLength: 8, maxLength: 40, pattern: '^[A-Za-z0-9][A-Za-z0-9_-]{7,39}$' } }
+      responses:
+        '200':
+          description: Source-bound execution graph with explicit coverage gaps
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkflowTrace' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
         default: { $ref: '#/components/responses/Error' }
   /api/admin/evaluation-batches:
     post:
@@ -8416,7 +8790,7 @@ paths:
         - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 100 } }
       responses:
         '200':
-          description: Unknown calls; no prompt, response, or credential is returned.
+          description: Unknown calls; no prompt, response, or credential is returned. An adaptive_budget_overage object is included when provider-reported usage exceeded a signed adaptive Task hold and the administrator must confirm the usage with provider evidence.
           content:
             application/json:
               schema:
@@ -8430,7 +8804,7 @@ paths:
                       required: [owner_id, source, call_id, model_id, provider_model, reserved_tokens, created_at, unknown_at]
                       properties:
                         owner_id: { $ref: '#/components/schemas/UserId' }
-                        source: { type: string, enum: [client, chat, task, route, probe, compaction] }
+                        source: { type: string, enum: [client, chat, task, probe, route, compaction, review, terminal_delivery] }
                         call_id: { type: string }
                         model_id: { type: string }
                         provider_model: { type: string }
@@ -8438,6 +8812,23 @@ paths:
                         reserved_tokens: { type: integer, format: int64, minimum: 1 }
                         created_at: { type: string, format: date-time }
                         unknown_at: { type: string, format: date-time }
+                        adaptive_budget_overage:
+                          type: object
+                          required: [status, reason_code, reserved_input_tokens, reserved_output_tokens, reported_input_tokens, reported_output_tokens, input_overage_tokens, output_overage_tokens]
+                          properties:
+                            status: { type: string, enum: [open] }
+                            reason_code: { type: string, enum: [input_bound_exceeded, output_cap_exceeded, input_and_output_exceeded] }
+                            reserved_input_tokens: { type: integer, format: int64, minimum: 0 }
+                            reserved_output_tokens: { type: integer, format: int64, minimum: 1 }
+                            reported_input_tokens: { type: integer, format: int64, minimum: 0 }
+                            reported_output_tokens: { type: integer, format: int64, minimum: 0 }
+                            input_overage_tokens: { type: integer, format: int64, minimum: 0 }
+                            output_overage_tokens: { type: integer, format: int64, minimum: 0 }
+                            project_id: { type: string }
+                            currency: { type: string, pattern: '^[A-Z]{3}$' }
+                            reserved_micros: { type: integer, format: int64, minimum: 1 }
+                            reported_micros: { type: integer, format: int64, minimum: 0 }
+                            money_overage_micros: { type: integer, format: int64, minimum: 0 }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -8447,7 +8838,7 @@ paths:
       tags: [Admin]
       operationId: reconcileUnknownModelUsage
       summary: Record provider-verified usage for an unknown model call
-      description: An approved administrator verifies the provider's counts before submitting them. The ledger, associated server Task usage and audit record commit atomically. Only unknown calls can be reconciled. A repeat by the same administrator with identical counts and evidence is idempotent; different submissions conflict. This does not restore an unpersisted model response or restart the call.
+      description: An approved administrator verifies the provider's counts before submitting them. The ledger, associated server Task usage and audit record commit atomically. For an adaptive Task budget overage, the administrator must confirm authoritative provider usage; the account and project ledgers are settled with those verified actual amounts even when they exceed the original hold, and the overage record is resolved with the administrator, evidence and verified amounts. This does not increase any budget, restore an unpersisted model response, or restart the call. Other unknown calls still cannot be reconciled above their signed reservation. A repeat by the same administrator with identical counts and evidence is idempotent; different submissions conflict.
       security: [{ portalSession: [] }]
       requestBody:
         required: true
@@ -8459,7 +8850,7 @@ paths:
               required: [owner_id, source, call_id, input_tokens, output_tokens, evidence]
               properties:
                 owner_id: { $ref: '#/components/schemas/UserId' }
-                source: { type: string, enum: [client, chat, task, route, probe, compaction] }
+                source: { type: string, enum: [client, chat, task, probe, route, compaction, review, terminal_delivery] }
                 call_id: { type: string, minLength: 8, maxLength: 128 }
                 input_tokens: { type: integer, format: int64, minimum: 0 }
                 output_tokens: { type: integer, format: int64, minimum: 0 }
@@ -9437,8 +9828,8 @@ components:
           items: { $ref: '#/components/schemas/HostMemberPermission' }
     TokenId: { type: string, pattern: '^t[a-z0-9]{7}$' }
     ClientInstallationId: { type: string, pattern: '^i[a-z0-9]{7}$' }
-    PersonalMutationObjectType: { type: string, enum: [profile, memory, rule_candidate, soul, diary, goal, feed_post, feed_preferences, idea_mark, library_item, skill_setting, connector_setting] }
-    PersonalObjectType: { type: string, enum: [profile, memory, rule_candidate, soul, diary, goal, schedule, feed_post, feed_preferences, idea_mark, library_item, skill_setting, connector_setting] }
+    PersonalMutationObjectType: { type: string, enum: [profile, memory, rule_candidate, skill_candidate, soul, diary, goal, feed_post, feed_preferences, idea_mark, library_item, skill_setting, connector_setting] }
+    PersonalObjectType: { type: string, enum: [profile, memory, rule_candidate, skill_candidate, soul, diary, goal, schedule, feed_post, feed_preferences, idea_mark, library_item, skill_setting, connector_setting] }
     PersonalObjectId:
       type: string
       minLength: 1
@@ -9474,6 +9865,7 @@ components:
           pattern: '^https://'
           description: HTTPS URL whose DNS host must be on the server's outbound allowlist.
         model_name: { type: string, minLength: 1, maxLength: 256 }
+        max_output_override_tokens: { type: [integer, 'null'], minimum: 1, maximum: 2000000, description: Optional output-capacity metadata override for personal custom model routes. This records provider-documented capacity and does not change the gateway dispatch limit. System presets are maintained by Morde. }
         context_window_tokens: { type: [integer, 'null'], minimum: 4096, maximum: 2000000, deprecated: true, description: Legacy write alias for context_window_override_tokens. New clients should use context_window_override_tokens. }
         context_window_override_tokens: { type: [integer, 'null'], minimum: 4096, maximum: 2000000, description: Optional advanced override for custom model routes; null clears the override. System presets use Morde-maintained capacity metadata and cannot be overridden. }
         api_key: { type: string, minLength: 1, maxLength: 4096, writeOnly: true }
@@ -9493,6 +9885,7 @@ components:
           pattern: '^https://'
           description: HTTPS URL whose DNS host must be on the server's outbound allowlist.
         model_name: { type: string, minLength: 1, maxLength: 256 }
+        max_output_override_tokens: { type: [integer, 'null'], minimum: 1, maximum: 2000000, description: Optional output-capacity metadata override for personal custom model routes. Omitted preserves it for an unchanged route; route changes clear it unless a new value is supplied; null clears it. This records provider-documented capacity and does not change the gateway dispatch limit. System presets are maintained by Morde. }
         context_window_tokens: { type: [integer, 'null'], minimum: 4096, maximum: 2000000, deprecated: true, description: Legacy write alias for context_window_override_tokens. New clients should use context_window_override_tokens. }
         context_window_override_tokens: { type: [integer, 'null'], minimum: 4096, maximum: 2000000, description: Optional advanced override for custom model routes; null clears the override. Omitted preserves it for an unchanged route; route changes clear it unless a new value is supplied. System presets use Morde-maintained capacity metadata and cannot be overridden. }
         api_key:
@@ -9521,12 +9914,19 @@ components:
       additionalProperties: false
     ModelConnection:
       type: object
+      # These response fields are additive and remain optional while older servers may omit them during rolling upgrades.
       required: [id, name, base_url, model_name, context_window_tokens, context_window_override_tokens, context_window_source, context_window_resolved_at, context_window_catalog_version, shared, has_api_key, capabilities, checked_at, created_at, updated_at]
       properties:
         id: { $ref: '#/components/schemas/ModelConnectionId' }
         name: { type: string }
         base_url: { type: string, format: uri }
         model_name: { type: string }
+        max_output_tokens: { type: [integer, 'null'], minimum: 1, maximum: 2000000, description: Additive response field. Effective model output-capacity metadata for this exact configured route; null means unknown. It does not imply that the current gateway can dispatch this many tokens. Older servers may omit it. }
+        max_output_override_tokens: { type: [integer, 'null'], minimum: 1, maximum: 2000000, description: Additive response field. Explicit output-capacity metadata override for personal custom routes only. Older servers may omit it. }
+        max_output_source: { type: string, enum: [unknown, override, model_catalog], description: Additive response field. Older servers may omit it. }
+        max_output_resolved_at: { type: [string, 'null'], format: date-time, description: Additive response field. Older servers may omit it. }
+        max_output_catalog_version: { type: [string, 'null'], maxLength: 64, description: Additive response field. Older servers may omit it. }
+        max_output_source_url: { type: [string, 'null'], format: uri, pattern: '^https://', maxLength: 2048, description: Additive response field. Older servers may omit it. }
         context_window_tokens: { type: [integer, 'null'], minimum: 4096, maximum: 2000000, description: Effective capacity for the configured route, resolved by Morde metadata or an explicit custom-route override; null means unknown. }
         context_window_override_tokens: { type: [integer, 'null'], minimum: 4096, maximum: 2000000, description: Explicit advanced override for custom routes only. }
         context_window_source: { type: string, enum: [unknown, override, legacy_manual, provider_metadata, model_catalog, provider_error] }
@@ -11183,7 +11583,7 @@ components:
     ScheduleSyncDefinition:
       type: object
       additionalProperties: false
-      required: [status, host_id, model_id, title, objective, timing, budget, misfire_policy, notification_events]
+      required: [status, host_id, model_id, title, objective, file_delivery_intent, timing, budget, misfire_policy, notification_events]
       allOf:
         - if:
             required: [observation]
@@ -11198,6 +11598,7 @@ components:
         model_id: { type: string, minLength: 1, maxLength: 200 }
         title: { type: string, minLength: 1, maxLength: 32768, description: 'Display title must be non-empty after trimming and is limited to 1–32768 UTF-8 bytes; independent of the model objective.' }
         objective: { type: string, minLength: 1, maxLength: 32768, description: 'Execution objective must be non-empty after trimming and is limited to 1–32768 UTF-8 bytes.' }
+        file_delivery_intent: { type: string, enum: [none, required, unclear], description: Structured output intent. Omission from legacy sync definitions means none; schedules currently only execute with none because they have no Workspace binding. }
         timing: { $ref: '#/components/schemas/ScheduleTiming' }
         budget: { $ref: '#/components/schemas/ScheduleBudget' }
         misfire_policy: { $ref: '#/components/schemas/ScheduleMisfirePolicy' }
@@ -11206,6 +11607,7 @@ components:
           uniqueItems: true
           items: { $ref: '#/components/schemas/ScheduleNotificationEvent' }
         observation: { $ref: '#/components/schemas/ScheduleObservation' }
+        personal_rule: { oneOf: [{ $ref: '#/components/schemas/SchedulePersonalRuleBinding' }, { type: 'null' }] }
     GoalCreateRequest:
       type: object
       additionalProperties: false
@@ -11252,6 +11654,10 @@ components:
         model_id: { type: string, minLength: 1, maxLength: 200 }
         title: { type: string, minLength: 1, maxLength: 32768, description: 'Optional display title; when supplied it must be non-empty after trimming and is limited to 1–32768 UTF-8 bytes; when omitted the server derives it from the trimmed objective.' }
         objective: { type: string, minLength: 1, maxLength: 32768, description: 'Required execution objective, non-empty after trimming and limited to 1–32768 UTF-8 bytes.' }
+        file_delivery_intent:
+          type: string
+          enum: [none, required, unclear]
+          description: Structured output intent; never inferred from objective text. Omission means none. Schedules currently have no Workspace binding, so required is rejected; unclear must be clarified before saving.
         timing: { $ref: '#/components/schemas/ScheduleTiming' }
         budget: { $ref: '#/components/schemas/ScheduleBudget' }
         misfire_policy: { $ref: '#/components/schemas/ScheduleMisfirePolicy' }
@@ -11260,6 +11666,9 @@ components:
           uniqueItems: true
           items: { $ref: '#/components/schemas/ScheduleNotificationEvent' }
         observation: { oneOf: [{ $ref: '#/components/schemas/ScheduleObservation' }, { type: 'null' }] }
+        personal_rule:
+          oneOf: [{ $ref: '#/components/schemas/SchedulePersonalRuleSelection' }, { type: 'null' }]
+          description: Optional explicit opt-in to one active personal rule revision. The server resolves and stores the exact source memory revision.
     ScheduleUpdateRequest:
       type: object
       additionalProperties: false
@@ -11270,6 +11679,10 @@ components:
         model_id: { type: string, minLength: 1, maxLength: 200 }
         title: { type: string, minLength: 1, maxLength: 32768, description: 'Optional independent display-title update; when supplied it must be non-empty after trimming and is limited to 1–32768 UTF-8 bytes; omission preserves the current title.' }
         objective: { type: string, minLength: 1, maxLength: 32768, description: 'Optional execution objective update; when supplied it must be non-empty after trimming and is limited to 1–32768 UTF-8 bytes.' }
+        file_delivery_intent:
+          type: string
+          enum: [none, required, unclear]
+          description: Structured output intent; never inferred from objective text. Omission preserves the current value. Schedules currently have no Workspace binding, so required is rejected; unclear must be clarified before saving.
         timing: { $ref: '#/components/schemas/ScheduleTiming' }
         budget: { $ref: '#/components/schemas/ScheduleBudget' }
         misfire_policy: { $ref: '#/components/schemas/ScheduleMisfirePolicy' }
@@ -11278,6 +11691,9 @@ components:
           uniqueItems: true
           items: { $ref: '#/components/schemas/ScheduleNotificationEvent' }
         observation: { oneOf: [{ $ref: '#/components/schemas/ScheduleObservation' }, { type: 'null' }] }
+        personal_rule:
+          oneOf: [{ $ref: '#/components/schemas/SchedulePersonalRuleSelection' }, { type: 'null' }]
+          description: Omission preserves the current binding; null removes it; an object replaces it with one explicitly selected candidate revision.
     ScheduleActionRequest:
       type: object
       additionalProperties: false
@@ -11287,11 +11703,28 @@ components:
         expected_version: { type: integer, format: int64, minimum: 1 }
         current_run_action: { type: string, enum: [continue, cancel] }
     ScheduleRunStatus: { type: string, enum: [queued, running, waiting_user, pausing, paused, stopping, completed, failed, cancelled, skipped, missed] }
-    ScheduleRunSkipReason: { type: string, enum: [dst_gap, overlap, authorization_ended] }
+    ScheduleRunSkipReason: { type: string, enum: [dst_gap, overlap, authorization_ended, personal_rule_revoked] }
+    SchedulePersonalRuleValidationStatus: { type: string, enum: [not_bound, validated, revoked] }
+    SchedulePersonalRuleSelection:
+      type: object
+      additionalProperties: false
+      required: [candidate_id, candidate_revision]
+      properties:
+        candidate_id: { type: string, pattern: '^r_[a-z0-9]{8}$' }
+        candidate_revision: { type: integer, format: int64, minimum: 1 }
+    SchedulePersonalRuleBinding:
+      type: object
+      additionalProperties: false
+      required: [candidate_id, candidate_revision, source_memory_id, source_memory_revision]
+      properties:
+        candidate_id: { type: string, pattern: '^r_[a-z0-9]{8}$' }
+        candidate_revision: { type: integer, format: int64, minimum: 1 }
+        source_memory_id: { type: string, minLength: 1, maxLength: 128 }
+        source_memory_revision: { type: integer, format: int64, minimum: 1 }
     ScheduleRun:
       type: object
       additionalProperties: false
-      required: [id, schedule_id, schedule_version, occurrence_key, scheduled_at, coalesced_count, status, skip_reason, task_id, notification_events, observation, observation_outcome, created_at, updated_at, finished_at]
+      required: [id, schedule_id, schedule_version, occurrence_key, scheduled_at, coalesced_count, status, skip_reason, task_id, notification_events, observation, personal_rule, personal_rule_validation_status, personal_rule_validated_at, personal_rule_revoked_at, observation_outcome, created_at, updated_at, finished_at]
       properties:
         id: { $ref: '#/components/schemas/ScheduleRunId' }
         schedule_id: { $ref: '#/components/schemas/ScheduleId' }
@@ -11306,6 +11739,10 @@ components:
           type: array
           items: { $ref: '#/components/schemas/ScheduleNotificationEvent' }
         observation: { oneOf: [{ $ref: '#/components/schemas/ScheduleObservation' }, { type: 'null' }] }
+        personal_rule: { oneOf: [{ $ref: '#/components/schemas/SchedulePersonalRuleBinding' }, { type: 'null' }] }
+        personal_rule_validation_status: { $ref: '#/components/schemas/SchedulePersonalRuleValidationStatus' }
+        personal_rule_validated_at: { type: [string, 'null'], format: date-time }
+        personal_rule_revoked_at: { type: [string, 'null'], format: date-time }
         observation_outcome: { type: string, enum: [unknown, baseline, changed, no_change] }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
@@ -11313,7 +11750,7 @@ components:
     Schedule:
       type: object
       additionalProperties: false
-      required: [id, version, status, host_id, model_id, title, objective, timing, budget, misfire_policy, notification_events, observation, next_run_at, last_run, current_run, created_at, updated_at]
+      required: [id, version, status, host_id, model_id, title, objective, file_delivery_intent, timing, budget, misfire_policy, notification_events, observation, personal_rule, next_run_at, last_run, current_run, created_at, updated_at]
       allOf:
         - if:
             required: [observation]
@@ -11330,6 +11767,7 @@ components:
         model_id: { type: string }
         title: { type: string, minLength: 1, maxLength: 32768, description: 'Display title, non-empty after trimming and limited to 1–32768 UTF-8 bytes; independent of the model objective.' }
         objective: { type: string, minLength: 1, maxLength: 32768, description: 'Stored execution objective, non-empty after trimming and limited to 1–32768 UTF-8 bytes.' }
+        file_delivery_intent: { type: string, enum: [none, required, unclear], description: Structured output intent selected when the schedule is defined. Currently only none can execute because schedules have no Workspace binding. }
         timing: { $ref: '#/components/schemas/ScheduleTiming' }
         budget: { $ref: '#/components/schemas/ScheduleBudget' }
         misfire_policy: { $ref: '#/components/schemas/ScheduleMisfirePolicy' }
@@ -11337,6 +11775,7 @@ components:
           type: array
           items: { $ref: '#/components/schemas/ScheduleNotificationEvent' }
         observation: { oneOf: [{ $ref: '#/components/schemas/ScheduleObservation' }, { type: 'null' }] }
+        personal_rule: { oneOf: [{ $ref: '#/components/schemas/SchedulePersonalRuleBinding' }, { type: 'null' }] }
         next_run_at: { type: [string, 'null'], format: date-time }
         last_run: { oneOf: [{ $ref: '#/components/schemas/ScheduleRun' }, { type: 'null' }] }
         current_run: { oneOf: [{ $ref: '#/components/schemas/ScheduleRun' }, { type: 'null' }] }
@@ -12346,7 +12785,8 @@ components:
         duplicate_of_message_id: { $ref: '#/components/schemas/MessageId', description: Authorized original user message for a repeated request; the current message remains a separate timeline entry. }
         related_task_id: { $ref: '#/components/schemas/TaskId', description: Task associated through the original request, when one exists and is visible to the caller. }
         client_message_id: { type: string, pattern: '^[A-Za-z0-9._~-]{8,128}$' }
-        routing_status: { type: string, enum: [pending, processing, routed, waiting_user, waiting_adjustment, failed] }
+        response_mode: { type: string, enum: [short, long_form], description: Requested direct-reply mode for this user message; legacy messages may omit it. }
+        routing_status: { type: string, enum: [pending, processing, cancel_requested, routed, waiting_user, waiting_adjustment, partial, cancelled, failed] }
         routing_failure_reason: { type: string, enum: [model_unavailable, routing_context_unavailable, routing_action_unavailable, message_too_long] }
         agent_acknowledged: { type: boolean, description: True only after the Main Agent chose to acknowledge this message and its associated background Task actually started. Clients cannot set this field. }
         tool_activity: { $ref: '#/components/schemas/ConversationToolActivity' }
@@ -12416,6 +12856,7 @@ components:
         application_id: { type: string, maxLength: 64 }
         model_id: { type: string, maxLength: 256, description: Optional routing hint; a server default may be selected asynchronously. }
         time_zone: { type: string, maxLength: 64, description: Optional IANA time-zone identifier captured when the user sends the message. }
+        response_mode: { type: string, enum: [short, long_form], description: Explicitly choose a direct short response or the bounded long-form conversation reply path. Omission defaults to short. }
         content: { type: string, maxLength: 32768 }
         mcp_connector_ids:
           type: array
@@ -12437,6 +12878,18 @@ components:
       properties:
         message: { $ref: '#/components/schemas/ConversationMessage' }
         replayed: { type: boolean, description: True when an identical message receipt was returned. }
+    ConversationMessageRetryEligibility:
+      type: object
+      required: [retry_eligible, retry_reason]
+      properties:
+        retry_eligible: { type: boolean, description: Whether the saved source message currently passes the server retry gate. }
+        retry_reason:
+          type: string
+          enum: [retry_available, route_not_failed, task_already_created, message_too_long, reconciliation_required, route_processing, result_review_not_retryable, result_review_outcome_unknown, retry_limit_reached]
+        retry_warning:
+          type: string
+          enum: [previous_personal_model_call_outcome_unknown]
+          description: A previous personal model call has an unknown outcome. A new attempt is independent and does not prove the previous call settled.
     CreateConversationMessageVariantRequest:
       type: object
       additionalProperties: false
@@ -12676,6 +13129,8 @@ components:
         end_byte: { type: integer, minimum: 1, description: Exclusive UTF-8 byte offset into the SHA-256-bound Task result. }
         evidence_refs: { type: array, minItems: 1, maxItems: 64, items: { $ref: '#/components/schemas/TaskValidationEvidenceRef' } }
         performance_comparison: { $ref: '#/components/schemas/TaskValidationPerformanceComparison' }
+        source_location_state: { type: string, enum: [mapped, partial, unavailable, restricted, no_locator, truncated], description: Server-derived locator availability for the exact evidence steps cited by this claim; this is not a correctness verdict. }
+        source_location_ids: { type: array, maxItems: 32, items: { type: string, pattern: '^src_[a-f0-9]{32}$' }, description: References into the response's deduplicated source_locations list. }
     TaskValidationEvidenceDetail:
       type: object
       additionalProperties: false
@@ -12685,6 +13140,7 @@ components:
         event_sequence: { type: integer, format: int64, minimum: 1 }
         result_sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
         claims: { type: array, minItems: 1, maxItems: 64, items: { $ref: '#/components/schemas/TaskValidationEvidenceClaim' } }
+        source_locations: { type: array, maxItems: 32, items: { $ref: '#/components/schemas/TaskStepSourceLocation' }, description: Server-validated locators used by claim source_location_ids. Workspace paths are returned only when the reader is authorized for the Task Workspace. }
     TaskSummary:
       type: object
       required: [id, owner_id, initiator_id, execution_location, conversation_id, model_id, objective, status, queue_priority, current_step, step_count, completed_step_count, budget, usage, dependencies, child_jobs, result_review, created_at, updated_at]
@@ -12704,6 +13160,7 @@ components:
         model_id: { type: string }
         objective: { type: string }
         status: { $ref: '#/components/schemas/TaskStatus' }
+        waiting_reason: { type: [string, 'null'], description: Safe Task wait/pause reason used for status presentation; clients should not infer a user action from the reason alone. }
         queue_priority: { $ref: '#/components/schemas/TaskQueuePriority', description: User priority for queued work; tasks waiting for 15 minutes or longer are promoted into an age-ordered fairness band. }
         current_step: { type: [string, 'null'] }
         step_count: { type: integer, format: int64, minimum: 0, description: Count of Task steps excluding budget steps. }
@@ -12749,6 +13206,72 @@ components:
         outputs: { type: array, maxItems: 8, items: { type: string, minLength: 1, maxLength: 256 } }
         completion_criteria: { type: array, maxItems: 8, items: { type: string, minLength: 1, maxLength: 512 } }
         status: { type: string, enum: [pending, in_progress, completed, blocked] }
+        verification_applicability: { type: string, enum: [check, not_applicable], description: Omitted on legacy plans means verification applicability is unknown and H07 must remain pending. New fix plan submissions classify every step. }
+        verification_check:
+          type: object
+          additionalProperties: false
+          required: [kind, basis, command, coverage_paths]
+          description: Typed check identity for H07. A declared coverage path is plan scope, not proof of actual test coverage.
+          properties:
+            kind: { type: string, enum: [test, build, lint, typecheck, other] }
+            basis: { type: string, enum: [required, risk_selected], description: Required checks cite an explicit user message or project file; risk_selected checks are chosen for this task. }
+            command: { type: string, minLength: 1, maxLength: 1024 }
+            scope_mode: { type: string, enum: [full_suite, targeted] }
+            coverage_paths: { type: array, minItems: 1, maxItems: 8, items: { type: string, minLength: 1, maxLength: 512 } }
+            selectors: { type: array, maxItems: 8, items: { type: string, maxLength: 256 } }
+            requirement_ids: { type: array, maxItems: 32, items: { type: string, pattern: '^rq_[0-9a-f]{64}$' } }
+            requirement_source:
+              type: object
+              additionalProperties: false
+              required: [kind, content_sha256]
+              properties:
+                kind: { type: string, enum: [user_message, project_file] }
+                message_id: { type: string, pattern: '^m[a-z0-9]{7}$' }
+                workspace_path: { type: string, maxLength: 512 }
+                workspace_revision: { type: integer, format: int64, minimum: 0 }
+                content_sha256: { type: string, pattern: '^[0-9a-f]{64}$', description: Canonical digest stored in the plan; new plan-tool submissions have the server resolve the source and compute this value. }
+    TaskPlanRequirementSource:
+      description: Canonical persisted source identity. Submission-only locator/token fields are never stored in a Plan event.
+      oneOf:
+        - $ref: '#/components/schemas/TaskPlanUserMessageRequirementSource'
+        - $ref: '#/components/schemas/TaskPlanProjectFileRequirementSource'
+    TaskPlanUserMessageRequirementSource:
+      type: object
+      additionalProperties: false
+      required: [kind, message_id, content_sha256]
+      properties:
+        kind: { type: string, const: user_message }
+        message_id: { type: string, pattern: '^m[a-z0-9]{7}$' }
+        content_sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+    TaskPlanProjectFileRequirementSource:
+      type: object
+      additionalProperties: false
+      required: [kind, workspace_path, workspace_revision, content_sha256]
+      properties:
+        kind: { type: string, const: project_file }
+        workspace_path: { type: string, minLength: 1, maxLength: 512 }
+        workspace_revision: { type: integer, format: int64, minimum: 0 }
+        content_sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+    TaskPlanRequirementObligation:
+      type: object
+      additionalProperties: false
+      required: [id, statement, kind, scope_mode, coverage_paths, source]
+      properties:
+        id: { type: string, pattern: '^rq_[0-9a-f]{64}$' }
+        statement: { type: string, minLength: 1, maxLength: 512 }
+        kind: { type: string, enum: [test, build, lint, typecheck, other] }
+        scope_mode: { type: string, enum: [full_suite, targeted] }
+        coverage_paths: { type: array, minItems: 1, maxItems: 8, items: { type: string, maxLength: 512 } }
+        selectors: { type: array, maxItems: 8, items: { type: string, maxLength: 256 } }
+        source: { $ref: '#/components/schemas/TaskPlanRequirementSource' }
+    TaskPlanRequirementManifest:
+      type: object
+      additionalProperties: false
+      required: [version, obligations, digest]
+      properties:
+        version: { type: integer, const: 1 }
+        obligations: { type: array, maxItems: 32, items: { $ref: '#/components/schemas/TaskPlanRequirementObligation' } }
+        digest: { type: string, pattern: '^[0-9a-f]{64}$', description: Server-computed digest of the canonical candidate manifest. It does not prove completeness. }
     TaskPlan:
       type: object
       additionalProperties: false
@@ -12759,7 +13282,29 @@ components:
         goal: { type: string, minLength: 1, maxLength: 2048 }
         cost_estimate_state: { type: string, const: unknown, description: Cost is unknown unless an independently verified estimate is later provided. }
         steps: { type: array, minItems: 1, maxItems: 32, items: { $ref: '#/components/schemas/TaskPlanStep' } }
+        requirement_manifest: { $ref: '#/components/schemas/TaskPlanRequirementManifest' }
         created_at: { type: string, format: date-time }
+    TaskRequirementManifestConfirmationRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_task_revision, expected_plan_revision, expected_plan_event_sequence, requirements_complete_attested]
+      properties:
+        expected_task_revision: { type: integer, format: int64, minimum: 0 }
+        expected_plan_revision: { type: integer, format: int64, minimum: 1 }
+        expected_plan_event_sequence: { type: integer, format: int64, minimum: 1 }
+        requirements_complete_attested: { type: boolean, const: true, description: Authenticated user declaration that the reviewed obligation list is complete and faithfully expresses the applicable requirements. }
+    TaskRequirementManifestConfirmation:
+      type: object
+      required: [task_id, task_revision, plan_revision, plan_event_sequence, manifest_digest, requirements_complete_attested, attested_at, confirmed_at]
+      properties:
+        task_id: { $ref: '#/components/schemas/TaskId' }
+        task_revision: { type: integer, format: int64, minimum: 0 }
+        plan_revision: { type: integer, format: int64, minimum: 1 }
+        plan_event_sequence: { type: integer, format: int64, minimum: 1 }
+        manifest_digest: { type: string, pattern: '^[0-9a-f]{64}$' }
+        requirements_complete_attested: { type: boolean, const: true }
+        attested_at: { type: string, format: date-time }
+        confirmed_at: { type: string, format: date-time }
     TaskStepRetryRequest:
       type: object
       additionalProperties: false
@@ -12767,6 +13312,13 @@ components:
       properties:
         expected_task_revision: { type: integer, format: int64, minimum: 0 }
         expected_attempt: { type: integer, format: int64, minimum: 1 }
+    TaskModelRecoveryRetryRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_revision, expected_event_sequence]
+      properties:
+        expected_revision: { type: integer, format: int64, minimum: 0 }
+        expected_event_sequence: { type: integer, format: int64, minimum: 0 }
     TaskStepRetryResult:
       type: object
       required: [task_id, source_step_id, attempt_step_id, attempt, status, replayed]
@@ -12806,6 +13358,25 @@ components:
         execution: { $ref: '#/components/schemas/TaskStepExecution' }
         content_evidence:
           $ref: '#/components/schemas/TaskStepContentEvidence'
+        source_locations:
+          type: array
+          maxItems: 30
+          description: Server-derived source locations from successful tool reads. Workspace paths are returned only to readers authorized for the Task Workspace. These locations are not yet a claim-to-source correctness verdict.
+          items: { $ref: '#/components/schemas/TaskStepSourceLocation' }
+    TaskStepSourceLocation:
+      type: object
+      required: [id, kind, state, content_sha256]
+      properties:
+        id: { type: string, pattern: '^src_[0-9a-f]{32}$', description: 'Stable server-derived identity bound to Task owner, Task, step, revision, tool call, and this source locator.' }
+        kind: { type: string, enum: [public_web_page, workspace_file, workspace_search_match] }
+        uri: { type: string, format: uri, maxLength: 2048, description: Canonical HTTPS request URI with query and fragment removed; present only for public_web_page. }
+        workspace_id: { type: string, pattern: '^w[a-z0-9]{7,63}$', description: Bound Task Workspace ID; present only for Workspace locators. }
+        revision: { type: integer, format: int64, minimum: 0, description: 'Workspace revision requested by the successful read. For live_directory state this is the Task checkpoint revision, not an immutable content version.' }
+        path: { type: string, minLength: 1, maxLength: 4096, description: Normalized, nonsensitive Workspace-relative path. }
+        line: { type: integer, minimum: 1, description: One-based line number for a Workspace search match. }
+        manifest_sha256: { type: string, pattern: '^[0-9a-f]{64}$', description: Immutable Workspace manifest digest; absent for live-directory reads. }
+        state: { type: string, enum: [requested_uri_only, immutable_workspace_revision, live_workspace_directory] }
+        content_sha256: { type: string, pattern: '^[0-9a-f]{64}$', description: 'Captured web output digest or verified Workspace file-content digest associated with this locator.' }
     TaskStepContentEvidence:
       type: object
       description: Bounded, persisted excerpt from a successful built-in web search/read result, returned only after Task access and evidence identity checks. Treat preview text as untrusted web content; it is not a structured citation list. SHA-256 covers the full captured text before preview truncation.
@@ -12881,6 +13452,11 @@ components:
         disclosures: { $ref: '#/components/schemas/TaskApprovalDisclosures' }
         expires_at: { type: [string, 'null'], format: date-time, description: Null unless a trusted service policy explicitly sets an expiry. }
         media_preview_operation_id: { $ref: '#/components/schemas/OperationId', description: Present only while an image, video or speech output awaits the Task owner's save decision; use it with the Task media preview route. }
+        evidence_pointer: { type: string, description: 'Evidence anchor for the action, "step:<step-id>" of the step whose command and output justify it. Empty for approvals created before E05.' }
+        this_cost_micros: { type: [integer, 'null'], format: int64, minimum: 0, description: Trusted cost of this exact action in micro-units. Null when no trusted per-action cost source exists; never a fabricated 0. }
+        total_cost_micros: { type: [integer, 'null'], format: int64, minimum: 0, description: Trusted cumulative cost of the task in micro-units at the moment the card was created. Null when any cost component is unknown. }
+        trigger_rule: { type: string, enum: [host_sensitive_tool, external_mcp_tool, workspace_live_write, media_publish], description: Action-matrix category that required this approval. Empty for approvals created before E05. }
+        rejection_consequence: { type: string, description: What happens if the user rejects the action. Empty when the approval text did not state one. }
     TaskApprovalTextDisclosure:
       type: object
       additionalProperties: false
@@ -12919,11 +13495,16 @@ components:
         revocation: { $ref: '#/components/schemas/TaskApprovalTextDisclosure' }
     TaskClarificationRequest:
       type: object
-      required: [id, version, question]
+      required: [id, version, question, call_id]
       properties:
         id: { $ref: '#/components/schemas/ClarificationId' }
         version: { type: integer, minimum: 1 }
         question: { type: string }
+        call_id:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: Opaque clarification identity used by clients to select any structured answer fields. Clients must not infer clarification type from question text.
     TaskStopRequest:
       type: object
       required: [id, action, status, safe_after, unsettled_operation_ids]
@@ -13034,7 +13615,7 @@ components:
         task_revision: { type: integer, format: int64, minimum: 0 }
         result_event_sequence: { type: integer, format: int64, minimum: 1, description: Exact event identifying this completed result. }
         role: { type: string, const: assistant }
-        content: { type: string, maxLength: 32768 }
+        content: { type: string, maxLength: 2097152, description: Maximum UTF-8 encoded size is 2 MiB; streaming deltas are each limited to 32 KiB. }
         status: { type: string, enum: [streaming, completed, interrupted] }
         created_at: { type: string, format: date-time }
     TaskWorkbenchObservationTicket:
@@ -13046,6 +13627,13 @@ components:
         task_id: { $ref: '#/components/schemas/TaskId' }
         host_id: { $ref: '#/components/schemas/HostId' }
         expires_at: { type: string, format: date-time }
+    TaskPCDeliveryObservationRequest:
+      type: object
+      additionalProperties: false
+      required: [message_id, task_revision]
+      properties:
+        message_id: { $ref: '#/components/schemas/MessageId' }
+        task_revision: { type: integer, format: int64, minimum: 0, description: Exact revision represented by the completed assistant message. }
     TaskWorkbenchObservationSnapshot:
       type: object
       additionalProperties: false
@@ -13081,6 +13669,7 @@ components:
           required: [event_sequence, result, waiting_reason, steps, batch_items, artifacts, pending_request, clarification_request, stop_request, assistant_message, finished_at]
           properties:
             event_sequence: { type: integer, format: int64, minimum: 0, description: Event cursor from the same database snapshot as this Task; resume task events after this sequence. }
+            attention: { oneOf: [{ $ref: '#/components/schemas/TaskAttention' }, { type: 'null' }], description: Server-derived presentation state for this authenticated caller. Action is non-null only for a current operation the caller can perform; event_sequence must match this Task snapshot. }
             result: { type: [string, 'null'] }
             validation_detail: { $ref: '#/components/schemas/TaskValidationEvidenceDetail', description: Optional read-only claim-to-evidence mapping for the current Task revision. Event streams do not expose this detail. }
             current_revision_started: { type: boolean, description: True only after the current Task revision's root Agent has durably begun a turn; also compare current_revision and desired_revision before showing it for a pending change. }
@@ -13089,6 +13678,8 @@ components:
             waiting_reason: { type: [string, 'null'], description: 'Reason for waiting; model_context_limit means the full model request exceeded its input limit and the original message remains available.' }
             steps: { type: array, items: { $ref: '#/components/schemas/TaskStep' } }
             plan: { oneOf: [{ $ref: '#/components/schemas/TaskPlan' }, { type: 'null' }], description: Latest advisory plan for the current Task revision. It never grants authorization; prior revisions remain in the task event history. }
+            plan_event_sequence: { type: integer, format: int64, minimum: 1, description: Durable Task event sequence for the current plan, used as a confirmation precondition. }
+            requirement_manifest_confirmation: { $ref: '#/components/schemas/TaskRequirementManifestStatus', description: Present only for a current plan manifest with a matching authenticated user completeness attestation. }
             billing: { $ref: '#/components/schemas/TaskBilling', description: Task-scoped model call totals from the authorized account/project usage ledger. Costs retain currency and rate snapshot versions; unknown, estimates and BYOK remain distinct. }
             agents: { type: array, items: { $ref: '#/components/schemas/TaskAgentExecution' } }
             batch_items: { type: array, items: { $ref: '#/components/schemas/TaskBatchItem' } }
@@ -13098,12 +13689,29 @@ components:
             stop_request: { oneOf: [{ $ref: '#/components/schemas/TaskStopRequest' }, { type: 'null' }] }
             assistant_message: { oneOf: [{ $ref: '#/components/schemas/TaskAssistantMessage' }, { type: 'null' }] }
             finished_at: { type: [string, 'null'], format: date-time }
+    TaskAttention:
+      type: object
+      additionalProperties: false
+      required: [kind, reason, action, event_sequence]
+      properties:
+        kind: { type: string, enum: [needs_user_action, recovering, paused_retryable, interrupted, result_unverified] }
+        reason: { type: string, enum: [approval_required, clarification_required, recovery_scheduled, retry_available, execution_failed, outcome_unknown, unknown], description: Safe category only; never a provider error, tool name, or credential. }
+        action: { type: [string, 'null'], enum: [approve, clarify, retry, view_details, null], description: Null when no current authorized action exists. }
+        event_sequence: { type: integer, format: int64, minimum: 0, description: Must match the event_sequence of the Task snapshot. }
     TaskPage:
       type: object
       required: [items, next_cursor]
       properties:
         items: { type: array, items: { $ref: '#/components/schemas/TaskSummary' } }
         next_cursor: { type: [string, 'null'] }
+    TaskRequirementManifestStatus:
+      type: object
+      additionalProperties: false
+      required: [manifest_digest, requirements_complete_attested, attested_at]
+      properties:
+        manifest_digest: { type: string, pattern: '^[0-9a-f]{64}$' }
+        requirements_complete_attested: { type: boolean, const: true }
+        attested_at: { type: string, format: date-time }
     TaskApprovalPage:
       type: object
       additionalProperties: false
@@ -13145,6 +13753,11 @@ components:
         responded_at: { type: [string, 'null'], format: date-time }
         created_at: { type: string, format: date-time }
         media_preview_operation_id: { $ref: '#/components/schemas/OperationId' }
+        evidence_pointer: { type: string, description: 'Evidence anchor for the action, "step:<step-id>" of the step whose command and output justify it. Empty for approvals created before E05.' }
+        this_cost_micros: { type: [integer, 'null'], format: int64, minimum: 0, description: Trusted cost of this exact action in micro-units. Null when no trusted per-action cost source exists; never a fabricated 0. }
+        total_cost_micros: { type: [integer, 'null'], format: int64, minimum: 0, description: Trusted cumulative cost of the task in micro-units at the moment the card was created. Null when any cost component is unknown. }
+        trigger_rule: { type: string, enum: [host_sensitive_tool, external_mcp_tool, workspace_live_write, media_publish], description: Action-matrix category that required this approval. Empty for approvals created before E05. }
+        rejection_consequence: { type: string, description: What happens if the user rejects the action. Empty when the approval text did not state one. }
     ConversationActiveTask:
       allOf:
         - { $ref: '#/components/schemas/TaskSummary' }
@@ -13171,6 +13784,10 @@ components:
         application_id: { type: string, maxLength: 64 }
         model_id: { type: string, minLength: 1, maxLength: 256 }
         objective: { type: string, minLength: 1, maxLength: 32768 }
+        file_delivery_intent:
+          type: string
+          enum: [none, required, unclear]
+          description: Structured output intent for the Task. Omission means none. `required` requires workspace_id. `unclear` opens a versioned clarification; it is never inferred from objective text.
         mcp_connector_ids:
           type: array
           maxItems: 16
@@ -13188,6 +13805,10 @@ components:
       properties:
         key: { type: string, minLength: 1, maxLength: 100 }
         input: { type: string, minLength: 1, maxLength: 32768 }
+        file_delivery_intent:
+          type: string
+          enum: [none, required, unclear]
+          description: Structured output intent for this batch item. Omission means none. `required` requires workspace_id. `unclear` opens a versioned clarification targeted to this item and its current attempt.
     TaskActionRequest:
       type: object
       additionalProperties: false
@@ -13232,6 +13853,10 @@ components:
         clarification_id: { $ref: '#/components/schemas/ClarificationId' }
         clarification_version: { type: integer, minimum: 1 }
         answer: { type: string, minLength: 1, maxLength: 16384 }
+        file_delivery_intent:
+          type: string
+          enum: [none, required]
+          description: Required only when answering a file delivery clarification. This structured choice is authoritative; it is not inferred from answer text. `required` requires the Task to have a Workspace.
     TaskApprovalResponseRequest:
       type: object
       additionalProperties: false
@@ -13314,7 +13939,7 @@ components:
       additionalProperties: false
       properties:
         runtime_generation: { type: integer, format: int64, minimum: 1 }
-        confirm_retry: { type: boolean, description: Confirm that the external issue is fixed before creating a replacement sandbox. }
+        confirm_retry: { type: boolean, description: Confirm an administrator reviewed the remote state and the external issue is fixed before creating a replacement sandbox; adoption does not create or replace a sandbox. }
     AdminHostRecoveryResult:
       type: object
       required: [host_id, runtime_generation, action, sandbox_count]
@@ -13435,6 +14060,147 @@ components:
         summary: { $ref: '#/components/schemas/AdminUsageSummary' }
         by_day: { type: array, items: { $ref: '#/components/schemas/AdminUsageDay' } }
         by_model: { type: array, items: { $ref: '#/components/schemas/AdminUsageModel' } }
+      additionalProperties: false
+    AdminObservabilityStatus:
+      type: string
+      enum: [available, partial, unavailable, disabled]
+    AdminObservabilitySource:
+      type: object
+      required: [status, reason, updated_at]
+      properties:
+        status: { $ref: '#/components/schemas/AdminObservabilityStatus' }
+        reason: { type: [string, 'null'], maxLength: 256 }
+        updated_at: { type: [string, 'null'], format: date-time }
+      additionalProperties: false
+    AdminObservabilityOverview:
+      type: object
+      required: [sources, spans_24h]
+      properties:
+        sources:
+          type: object
+          required: [spans, logs, dsh_events]
+          properties:
+            spans: { $ref: '#/components/schemas/AdminObservabilitySource' }
+            logs: { $ref: '#/components/schemas/AdminObservabilitySource' }
+            dsh_events: { $ref: '#/components/schemas/AdminObservabilitySource' }
+          additionalProperties: false
+        spans_24h:
+          type: object
+          required: [request_count, error_count, p95_duration_ms]
+          properties:
+            request_count: { type: integer, format: int64, minimum: 0 }
+            error_count: { type: integer, format: int64, minimum: 0 }
+            p95_duration_ms: { type: number, minimum: 0 }
+          additionalProperties: false
+      additionalProperties: false
+    AdminObservabilityTraceSummary:
+      type: object
+      required: [trace_id, request_id, task_id, started_at, ended_at, status, span_count, error_count]
+      properties:
+        trace_id: { type: string, pattern: '^[0-9a-f]{32}$' }
+        request_id: { type: [string, 'null'], maxLength: 255 }
+        task_id: { type: [string, 'null'], maxLength: 128 }
+        started_at: { type: string, format: date-time }
+        ended_at: { type: [string, 'null'], format: date-time }
+        status: { type: string, enum: [ok, error, partial] }
+        span_count: { type: integer, format: int64, minimum: 0 }
+        error_count: { type: integer, format: int64, minimum: 0 }
+      additionalProperties: false
+    AdminObservabilityTracePage:
+      type: object
+      required: [items, next_cursor, sources]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/AdminObservabilityTraceSummary' } }
+        next_cursor: { type: [string, 'null'], maxLength: 512 }
+        sources:
+          type: object
+          required: [spans]
+          properties:
+            spans: { $ref: '#/components/schemas/AdminObservabilitySource' }
+          additionalProperties: false
+      additionalProperties: false
+    AdminObservabilitySpan:
+      type: object
+      required: [trace_id, span_id, parent_span_id, name, kind, status, start_at, end_at, attributes, links, events]
+      properties:
+        trace_id: { type: string, pattern: '^[0-9a-f]{32}$' }
+        span_id: { type: string, pattern: '^[0-9a-f]{16}$' }
+        parent_span_id: { type: [string, 'null'], pattern: '^[0-9a-f]{16}$' }
+        name: { type: string, minLength: 1, maxLength: 256 }
+        kind: { type: string, enum: [unspecified, internal, server, client, producer, consumer] }
+        status: { type: string, enum: [unset, ok, error] }
+        start_at: { type: string, format: date-time }
+        end_at: { type: [string, 'null'], format: date-time }
+        attributes: { type: object, additionalProperties: true }
+        links: { type: array, maxItems: 16, items: { $ref: '#/components/schemas/AdminObservabilitySpanLink' } }
+        events: { type: array, items: { type: object, additionalProperties: true } }
+      additionalProperties: false
+    AdminObservabilitySpanLink:
+      type: object
+      required: [trace_id, span_id, attributes]
+      properties:
+        trace_id: { type: string, pattern: '^[0-9a-f]{32}$' }
+        span_id: { type: string, pattern: '^[0-9a-f]{16}$' }
+        attributes: { type: object, additionalProperties: true }
+      additionalProperties: false
+    AdminObservabilityTrace:
+      type: object
+      required: [trace_id, spans, coverage]
+      properties:
+        trace_id: { type: string, pattern: '^[0-9a-f]{32}$' }
+        spans: { type: array, maxItems: 500, items: { $ref: '#/components/schemas/AdminObservabilitySpan' } }
+        coverage: { $ref: '#/components/schemas/AdminObservabilitySource' }
+      additionalProperties: false
+    AdminObservabilityAgentSession:
+      type: object
+      required: [session_id, parent_session_id, step_id, role]
+      properties:
+        session_id: { type: string, minLength: 1, maxLength: 128 }
+        parent_session_id: { type: [string, 'null'], maxLength: 128 }
+        step_id: { type: [string, 'null'], maxLength: 128 }
+        role: { type: string, enum: [root, subagent] }
+      additionalProperties: false
+    AdminObservabilityDSHEvent:
+      type: object
+      required: [session_id, sequence, time, type, data]
+      properties:
+        session_id: { type: string, minLength: 1, maxLength: 128 }
+        sequence: { type: integer, format: int64, minimum: 0 }
+        time: { type: string, format: date-time }
+        type: { type: string, minLength: 1, maxLength: 128 }
+        data: {}
+      additionalProperties: false
+    AdminObservabilityTraceEvents:
+      type: object
+      required: [task_id, agent_sessions, events, next_sequence, coverage]
+      properties:
+        task_id: { type: [string, 'null'], maxLength: 128 }
+        agent_sessions: { type: array, maxItems: 128, items: { $ref: '#/components/schemas/AdminObservabilityAgentSession' } }
+        events: { type: array, maxItems: 100, items: { $ref: '#/components/schemas/AdminObservabilityDSHEvent' } }
+        next_sequence: { type: [integer, 'null'], format: int64, minimum: 0 }
+        coverage: { $ref: '#/components/schemas/AdminObservabilitySource' }
+      additionalProperties: false
+    AdminObservabilityLog:
+      type: object
+      required: [time, severity, service, message, trace_id, span_id, request_id, task_id, attributes]
+      properties:
+        time: { type: string, format: date-time }
+        severity: { type: string, enum: [debug, info, warn, error, dpanic, panic, fatal] }
+        service: { type: string, minLength: 1, maxLength: 128 }
+        message: { type: string, minLength: 1, maxLength: 2048 }
+        trace_id: { type: string, pattern: '^[0-9a-f]{32}$' }
+        span_id: { type: [string, 'null'], pattern: '^[0-9a-f]{16}$' }
+        request_id: { type: [string, 'null'], maxLength: 255 }
+        task_id: { type: [string, 'null'], maxLength: 128 }
+        attributes: { type: object, additionalProperties: true }
+      additionalProperties: false
+    AdminObservabilityLogPage:
+      type: object
+      required: [items, next_cursor, coverage]
+      properties:
+        items: { type: array, maxItems: 100, items: { $ref: '#/components/schemas/AdminObservabilityLog' } }
+        next_cursor: { type: [string, 'null'], maxLength: 512 }
+        coverage: { $ref: '#/components/schemas/AdminObservabilitySource' }
       additionalProperties: false
     EvaluationScore:
       type: string
@@ -13681,6 +14447,61 @@ components:
         pending_reason: { type: string }
         review_count: { type: integer, minimum: 0 }
         arbitration_count: { type: integer, minimum: 0 }
+      additionalProperties: false
+    WorkflowTrace:
+      type: object
+      required: [version, trace_id, data_class, captured_at, coverage, coverage_source_ids, sources, nodes, edges, gaps]
+      properties:
+        version: { type: integer, const: 1 }
+        trace_id: { type: string, maxLength: 128 }
+        run_id: { type: string, maxLength: 128 }
+        data_class: { type: string, enum: [synthetic, live-scripted, live-observed] }
+        captured_at: { type: string, format: date-time }
+        coverage: { type: string, enum: [declared_complete, partial, unknown] }
+        coverage_source_ids: { type: array, maxItems: 256, items: { type: string, maxLength: 128 } }
+        sources: { type: array, minItems: 1, maxItems: 256, items: { $ref: '#/components/schemas/WorkflowSource' } }
+        nodes: { type: array, minItems: 1, maxItems: 1024, items: { $ref: '#/components/schemas/WorkflowNode' } }
+        edges: { type: array, maxItems: 2048, items: { $ref: '#/components/schemas/WorkflowEdge' } }
+        gaps: { type: array, maxItems: 256, items: { $ref: '#/components/schemas/WorkflowGap' } }
+      additionalProperties: false
+    WorkflowSource:
+      type: object
+      required: [id, kind, locator]
+      properties:
+        id: { type: string, maxLength: 128 }
+        kind: { type: string, enum: [task_ledger, agent_ledger, model_call_ledger, operation_ledger, approval_ledger, validation_ledger, conversation_output, pc_observation, authorization_snapshot, runtime_snapshot, host_snapshot, route_result, local_test, code_inspection, evaluation_run] }
+        locator: { type: string, maxLength: 1024 }
+        sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+      additionalProperties: false
+    WorkflowNode:
+      type: object
+      required: [id, kind, state, source_ids]
+      properties:
+        id: { type: string, maxLength: 128 }
+        kind: { type: string, enum: [route, task, agent, model_call, operation, approval, validation, delivery, host, runtime, authorization] }
+        state: { type: string, enum: [started, running, settled, completed, failed, waiting, waiting_user, pending, approved, rejected, expired, cancelled, unknown, unavailable] }
+        source_ids: { type: array, minItems: 1, items: { type: string, maxLength: 128 } }
+      additionalProperties: false
+    WorkflowEdge:
+      type: object
+      required: [id, from, to, kind, source_ids]
+      properties:
+        id: { type: string, maxLength: 128 }
+        from: { type: string, maxLength: 128 }
+        to: { type: string, maxLength: 128 }
+        kind: { type: string, enum: [created, handoff, invoked, returned, approved, rejected, verified, delivered, resumed, routed, targets, authorized, approval_requested] }
+        source_ids: { type: array, minItems: 1, items: { type: string, maxLength: 128 } }
+      additionalProperties: false
+    WorkflowGap:
+      type: object
+      required: [id, stage, scope, state, source_ids]
+      properties:
+        id: { type: string, maxLength: 128 }
+        stage: { type: string, enum: [route, task, agent, model_call, operation, approval, verification, delivery, host, runtime, authorization, provenance] }
+        scope: { type: string, maxLength: 512 }
+        state: { type: string, enum: [absent, not_run, unavailable, unknown] }
+        count: { type: integer, minimum: 0 }
+        source_ids: { type: array, items: { type: string, maxLength: 128 } }
       additionalProperties: false
     AdminQuality:
       type: object
@@ -14103,3 +14924,10 @@ components:
         role: { $ref: '#/components/schemas/UserRole' }
         quota: { $ref: '#/components/schemas/Quota' }
         default_host_resources: { $ref: '#/components/schemas/HostResourcesTarget' }
+    AdminResetUserPasswordRequest:
+      type: object
+      required: [expected_status, new_password]
+      additionalProperties: false
+      properties:
+        expected_status: { $ref: '#/components/schemas/AccountStatus' }
+        new_password: { type: string, minLength: 8, maxLength: 72, writeOnly: true }

@@ -3,7 +3,9 @@ package worker
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain/task"
@@ -58,6 +60,42 @@ func (s *cloudDSHTestStreamStore) AppendCloudDSHTextDelta(_ context.Context, del
 	}
 	s.deltas = append(s.deltas, delta)
 	return true, nil
+}
+
+func TestCloudDSHTextStreamSplitsLargeProviderDeltaIntoDurableChunks(t *testing.T) {
+	store := &cloudDSHTestStreamStore{allow: true}
+	stream := newCloudDSHTextStream(context.Background(), store, app.ModelTaskFence{}, "synthetic-call", nil)
+	text := strings.Repeat("长回复🙂", 12000)
+	if len(text) <= app.MaxAssistantMessageBytes {
+		t.Fatal("test response must exceed the per-delta limit")
+	}
+	if err := stream.append(text); err != nil {
+		t.Fatalf("append large provider delta: %v", err)
+	}
+	var combined strings.Builder
+	for _, delta := range store.deltas {
+		if len(delta.Text) == 0 || len(delta.Text) > app.MaxAssistantMessageBytes || !utf8.ValidString(delta.Text) {
+			t.Fatalf("stream delta has invalid size or UTF-8: bytes=%d", len(delta.Text))
+		}
+		combined.WriteString(delta.Text)
+	}
+	if len(store.deltas) < 2 || combined.String() != text || !stream.hasVisibleText() {
+		t.Fatalf("large stream did not round trip through bounded deltas: count=%d bytes=%d", len(store.deltas), combined.Len())
+	}
+	if _, _, ok := stream.matchingResult(text); !ok {
+		t.Fatal("large visible prefix did not match the final response")
+	}
+}
+
+func TestCloudDSHTextStreamDisablesDisplayAboveFiniteReplyLimit(t *testing.T) {
+	store := &cloudDSHTestStreamStore{allow: true}
+	stream := newCloudDSHTextStream(context.Background(), store, app.ModelTaskFence{}, "synthetic-call", nil)
+	if err := stream.append(strings.Repeat("x", app.MaxAssistantReplyBytes+1)); err != nil {
+		t.Fatalf("oversized optional stream aborted provider handling: %v", err)
+	}
+	if len(store.deltas) != 0 || stream.hasVisibleText() {
+		t.Fatalf("oversized stream was partially displayed: deltas=%d visible=%t", len(store.deltas), stream.hasVisibleText())
+	}
 }
 
 func TestCloudDSHTextStreamPreservesPartialOnWriteFailureAndRejectsMismatch(t *testing.T) {

@@ -23,7 +23,9 @@ func (s *Store) ReserveModelCall(ctx context.Context, request app.ModelCallReser
 	if request.Source == app.ModelCallRoute || !domain.ValidUserID(request.OwnerID) || !domain.ValidModelConnectionID(request.ModelID) || len(request.RequestDigest) != 32 ||
 		request.ReservedTokens <= 0 || request.ProviderModel == "" || len(request.ProviderModel) > 256 ||
 		len(request.CallID) < 8 || len(request.CallID) > 128 || (request.Source == app.ModelCallCompaction) != (request.Summary != nil) ||
-		(request.Source == app.ModelCallReview) != (request.Review != nil) || request.Source == app.ModelCallReview && !validReviewModelCallReservation(request) {
+		(request.Source == app.ModelCallReview) != (request.Review != nil) || request.Source == app.ModelCallReview && !validReviewModelCallReservation(request) ||
+		(request.Source == app.ModelCallTerminalDelivery) != (request.TerminalDelivery != nil) ||
+		request.Source == app.ModelCallTerminalDelivery && !validTaskTerminalDeliveryModelCallReservation(request) {
 		return domain.InvalidArgument("model_call", "invalid model reservation")
 	}
 	return s.WithTx(ctx, func(tx pgx.Tx) error { return reserveModelCallInTx(ctx, tx, request, nil) })
@@ -60,6 +62,14 @@ func modelCallIsPersonal(ctx context.Context, tx pgx.Tx, ownerID string, source 
 
 // reserveModelCallInTx records every call; only platform models reserve platform budgets.
 func reserveModelCallInTx(ctx context.Context, tx pgx.Tx, request app.ModelCallReservation, projectReservation *app.ProjectModelReservation) error {
+	return reserveModelCallInTxWithState(ctx, tx, request, projectReservation, "dispatched")
+}
+
+func reserveModelCallInTxWithState(ctx context.Context, tx pgx.Tx, request app.ModelCallReservation,
+	projectReservation *app.ProjectModelReservation, initialState string) error {
+	if initialState != "prepared" && initialState != "dispatched" {
+		return domain.NewError(domain.CodeInvalidState, "model call reservation state is invalid")
+	}
 	if err := lockModelLedgerOwner(ctx, tx, request.OwnerID); err != nil {
 		return err
 	}
@@ -78,9 +88,15 @@ func reserveModelCallInTx(ctx context.Context, tx pgx.Tx, request app.ModelCallR
 	if err := checkModelCaller(ctx, tx, request); err != nil {
 		return err
 	}
+	if request.Source == app.ModelCallTask && request.Task != nil && request.Task.RecoveryCallID != "" {
+		if err := verifyTaskModelRecoveryAttemptForReservation(ctx, tx, request); err != nil {
+			return err
+		}
+	}
 	var taskProjectID string
 	var err error
-	if request.Source == app.ModelCallTask {
+	switch request.Source {
+	case app.ModelCallTask:
 		if request.Task == nil {
 			return domain.NewError(domain.CodeUnauthenticated, "task model authorization is unavailable")
 		}
@@ -88,18 +104,27 @@ func reserveModelCallInTx(ctx context.Context, tx pgx.Tx, request app.ModelCallR
 			request.Task.TaskID, request.Task.OwnerID, request.Task.InitiatorID).Scan(&taskProjectID); err != nil {
 			return domain.NewError(domain.CodeUnauthenticated, "task model project scope is unavailable")
 		}
-	} else if request.Source == app.ModelCallReview {
+	case app.ModelCallReview:
 		taskProjectID, err = checkTaskValidationReviewModelFence(ctx, tx, *request.Review)
 		if err != nil {
 			return err
 		}
+	case app.ModelCallTerminalDelivery:
+		var current bool
+		taskProjectID, current, err = checkTaskTerminalDeliveryModelFenceInTx(ctx, tx, *request.TerminalDelivery)
+		if err != nil {
+			return err
+		}
+		if !current {
+			return domain.NewError(domain.CodeConflict, "terminal delivery model claim is no longer current")
+		}
 	}
-	if (request.Source == app.ModelCallTask || request.Source == app.ModelCallReview) && request.ProjectID != taskProjectID {
+	if (request.Source == app.ModelCallTask || request.Source == app.ModelCallReview || request.Source == app.ModelCallTerminalDelivery) && request.ProjectID != taskProjectID {
 		return domain.NewError(domain.CodeUnauthenticated, "Task model project scope is unavailable")
 	}
 	projectID := request.ProjectID
 	if projectID != "" && (!project.ValidID(projectID) || (!request.PersonalModel && (projectReservation == nil || projectReservation.ProjectID != projectID)) ||
-		(request.PersonalModel && (projectReservation != nil || (request.Source != app.ModelCallTask && request.Source != app.ModelCallReview &&
+		(request.PersonalModel && (projectReservation != nil || (request.Source != app.ModelCallTask && request.Source != app.ModelCallReview && request.Source != app.ModelCallTerminalDelivery &&
 			request.Source != app.ModelCallRoute && request.Source != app.ModelCallCompaction)))) {
 		return domain.NewError(domain.CodeInvalidState, "project model budget reservation is required")
 	}
@@ -113,6 +138,48 @@ func reserveModelCallInTx(ctx context.Context, tx pgx.Tx, request app.ModelCallR
 		if !bytes.Equal(priorDigest, request.RequestDigest) {
 			return domain.NewError(domain.CodeIdempotencyConflict, "model call key was used with different content")
 		}
+		if request.Source == app.ModelCallTerminalDelivery {
+			var state, modelID, providerModel, taskID string
+			var deliveryID int64
+			var reservedTokens int64
+			var personalModel bool
+			var dispatchStarted bool
+			if err := tx.QueryRow(ctx, `SELECT state,model_id,provider_model,COALESCE(task_id,''),reserved_tokens,
+personal_model,terminal_delivery_id,terminal_delivery_dispatch_started
+FROM model_call_ledger WHERE owner_id=$1 AND source='terminal_delivery' AND call_id=$2 FOR UPDATE`,
+				request.OwnerID, request.CallID).Scan(&state, &modelID, &providerModel, &taskID, &reservedTokens,
+				&personalModel, &deliveryID, &dispatchStarted); err != nil {
+				return fmt.Errorf("read terminal delivery model reservation: %w", err)
+			}
+			if state == "dispatched" && modelID == request.ModelID && providerModel == request.ProviderModel &&
+				taskID == request.TerminalDelivery.TaskID && reservedTokens == request.ReservedTokens &&
+				personalModel == request.PersonalModel && deliveryID == request.TerminalDelivery.DeliveryID && !dispatchStarted {
+				if projectReservation != nil {
+					var projectDigest []byte
+					var projectState, actorID, projectTaskID, projectModelID string
+					var rateProvider, rateModel, currency string
+					var rateVersion, inputRate, outputRate, reservedInput, reservedOutput, reservedMicros int64
+					if err := tx.QueryRow(ctx, `SELECT request_digest,status,actor_id,COALESCE(task_id,''),model_id,
+rate_provider,rate_model,rate_version,currency,input_micros_per_million,output_micros_per_million,
+reserved_input_tokens,reserved_output_tokens,reserved_micros FROM project_budget_ledger
+WHERE project_id=$1 AND source='terminal_delivery' AND call_id=$2 FOR UPDATE`,
+						projectReservation.ProjectID, request.CallID).Scan(&projectDigest, &projectState, &actorID, &projectTaskID,
+						&projectModelID, &rateProvider, &rateModel, &rateVersion, &currency, &inputRate, &outputRate,
+						&reservedInput, &reservedOutput, &reservedMicros); err != nil ||
+						!bytes.Equal(projectDigest, projectReservation.RequestDigest) || projectState != "reserved" ||
+						actorID != request.OwnerID || projectTaskID != request.TerminalDelivery.TaskID ||
+						projectModelID != projectReservation.ModelID || rateProvider != projectReservation.Rate.Provider ||
+						rateModel != projectReservation.Rate.Model || rateVersion != projectReservation.Rate.Version ||
+						currency != projectReservation.Rate.Currency || inputRate != projectReservation.Rate.InputMicrosPerMillion ||
+						outputRate != projectReservation.Rate.OutputMicrosPerMillion ||
+						reservedInput != projectReservation.Usage.InputTokens || reservedOutput != projectReservation.Usage.OutputTokens ||
+						reservedMicros != projectReservation.ReservedMicros {
+						return domain.NewError(domain.CodeInvalidState, "project terminal delivery reservation is unavailable")
+					}
+				}
+				return nil
+			}
+		}
 		return domain.NewError(domain.CodeConflict, "model call was already dispatched; reconcile its result")
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
@@ -123,7 +190,7 @@ func reserveModelCallInTx(ctx context.Context, tx pgx.Tx, request app.ModelCallR
 		var running int32
 		var unknown bool
 		err = tx.QueryRow(ctx, `SELECT COALESCE(SUM(CASE WHEN state='settled' THEN input_tokens+output_tokens WHEN state='rejected' THEN 0 ELSE reserved_tokens END),0),
-  count(*) FILTER (WHERE state='dispatched'), COALESCE(bool_or(state='unknown'),false)
+			  count(*) FILTER (WHERE state IN ('prepared','dispatched')), COALESCE(bool_or(state='unknown'),false)
 	  FROM model_call_ledger WHERE owner_id=$1 AND NOT personal_model`, request.OwnerID).Scan(&used, &running, &unknown)
 		if err != nil {
 			return fmt.Errorf("read model usage: %w", err)
@@ -131,7 +198,15 @@ func reserveModelCallInTx(ctx context.Context, tx pgx.Tx, request app.ModelCallR
 		if unknown {
 			return domain.NewError(domain.CodeInvalidState, "model usage is unknown and requires reconciliation")
 		}
-		if running >= maxConcurrent {
+		claimTaskID := ""
+		if request.Task != nil {
+			claimTaskID = request.Task.TaskID
+		}
+		claims, err := modelBudgetCapacitySlotClaimsInTx(ctx, tx, request.OwnerID, claimTaskID, request.BudgetCallID)
+		if err != nil {
+			return err
+		}
+		if int64(running)+claims >= int64(maxConcurrent) {
 			limited := domain.NewError(domain.CodeRateLimited, "model concurrency limit reached")
 			limited.Details["reason"] = "model_concurrency_limit"
 			limited.Details["stage"] = "reservation"
@@ -148,7 +223,7 @@ func reserveModelCallInTx(ctx context.Context, tx pgx.Tx, request app.ModelCallR
 			return domain.NewError(domain.CodeInvalidState, "task model usage is unavailable")
 		}
 		var pending int64
-		if err := tx.QueryRow(ctx, `SELECT COALESCE(SUM(reserved_tokens),0) FROM model_call_ledger WHERE task_id=$1 AND source='task' AND state='dispatched'`, request.Task.TaskID).Scan(&pending); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT COALESCE(SUM(reserved_tokens),0) FROM model_call_ledger WHERE task_id=$1 AND source='task' AND state IN ('prepared','dispatched')`, request.Task.TaskID).Scan(&pending); err != nil {
 			return fmt.Errorf("read task model reservations: %w", err)
 		}
 		if taskUsed > taskLimit || pending > taskLimit-taskUsed || request.ReservedTokens > taskLimit-taskUsed-pending {
@@ -159,6 +234,8 @@ func reserveModelCallInTx(ctx context.Context, tx pgx.Tx, request app.ModelCallR
 		taskID = request.Task.TaskID
 	} else if request.Review != nil {
 		taskID = request.Review.Claim.TaskID
+	} else if request.TerminalDelivery != nil {
+		taskID = request.TerminalDelivery.TaskID
 	}
 	if projectReservation != nil {
 		if err := reserveProjectBudgetLedgerInTx(ctx, tx, *projectReservation); err != nil {
@@ -167,17 +244,23 @@ func reserveModelCallInTx(ctx context.Context, tx pgx.Tx, request app.ModelCallR
 	}
 	var reviewTaskRevision, reviewResultSequence, reviewClaimGeneration any
 	var reviewResultSHA256 any
+	var terminalDeliveryID, terminalDeliveryClaimGeneration any
 	if request.Review != nil {
 		claim := request.Review.Claim
 		reviewTaskRevision, reviewResultSequence, reviewResultSHA256, reviewClaimGeneration = claim.TaskRevision, claim.ResultEventSequence,
 			claim.ResultSHA256, claim.ClaimGeneration
 	}
+	if request.TerminalDelivery != nil {
+		terminalDeliveryID, terminalDeliveryClaimGeneration = request.TerminalDelivery.DeliveryID, request.TerminalDelivery.ClaimGeneration
+	}
 	if _, err := tx.Exec(ctx, `INSERT INTO model_call_ledger
 		 (owner_id,source,call_id,request_digest,model_id,provider_model,task_id,reserved_tokens,state,created_at,personal_model,
-		  review_task_revision,review_result_event_sequence,review_result_sha256,review_claim_generation)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'dispatched',clock_timestamp(),$9,$10,$11,$12,$13)`, request.OwnerID, string(request.Source), request.CallID,
+		  review_task_revision,review_result_event_sequence,review_result_sha256,review_claim_generation,
+		  terminal_delivery_id,terminal_delivery_claim_generation)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$16,clock_timestamp(),$9,$10,$11,$12,$13,$14,$15)`, request.OwnerID, string(request.Source), request.CallID,
 		request.RequestDigest, request.ModelID, request.ProviderModel, taskID, request.ReservedTokens, request.PersonalModel,
-		reviewTaskRevision, reviewResultSequence, reviewResultSHA256, reviewClaimGeneration); err != nil {
+		reviewTaskRevision, reviewResultSequence, reviewResultSHA256, reviewClaimGeneration,
+		terminalDeliveryID, terminalDeliveryClaimGeneration, initialState); err != nil {
 		return fmt.Errorf("reserve model call: %w", err)
 	}
 	if request.Source == app.ModelCallCompaction {
@@ -298,6 +381,9 @@ func projectTaskID(request app.ModelCallReservation) any {
 		if request.Review != nil {
 			return request.Review.Claim.TaskID
 		}
+		if request.TerminalDelivery != nil {
+			return request.TerminalDelivery.TaskID
+		}
 		return nil
 	}
 	return request.Task.TaskID
@@ -318,7 +404,9 @@ func (s *Store) BeginModelCallDispatchWithTextStreaming(ctx context.Context, req
 func (s *Store) beginModelCallDispatch(ctx context.Context, request app.ModelCallReservation, requestStreaming bool) (bool, error) {
 	if request.Source == app.ModelCallRoute || !domain.ValidUserID(request.OwnerID) || len(request.CallID) < 8 || len(request.CallID) > 128 ||
 		(request.Source == app.ModelCallCompaction) != (request.Summary != nil) ||
-		(request.Source == app.ModelCallReview) != (request.Review != nil) || request.Source == app.ModelCallReview && !validReviewModelCallReservation(request) {
+		(request.Source == app.ModelCallReview) != (request.Review != nil) || request.Source == app.ModelCallReview && !validReviewModelCallReservation(request) ||
+		(request.Source == app.ModelCallTerminalDelivery) != (request.TerminalDelivery != nil) ||
+		request.Source == app.ModelCallTerminalDelivery && !validTaskTerminalDeliveryModelCallReservation(request) {
 		return false, domain.InvalidArgument("model_call", "invalid model dispatch")
 	}
 	var streaming bool
@@ -342,7 +430,8 @@ func (s *Store) beginModelCallDispatch(ctx context.Context, request app.ModelCal
 			return err
 		}
 		projectID := request.ProjectID
-		if request.Source == app.ModelCallTask {
+		switch request.Source {
+		case app.ModelCallTask:
 			if request.Task == nil {
 				return domain.NewError(domain.CodeUnauthenticated, "task model project scope is unavailable")
 			}
@@ -350,11 +439,18 @@ func (s *Store) beginModelCallDispatch(ctx context.Context, request app.ModelCal
 				request.Task.TaskID, request.Task.OwnerID, request.Task.InitiatorID).Scan(&projectID); err != nil || projectID != request.ProjectID {
 				return domain.NewError(domain.CodeUnauthenticated, "task model project scope is unavailable")
 			}
-		} else if request.Source == app.ModelCallReview {
+		case app.ModelCallReview:
 			var err error
 			projectID, err = checkTaskValidationReviewModelFence(ctx, tx, *request.Review)
 			if err != nil || projectID != request.ProjectID {
 				return domain.NewError(domain.CodeUnauthenticated, "Task validation review project scope is unavailable")
+			}
+		case app.ModelCallTerminalDelivery:
+			var current bool
+			var err error
+			projectID, current, err = checkTaskTerminalDeliveryModelFenceInTx(ctx, tx, *request.TerminalDelivery)
+			if err != nil || !current || projectID != request.ProjectID {
+				return domain.NewError(domain.CodeUnauthenticated, "terminal delivery model project scope is unavailable")
 			}
 		}
 		if projectID != "" {
@@ -382,12 +478,48 @@ FROM model_call_ledger WHERE owner_id=$1 AND source=$2 AND call_id=$3 FOR UPDATE
 			&reviewTaskRevision, &reviewResultSequence, &reviewResultSHA256, &reviewClaimGeneration); err != nil {
 			return storeError("find model dispatch", "model call", err)
 		}
-		if state != "dispatched" || modelID != request.ModelID || !bytes.Equal(priorDigest, request.RequestDigest) {
+		if request.BudgetPlanID != "" {
+			if request.Source != app.ModelCallTask || state != "prepared" || modelID != request.ModelID || !bytes.Equal(priorDigest, request.RequestDigest) {
+				return domain.NewError(domain.CodeInvalidState, "prepared model call is no longer awaiting dispatch")
+			}
+			if err := verifyTaskModelBudgetPreparationInTx(ctx, tx, request, map[string]bool{"prepared": true}, true); err != nil {
+				return err
+			}
+		} else if state != "dispatched" || modelID != request.ModelID || !bytes.Equal(priorDigest, request.RequestDigest) {
 			return domain.NewError(domain.CodeInvalidState, "model call is no longer awaiting dispatch")
 		}
 		if request.Source == app.ModelCallReview && !modelCallReviewAttributionMatches(storedTaskID, reviewTaskRevision,
 			reviewResultSequence, reviewResultSHA256, reviewClaimGeneration, request.Review) {
 			return domain.NewError(domain.CodeInvalidState, "Task validation review model call attribution changed")
+		}
+		if request.Source == app.ModelCallTerminalDelivery {
+			if storedTaskID != request.TerminalDelivery.TaskID {
+				return domain.NewError(domain.CodeInvalidState, "terminal delivery model call Task attribution changed")
+			}
+			if err := s.beginTerminalDeliveryModelDispatchInTx(ctx, tx, request); err != nil {
+				return err
+			}
+		} else if request.BudgetPlanID != "" {
+			result, err := tx.Exec(ctx, `UPDATE model_call_ledger SET state='dispatched',created_at=clock_timestamp()
+WHERE owner_id=$1 AND source='task' AND call_id=$2 AND state='prepared'`, request.OwnerID, request.CallID)
+			if err != nil || result.RowsAffected() != 1 {
+				if err != nil {
+					return fmt.Errorf("mark prepared model dispatch start: %w", err)
+				}
+				return domain.NewError(domain.CodeConflict, "prepared model call changed before dispatch")
+			}
+			result, err = tx.Exec(ctx, `UPDATE model_budget_preparations SET consumed_at=clock_timestamp()
+WHERE owner_id=$1 AND source='task' AND call_id=$2 AND plan_id=$3 AND budget_call_id=$4 AND consumed_at IS NULL`,
+				request.OwnerID, request.CallID, request.BudgetPlanID, request.BudgetCallID)
+			if err != nil || result.RowsAffected() != 1 {
+				if err != nil {
+					return fmt.Errorf("consume prepared model budget plan: %w", err)
+				}
+				return domain.NewError(domain.CodeConflict, "prepared model budget plan changed before dispatch")
+			}
+		} else if _, err := tx.Exec(ctx, `UPDATE model_call_ledger SET created_at=clock_timestamp()
+WHERE owner_id=$1 AND source=$2 AND call_id=$3 AND state='dispatched'`, request.OwnerID, string(request.Source), request.CallID); err != nil {
+			return fmt.Errorf("mark model dispatch start: %w", err)
 		}
 		if requestStreaming {
 			err := tx.QueryRow(ctx, `SELECT state='verified' FROM model_text_streaming_capabilities
@@ -416,10 +548,6 @@ VALUES ($1,'task',$2,$3,$4,$1,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`, 
 				}
 			}
 		}
-		if _, err := tx.Exec(ctx, `UPDATE model_call_ledger SET created_at=clock_timestamp()
-WHERE owner_id=$1 AND source=$2 AND call_id=$3 AND state='dispatched'`, request.OwnerID, string(request.Source), request.CallID); err != nil {
-			return fmt.Errorf("mark model dispatch start: %w", err)
-		}
 		return nil
 	})
 	return streaming, err
@@ -428,17 +556,25 @@ WHERE owner_id=$1 AND source=$2 AND call_id=$3 AND state='dispatched'`, request.
 // shortcut: the existing ledger has no distinct pre-dispatch state; call only
 // when the gateway can prove no provider request was sent.
 func (s *Store) AbandonModelCallReservation(ctx context.Context, request app.ModelCallReservation) error {
+	adaptiveBudget := request.BudgetPlanID != "" || request.BudgetCallID != "" || request.BudgetRequestDigest != ""
 	if !domain.ValidUserID(request.OwnerID) || !domain.ValidModelConnectionID(request.ModelID) ||
 		len(request.RequestDigest) != 32 || request.ReservedTokens <= 0 || len(request.CallID) < 8 || len(request.CallID) > 128 ||
 		(request.ProjectID != "" && !project.ValidID(request.ProjectID)) ||
 		(request.Source != app.ModelCallClient && request.Source != app.ModelCallChat && request.Source != app.ModelCallTask &&
-			request.Source != app.ModelCallProbe && request.Source != app.ModelCallCompaction && request.Source != app.ModelCallReview) ||
+			request.Source != app.ModelCallProbe && request.Source != app.ModelCallCompaction && request.Source != app.ModelCallReview &&
+			request.Source != app.ModelCallTerminalDelivery) ||
 		(request.Source == app.ModelCallTask) != (request.Task != nil) ||
 		(request.Source == app.ModelCallCompaction) != (request.Summary != nil) ||
 		(request.Source == app.ModelCallReview) != (request.Review != nil) || request.Source == app.ModelCallReview && !validReviewModelCallReservation(request) ||
+		(request.Source == app.ModelCallTerminalDelivery) != (request.TerminalDelivery != nil) ||
+		request.Source == app.ModelCallTerminalDelivery && !validTaskTerminalDeliveryModelCallReservation(request) ||
 		(request.Task != nil && request.Task.InitiatorID != request.OwnerID) ||
 		(request.ProjectID != "" && request.Source == app.ModelCallProbe) {
 		return domain.InvalidArgument("model_call", "invalid model reservation release")
+	}
+	if adaptiveBudget && (request.Source != app.ModelCallTask || request.BudgetPlanID == "" || request.BudgetCallID == "" ||
+		!app.ValidModelBudgetRequestDigest(request.BudgetRequestDigest)) {
+		return domain.InvalidArgument("model_call", "invalid adaptive model reservation release")
 	}
 	return s.WithTx(ctx, func(tx pgx.Tx) error {
 		if err := lockModelLedgerOwner(ctx, tx, request.OwnerID); err != nil {
@@ -456,11 +592,25 @@ func (s *Store) AbandonModelCallReservation(ctx context.Context, request app.Mod
 				return err
 			}
 		}
+		if adaptiveBudget {
+			if err := verifyTaskModelBudgetPreparationInTx(ctx, tx, request, map[string]bool{"prepared": true, "dispatched": true}, false); err != nil {
+				return err
+			}
+		}
+		if request.Source == app.ModelCallTerminalDelivery {
+			if _, current, err := checkTaskTerminalDeliveryModelFenceInTx(ctx, tx, *request.TerminalDelivery); err != nil {
+				return err
+			} else if !current {
+				return domain.NewError(domain.CodeConflict, "terminal delivery model claim is no longer current")
+			}
+		}
 		expectedTaskID := ""
 		if request.Task != nil {
 			expectedTaskID = request.Task.TaskID
 		} else if request.Review != nil {
 			expectedTaskID = request.Review.Claim.TaskID
+		} else if request.TerminalDelivery != nil {
+			expectedTaskID = request.TerminalDelivery.TaskID
 		}
 		if request.ProjectID != "" && !personal {
 			if err := lockProjectByIDInTx(ctx, tx, request.ProjectID); err != nil {
@@ -485,21 +635,40 @@ FROM project_budget_ledger WHERE project_id=$1 AND source=$2 AND call_id=$3 FOR 
 		var reservedTokens int64
 		var reviewTaskRevision, reviewResultSequence, reviewClaimGeneration int64
 		var reviewResultSHA256 string
+		var terminalDeliveryID, terminalDeliveryClaimGeneration *int64
+		var terminalDeliveryDispatchStarted bool
 		if err := tx.QueryRow(ctx, `SELECT state,model_id,provider_model,request_digest,COALESCE(task_id,''),reserved_tokens,
 COALESCE(review_task_revision,-1),COALESCE(review_result_event_sequence,-1),COALESCE(encode(review_result_sha256,'hex'),''),
-COALESCE(review_claim_generation,-1) FROM model_call_ledger
+COALESCE(review_claim_generation,-1),terminal_delivery_id,terminal_delivery_claim_generation,terminal_delivery_dispatch_started FROM model_call_ledger
 WHERE owner_id=$1 AND source=$2 AND call_id=$3 FOR UPDATE`, request.OwnerID, string(request.Source), request.CallID).
 			Scan(&state, &modelID, &providerModel, &priorDigest, &taskID, &reservedTokens, &reviewTaskRevision,
-				&reviewResultSequence, &reviewResultSHA256, &reviewClaimGeneration); err != nil {
+				&reviewResultSequence, &reviewResultSHA256, &reviewClaimGeneration,
+				&terminalDeliveryID, &terminalDeliveryClaimGeneration, &terminalDeliveryDispatchStarted); err != nil {
 			return storeError("find model reservation release", "model call", err)
 		}
-		if state != "dispatched" || modelID != request.ModelID || providerModel != request.ProviderModel ||
+		stateAllowed := state == "dispatched" || adaptiveBudget && state == "prepared"
+		if !stateAllowed || modelID != request.ModelID || providerModel != request.ProviderModel ||
 			taskID != expectedTaskID || reservedTokens != request.ReservedTokens || !bytes.Equal(priorDigest, request.RequestDigest) {
 			return domain.NewError(domain.CodeConflict, "model reservation is no longer undispatched")
 		}
 		if request.Source == app.ModelCallReview && !modelCallReviewAttributionMatches(taskID, reviewTaskRevision,
 			reviewResultSequence, reviewResultSHA256, reviewClaimGeneration, request.Review) {
 			return domain.NewError(domain.CodeConflict, "Task validation review reservation attribution changed")
+		}
+		if request.Source == app.ModelCallTerminalDelivery && (terminalDeliveryID == nil || terminalDeliveryClaimGeneration == nil ||
+			*terminalDeliveryID != request.TerminalDelivery.DeliveryID || taskID != expectedTaskID || terminalDeliveryDispatchStarted) {
+			return domain.NewError(domain.CodeConflict, "terminal delivery model reservation may already have been dispatched")
+		}
+		if adaptiveBudget {
+			result, err := tx.Exec(ctx, `DELETE FROM model_budget_preparations
+WHERE owner_id=$1 AND source='task' AND call_id=$2 AND plan_id=$3 AND budget_call_id=$4`,
+				request.OwnerID, request.CallID, request.BudgetPlanID, request.BudgetCallID)
+			if err != nil {
+				return fmt.Errorf("delete undispatched model budget plan: %w", err)
+			}
+			if result.RowsAffected() != 1 {
+				return domain.NewError(domain.CodeConflict, "model budget plan changed before release")
+			}
 		}
 		if request.ProjectID != "" && !personal {
 			result, err := tx.Exec(ctx, `DELETE FROM project_budget_ledger WHERE project_id=$1 AND source=$2 AND call_id=$3 AND status='reserved'`,
@@ -520,8 +689,12 @@ WHERE owner_id=$1 AND source=$2 AND call_id=$3 FOR UPDATE`, request.OwnerID, str
 				return domain.NewError(domain.CodeConflict, "project model reservation identity is unavailable")
 			}
 		}
+		deleteState := `state='dispatched'`
+		if adaptiveBudget {
+			deleteState = `state IN ('prepared','dispatched')`
+		}
 		result, err := tx.Exec(ctx, `DELETE FROM model_call_ledger WHERE owner_id=$1 AND source=$2 AND call_id=$3
-AND state='dispatched' AND model_id=$4 AND request_digest=$5`, request.OwnerID, string(request.Source), request.CallID,
+AND `+deleteState+` AND model_id=$4 AND request_digest=$5`, request.OwnerID, string(request.Source), request.CallID,
 			request.ModelID, request.RequestDigest)
 		if err != nil {
 			return fmt.Errorf("release model token reservation: %w", err)
@@ -627,6 +800,18 @@ func checkModelCaller(ctx context.Context, tx pgx.Tx, request app.ModelCallReser
 		}
 		if projectID != request.ProjectID {
 			return domain.NewError(domain.CodeUnauthenticated, "Task validation review project scope is unavailable")
+		}
+	case app.ModelCallTerminalDelivery:
+		if !validTaskTerminalDeliveryModelCallReservation(request) || request.OwnerID != request.TerminalDelivery.InitiatorID ||
+			request.TerminalDelivery.ModelCallID != request.CallID {
+			return domain.NewError(domain.CodeUnauthenticated, "terminal delivery model authorization is unavailable")
+		}
+		projectID, current, err := checkTaskTerminalDeliveryModelFenceInTx(ctx, tx, *request.TerminalDelivery)
+		if err != nil {
+			return err
+		}
+		if !current || projectID != request.ProjectID {
+			return domain.NewError(domain.CodeUnauthenticated, "terminal delivery model project scope is unavailable")
 		}
 	default:
 		return domain.InvalidArgument("model_call", "invalid model call source")
@@ -759,7 +944,10 @@ FROM task_agent_sessions WHERE task_id=$1 AND owner_id=$2 AND session_id=$3 FOR 
 		return fmt.Errorf("lock task model Agent Session: %w", err)
 	}
 	if fence.AgentSessionID == rootSessionID {
-		if parentSessionID != "" || stepID != "" || sessionThrough != through || !bytes.Equal(sessionDigest, checkpointDigest) {
+		recoveryCall := fence.RecoveryCallID != "" && fence.RecoveryDSHCallID != ""
+		if parentSessionID != "" || stepID != "" || sessionThrough != through || !bytes.Equal(sessionDigest, checkpointDigest) ||
+			(!recoveryCall && sessionThrough != fence.ThroughSequence) ||
+			(recoveryCall && sessionThrough < fence.ThroughSequence) {
 			return domain.NewError(domain.CodeInvalidState, "task model root checkpoint is not committed")
 		}
 	} else {
@@ -778,11 +966,33 @@ FROM task_agent_sessions WHERE task_id=$1 AND owner_id=$2 AND session_id=$3 FOR 
 			return domain.NewError(domain.CodeUnauthenticated, "task model child Agent Session is not running")
 		}
 	}
-	if sessionThrough != fence.ThroughSequence || len(sessionDigest) != 32 {
+	recoveryCall := fence.RecoveryCallID != "" && fence.RecoveryDSHCallID != ""
+	if (!recoveryCall && sessionThrough != fence.ThroughSequence) ||
+		(recoveryCall && sessionThrough < fence.ThroughSequence) || len(sessionDigest) != 32 {
 		return domain.NewError(domain.CodeInvalidState, "task model Agent Session checkpoint head is not committed")
 	}
 	var checkpoint bool
-	err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM task_agent_checkpoints c
+	if recoveryCall {
+		err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM task_model_recovery_schedules recovery
+JOIN task_agent_checkpoints c ON c.task_id=recovery.task_id AND c.owner_id=recovery.owner_id
+JOIN task_agent_instances i ON i.task_id=c.task_id AND i.owner_id=c.owner_id
+ AND i.agent_generation=c.agent_generation AND i.agent_instance_id=c.agent_instance_id
+ AND i.agent_session_id=c.agent_root_session_id AND i.engine_version=c.engine_version
+ AND i.profile_version=c.profile_version AND i.auth_version=c.auth_version AND i.lease_version=c.lease_version
+WHERE recovery.task_id=$1 AND recovery.owner_id=$2 AND recovery.recovery_call_id=$10
+ AND recovery.recovery_dsh_call_id=$11 AND recovery.state='attempting'
+ AND c.agent_session_id=$3 AND c.agent_root_session_id=$4
+ AND c.through_seq=$5 AND c.digest=recovery.checkpoint_digest
+ AND octet_length($6::bytea)=32
+ AND c.auth_version=$7 AND c.engine_version=$8 AND c.profile_version=$9
+ AND c.agent_generation<=recovery.agent_generation AND c.lease_version<=recovery.failed_lease_version
+ AND i.state='stopped' AND ((i.stop_receipt IS NOT NULL AND i.stop_receipt_digest=sha256(i.stop_receipt))
+   OR (i.guardian_stop_attestation IS NOT NULL AND i.guardian_stop_attestation_digest=sha256(i.guardian_stop_attestation))))`,
+			fence.TaskID, fence.OwnerID, fence.AgentSessionID, rootSessionID, fence.ThroughSequence, sessionDigest,
+			fence.AuthorizationVersion, fence.EngineVersion, fence.ProfileVersion,
+			fence.RecoveryCallID, fence.RecoveryDSHCallID).Scan(&checkpoint)
+	} else {
+		err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM task_agent_checkpoints c
 JOIN task_agent_instances i ON i.task_id=c.task_id AND i.owner_id=c.owner_id
  AND i.agent_generation=c.agent_generation AND i.agent_instance_id=c.agent_instance_id
  AND i.agent_session_id=c.agent_root_session_id AND i.engine_version=c.engine_version
@@ -790,9 +1000,13 @@ JOIN task_agent_instances i ON i.task_id=c.task_id AND i.owner_id=c.owner_id
 WHERE c.task_id=$1 AND c.owner_id=$2 AND c.agent_session_id=$3 AND c.agent_root_session_id=$4
  AND c.through_seq=$5 AND c.digest=$6 AND c.auth_version=$7 AND c.engine_version=$8 AND c.profile_version=$9
  AND ((c.agent_generation=$10 AND i.state='active') OR (c.agent_generation<$10 AND i.state='stopped')))`,
-		fence.TaskID, fence.OwnerID, fence.AgentSessionID, rootSessionID, fence.ThroughSequence, sessionDigest,
-		fence.AuthorizationVersion, fence.EngineVersion, fence.ProfileVersion, fence.AgentGeneration).Scan(&checkpoint)
-	if err != nil || !checkpoint {
+			fence.TaskID, fence.OwnerID, fence.AgentSessionID, rootSessionID, fence.ThroughSequence, sessionDigest,
+			fence.AuthorizationVersion, fence.EngineVersion, fence.ProfileVersion, fence.AgentGeneration).Scan(&checkpoint)
+	}
+	if err != nil {
+		return fmt.Errorf("verify task model checkpoint: %w", err)
+	}
+	if !checkpoint {
 		return domain.NewError(domain.CodeInvalidState, "task checkpoint is not committed")
 	}
 	// Resource ownership and revocation are checked before installation credentials.
@@ -972,11 +1186,16 @@ func (s *Store) SettleModelCall(ctx context.Context, settlement app.ModelCallSet
 	reviewCall := settlement.ReviewCall
 	reviewCallValid := reviewCall != nil && validReviewModelCallReservation(*reviewCall) && reviewCall.OwnerID == settlement.OwnerID &&
 		reviewCall.CallID == settlement.CallID && len(reviewCall.RequestDigest) == 32
+	terminalDeliveryCall := settlement.TerminalDeliveryCall
+	terminalDeliveryCallValid := validTerminalDeliverySettlementCall(terminalDeliveryCall, settlement.OwnerID, settlement.CallID)
 	if settlement.Source == app.ModelCallRoute || !domain.ValidUserID(settlement.OwnerID) || settlement.CallID == "" ||
 		(settlement.Source == app.ModelCallCompaction) != (settlement.Summary != nil) ||
 		(settlement.Source == app.ModelCallReview && !settlement.Unknown && !settlement.ResponseInvalid && settlement.ReviewCall == nil) ||
+		(settlement.Source == app.ModelCallTerminalDelivery && !settlement.Unknown && !settlement.ResponseInvalid && settlement.TerminalDeliveryCall == nil) ||
 		settlement.ReviewCall != nil && !reviewCallValid ||
+		settlement.TerminalDeliveryCall != nil && !terminalDeliveryCallValid ||
 		settlement.Source != app.ModelCallCompaction && settlement.Source != app.ModelCallTask && settlement.Source != app.ModelCallReview &&
+			settlement.Source != app.ModelCallTerminalDelivery &&
 			(len(settlement.ResponseCiphertext) != 0 || len(settlement.ResponseDigest) != 0 || len(settlement.ResponseTextDigest) != 0 || settlement.ResponseInvalid) ||
 		settlement.Source == app.ModelCallReview && ((len(settlement.ResponseCiphertext) != 0) != (len(settlement.ResponseDigest) != 0) ||
 			len(settlement.ResponseCiphertext) > app.MaxTaskValidationReviewModelResponseCiphertext ||
@@ -985,8 +1204,15 @@ func (s *Store) SettleModelCall(ctx context.Context, settlement app.ModelCallSet
 			settlement.Unknown && len(settlement.ResponseCiphertext) != 0 || settlement.ResponseInvalid && len(settlement.ResponseCiphertext) != 0 ||
 			(settlement.Unknown || settlement.ResponseInvalid) && len(settlement.ResponseTextDigest) != 0 ||
 			!settlement.Unknown && !settlement.ResponseInvalid && (len(settlement.ResponseCiphertext) == 0 || len(settlement.ResponseTextDigest) != 32)) ||
+		settlement.Source == app.ModelCallTerminalDelivery && ((len(settlement.ResponseCiphertext) != 0) != (len(settlement.ResponseDigest) != 0) ||
+			len(settlement.ResponseCiphertext) > app.MaxTaskTerminalDeliveryModelResponseCiphertext ||
+			len(settlement.ResponseDigest) != 0 && len(settlement.ResponseDigest) != 32 ||
+			len(settlement.ResponseTextDigest) != 0 && len(settlement.ResponseTextDigest) != 32 ||
+			(settlement.Unknown || settlement.ResponseInvalid) && (len(settlement.ResponseCiphertext) != 0 || len(settlement.ResponseTextDigest) != 0) ||
+			!settlement.Unknown && !settlement.ResponseInvalid && (len(settlement.ResponseCiphertext) == 0 || len(settlement.ResponseTextDigest) != 32)) ||
 		settlement.TaskCall != nil && !taskCallValid ||
-		settlement.TaskCall != nil && settlement.ReviewCall != nil ||
+		settlement.TaskCall != nil && settlement.ReviewCall != nil || settlement.TaskCall != nil && settlement.TerminalDeliveryCall != nil ||
+		settlement.ReviewCall != nil && settlement.TerminalDeliveryCall != nil ||
 		settlement.Source == app.ModelCallTask && (len(settlement.ResponseTextDigest) != 0 ||
 			((len(settlement.ResponseCiphertext) != 0) != (len(settlement.ResponseDigest) != 0) ||
 				len(settlement.ResponseDigest) != 0 && len(settlement.ResponseDigest) != 32 ||
@@ -1020,10 +1246,14 @@ func (s *Store) SettleModelCall(ctx context.Context, settlement app.ModelCallSet
 		var accountRequestDigest []byte
 		var reviewTaskRevision, reviewResultSequence, reviewClaimGeneration *int64
 		var reviewResultSHA256 []byte
+		var terminalDeliveryID, terminalDeliveryClaimGeneration *int64
+		var terminalDeliveryDispatchStarted bool
 		err = tx.QueryRow(ctx, `SELECT state,task_id,input_tokens,output_tokens,request_digest,review_task_revision,
-review_result_event_sequence,review_result_sha256,review_claim_generation FROM model_call_ledger
+review_result_event_sequence,review_result_sha256,review_claim_generation,terminal_delivery_id,
+terminal_delivery_claim_generation,terminal_delivery_dispatch_started FROM model_call_ledger
  WHERE owner_id=$1 AND source=$2 AND call_id=$3 FOR UPDATE`, settlement.OwnerID, string(settlement.Source), settlement.CallID).
-			Scan(&state, &taskID, &input, &output, &accountRequestDigest, &reviewTaskRevision, &reviewResultSequence, &reviewResultSHA256, &reviewClaimGeneration)
+			Scan(&state, &taskID, &input, &output, &accountRequestDigest, &reviewTaskRevision, &reviewResultSequence, &reviewResultSHA256,
+				&reviewClaimGeneration, &terminalDeliveryID, &terminalDeliveryClaimGeneration, &terminalDeliveryDispatchStarted)
 		if err != nil {
 			return storeError("find model settlement", "model call", err)
 		}
@@ -1036,6 +1266,16 @@ review_result_event_sequence,review_result_sha256,review_claim_generation FROM m
 				*reviewTaskRevision != reviewCall.Review.Claim.TaskRevision || *reviewResultSequence != reviewCall.Review.Claim.ResultEventSequence ||
 				!bytes.Equal(reviewResultSHA256, reviewCall.Review.Claim.ResultSHA256) || *reviewClaimGeneration != reviewCall.Review.Claim.ClaimGeneration) {
 				return domain.NewError(domain.CodeInvalidState, "Task validation review model call attribution changed")
+			}
+		}
+		if settlement.Source == app.ModelCallTerminalDelivery {
+			storedTaskID := ""
+			if taskID != nil {
+				storedTaskID = *taskID
+			}
+			if err := verifyTerminalDeliveryLedgerAttribution(ctx, tx, settlement.OwnerID, settlement.CallID, storedTaskID,
+				accountRequestDigest, terminalDeliveryID, terminalDeliveryClaimGeneration, terminalDeliveryDispatchStarted, terminalDeliveryCall); err != nil {
+				return err
 			}
 		}
 		if state != "dispatched" {
@@ -1051,6 +1291,16 @@ review_result_event_sequence,review_result_sha256,review_claim_generation FROM m
 					settlement.Usage.InputTokens, settlement.Usage.OutputTokens)
 				if err != nil {
 					return fmt.Errorf("settle late model usage: %w", err)
+				}
+				if settlement.Source == app.ModelCallTerminalDelivery && !settlement.ResponseInvalid {
+					stored, err := storeTaskTerminalDeliveryModelResponseInTx(ctx, tx, terminalDeliveryCall,
+						settlement.ResponseCiphertext, settlement.ResponseDigest)
+					if err != nil {
+						return err
+					}
+					if !stored {
+						responseRejected = domain.NewError(domain.CodeConflict, "terminal delivery model response source is no longer current")
+					}
 				}
 				if taskID != nil && settlement.Source == app.ModelCallTask {
 					var unknown bool
@@ -1076,6 +1326,10 @@ review_result_event_sequence,review_result_sha256,review_claim_generation FROM m
 				}
 				if state == "settled" && settlement.Source == app.ModelCallReview && settlement.ReviewCall != nil && !settlement.ResponseInvalid {
 					return verifySettledTaskValidationReviewModelResponseInTx(ctx, tx, settlement)
+				}
+				if state == "settled" && settlement.Source == app.ModelCallTerminalDelivery && terminalDeliveryCall != nil && !settlement.ResponseInvalid {
+					return verifySettledTerminalDeliveryModelResponseInTx(ctx, tx, terminalDeliveryCall,
+						settlement.ResponseCiphertext, settlement.ResponseDigest, false)
 				}
 				return nil
 			}
@@ -1108,6 +1362,16 @@ review_result_event_sequence,review_result_sha256,review_claim_generation FROM m
 		if settlement.Source == app.ModelCallReview && !settlement.Unknown && !settlement.ResponseInvalid {
 			if _, err := recordTaskValidationReviewModelResponseInTx(ctx, tx, settlement); err != nil {
 				return err
+			}
+		}
+		if settlement.Source == app.ModelCallTerminalDelivery && !settlement.Unknown && !settlement.ResponseInvalid {
+			stored, err := storeTaskTerminalDeliveryModelResponseInTx(ctx, tx, terminalDeliveryCall,
+				settlement.ResponseCiphertext, settlement.ResponseDigest)
+			if err != nil {
+				return err
+			}
+			if !stored {
+				responseRejected = domain.NewError(domain.CodeConflict, "terminal delivery model response source is no longer current")
 			}
 		}
 		if taskID != nil && settlement.Source == app.ModelCallTask {

@@ -20,9 +20,11 @@ const goal: components['schemas']['PersonalObject'] = {
 
 const schedule: components['schemas']['Schedule'] = {
   id: 'j1234567', version: 2, status: 'enabled', host_id: 'h1234567', model_id: 'model-1', title: '日报标题', objective: '检查日报',
+  file_delivery_intent: 'none',
   timing: { kind: 'daily', starts_on: '2026-11-02', local_time: '09:00', time_zone: 'Asia/Shanghai' },
   budget: { active_seconds: 300, tool_calls: 12, model_tokens: 9000 }, misfire_policy: 'skip',
   notification_events: ['completed', 'failed'], observation: null, next_run_at: '2026-11-03T01:00:00Z',
+  personal_rule: null,
   last_run: null, current_run: null, created_at: '2026-11-01T00:00:00Z', updated_at: '2026-11-02T00:00:00Z',
 };
 type TestHost = Awaited<ReturnType<typeof portalApi.hosts>>['items'][number];
@@ -388,6 +390,7 @@ describe('GoalsAndSchedules', () => {
     vi.spyOn(portalApi, 'scheduleRuns').mockResolvedValue({ items: [{
       id: 'y1234567', schedule_id: schedule.id, schedule_version: 2, occurrence_key: 'occurrence-1', scheduled_at: schedule.next_run_at,
       coalesced_count: 0, status: 'completed', skip_reason: null, task_id: 'task-1', notification_events: ['completed'], observation: null,
+      personal_rule: null, personal_rule_validation_status: 'not_bound', personal_rule_validated_at: null, personal_rule_revoked_at: null,
       observation_outcome: 'unknown', created_at: '2026-11-02T01:00:00Z', updated_at: '2026-11-02T01:05:00Z', finished_at: '2026-11-02T01:05:00Z',
     }], next_cursor: '' });
     vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [] });
@@ -408,11 +411,13 @@ describe('GoalsAndSchedules', () => {
       .mockResolvedValueOnce({ items: [{
         id: 'y1234567', schedule_id: schedule.id, schedule_version: 2, occurrence_key: 'occurrence-1', scheduled_at: schedule.next_run_at,
         coalesced_count: 0, status: 'completed', skip_reason: null, task_id: 'task-1', notification_events: ['completed'], observation: null,
+        personal_rule: null, personal_rule_validation_status: 'not_bound', personal_rule_validated_at: null, personal_rule_revoked_at: null,
         observation_outcome: 'unknown', created_at: '2026-11-02T01:00:00Z', updated_at: '2026-11-02T01:05:00Z', finished_at: '2026-11-02T01:05:00Z',
       }], next_cursor: 'runs-next' })
       .mockResolvedValueOnce({ items: [{
         id: 'y2234567', schedule_id: schedule.id, schedule_version: 3, occurrence_key: 'occurrence-2', scheduled_at: schedule.next_run_at,
         coalesced_count: 0, status: 'failed', skip_reason: null, task_id: 'task-2', notification_events: ['failed'], observation: null,
+        personal_rule: null, personal_rule_validation_status: 'not_bound', personal_rule_validated_at: null, personal_rule_revoked_at: null,
         observation_outcome: 'unknown', created_at: '2026-11-03T01:00:00Z', updated_at: '2026-11-03T01:05:00Z', finished_at: '2026-11-03T01:05:00Z',
       }], next_cursor: '' });
     vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [] });

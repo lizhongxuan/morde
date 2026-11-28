@@ -12,9 +12,11 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
 	"morde/server/internal/app"
@@ -27,6 +29,8 @@ import (
 
 type cloudDSHSessionState struct {
 	identity                cloudDSHIdentity
+	traceCtx                context.Context
+	traceSpan               trace.Span
 	parentSessionID         string
 	spawnKey                string
 	rootCheckpointThrough   int64
@@ -50,6 +54,8 @@ type cloudDSHSessionState struct {
 	lastObservationSequence int64
 	activeActivities        map[string]string
 	activeActivityOrder     []string
+	recoveryInputDelivered  *atomic.Bool
+	recoverySteerDelivered  *atomic.Bool
 	agentRequests           map[string]cloudDSHAgentRequest
 	timedOutAgentRequests   map[string]struct{}
 	verifiedAgentRequests   map[string]struct{}
@@ -69,6 +75,20 @@ type cloudDSHAgentRequestRunner func(*cloudDSHSessionState, cloudDSHAgentRequest
 
 func (request cloudDSHAgentRequest) key() string {
 	return request.phase + "\x00" + request.kind + "\x00" + request.activityID + "\x00" + request.digest
+}
+
+// cloudDSHSessionDepth counts delegation hops from the root session: the
+// root is 0, its direct children are 1. The identity guard in
+// createCloudDSHChildSession already rejects parents deeper than a direct
+// child, so only 0, 1, or 2 occur here.
+func cloudDSHSessionDepth(state *cloudDSHSessionState, rootSessionID string) int {
+	if state == nil || state.identity.SessionID == rootSessionID {
+		return 0
+	}
+	if state.parentSessionID == rootSessionID {
+		return 1
+	}
+	return 2
 }
 
 func (state *cloudDSHSessionState) beginAgentRequest(request cloudDSHAgentRequest) error {
@@ -130,6 +150,158 @@ func cloudDSHAgentRequestForFrame(frame cloudDSHFrame, state *cloudDSHSessionSta
 }
 
 const cloudDSHMaxPendingModelCalls = 17
+const cloudDSHModelBudgetPlanTTL = 2 * time.Minute
+
+// Mirrors the ModelGateway task request maximum in app/model_gateway.go.
+const cloudDSHModelBudgetProtocolMaxTokens = app.MaxModelOutputTokens
+
+type cloudDSHModelBudgetPlanBinding struct {
+	Identity      cloudDSHIdentity
+	ThroughSeq    int64
+	CallID        string
+	DSHCallID     string
+	LedgerCallID  string
+	RequestID     string
+	RequestDigest string
+	PlanID        string
+	MaxTokens     int
+	ExpiresAt     time.Time
+}
+
+func pruneCloudDSHModelBudgetPlans(plans map[string]cloudDSHModelBudgetPlanBinding, now time.Time) {
+	for id, plan := range plans {
+		if !now.Before(plan.ExpiresAt) {
+			delete(plans, id)
+		}
+	}
+}
+
+func storeCloudDSHModelBudgetPlan(plans map[string]cloudDSHModelBudgetPlanBinding, plan cloudDSHModelBudgetPlanBinding,
+	now time.Time) error {
+	pruneCloudDSHModelBudgetPlans(plans, now)
+	if !cloudDSHID.MatchString(plan.PlanID) || !cloudDSHID.MatchString(plan.RequestID) ||
+		!cloudDSHID.MatchString(plan.CallID) || !cloudDSHID.MatchString(plan.DSHCallID) ||
+		!cloudDSHID.MatchString(plan.LedgerCallID) ||
+		plan.MaxTokens <= 0 || plan.MaxTokens > cloudDSHModelBudgetProtocolMaxTokens ||
+		plan.ThroughSeq < 0 {
+		return errors.New("dsh model budget plan is invalid")
+	}
+	if _, ok := cloudDSHDigestBytes(plan.RequestDigest); !ok {
+		return errors.New("dsh model budget plan digest is invalid")
+	}
+	if len(plans) >= cloudDSHMaxPendingModelCalls {
+		return errors.New("dsh model budget plan limit was reached")
+	}
+	for id, current := range plans {
+		if id == plan.PlanID || current.RequestID == plan.RequestID ||
+			current.Identity.SessionID == plan.Identity.SessionID {
+			return errors.New("dsh model budget plan identity is repeated")
+		}
+	}
+	if plan.ExpiresAt.IsZero() {
+		plan.ExpiresAt = now.Add(cloudDSHModelBudgetPlanTTL)
+	}
+	if !now.Before(plan.ExpiresAt) || plan.ExpiresAt.After(now.Add(cloudDSHModelBudgetPlanTTL)) {
+		return errors.New("dsh model budget plan expiry is invalid")
+	}
+	plans[plan.PlanID] = plan
+	return nil
+}
+
+func consumeCloudDSHModelBudgetPlan(plans map[string]cloudDSHModelBudgetPlanBinding, identity cloudDSHIdentity,
+	throughSeq int64, dshCallID, budgetCallID, planID, requestDigest string, rawRequest []byte, now time.Time) (string, int, error) {
+	pruneCloudDSHModelBudgetPlans(plans, now)
+	plan, ok := plans[planID]
+	if !ok {
+		return "", 0, errors.New("dsh model budget plan is unavailable")
+	}
+	delete(plans, planID)
+	digest, validDigest := cloudDSHModelBudgetRequestDigest(rawRequest)
+	maxTokens, validMaxTokens := cloudDSHModelBudgetMaxTokens(rawRequest)
+	preparedCallID, preparedIDErr := app.DSHModelCallID(identity.TaskID, identity.SessionID, plan.ThroughSeq)
+	finalCallID, finalIDErr := app.DSHModelCallID(identity.TaskID, identity.SessionID, throughSeq)
+	ordinaryFrame := preparedIDErr == nil && finalIDErr == nil && plan.DSHCallID == preparedCallID &&
+		plan.LedgerCallID == plan.DSHCallID && dshCallID == finalCallID
+	recoveryFrame := plan.DSHCallID == dshCallID && strings.HasPrefix(dshCallID, "mdr_") &&
+		strings.HasPrefix(plan.LedgerCallID, "mrc_") && plan.LedgerCallID != plan.DSHCallID
+	if !validDigest || !validMaxTokens || plan.Identity != identity || plan.ThroughSeq > throughSeq ||
+		(!ordinaryFrame && !recoveryFrame) || plan.CallID != budgetCallID || digest != plan.RequestDigest ||
+		requestDigest != plan.RequestDigest || maxTokens != plan.MaxTokens {
+		return "", 0, errors.New("dsh model budget plan does not match the model request")
+	}
+	return plan.LedgerCallID, maxTokens, nil
+}
+
+func cloudDSHModelBudgetMaxTokens(raw []byte) (int, bool) {
+	var fields map[string]json.RawMessage
+	if len(raw) == 0 || !uniqueCloudDSHJSON(raw) || json.Unmarshal(raw, &fields) != nil || fields == nil || len(fields) != 5 {
+		return 0, false
+	}
+	for _, key := range []string{"provider", "model", "messages", "tools", "max_tokens"} {
+		if _, exists := fields[key]; !exists {
+			return 0, false
+		}
+	}
+	var request struct {
+		MaxTokens *int `json:"max_tokens"`
+	}
+	if json.Unmarshal(raw, &request) != nil || request.MaxTokens == nil ||
+		*request.MaxTokens <= 0 || *request.MaxTokens > cloudDSHModelBudgetProtocolMaxTokens {
+		return 0, false
+	}
+	return *request.MaxTokens, true
+}
+
+func validateCloudDSHModelBudgetPrepareRequest(frame cloudDSHFrame, modelID string,
+	definitions []app.AgentToolDefinition) (string, error) {
+	if frame.Type != "model_budget_prepare" || frame.Through == nil || *frame.Through < 0 ||
+		frame.Turn == nil || *frame.Turn < 0 || *frame.Turn > 1<<53-1 ||
+		frame.Step == nil || *frame.Step < 0 || *frame.Step > 1<<53-1 ||
+		!cloudDSHID.MatchString(frame.ID) || !cloudDSHID.MatchString(frame.CallID) || !cloudDSHID.MatchString(frame.DSHCallID) ||
+		!uniqueCloudDSHJSON(frame.Config) || !uniqueCloudDSHJSON(frame.ToolHistory) {
+		return "", errors.New("dsh model budget request identity is invalid")
+	}
+	var config map[string]json.RawMessage
+	if json.Unmarshal(frame.Config, &config) != nil || config == nil {
+		return "", errors.New("dsh model budget config is invalid")
+	}
+	if _, exists := config["maxTokens"]; exists {
+		return "", errors.New("dsh model budget config still contains an output cap")
+	}
+	if _, exists := config["max_tokens"]; exists {
+		return "", errors.New("dsh model budget config still contains an output cap")
+	}
+	var requestFields map[string]json.RawMessage
+	if json.Unmarshal(frame.Request, &requestFields) != nil || requestFields == nil || len(requestFields) != 4 {
+		return "", errors.New("dsh model budget draft request shape is invalid")
+	}
+	for _, key := range []string{"provider", "model", "messages", "tools"} {
+		if _, exists := requestFields[key]; !exists {
+			return "", errors.New("dsh model budget draft request shape is invalid")
+		}
+	}
+	var configRoute struct {
+		Provider string `json:"provider"`
+		Model    string `json:"model"`
+	}
+	var requestRoute struct {
+		Provider string `json:"provider"`
+		Model    string `json:"model"`
+	}
+	if json.Unmarshal(frame.Config, &configRoute) != nil || json.Unmarshal(frame.Request, &requestRoute) != nil ||
+		configRoute.Provider != requestRoute.Provider || requestRoute.Provider != "morde" ||
+		configRoute.Model != requestRoute.Model || requestRoute.Model != modelID {
+		return "", errors.New("dsh model budget config route does not match its request")
+	}
+	if reason := cloudDSHModelRequestInvalidReason(frame.Request, modelID, definitions); reason != "" {
+		return "", fmt.Errorf("dsh model budget draft request is invalid: %s", reason)
+	}
+	digest, ok := cloudDSHModelBudgetRequestDigest(frame.Request)
+	if !ok || digest != frame.RequestDigest {
+		return "", errors.New("dsh model budget request digest is invalid")
+	}
+	return digest, nil
+}
 
 type cloudDSHPendingModelCall struct {
 	identity           cloudDSHIdentity
@@ -161,9 +333,28 @@ func newCloudDSHSessionState(fence app.AgentInstanceFence, identity cloudDSHIden
 		definitions:           definitions, canDelegate: canDelegate, resume: resume, through: through, restoreThrough: through, lastModel: -1, readThrough: -1,
 		checkpointDigest: append([]byte(nil), digest...), restoreDigest: append([]byte(nil), digest...),
 		checkpointIDs: make(map[string]struct{}), pageReadIDs: make(map[string]struct{}),
-		history: history, images: newCloudDSHImageRegistry(cloudDSHModelFence(fence, identity.SessionID, through)),
+		history: history, images: newCloudDSHImageRegistry(cloudDSHModelFence(fence, identity.SessionID, through, 0)),
 		activeActivities: make(map[string]string), agentRequests: make(map[string]cloudDSHAgentRequest),
-		timedOutAgentRequests: make(map[string]struct{}), verifiedAgentRequests: make(map[string]struct{})}
+		timedOutAgentRequests: make(map[string]struct{}), verifiedAgentRequests: make(map[string]struct{}),
+		recoveryInputDelivered: &atomic.Bool{}, recoverySteerDelivered: &atomic.Bool{}}
+}
+
+func (state *cloudDSHSessionState) noteRecoveryInput(mode app.AgentMessageDeliveryMode) {
+	if state == nil || state.recoveryInputDelivered == nil {
+		return
+	}
+	state.recoveryInputDelivered.Store(true)
+	if mode == app.AgentMessageDeliverySteer && state.recoverySteerDelivered != nil {
+		state.recoverySteerDelivered.Store(true)
+	}
+}
+
+func (state *cloudDSHSessionState) hasRecoveryInput() bool {
+	return state != nil && state.recoveryInputDelivered != nil && state.recoveryInputDelivered.Load()
+}
+
+func (state *cloudDSHSessionState) hasRecoverySteer() bool {
+	return state != nil && state.recoverySteerDelivered != nil && state.recoverySteerDelivered.Load()
 }
 
 func cloudDSHToolDefinitionsSummary(definitions []app.AgentToolDefinition) ([32]byte, bool) {
@@ -292,10 +483,37 @@ func cloudDSHCheckpointToolSelection(payload []byte, definitions []app.AgentTool
 	}
 	actual, valid := cloudDSHToolPayloadSummary(encoded)
 	expected, expectedValid := cloudDSHToolDefinitionsSummary(definitions)
-	if !valid || !expectedValid || !bytes.Equal(actual[:], expected[:]) {
+	if !valid || !expectedValid {
 		return false, assistantMessageSeen, errors.New("dsh checkpoint tool definitions changed")
 	}
+	if !bytes.Equal(actual[:], expected[:]) {
+		legacy := cloudDSHLegacyDelegateToolDefinitions(definitions)
+		legacyExpected, legacyValid := cloudDSHToolDefinitionsSummary(legacy)
+		if !legacyValid || !bytes.Equal(actual[:], legacyExpected[:]) {
+			return false, assistantMessageSeen, errors.New("dsh checkpoint tool definitions changed")
+		}
+	}
 	return true, assistantMessageSeen, nil
+}
+
+func cloudDSHLegacyDelegateToolDefinitions(definitions []app.AgentToolDefinition) []app.AgentToolDefinition {
+	available := make([]app.AgentToolDefinition, 0, len(definitions))
+	delegateIndex := -1
+	for index, definition := range definitions {
+		switch {
+		case definition.Name == cloudDSHDelegateToolName:
+			delegateIndex = index
+		case cloudDSHJobTool(definition.Name), definition.Name == cloudDSHResultEvidenceToolName:
+		default:
+			available = append(available, definition)
+		}
+	}
+	if delegateIndex < 0 {
+		return definitions
+	}
+	legacy := append([]app.AgentToolDefinition(nil), definitions...)
+	legacy[delegateIndex] = cloudDSHDelegateTool(available)
+	return legacy
 }
 
 func cloudDSHDefinitionsFromCheckpointToolPayload(current []app.AgentToolDefinition, payloads []json.RawMessage,
@@ -346,6 +564,7 @@ func cloudDSHDefinitionsFromCheckpointToolPayload(current []app.AgentToolDefinit
 	for _, definition := range base {
 		expected[definition.Name] = definition
 	}
+	var delegateCandidates []app.AgentToolDefinition
 	if childrenAllowed {
 		for _, definition := range cloudDSHJobTools() {
 			expected[definition.Name] = definition
@@ -358,8 +577,8 @@ func cloudDSHDefinitionsFromCheckpointToolPayload(current []app.AgentToolDefinit
 			}
 		}
 		if hasDelegableTools {
-			delegate := cloudDSHDelegateTool(base)
-			expected[delegate.Name] = delegate
+			delegateCandidates = []app.AgentToolDefinition{cloudDSHDelegateTool(base), cloudDSHDelegateToolWithPlanSelectors(base)}
+			expected[cloudDSHDelegateToolName] = delegateCandidates[1]
 		}
 	}
 	if evidenceAllowed && len(base) > 0 {
@@ -373,6 +592,26 @@ func cloudDSHDefinitionsFromCheckpointToolPayload(current []app.AgentToolDefinit
 		}
 		if json.Unmarshal(raw, &named) != nil {
 			return nil, errors.New("dsh checkpoint tool selection is invalid")
+		}
+		if named.Name == cloudDSHDelegateToolName {
+			matched := false
+			for _, candidate := range delegateCandidates {
+				encoded, err := json.Marshal(cloudDSHToolPayload([]app.AgentToolDefinition{candidate})[0])
+				if err != nil {
+					return nil, errors.New("dsh checkpoint tool definition is invalid")
+				}
+				actualCanonical, actualOK := canonicalCloudDSHJSON(raw)
+				expectedCanonical, expectedOK := canonicalCloudDSHJSON(encoded)
+				if actualOK && expectedOK && bytes.Equal(actualCanonical, expectedCanonical) {
+					selected = append(selected, candidate)
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				return nil, errors.New("dsh checkpoint tool definition changed")
+			}
+			continue
 		}
 		definition, exists := expected[named.Name]
 		if !exists {
@@ -393,6 +632,98 @@ func cloudDSHDefinitionsFromCheckpointToolPayload(current []app.AgentToolDefinit
 		return nil, errors.New("dsh checkpoint tool selection is invalid")
 	}
 	return selected, nil
+}
+
+func cloudDSHDelegateToolWithPlanSelectors(available []app.AgentToolDefinition) app.AgentToolDefinition {
+	return cloudDSHDelegateDefinitionWithPlanSelectors(cloudDSHDelegateTool(available))
+}
+
+func cloudDSHDelegateDefinitionWithPlanSelectors(definition app.AgentToolDefinition) app.AgentToolDefinition {
+	var schema map[string]any
+	if json.Unmarshal(definition.Parameters, &schema) != nil {
+		return definition
+	}
+	properties, ok := schema["properties"].(map[string]any)
+	if !ok {
+		return definition
+	}
+	properties["morde_plan_step_id"] = map[string]any{"type": "string", "minLength": 1, "maxLength": 40,
+		"description": "Exact step ID from the current Task plan. Supply this together with morde_plan_revision when a plan is active; omit both when no plan exists."}
+	properties["morde_plan_revision"] = map[string]any{"type": "integer", "minimum": 1,
+		"description": "Exact revision of the current Task plan, paired with morde_plan_step_id."}
+	encoded, err := json.Marshal(schema)
+	if err != nil {
+		return definition
+	}
+	definition.Parameters = encoded
+	definition.Description += " When the current Task has a plan, include its exact morde_plan_step_id and morde_plan_revision; omit both only when no plan exists. The server blocks missing, stale, or dependency-unready plan selections."
+	return definition
+}
+
+func cloudDSHAddPlanSelectorsToDelegate(definitions []app.AgentToolDefinition) []app.AgentToolDefinition {
+	for index, definition := range definitions {
+		if definition.Name != cloudDSHDelegateToolName {
+			continue
+		}
+		updated := append([]app.AgentToolDefinition(nil), definitions...)
+		updated[index] = cloudDSHDelegateDefinitionWithPlanSelectors(definition)
+		return updated
+	}
+	return definitions
+}
+
+func cloudDSHDelegatePlanStepSelection(raw []byte) (string, int64, []byte, error) {
+	if len(raw) == 0 || len(raw) > 64<<10 || !uniqueCloudDSHJSON(raw) {
+		return "", 0, nil, errors.New("dsh child Agent request is invalid")
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil || fields == nil {
+		return "", 0, nil, errors.New("dsh child Agent request is invalid")
+	}
+	stepRaw, hasStep := fields["morde_plan_step_id"]
+	revisionRaw, hasRevision := fields["morde_plan_revision"]
+	if hasStep != hasRevision {
+		return "", 0, nil, errors.New("dsh child Agent plan selection is incomplete")
+	}
+	var stepID string
+	var planRevision int64
+	if hasStep {
+		if json.Unmarshal(stepRaw, &stepID) != nil || json.Unmarshal(revisionRaw, &planRevision) != nil ||
+			!validCloudDSHPlanStepID(stepID) || planRevision < 1 {
+			return "", 0, nil, errors.New("dsh child Agent plan selection is invalid")
+		}
+		delete(fields, "morde_plan_step_id")
+		delete(fields, "morde_plan_revision")
+	}
+	businessArguments, err := json.Marshal(fields)
+	if err != nil {
+		return "", 0, nil, errors.New("dsh child Agent arguments could not be normalized")
+	}
+	return stepID, planRevision, businessArguments, nil
+}
+
+func validCloudDSHPlanStepID(value string) bool {
+	if value == "" || len(value) > 40 {
+		return false
+	}
+	for index, char := range value {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') ||
+			(index > 0 && (char == '-' || char == '_')) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func validateCloudDSHDelegateArgumentsWithPlanSelection(raw []byte, parentDefinitions []app.AgentToolDefinition) (
+	cloudDSHDelegateArguments, []app.AgentToolDefinition, string, int64, []byte, error) {
+	stepID, planRevision, businessArguments, err := cloudDSHDelegatePlanStepSelection(raw)
+	if err != nil {
+		return cloudDSHDelegateArguments{}, nil, "", 0, nil, err
+	}
+	arguments, definitions, err := validateCloudDSHDelegateArguments(businessArguments, parentDefinitions)
+	return arguments, definitions, stepID, planRevision, businessArguments, err
 }
 
 // cloudDSHCheckpointToolDefinitionUnavailable keeps the externally visible
@@ -507,15 +838,19 @@ func (state *cloudDSHSessionState) currentActivity() (string, string) {
 	return state.activeActivities[activityID], activityID
 }
 
-func cloudDSHModelFence(fence app.AgentInstanceFence, sessionID string, through int64) app.ModelTaskFence {
+func cloudDSHModelFence(fence app.AgentInstanceFence, sessionID string, through int64, revisions ...int64) app.ModelTaskFence {
+	revision := int64(0)
+	if len(revisions) != 0 {
+		revision = revisions[0]
+	}
 	return app.ModelTaskFence{TaskID: fence.TaskID, OwnerID: fence.OwnerID, InitiatorID: fence.InitiatorID, LeaseOwner: fence.LeaseOwner,
-		LeaseVersion: fence.LeaseVersion, AgentInstanceID: fence.AgentInstanceID, AgentGeneration: fence.AgentGeneration,
+		TaskRevision: revision, LeaseVersion: fence.LeaseVersion, AgentInstanceID: fence.AgentInstanceID, AgentGeneration: fence.AgentGeneration,
 		AgentSessionID: sessionID, AgentRootSessionID: fence.AgentSessionID, AuthorizationVersion: fence.AuthorizationVersion,
 		ThroughSequence: through, EngineVersion: fence.EngineVersion, ProfileVersion: fence.ProfileVersion}
 }
 
-func cloudDSHModelFencePointer(fence app.AgentInstanceFence, sessionID string, through int64) *app.ModelTaskFence {
-	modelFence := cloudDSHModelFence(fence, sessionID, through)
+func cloudDSHModelFencePointer(fence app.AgentInstanceFence, sessionID string, through int64, revisions ...int64) *app.ModelTaskFence {
+	modelFence := cloudDSHModelFence(fence, sessionID, through, revisions...)
 	return &modelFence
 }
 
@@ -919,7 +1254,7 @@ func cloudDSHBackgroundOutputContinuations(history *cloudDSHCheckpointHistory, c
 			delegation.status == app.AgentToolFailed {
 			return nil, false, errors.New("background child is not linked to a durable parent delegation")
 		}
-		arguments, definitions, err := validateCloudDSHDelegateArguments(delegation.arguments, parentDefinitions)
+		arguments, definitions, _, _, _, err := validateCloudDSHDelegateArgumentsWithPlanSelection(delegation.arguments, parentDefinitions)
 		if err != nil || !arguments.RunInBackground {
 			return nil, false, errors.New("background child delegation is invalid")
 		}
@@ -999,6 +1334,8 @@ func cloudDSHBackgroundOutputContinuations(history *cloudDSHCheckpointHistory, c
 				Objective       string   `json:"objective"`
 				ToolNames       []string `json:"tool_names"`
 				RunInBackground bool     `json:"run_in_background"`
+				PlanStepID      string   `json:"morde_plan_step_id"`
+				PlanRevision    int64    `json:"morde_plan_revision"`
 			}
 			decoder := json.NewDecoder(bytes.NewReader(delegation.arguments))
 			decoder.DisallowUnknownFields()
@@ -1008,7 +1345,7 @@ func cloudDSHBackgroundOutputContinuations(history *cloudDSHCheckpointHistory, c
 			if !selection.RunInBackground {
 				continue
 			}
-			if _, _, err := validateCloudDSHDelegateArguments(delegation.arguments, parentDefinitions); err != nil {
+			if _, _, _, _, _, err := validateCloudDSHDelegateArgumentsWithPlanSelection(delegation.arguments, parentDefinitions); err != nil {
 				return nil, false, errors.New("background job delegation in the parent checkpoint is invalid")
 			}
 			child, exists := bySpawnKey[spawnKey]
@@ -1062,7 +1399,7 @@ func (e *CloudDSHExecutor) cloudDSHRecoverSettledPersonalChildren(ctx context.Co
 		if !call.callSeen || !call.historical || call.status != "" {
 			return nil, nil, errors.New("personal child delegation is not checkpointed")
 		}
-		arguments, definitions, err := validateCloudDSHDelegateArguments(call.arguments, parentDefinitions)
+		arguments, definitions, _, _, _, err := validateCloudDSHDelegateArgumentsWithPlanSelection(call.arguments, parentDefinitions)
 		if err != nil || len(definitions) != len(arguments.ToolNames) {
 			return nil, nil, errors.New("personal child delegation authorization is invalid")
 		}
@@ -1193,7 +1530,7 @@ func (e *CloudDSHExecutor) deliverPendingMessagesOnce(ctx context.Context, fence
 func (e *CloudDSHExecutor) deliverPendingConversationMessages(ctx context.Context, fence app.AgentInstanceFence, input io.WriteCloser,
 	messages []app.AgentConversationMessage, seen map[string]string) error {
 	for _, message := range messages {
-		if !cloudDSHID.MatchString(message.ID) || (strings.TrimSpace(message.Content) == "" && len(message.AttachmentIDs) == 0) || len(message.Content) > app.MaxConversationAgentInputBytes ||
+		if !cloudDSHID.MatchString(message.ID) || (strings.TrimSpace(message.Content) == "" && len(message.AttachmentIDs) == 0) ||
 			!utf8.ValidString(message.Content) || strings.ContainsRune(message.Content, '\x00') || !validCloudDSHMessageAttachmentIDs(message.AttachmentIDs) {
 			return errors.New("pending conversation message is invalid")
 		}
@@ -1205,7 +1542,15 @@ func (e *CloudDSHExecutor) deliverPendingConversationMessages(ctx context.Contex
 			return errors.New("pending conversation message delivery mode is invalid")
 		}
 		message.Mode = mode
-		fingerprint := cloudDSHMessageDeliveryFingerprint(message)
+		content := message.Content
+		if len(content) > app.MaxConversationAgentInputBytes {
+			var err error
+			content, err = cloudDSHMessageReferenceContent(message, fence, mode, nil, fence.AgentSessionID)
+			if err != nil {
+				return errors.New("oversized pending conversation message has no valid source reference")
+			}
+		}
+		fingerprint := cloudDSHMessageDeliveryFingerprintForContent(message, content)
 		if content, ok := seen[message.ID]; ok {
 			if content != fingerprint {
 				return errors.New("pending conversation message identity changed")
@@ -1215,8 +1560,12 @@ func (e *CloudDSHExecutor) deliverPendingConversationMessages(ctx context.Contex
 		frame := map[string]any{"type": "message_delivery", "version": 3,
 			"task_id": fence.TaskID, "owner_id": fence.OwnerID, "agent_id": fence.AgentInstanceID,
 			"generation": fence.AgentGeneration, "authorization_version": fence.AuthorizationVersion,
-			"session_id": fence.AgentSessionID, "message_id": message.ID, "content": message.Content,
+			"session_id": fence.AgentSessionID, "message_id": message.ID, "content": content,
 			"attachment_ids": append([]string{}, message.AttachmentIDs...), "mode": string(message.Mode)}
+		if message.Reference != nil && len(message.Content) > app.MaxConversationAgentInputBytes {
+			frame["task_revision"] = message.Reference.TaskRevision
+			frame["conversation_id"] = message.Reference.ConversationID
+		}
 		if err := writeCloudDSHFrame(ctx, input, frame); err != nil {
 			return err
 		}
@@ -1233,7 +1582,7 @@ func (e *CloudDSHExecutor) deliverSupersedingMessages(ctx context.Context, fence
 	foundSteer := false
 	for _, message := range messages {
 		if !cloudDSHID.MatchString(message.ID) || (strings.TrimSpace(message.Content) == "" && len(message.AttachmentIDs) == 0) ||
-			len(message.Content) > app.MaxConversationAgentInputBytes || !utf8.ValidString(message.Content) ||
+			!utf8.ValidString(message.Content) ||
 			strings.ContainsRune(message.Content, '\x00') || !validCloudDSHMessageAttachmentIDs(message.AttachmentIDs) {
 			return errors.New("pending conversation message is invalid")
 		}
@@ -1244,15 +1593,28 @@ func (e *CloudDSHExecutor) deliverSupersedingMessages(ctx context.Context, fence
 		if mode != app.AgentMessageDeliverySteer && mode != app.AgentMessageDeliveryFollowup {
 			return errors.New("pending conversation message delivery mode is invalid")
 		}
-		fingerprint := cloudDSHMessageDeliveryFingerprint(message)
+		message.Mode = mode
+		content := message.Content
+		if len(content) > app.MaxConversationAgentInputBytes {
+			var err error
+			content, err = cloudDSHMessageReferenceContent(message, fence, mode, nil, fence.AgentSessionID)
+			if err != nil {
+				return errors.New("oversized pending conversation message has no valid source reference")
+			}
+		}
+		fingerprint := cloudDSHMessageDeliveryFingerprintForContent(message, content)
 		if existing, ok := seen[message.ID]; ok && existing != fingerprint {
 			return errors.New("pending conversation message identity changed")
 		}
 		frame := map[string]any{"type": "message_delivery", "version": 3,
 			"task_id": fence.TaskID, "owner_id": fence.OwnerID, "agent_id": fence.AgentInstanceID,
 			"generation": fence.AgentGeneration, "authorization_version": fence.AuthorizationVersion,
-			"session_id": fence.AgentSessionID, "message_id": message.ID, "content": message.Content,
+			"session_id": fence.AgentSessionID, "message_id": message.ID, "content": content,
 			"attachment_ids": append([]string{}, message.AttachmentIDs...), "mode": string(mode)}
+		if message.Reference != nil && len(message.Content) > app.MaxConversationAgentInputBytes {
+			frame["task_revision"] = message.Reference.TaskRevision
+			frame["conversation_id"] = message.Reference.ConversationID
+		}
 		if mode == app.AgentMessageDeliverySteer {
 			foundSteer = true
 			frame["version"] = 4
@@ -1324,12 +1686,85 @@ func cloudDSHStartDeliveryMode(mode app.AgentMessageDeliveryMode) (app.AgentMess
 	return mode, mode == app.AgentMessageDeliverySteer || mode == app.AgentMessageDeliveryFollowup
 }
 
-func cloudDSHMessageDeliveryFingerprint(message app.AgentConversationMessage) string {
+func cloudDSHMessageDeliveryFingerprintForContent(message app.AgentConversationMessage, content string) string {
 	mode := message.Mode
 	if mode == "" {
 		mode = app.AgentMessageDeliveryFollowup
 	}
-	return message.Content + "\x00" + strings.Join(message.AttachmentIDs, "\x00") + "\x00" + string(mode)
+	return content + "\x00" + strings.Join(message.AttachmentIDs, "\x00") + "\x00" + string(mode)
+}
+
+func cloudDSHMessageReferenceContent(message app.AgentConversationMessage, fence app.AgentInstanceFence,
+	mode app.AgentMessageDeliveryMode, taskValue *task.Task, rootSessionID string) (string, error) {
+	reference := message.Reference
+	if reference == nil || rootSessionID == "" || message.SourceSequence < 1 || !domain.ValidMessageID(message.ID) ||
+		reference.MessageID != message.ID || reference.MessageSequence != message.SourceSequence ||
+		reference.TaskID != fence.TaskID || reference.OwnerID != fence.OwnerID ||
+		reference.AuthorizationVersion != fence.AuthorizationVersion || reference.AgentGeneration != fence.AgentGeneration ||
+		reference.RootSessionID != rootSessionID || reference.Mode != mode ||
+		!sameCloudDSHMessageAttachmentIDs(reference.AttachmentIDs, message.AttachmentIDs) ||
+		reference.ContentBytes != int64(len(message.Content)) || message.SourceContentBytes != reference.ContentBytes ||
+		reference.SourceSHA256 != fmt.Sprintf("%x", sha256.Sum256([]byte(message.Content))) ||
+		reference.TotalRunes != int64(utf8.RuneCountInString(message.Content)) ||
+		message.RepresentationKind != "reference" || message.RepresentationVersion != 1 ||
+		message.ManifestVersion != reference.ManifestVersion ||
+		!bytes.Equal(message.SourceSHA256, mustCloudDSHHex(reference.SourceSHA256)) ||
+		!bytes.Equal(message.ManifestSHA256, mustCloudDSHHex(reference.ManifestSHA256)) ||
+		!bytes.Equal(message.RepresentationSHA256, mustCloudDSHHex(reference.RepresentationSHA256)) {
+		return "", errors.New("message reference does not match its source")
+	}
+	if reference.TaskRevision != message.TaskRevision {
+		return "", errors.New("message reference task revision changed")
+	}
+	if taskValue != nil && (reference.TaskID != taskValue.ID || reference.OwnerID != taskValue.OwnerID ||
+		reference.ConversationID != taskValue.ConversationID || reference.TaskRevision != cloudDSHTaskRevision(*taskValue) ||
+		reference.AuthorizationVersion != taskValue.Authorization.Version || reference.AgentGeneration != taskValue.AgentGeneration) {
+		return "", errors.New("message reference is outside the current Task fence")
+	}
+	if err := app.ValidateAgentMessageReferenceEnvelope(*reference); err != nil {
+		return "", err
+	}
+	return app.FormatAgentMessageReferenceEnvelope(*reference)
+}
+
+func mustCloudDSHHex(value string) []byte {
+	decoded, err := hex.DecodeString(value)
+	if err != nil {
+		return nil
+	}
+	return decoded
+}
+
+func cloudDSHStartMessage(message app.AgentConversationMessage, fence app.AgentInstanceFence,
+	mode app.AgentMessageDeliveryMode, taskValue task.Task, rootSessionID string) (map[string]any, string, int, error) {
+	content := message.Content
+	if len(content) > app.MaxConversationAgentInputBytes {
+		var err error
+		content, err = cloudDSHMessageReferenceContent(message, fence, mode, &taskValue, rootSessionID)
+		if err != nil {
+			return nil, "", 0, err
+		}
+	}
+	attachmentIDs := append([]string{}, message.AttachmentIDs...)
+	delivery := map[string]any{"message_id": message.ID, "content": content,
+		"attachment_ids": attachmentIDs, "mode": string(mode)}
+	cost := len(content)
+	for _, id := range attachmentIDs {
+		cost += len(id) + 1
+	}
+	return delivery, cloudDSHMessageDeliveryFingerprintForContent(message, content), cost, nil
+}
+
+func sameCloudDSHMessageAttachmentIDs(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func rootCheckpointThroughSequence(parent *cloudDSHSessionState, rootSessionID string) int64 {
@@ -1650,12 +2085,26 @@ func (e *CloudDSHExecutor) resolveCloudDSHAgentRequestForSession(ctx context.Con
 }
 
 func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fence app.AgentInstanceFence,
-	input io.WriteCloser, output io.ReadCloser, resume, toolsAllowed, streamAllowed bool, completion *app.CloudDSHTaskCompletion, onStart func()) error {
+	input io.WriteCloser, output io.ReadCloser, resume, toolsAllowed, streamAllowed bool, completion *app.CloudDSHTaskCompletion, onStart func()) (runErr error) {
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
+	modelBudgetAdmission := false
+	if e.options.ModelBudgetPlanner != nil {
+		eligible, err := e.options.ModelBudgetPlanner.SupportsTaskModelBudgetAdmission(ctx, value)
+		if err != nil {
+			return errors.New("dsh task model budget eligibility is unavailable")
+		}
+		modelBudgetAdmission = eligible
+	}
 	input = &cloudDSHSerializedWriter{WriteCloser: input}
 	rootIdentity := cloudDSHIdentity{TaskID: fence.TaskID, OwnerID: fence.OwnerID, AgentID: fence.AgentInstanceID,
 		SessionID: fence.AgentSessionID, Generation: fence.AgentGeneration, AuthorizationVersion: fence.AuthorizationVersion}
+	modelBudgetPlans := make(map[string]cloudDSHModelBudgetPlanBinding)
+	defer func() {
+		for id := range modelBudgetPlans {
+			delete(modelBudgetPlans, id)
+		}
+	}()
 	baseDefinitions := []app.AgentToolDefinition{}
 	if toolsAllowed && e.options.Tools != nil {
 		definitions, err := e.options.Tools.Definitions(ctx, value)
@@ -1685,7 +2134,7 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			}
 		}
 		if hasDelegableTools && len(rootDefinitions) < 64 {
-			rootDefinitions = append(rootDefinitions, cloudDSHDelegateTool(baseDefinitions))
+			rootDefinitions = append(rootDefinitions, cloudDSHDelegateToolWithPlanSelectors(baseDefinitions))
 			canDelegate = true
 		}
 	}
@@ -1716,8 +2165,28 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			return errors.New("dsh step retry tool is not available in the pinned task context")
 		}
 	}
-	states := map[string]*cloudDSHSessionState{rootIdentity.SessionID: newCloudDSHSessionState(fence, rootIdentity, "", "",
-		rootDefinitions, canDelegate, resume, rootThrough, rootDigest)}
+	rootState := newCloudDSHSessionState(fence, rootIdentity, "", "", rootDefinitions, canDelegate, resume, rootThrough, rootDigest)
+	states := map[string]*cloudDSHSessionState{rootIdentity.SessionID: rootState}
+	e.startSessionTrace(ctx, value, rootState)
+	defer func() {
+		recovered := recover()
+		cause := runErr
+		status := cloudDSHAttemptSpanStatus(runErr)
+		if recovered != nil {
+			cause = errors.New("dsh session tree panicked")
+			status = "failed"
+		}
+		for _, state := range states {
+			if state.traceSpan == nil {
+				continue
+			}
+			cloudDSHEndSpan(state.traceSpan, status, cause)
+			state.traceSpan = nil
+		}
+		if recovered != nil {
+			panic(recovered)
+		}
+	}()
 	memoryValidator, protectsMemory := e.options.Tools.(cloudDSHMemoryProofValidator)
 	if scoped, ok := e.options.Tools.(cloudDSHTaskMemoryProofValidator); ok {
 		protectsMemory = protectsMemory && scoped.CloudDSHPersonalMemoryProofEnabledForTask(value)
@@ -1783,17 +2252,19 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			if err != nil {
 				return errors.New("dsh background job authorization is unavailable")
 			}
-			childCanDelegate := canDelegate && len(definitions) > 0
+			childCanDelegate := canDelegate && len(definitions) > 0 && 1 < e.maxSubagentDepth()
 			definitions, err = cloudDSHChildDelegationTools(definitions, childCanDelegate)
 			if err != nil {
 				return err
 			}
+			definitions = cloudDSHAddPlanSelectorsToDelegate(definitions)
 			identity := rootIdentity
 			identity.SessionID = child.SessionID
 			state := newCloudDSHSessionState(fence, identity, rootIdentity.SessionID, child.SpawnKey, definitions,
 				childCanDelegate, true, child.CheckpointThrough, child.CheckpointDigest)
 			state.rootCheckpointThrough = child.RootCheckpointThroughSequence
 			state.background = true
+			e.startSessionTrace(rootState.traceCtx, value, state)
 			states[child.SessionID] = state
 			backgroundJobs = append(backgroundJobs, map[string]any{"task_id": identity.TaskID, "owner_id": identity.OwnerID,
 				"agent_id": identity.AgentID, "session_id": identity.SessionID, "generation": identity.Generation,
@@ -1867,15 +2338,57 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 	pendingModels := make(map[string]*cloudDSHPendingModelCall)
 	queuedModelIDs := make([]string, 0, cloudDSHMaxPendingModelCalls)
 	activeModelIDs := make(map[string]struct{})
+	recoveryCallStarted := false
+	recoveryCallSucceeded := false
 	startModel := func(id string) {
 		pending := pendingModels[id]
+		var recoveryStartErr error
+		if intent := value.ModelRecovery; intent != nil {
+			beginAttempt, replayOnly, allowed := cloudDSHModelRecoveryStartAllowed(intent.State, id, intent.RecoveryDSHCallID,
+				recoveryCallStarted, recoveryCallSucceeded)
+			if !allowed {
+				recoveryStartErr = cloudDSHModelResultError{stage: "recovery_start", category: "recovery_attempt_not_allowed",
+					reasonCode: "recovery_call_identity_mismatch"}
+			} else if beginAttempt || replayOnly {
+				if pending.identity.SessionID != rootIdentity.SessionID {
+					recoveryStartErr = cloudDSHModelResultError{stage: "recovery_start", category: "recovery_attempt_not_allowed",
+						reasonCode: "recovery_session_mismatch"}
+				} else if pending.state.hasRecoveryInput() {
+					recoveryStartErr = cloudDSHModelResultError{stage: "recovery_start", category: "recovery_attempt_not_allowed",
+						reasonCode: "new_user_input_arrived_during_recovery"}
+				} else if checkpoint, ok := cloudDSHReadOnlyRecoveryCheckpointFor(value, pending.state, pending.modelCall, len(childSessions) > 0); !ok ||
+					checkpoint.ThroughSequence != intent.CheckpointThroughSequence || !bytes.Equal(checkpoint.Digest, intent.CheckpointDigest) ||
+					!bytes.Equal(checkpoint.ToolsetDigest, intent.ToolsetDigest) {
+					failureReason := cloudDSHReadOnlyRecoveryCheckpointFailureReason(value, pending.state, pending.modelCall, len(childSessions) > 0)
+					if failureReason == "" {
+						failureReason = "scheduled_checkpoint_or_toolset_digest_changed"
+					}
+					recoveryStartErr = cloudDSHModelResultError{stage: "recovery_start", category: "recovery_checkpoint_invalid",
+						reasonCode: failureReason}
+				} else if beginAttempt {
+					if starter, ok := e.options.Tools.(cloudDSHTaskModelRecoveryAttemptStarter); !ok {
+						recoveryStartErr = cloudDSHModelResultError{stage: "recovery_start", category: "recovery_attempt_unavailable",
+							reasonCode: "attempt_gate_unavailable"}
+					} else if err := starter.BeginTaskModelRecoveryAttempt(ctx, *intent, fence); err != nil {
+						recoveryStartErr = cloudDSHModelResultError{stage: "recovery_start", category: "recovery_attempt_unavailable",
+							reasonCode: "attempt_start_not_confirmed"}
+					} else {
+						recoveryCallStarted = true
+					}
+				} else {
+					pending.modelCall.ReplayTaskModelResponseOnly = true
+					recoveryCallStarted = true
+				}
+			}
+		}
 		modelCtx, cancelModel := context.WithCancel(ctx)
-		explicitCtx, cancelExplicit := context.WithCancel(context.Background())
-		modelCtx = app.WithModelExplicitCancellation(modelCtx, explicitCtx)
 		pending.cancel = cancelModel
 		activeModelIDs[id] = struct{}{}
+		explicitCtx, cancelExplicit := context.WithCancel(context.Background())
 		pending.cancelExplicit = cancelExplicit
 		modelCall, modelIdentity := pending.modelCall, pending.identity
+		modelCtx, modelSpan := e.startModelCallTrace(modelCtx, value, pending.state, modelCall)
+		modelCtx = app.WithModelExplicitCancellation(modelCtx, explicitCtx)
 		memoryVersions := append([]app.CloudDSHMemoryVersion(nil), pending.memoryVersions...)
 		if streamAllowed && modelIdentity.SessionID == rootIdentity.SessionID {
 			var proof *app.CloudDSHStreamPersonalProof
@@ -1888,7 +2401,11 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				}
 			}
 			if proofOK {
-				pending.stream = newCloudDSHTextStream(modelCtx, e.options.TextStreams, *modelCall.Task, modelCall.CallID, proof)
+				streamCallID := modelCall.CallID
+				if modelCall.Task != nil && modelCall.Task.RecoveryCallID != "" {
+					streamCallID = modelCall.Task.RecoveryCallID
+				}
+				pending.stream = newCloudDSHTextStream(modelCtx, e.options.TextStreams, *modelCall.Task, streamCallID, proof)
 				if pending.stream != nil {
 					modelCall.Request.OnTextDelta = pending.stream.append
 				}
@@ -1899,13 +2416,24 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			// runtime loop has exited; release its independent signal only after
 			// that model call actually returns.
 			defer cancelExplicit()
+			defer cloudDSHEndSpanOnPanic(modelSpan)
 			var response app.ModelResponse
 			var err error
-			if protectsMemory && memoryValidator.ValidatePersonalMemoryProof(modelCtx, value, memoryProof, memoryVersions) != nil {
+			if recoveryStartErr != nil {
+				err = recoveryStartErr
+			} else if protectsMemory && memoryValidator.ValidatePersonalMemoryProof(modelCtx, value, memoryProof, memoryVersions) != nil {
 				err = errCloudDSHPersonalMemoryChanged
 			} else {
 				response, err = e.options.Models.Complete(modelCtx, modelCall)
 			}
+			status := "completed"
+			if err != nil {
+				status = "failed"
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					status = "cancelled"
+				}
+			}
+			cloudDSHEndSpan(modelSpan, status, err)
 			select {
 			case modelResults <- cloudDSHModelResult{id: id, identity: modelIdentity, response: response, err: err}:
 			case <-ctx.Done():
@@ -1947,18 +2475,69 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 		}
 	}()
 	pendingCancels := make(map[string]cloudDSHJobCancelPending)
+	defer func() {
+		recovered := recover()
+		cause := runErr
+		status := cloudDSHAttemptSpanStatus(runErr)
+		if recovered != nil {
+			cause = errors.New("dsh job cancellation trace panicked")
+			status = "failed"
+		}
+		for id, pending := range pendingCancels {
+			if pending.traceSpan != nil {
+				cloudDSHEndSpan(pending.traceSpan, status, cause)
+				pending.traceSpan = nil
+				pendingCancels[id] = pending
+			}
+		}
+		if recovered != nil {
+			panic(recovered)
+		}
+	}()
 	ready := false
 	seenDeliveries := make(map[string]string)
 	var seenDeliveriesMu sync.Mutex
 	deliverPendingMessagesOnce := func(deliveryCtx context.Context) error {
 		seenDeliveriesMu.Lock()
 		defer seenDeliveriesMu.Unlock()
-		return e.deliverPendingMessagesOnce(deliveryCtx, fence, input, seenDeliveries)
+		messages, err := e.options.Checkpoints.PendingMessages(deliveryCtx, checkpointFence(fence))
+		if err != nil {
+			return err
+		}
+		for _, message := range messages {
+			if !rootState.resume || message.Initial || message.RevisionUpdate {
+				continue
+			}
+			if _, alreadyDelivered := seenDeliveries[message.ID]; alreadyDelivered {
+				continue
+			}
+			mode := message.Mode
+			if mode == "" {
+				mode = app.AgentMessageDeliveryFollowup
+			}
+			rootState.noteRecoveryInput(mode)
+		}
+		return e.deliverPendingConversationMessages(deliveryCtx, fence, input, messages, seenDeliveries)
 	}
 	deliverSupersedingMessages := func(deliveryCtx context.Context, messages []app.AgentConversationMessage,
 		supersedeSessionID, supersedeCallID string) error {
 		seenDeliveriesMu.Lock()
 		defer seenDeliveriesMu.Unlock()
+		if rootState.resume {
+			for _, message := range messages {
+				if message.Initial || message.RevisionUpdate {
+					continue
+				}
+				if _, alreadyDelivered := seenDeliveries[message.ID]; alreadyDelivered {
+					continue
+				}
+				mode := message.Mode
+				if mode == "" {
+					mode = app.AgentMessageDeliveryFollowup
+				}
+				rootState.noteRecoveryInput(mode)
+			}
+		}
 		return e.deliverSupersedingMessages(deliveryCtx, fence, input, messages, seenDeliveries, supersedeSessionID, supersedeCallID)
 	}
 	supersedeToolCall := func(deliveryCtx context.Context, messages []app.AgentConversationMessage,
@@ -2027,8 +2606,18 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 		}
 	}
 	executeToolAndRecordActivity := func(state *cloudDSHSessionState, request cloudDSHAgentRequest,
-		execute func() (app.AgentToolResult, error)) (app.AgentToolResult, error) {
-		value, err := runAgentRequest(state, request, func() (any, error) { return execute() })
+		toolName, callID string, eventSequence int64, execute func(context.Context) (app.AgentToolResult, error)) (app.AgentToolResult, error) {
+		value, err := runAgentRequest(state, request, func() (any, error) {
+			toolCtx, span := e.startToolCallTrace(ctx, value, state, toolName, callID, eventSequence)
+			defer cloudDSHEndSpanOnPanic(span)
+			result, executeErr := execute(toolCtx)
+			status := string(result.Status)
+			if status == "" {
+				status = "failed"
+			}
+			cloudDSHEndSpan(span, status, executeErr)
+			return result, executeErr
+		})
 		if err != nil {
 			return app.AgentToolResult{}, err
 		}
@@ -2090,6 +2679,10 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 						}
 					}
 				}
+				if !steerPending && pending.identity.SessionID == rootIdentity.SessionID && pending.modelCall.Task != nil &&
+					pending.modelCall.Task.RecoveryCallID != "" && pending.state.hasRecoverySteer() {
+					steerPending = true
+				}
 				if steerPending {
 					if err := deliverPendingMessagesOnce(ctx); err != nil {
 						return errors.New("pending conversation messages are unavailable")
@@ -2117,13 +2710,28 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 							continue
 						}
 					}
-					return cloudDSHModelResultErrorFor(result.err)
+					if pending.identity.SessionID == rootIdentity.SessionID {
+						if checkpoint, ok := cloudDSHReadOnlyRecoveryCheckpointFor(value, pending.state, pending.modelCall, len(childSessions) > 0); ok {
+							return cloudDSHModelResultErrorForCall(result.err, pending.modelCall, checkpoint)
+						}
+					}
+					return cloudDSHModelResultErrorForCall(result.err, pending.modelCall)
 				}
 				if failure := cloudDSHModelResponseFailureDiagnostic(result.response, pending.state.definitions); failure.Category != "" {
 					return cloudDSHModelResultError{category: failure.Category, reasonCode: failure.ReasonCode,
 						toolName: failure.ToolName, toolCallID: failure.ToolCallID, stage: failure.Stage}
 				}
-				if !steerPending && pending.modelCall.Task != nil && pending.modelCall.Task.ThroughSequence < pending.state.through {
+				if intent := value.ModelRecovery; intent != nil && pending.modelCall.Task != nil &&
+					pending.modelCall.Task.RecoveryCallID == intent.RecoveryCallID &&
+					pending.modelCall.Task.RecoveryDSHCallID == intent.RecoveryDSHCallID &&
+					pending.modelCall.CallID == intent.RecoveryDSHCallID {
+					recoveryCallSucceeded = true
+				}
+				recoveryModelCall := value.ModelRecovery != nil && pending.modelCall.Task != nil &&
+					pending.modelCall.Task.RecoveryCallID == value.ModelRecovery.RecoveryCallID &&
+					pending.modelCall.Task.RecoveryDSHCallID == value.ModelRecovery.RecoveryDSHCallID &&
+					pending.modelCall.CallID == value.ModelRecovery.RecoveryDSHCallID
+				if !steerPending && pending.modelCall.Task != nil && pending.modelCall.Task.ThroughSequence < pending.state.through && !recoveryModelCall {
 					result.response = app.ModelResponse{Text: "A new task input arrived during this model call. Re-evaluate the current task before taking action.",
 						StopReason: "stop", Usage: result.response.Usage, ProviderReportedModel: result.response.ProviderReportedModel}
 				} else if !steerPending && pending.stream.hasVisibleText() {
@@ -2157,7 +2765,15 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			start := map[string]any{"type": "start", "version": 1, "task_id": rootIdentity.TaskID, "owner_id": rootIdentity.OwnerID,
 				"agent_id": rootIdentity.AgentID, "session_id": rootIdentity.SessionID, "generation": rootIdentity.Generation,
 				"authorization_version": rootIdentity.AuthorizationVersion, "task_revision": cloudDSHTaskRevision(value), "model": value.ModelID,
-				"max_tokens": maxTokens, "tools": cloudDSHToolPayload(rootDefinitions)}
+				"tools": cloudDSHToolPayload(rootDefinitions)}
+			configureCloudDSHModelBudgetAdmission(start, e.options.ModelBudgetPlanner, modelBudgetAdmission, maxTokens)
+			if traceparent := cloudDSHTraceparent(trace.ContextWithSpan(ctx, rootState.traceSpan)); traceparent != "" {
+				start["version"] = 2
+				start["traceparent"] = traceparent
+			}
+			if domain.ValidConversationID(value.ConversationID) {
+				start["conversation_id"] = value.ConversationID
+			}
 			if models, ok := e.options.Models.(CloudDSHTaskContextWindowResolver); ok {
 				contextWindow, resolveErr := models.ResolveTaskContextWindow(ctx, value)
 				if resolveErr != nil {
@@ -2172,6 +2788,8 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				return errors.New("pending conversation messages are unavailable")
 			}
 			var revisionBatch []map[string]any
+			longRevisionObjectiveReferenced := false
+			longRevisionObjectiveIndex := -1
 			for _, message := range pending {
 				if !message.RevisionUpdate {
 					continue
@@ -2181,12 +2799,17 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 					!utf8.ValidString(message.Content) || strings.ContainsRune(message.Content, '\x00') || !validCloudDSHMessageAttachmentIDs(message.AttachmentIDs) || !validMode {
 					return errors.New("pending task revision is invalid")
 				}
-				if len(message.Content) > app.MaxConversationAgentInputBytes {
-					return cloudDSHModelResultError{category: "context_length_exceeded"}
+				delivery, fingerprint, _, err := cloudDSHStartMessage(message, fence, mode, value, rootIdentity.SessionID)
+				if err != nil {
+					return errors.New("pending task revision source reference is invalid")
 				}
-				revisionBatch = append(revisionBatch, map[string]any{"message_id": message.ID, "content": message.Content,
-					"attachment_ids": append([]string{}, message.AttachmentIDs...), "mode": string(mode)})
-				seenDeliveries[message.ID] = cloudDSHMessageDeliveryFingerprint(message)
+				if len(message.Content) > app.MaxConversationAgentInputBytes &&
+					(message.Content == value.Objective || app.ConversationRouteTaskMessageObjective(message.ID, message.Content) == value.Objective) {
+					longRevisionObjectiveReferenced = true
+					longRevisionObjectiveIndex = len(revisionBatch)
+				}
+				revisionBatch = append(revisionBatch, delivery)
+				seenDeliveries[message.ID] = fingerprint
 			}
 			if resume && len(revisionBatch) != 0 {
 				// A first attachment may still be pending after an interrupted
@@ -2197,13 +2820,16 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 					}
 					mode, validMode := cloudDSHStartDeliveryMode(message.Mode)
 					if !domain.ValidMessageID(message.ID) || !utf8.ValidString(message.Content) || strings.ContainsRune(message.Content, '\x00') ||
-						(strings.TrimSpace(message.Content) == "" && len(message.AttachmentIDs) == 0) || len(message.Content) > app.MaxConversationAgentInputBytes ||
+						(strings.TrimSpace(message.Content) == "" && len(message.AttachmentIDs) == 0) ||
 						!validCloudDSHMessageAttachmentIDs(message.AttachmentIDs) || !validMode {
 						return errors.New("pending initial conversation message is invalid")
 					}
-					revisionBatch = append([]map[string]any{{"message_id": message.ID, "content": message.Content,
-						"attachment_ids": append([]string{}, message.AttachmentIDs...), "mode": string(mode)}}, revisionBatch...)
-					seenDeliveries[message.ID] = cloudDSHMessageDeliveryFingerprint(message)
+					delivery, fingerprint, _, err := cloudDSHStartMessage(message, fence, mode, value, rootIdentity.SessionID)
+					if err != nil {
+						return errors.New("pending initial conversation source reference is invalid")
+					}
+					revisionBatch = append([]map[string]any{delivery}, revisionBatch...)
+					seenDeliveries[message.ID] = fingerprint
 				}
 			}
 			if len(revisionBatch) != 0 {
@@ -2211,15 +2837,31 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 					return errors.New("dsh step retry cannot include a new task revision")
 				}
 				batchBytes := 0
+				prefixCount := 0
 				for _, message := range revisionBatch {
-					batchBytes += len(message["content"].(string))
+					messageBytes := len(message["content"].(string))
 					for _, attachment := range message["attachment_ids"].([]string) {
-						batchBytes += len(attachment) + 1
+						messageBytes += len(attachment) + 1
 					}
+					if prefixCount != 0 && batchBytes+messageBytes > app.MaxConversationAgentInputBytes {
+						break
+					}
+					if prefixCount == 0 && messageBytes > app.MaxConversationAgentInputBytes {
+						return cloudDSHModelResultError{category: "context_length_exceeded"}
+					}
+					batchBytes += messageBytes
+					prefixCount++
 				}
-				if batchBytes > app.MaxConversationAgentInputBytes {
+				if prefixCount == 0 {
 					return cloudDSHModelResultError{category: "context_length_exceeded"}
 				}
+				for _, message := range revisionBatch[prefixCount:] {
+					delete(seenDeliveries, message["message_id"].(string))
+				}
+				if !resume && longRevisionObjectiveReferenced && longRevisionObjectiveIndex >= prefixCount {
+					return errors.New("long Task revision source reference is outside the initial delivery batch")
+				}
+				revisionBatch = revisionBatch[:prefixCount]
 				start["revision_messages"] = revisionBatch
 			}
 			if toolsAllowed && e.options.Children != nil {
@@ -2266,6 +2908,22 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				start["resume"] = true
 				start["checkpoint_through_seq"] = rootThrough
 				start["checkpoint_sha256"] = hex.EncodeToString(rootDigest)
+				if intent := value.ModelRecovery; intent != nil &&
+					(intent.State == task.ModelRecoveryScheduled || intent.State == task.ModelRecoveryAttempting) {
+					if !app.ValidTaskModelRecoveryIntent(*intent) || intent.AgentSessionID != rootIdentity.SessionID ||
+						intent.TaskRevision != cloudDSHTaskRevision(value) || intent.AuthorizationVersion != rootIdentity.AuthorizationVersion ||
+						intent.CheckpointThroughSequence != rootThrough || !bytes.Equal(intent.CheckpointDigest, rootDigest) {
+						return errors.New("dsh model recovery identity does not match the pinned checkpoint")
+					}
+					start["model_recovery"] = map[string]any{
+						"task_id": intent.TaskID, "task_revision": intent.TaskRevision,
+						"session_id": intent.AgentSessionID, "authorization_version": intent.AuthorizationVersion,
+						"checkpoint_through_seq": intent.CheckpointThroughSequence,
+						"checkpoint_sha256":      hex.EncodeToString(intent.CheckpointDigest),
+						"failed_call_id":         intent.FailedCallID, "recovery_dsh_call_id": intent.RecoveryDSHCallID,
+						"recovery_call_id": intent.RecoveryCallID,
+					}
+				}
 				if value.StepRetry != nil {
 					start["step_retry"] = cloudDSHStepRetryStartPayload(*value.StepRetry)
 				}
@@ -2286,7 +2944,7 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 					if initial != nil || !domain.ValidMessageID(message.ID) ||
 						(strings.TrimSpace(message.Content) == "" && len(message.AttachmentIDs) == 0) ||
 						!utf8.ValidString(message.Content) || strings.ContainsRune(message.Content, '\x00') ||
-						len(message.Content) > app.MaxConversationAgentInputBytes || !validCloudDSHMessageAttachmentIDs(message.AttachmentIDs) {
+						!validCloudDSHMessageAttachmentIDs(message.AttachmentIDs) {
 						return errors.New("initial conversation message does not match the Task")
 					}
 					objectiveMatchesSource := message.Content == value.Objective ||
@@ -2337,6 +2995,19 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 					return cloudDSHModelResultError{category: "context_length_exceeded"}
 				}
 				if initial == nil {
+					if len(value.Objective) > app.MaxConversationAgentInputBytes {
+						if !longRevisionObjectiveReferenced {
+							return errors.New("long initial Task message source reference is unavailable")
+						}
+						prompt = contextText
+						if prompt != "" {
+							prompt += "\n\n"
+						}
+						prompt += "The current request is included as a source-referenced user message. Read or search it using the authorized current-message tools before answering."
+						if len(prompt) > cloudDSHMaxText {
+							return cloudDSHModelResultError{category: "context_length_exceeded"}
+						}
+					}
 					if len(revisionBatch) != 0 {
 						// Revision messages are delivered separately. Keep the existing
 						// full context as a trusted runtime message for that batch.
@@ -2360,12 +3031,15 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 					if !validMode {
 						return errors.New("initial conversation message delivery mode is invalid")
 					}
-					start["initial_message"] = map[string]any{"message_id": initial.ID, "content": initial.Content,
-						"attachment_ids": append([]string{}, initial.AttachmentIDs...), "mode": string(mode)}
+					delivery, fingerprint, _, err := cloudDSHStartMessage(*initial, fence, mode, value, rootIdentity.SessionID)
+					if err != nil {
+						return errors.New("initial conversation source reference is invalid")
+					}
+					start["initial_message"] = delivery
 					if contextText != "" {
 						start["initial_context"] = contextText
 					}
-					seenDeliveries[initial.ID] = cloudDSHMessageDeliveryFingerprint(*initial)
+					seenDeliveries[initial.ID] = fingerprint
 				}
 			}
 			if err := writeCloudDSHFrame(ctx, input, start); err != nil {
@@ -2407,7 +3081,26 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			supersedeChildCreate := func(deliveryCtx context.Context, messages []app.AgentConversationMessage) error {
 				return supersedeToolCall(deliveryCtx, messages, frame.SessionID, frame.CallID)
 			}
-			if _, err := e.createCloudDSHChildSession(ctx, value, fence, frame, states, baseDefinitions, input, supersedeChildCreate, runAgentRequest); err != nil {
+			parent := states[frame.SessionID]
+			if parent != nil && frame.Through != nil && *frame.Through == parent.through && cloudDSHID.MatchString(frame.CallID) {
+				childCtx, span := e.startToolCallTrace(ctx, value, parent, cloudDSHDelegateToolName, frame.CallID, *frame.Through)
+				var superseded bool
+				var createErr error
+				func() {
+					defer cloudDSHEndSpanOnPanic(span)
+					superseded, createErr = e.createCloudDSHChildSession(childCtx, value, fence, frame, states, baseDefinitions, input, supersedeChildCreate, runAgentRequest)
+				}()
+				status := "completed"
+				if superseded {
+					status = "superseded"
+				} else if createErr != nil {
+					status = "failed"
+				}
+				cloudDSHEndSpan(span, status, createErr)
+				if createErr != nil {
+					return createErr
+				}
+			} else if _, err := e.createCloudDSHChildSession(ctx, value, fence, frame, states, baseDefinitions, input, supersedeChildCreate, runAgentRequest); err != nil {
 				return err
 			}
 			continue
@@ -2552,6 +3245,86 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				"session_id": state.identity.SessionID}); err != nil {
 				return err
 			}
+		case "model_budget_prepare":
+			if !modelBudgetAdmission {
+				return errors.New("dsh model budget admission is not enabled")
+			}
+			if state.resume && state.readThrough != state.restoreThrough || !state.history.allCallsReconciled() ||
+				frame.Through == nil || *frame.Through != state.through || state.through <= state.lastModel {
+				return errors.New("dsh model budget request sequence is invalid")
+			}
+			for _, pending := range pendingModels {
+				if pending.identity.SessionID == state.identity.SessionID && !pending.cancelled {
+					return errors.New("dsh session already has a pending model request")
+				}
+			}
+			digest, err := validateCloudDSHModelBudgetPrepareRequest(frame, value.ModelID, state.definitions)
+			if err != nil {
+				return err
+			}
+			if cloudDSHRequestHasUnavailableAttachments(frame.Request, state.definitions) {
+				return cloudDSHModelResultError{category: "attachment_reader_unavailable"}
+			}
+			budgetFence := fence
+			budgetFence.TaskID = state.identity.TaskID
+			budgetFence.OwnerID = state.identity.OwnerID
+			budgetFence.AgentInstanceID = state.identity.AgentID
+			budgetFence.AgentGeneration = state.identity.Generation
+			budgetFence.AgentSessionID = state.identity.SessionID
+			budgetFence.AuthorizationVersion = state.identity.AuthorizationVersion
+			var recoveryLedgerCallID, recoveryDSHCallID string
+			ledgerCallID := frame.DSHCallID
+			if intent := value.ModelRecovery; intent != nil && state.identity.SessionID == rootIdentity.SessionID &&
+				frame.DSHCallID == intent.RecoveryDSHCallID && frame.Through != nil && *frame.Through == intent.CheckpointThroughSequence {
+				failedCallID, callIDErr := app.DSHModelCallID(value.ID, state.identity.SessionID, *frame.Through)
+				if !app.ValidTaskModelRecoveryIntent(*intent) || callIDErr != nil || failedCallID != intent.FailedCallID ||
+					(intent.State != task.ModelRecoveryScheduled && intent.State != task.ModelRecoveryAttempting) {
+					return errors.New("dsh adaptive recovery budget identity is invalid")
+				}
+				recoveryLedgerCallID, recoveryDSHCallID = intent.RecoveryCallID, intent.RecoveryDSHCallID
+				ledgerCallID = recoveryLedgerCallID
+			} else {
+				expectedCallID, callIDErr := app.DSHModelCallID(value.ID, state.identity.SessionID, *frame.Through)
+				if callIDErr != nil || expectedCallID != frame.DSHCallID {
+					return errors.New("dsh model budget call identity does not match its checkpoint")
+				}
+			}
+			plannerRequest := CloudDSHModelBudgetPlanRequest{Fence: budgetFence, ThroughSeq: *frame.Through,
+				TaskRevision: cloudDSHTaskRevision(value), SessionID: state.identity.SessionID, ModelID: value.ModelID,
+				Turn: *frame.Turn, Step: *frame.Step, CallID: frame.CallID, DSHCallID: frame.DSHCallID,
+				RecoveryCallID: recoveryLedgerCallID, RecoveryDSHCallID: recoveryDSHCallID, RequestDigest: digest,
+				Request: append(json.RawMessage(nil), frame.Request...), Config: append(json.RawMessage(nil), frame.Config...),
+				ToolHistory: append(json.RawMessage(nil), frame.ToolHistory...)}
+			result, planErr := e.options.ModelBudgetPlanner.PrepareModelBudget(ctx, plannerRequest)
+			writeBudgetResponse := func(ok bool) error {
+				response := map[string]any{"type": "model_budget_plan", "id": frame.ID, "task_id": state.identity.TaskID,
+					"owner_id": state.identity.OwnerID, "agent_id": state.identity.AgentID,
+					"generation": state.identity.Generation, "authorization_version": state.identity.AuthorizationVersion,
+					"session_id": state.identity.SessionID, "through_seq": *frame.Through,
+					"call_id": frame.CallID, "dsh_call_id": frame.DSHCallID, "request_digest": digest, "ok": ok}
+				if ok {
+					response["budget_plan_id"] = result.PlanID
+					response["max_tokens"] = result.MaxTokens
+				}
+				return writeCloudDSHFrame(ctx, input, response)
+			}
+			if planErr != nil || !cloudDSHID.MatchString(result.PlanID) || result.MaxTokens <= 0 || result.MaxTokens > cloudDSHModelBudgetProtocolMaxTokens {
+				return cloudDSHModelBudgetPlanDenialError(planErr, writeBudgetResponse(false))
+			}
+			binding := cloudDSHModelBudgetPlanBinding{Identity: state.identity, ThroughSeq: *frame.Through,
+				CallID: frame.CallID, DSHCallID: frame.DSHCallID, LedgerCallID: ledgerCallID,
+				RequestID: frame.ID, RequestDigest: digest, PlanID: result.PlanID,
+				MaxTokens: result.MaxTokens, ExpiresAt: time.Now().Add(cloudDSHModelBudgetPlanTTL)}
+			if err := storeCloudDSHModelBudgetPlan(modelBudgetPlans, binding, time.Now()); err != nil {
+				if denialErr := writeBudgetResponse(false); denialErr != nil {
+					return denialErr
+				}
+				return err
+			}
+			if err := writeBudgetResponse(true); err != nil {
+				delete(modelBudgetPlans, result.PlanID)
+				return err
+			}
 		case "model":
 			if state.resume && state.readThrough != state.restoreThrough {
 				return errors.New("dsh model request resume state is invalid")
@@ -2577,9 +3350,42 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			if cloudDSHRequestHasUnavailableAttachments(frame.Request, state.definitions) {
 				return cloudDSHModelResultError{category: "attachment_reader_unavailable"}
 			}
-			callID, err := app.DSHModelCallID(value.ID, state.identity.SessionID, state.through)
-			if err != nil || frame.ID != callID {
+			canonicalCallID, err := app.DSHModelCallID(value.ID, state.identity.SessionID, state.through)
+			if err != nil {
 				return errors.New("dsh model identity is invalid")
+			}
+			recoveryFrame := false
+			if intent := value.ModelRecovery; intent != nil && state.identity.SessionID == rootIdentity.SessionID &&
+				frame.ID == intent.RecoveryDSHCallID && state.resume && state.restoreThrough == intent.CheckpointThroughSequence &&
+				state.lastModel < 0 && state.through >= intent.CheckpointThroughSequence {
+				failedCallID, failedCallErr := app.DSHModelCallID(value.ID, state.identity.SessionID, intent.CheckpointThroughSequence)
+				recoveryFrame = app.ValidTaskModelRecoveryIntent(*intent) && failedCallErr == nil && intent.FailedCallID == failedCallID &&
+					(intent.State == task.ModelRecoveryScheduled || intent.State == task.ModelRecoveryAttempting)
+			}
+			if frame.ID != canonicalCallID && !recoveryFrame {
+				return errors.New("dsh model identity is invalid")
+			}
+			ledgerCallID := ""
+			if !modelBudgetAdmission {
+				if frame.BudgetPlanID != "" || frame.BudgetCallID != "" || frame.RequestDigest != "" {
+					return errors.New("dsh model budget fields were sent while admission is disabled")
+				}
+			} else {
+				if frame.BudgetPlanID == "" || frame.BudgetCallID == "" || frame.RequestDigest == "" {
+					return errors.New("dsh model budget plan is missing")
+				}
+				var err error
+				ledgerCallID, _, err = consumeCloudDSHModelBudgetPlan(modelBudgetPlans, state.identity, state.through,
+					frame.ID, frame.BudgetCallID, frame.BudgetPlanID, frame.RequestDigest, frame.Request, time.Now())
+				if err != nil {
+					return err
+				}
+				if recoveryFrame {
+					intent := value.ModelRecovery
+					if intent == nil || ledgerCallID != intent.RecoveryCallID {
+						return errors.New("dsh recovery budget ledger identity is invalid")
+					}
+				}
 			}
 			if _, exists := pendingModels[frame.ID]; exists {
 				return errors.New("dsh model request identity is repeated")
@@ -2597,8 +3403,16 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			if cancelRequested {
 				continue
 			}
-			modelCall := app.ModelCall{Source: app.ModelCallTask, Task: cloudDSHModelFencePointer(fence, state.identity.SessionID, state.through),
-				ModelID: value.ModelID, CallID: frame.ID, RawRequest: append(json.RawMessage(nil), frame.Request...), ImageResolver: state.images}
+			modelFence := cloudDSHModelFence(fence, state.identity.SessionID, state.through, cloudDSHTaskRevision(value))
+			if intent := value.ModelRecovery; recoveryFrame && intent != nil &&
+				(intent.State == task.ModelRecoveryScheduled || intent.State == task.ModelRecoveryAttempting) && state.identity.SessionID == rootIdentity.SessionID {
+				modelFence.ThroughSequence = intent.CheckpointThroughSequence
+				modelFence.RecoveryCallID, modelFence.RecoveryDSHCallID = intent.RecoveryCallID, intent.RecoveryDSHCallID
+			}
+			modelCall := app.ModelCall{Source: app.ModelCallTask, Task: &modelFence,
+				ModelID: value.ModelID, CallID: frame.ID, LedgerCallID: ledgerCallID,
+				BudgetPlanID: frame.BudgetPlanID, BudgetCallID: frame.BudgetCallID,
+				BudgetRequestDigest: frame.RequestDigest, RawRequest: append(json.RawMessage(nil), frame.Request...), ImageResolver: state.images}
 			var memoryVersions []app.CloudDSHMemoryVersion
 			if protectsMemory {
 				memoryVersions, err = cloudDSHMemoryWritesWithReceipts(states, false, recoveredPersonalWrites)
@@ -2687,7 +3501,6 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				(frame.Status != "cancelled" && frame.Status != "succeeded" && frame.Status != "failed" && frame.Status != "unknown") {
 				return errors.New("dsh job cancellation response is invalid")
 			}
-			delete(pendingCancels, frame.ID)
 			child, err := e.options.Children.Get(ctx, pending.fence, pending.identity.SessionID, pending.jobID)
 			if err != nil || child.Step.Status == task.StepRunning || cloudDSHJobStatus(child) != frame.Status {
 				return errors.New("dsh job cancellation was not durably confirmed")
@@ -2705,8 +3518,11 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			}
 			if admission.Status == app.AgentToolCallSuperseded {
 				if err := supersedeToolCall(ctx, admission.PendingMessages, pending.session.identity.SessionID, pending.frame.CallID); err != nil {
+					cloudDSHEndSpan(pending.traceSpan, "failed", err)
 					return err
 				}
+				delete(pendingCancels, frame.ID)
+				cloudDSHEndSpan(pending.traceSpan, "superseded", nil)
 				continue
 			}
 			if admission.Status != app.AgentToolCallAdmitted {
@@ -2729,8 +3545,11 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				"generation": pending.identity.Generation, "authorization_version": pending.identity.AuthorizationVersion,
 				"session_id": pending.identity.SessionID, "call_id": pending.frame.CallID, "status": result.Status,
 				"output": result.Output, "images": []any{}}); err != nil {
+				cloudDSHEndSpan(pending.traceSpan, "failed", err)
 				return err
 			}
+			delete(pendingCancels, frame.ID)
+			cloudDSHEndSpan(pending.traceSpan, string(result.Status), nil)
 		case "child_settle":
 			parent := states[state.parentSessionID]
 			if e.options.Children == nil || state.identity.SessionID == rootIdentity.SessionID || parent == nil || parent.settled ||
@@ -2819,6 +3638,8 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				"output": toolOutput}); err != nil {
 				return err
 			}
+			cloudDSHEndSpan(state.traceSpan, string(status), nil)
+			state.traceSpan = nil
 		case "tool_call":
 			if (e.options.Tools == nil && !cloudDSHJobTool(frame.Name)) || frame.Through == nil || *frame.Through != state.through || state.through < 0 ||
 				!cloudDSHID.MatchString(frame.ID) || frame.CallID == "" || len(frame.CallID) > 256 || !cloudDSHID.MatchString(frame.Name) ||
@@ -2849,7 +3670,8 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				toolCallID = cloudDSHNamespacedToolCallID(value.ID, state.identity.SessionID, frame.CallID)
 			}
 			call := app.ModelToolCall{CallID: toolCallID, Name: frame.Name, Arguments: string(arguments),
-				TaskFence: cloudDSHModelFencePointer(fence, state.identity.SessionID, state.through)}
+				CurrentTaskTurnMessageID: frame.CurrentTaskTurnMessageID,
+				TaskFence:                cloudDSHModelFencePointer(fence, state.identity.SessionID, state.through)}
 			var result app.AgentToolResult
 			recoveredPersonalResult := false
 			if recoveryCall {
@@ -2940,28 +3762,50 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 					}
 					if result.Status == "" {
 						if frame.Name == cloudDSHJobCancelToolName {
-							immediate, pending, jobID, cancelErr := e.cancelCloudDSHJob(ctx, fence, state.identity.SessionID, frame.CallID, frame.Arguments)
+							toolCtx, toolSpan := e.startToolCallTrace(ctx, value, state, frame.Name, frame.CallID, state.through)
+							var immediate app.AgentToolResult
+							var pending bool
+							var jobID string
+							var cancelErr error
+							func() {
+								defer cloudDSHEndSpanOnPanic(toolSpan)
+								immediate, pending, jobID, cancelErr = e.cancelCloudDSHJob(toolCtx, fence, state.identity.SessionID, frame.CallID, frame.Arguments)
+							}()
 							if cancelErr != nil {
 								if messages, superseded := cloudDSHTaskInputPendingMessages(cancelErr); superseded {
 									if err := supersedeToolCall(ctx, messages, state.identity.SessionID, frame.CallID); err != nil {
+										cloudDSHEndSpan(toolSpan, "failed", err)
 										return err
 									}
+									cloudDSHEndSpan(toolSpan, "superseded", nil)
 									continue
 								}
+								cloudDSHEndSpan(toolSpan, "failed", cancelErr)
 								return errors.New("dsh background job cancellation could not be authorized")
 							}
 							if pending {
 								pendingCancels[frame.ID] = cloudDSHJobCancelPending{session: state, fence: fence, frame: frame,
-									arguments: arguments, identity: state.identity, jobID: jobID}
+									arguments: arguments, identity: state.identity, jobID: jobID, traceSpan: toolSpan}
 								if err := e.writeCloudDSHJobCancel(ctx, state.identity, frame.ID, jobID, input); err != nil {
 									delete(pendingCancels, frame.ID)
+									cloudDSHEndSpan(toolSpan, "failed", err)
 									return err
 								}
 								continue
 							}
 							result = immediate
+							cloudDSHEndSpan(toolSpan, string(immediate.Status), nil)
 						} else {
-							result, err = e.executeCloudDSHJobRead(ctx, value, fence, frame, states)
+							toolCtx, toolSpan := e.startToolCallTrace(ctx, value, state, frame.Name, frame.CallID, state.through)
+							func() {
+								defer cloudDSHEndSpanOnPanic(toolSpan)
+								result, err = e.executeCloudDSHJobRead(toolCtx, value, fence, frame, states)
+							}()
+							status := string(result.Status)
+							if status == "" {
+								status = "failed"
+							}
+							cloudDSHEndSpan(toolSpan, status, err)
 						}
 					}
 				} else if recoveryCall {
@@ -2981,13 +3825,13 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 						if !ok {
 							return errors.New("dsh recovery broker is unavailable")
 						}
-						result, err = executeToolAndRecordActivity(state, request, func() (app.AgentToolResult, error) {
-							return recoveryTools.Reconcile(ctx, value, call, state.history.recoveryOutput(frame.CallID))
+						result, err = executeToolAndRecordActivity(state, request, frame.Name, frame.CallID, state.through, func(toolCtx context.Context) (app.AgentToolResult, error) {
+							return recoveryTools.Reconcile(toolCtx, value, call, state.history.recoveryOutput(frame.CallID))
 						})
 					}
 				} else {
-					result, err = executeToolAndRecordActivity(state, request, func() (app.AgentToolResult, error) {
-						return e.options.Tools.Execute(ctx, value, call)
+					result, err = executeToolAndRecordActivity(state, request, frame.Name, frame.CallID, state.through, func(toolCtx context.Context) (app.AgentToolResult, error) {
+						return e.options.Tools.Execute(toolCtx, value, call)
 					})
 				}
 			}
@@ -3127,13 +3971,25 @@ func (e *CloudDSHExecutor) createCloudDSHChildSession(ctx context.Context, value
 		frame.cloudDSHIdentity != parent.identity || frame.Through == nil || *frame.Through != parent.through || !cloudDSHID.MatchString(frame.CallID) {
 		return false, errors.New("dsh child Agent request identity is invalid")
 	}
+	// E12 subagent depth limit: a new child may only be spawned while the
+	// delegation depth stays within MaxSubagentDepth (default 2). A deeper
+	// spawn is rejected with an
+	// explicit error, never silently dropped, so the model learns the
+	// delegation is unavailable instead of retrying it. A recovery replay
+	// of an already-checkpointed delegate call is exempt: it finishes a
+	// spawn admitted before this limit, it does not create a new level.
+	parentDepth := cloudDSHSessionDepth(parent, fence.AgentSessionID)
+	recoveryCall := parent.resume && parent.history.isRecoveryCall(frame.CallID)
+	if !recoveryCall && parentDepth+1 > e.maxSubagentDepth() {
+		return false, errors.New("dsh child Agent delegation exceeds the subagent depth limit")
+	}
 	if parent.identity.SessionID != fence.AgentSessionID {
 		parentDefinitions = parent.definitions
 	}
-	arguments, definitions, err := validateCloudDSHDelegateArguments(frame.Arguments, parentDefinitions)
+	arguments, definitions, planStepID, planRevision, businessArguments, err := validateCloudDSHDelegateArgumentsWithPlanSelection(frame.Arguments, parentDefinitions)
 	canonical, canonicalOK := canonicalCloudDSHJSON(frame.Arguments)
-	recoveryCall := parent.resume && parent.history.isRecoveryCall(frame.CallID)
-	if err != nil || !canonicalOK || (recoveryCall && (parent.readThrough != parent.restoreThrough ||
+	businessCanonical, businessCanonicalOK := canonicalCloudDSHJSON(businessArguments)
+	if err != nil || !canonicalOK || !businessCanonicalOK || (recoveryCall && (parent.readThrough != parent.restoreThrough ||
 		parent.history.validateRecoveryToolCall(frame.CallID, cloudDSHDelegateToolName, canonical) != nil)) ||
 		(!recoveryCall && (!parent.history.allHistoricalCallsReconciled() ||
 			parent.history.validateToolCall(frame.CallID, cloudDSHDelegateToolName, canonical) != nil)) {
@@ -3192,7 +4048,8 @@ func (e *CloudDSHExecutor) createCloudDSHChildSession(ctx context.Context, value
 	childReplayed := false
 	childValue, err := runAgentRequest(parent, request, func() (any, error) {
 		child, replayed, err := e.options.Children.Create(ctx, app.AgentChildSessionCommand{Fence: fence, ParentSessionID: parent.identity.SessionID,
-			SpawnKey: frame.CallID, Arguments: canonical, Title: strings.TrimSpace(arguments.Title), AllowedTools: allowedTools,
+			SpawnKey: frame.CallID, Arguments: businessCanonical, PlanStepID: planStepID, PlanRevision: planRevision,
+			Title: strings.TrimSpace(arguments.Title), AllowedTools: allowedTools,
 			Background: arguments.RunInBackground, RootCheckpointThroughSequence: rootCheckpointThrough})
 		childReplayed = replayed
 		return child, err
@@ -3294,11 +4151,13 @@ func (e *CloudDSHExecutor) createCloudDSHChildSession(ctx context.Context, value
 	}
 	identity := parent.identity
 	identity.SessionID = child.SessionID
-	childCanDelegate := parent.identity.SessionID == fence.AgentSessionID && len(definitions) > 0
+	childDepth := parentDepth + 1
+	childCanDelegate := childDepth < e.maxSubagentDepth() && len(definitions) > 0
 	childDefinitions, err := cloudDSHChildDelegationTools(definitions, childCanDelegate)
 	if err != nil {
 		return false, err
 	}
+	childDefinitions = cloudDSHAddPlanSelectorsToDelegate(childDefinitions)
 	if child.Step.Status == task.StepRunning {
 		if existing := states[child.SessionID]; existing != nil {
 			if existing.spawnKey != frame.CallID || existing.identity != identity || existing.background != arguments.RunInBackground {
@@ -3306,10 +4165,16 @@ func (e *CloudDSHExecutor) createCloudDSHChildSession(ctx context.Context, value
 			}
 		} else {
 			resume := child.CheckpointThrough >= 0
-			states[child.SessionID] = newCloudDSHSessionState(fence, identity, parent.identity.SessionID, frame.CallID,
+			childState := newCloudDSHSessionState(fence, identity, parent.identity.SessionID, frame.CallID,
 				childDefinitions, childCanDelegate, resume, child.CheckpointThrough, child.CheckpointDigest)
-			states[child.SessionID].rootCheckpointThrough = child.RootCheckpointThroughSequence
-			states[child.SessionID].background = arguments.RunInBackground
+			childState.rootCheckpointThrough = child.RootCheckpointThroughSequence
+			childState.background = arguments.RunInBackground
+			parentTraceContext := ctx
+			if parent.traceSpan != nil {
+				parentTraceContext = trace.ContextWithSpan(ctx, parent.traceSpan)
+			}
+			e.startSessionTrace(parentTraceContext, value, childState)
+			states[child.SessionID] = childState
 		}
 	}
 	response := map[string]any{"type": "child_session", "call_id": frame.CallID,

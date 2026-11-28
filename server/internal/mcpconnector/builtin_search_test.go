@@ -21,15 +21,26 @@ func TestBuiltinSearchRejectsUnsafeConfigurationAndArguments(t *testing.T) {
 	if !validBuiltinSearxngURL("http://127.0.0.1:8189") {
 		t.Fatal("rejected fixed loopback endpoint")
 	}
+	if !validBuiltinSearchArguments("searxng_web_search", json.RawMessage(`{"query":"!mgn news","time_range":"week"}`)) {
+		t.Fatal("rejected the bounded Morde news engine query")
+	}
+	if !validBuiltinSearchArguments("web_url_read", json.RawMessage(`{"url":"https://example.com/news","startChar":4800,"maxLength":2000}`)) {
+		t.Fatal("rejected a bounded public page window")
+	}
 	for _, input := range []struct{ name, args string }{
 		{"other", `{"query":"news"}`},
 		{"searxng_web_search", `{"query":"news","url":"http://127.0.0.1"}`},
 		{"searxng_web_search", `{"query":"news","time_range":"forever"}`},
 		{"searxng_web_search", `{"query":"news","time_range":null}`},
+		{"searxng_web_search", `{"query":"news","categories":"general"}`},
 		{"searxng_web_search", `{"query":""}`},
 		{"web_url_read", `{"url":"file:///etc/passwd"}`},
 		{"web_url_read", `{"url":"http://example.com/news"}`},
 		{"web_url_read", `{"url":"https://user:password@example.com"}`},
+		{"web_url_read", `{"url":"https://example.com","startChar":-1}`},
+		{"web_url_read", `{"url":"https://example.com","startChar":100001}`},
+		{"web_url_read", `{"url":"https://example.com","maxLength":2401}`},
+		{"web_url_read", `{"url":"https://example.com","unexpected":true}`},
 	} {
 		if validBuiltinSearchArguments(input.name, json.RawMessage(input.args)) {
 			t.Errorf("accepted unsupported arguments for %s", input.name)
@@ -73,7 +84,7 @@ readline.createInterface({input:process.stdin}).on('line', line => {
   if (request.id === undefined) return;
   let result;
   if (request.method === 'initialize') result = {protocolVersion:request.params.protocolVersion,capabilities:{tools:{}},serverInfo:{name:'fixture',version:'1'}};
-	else if (request.method === 'tools/call') { calls++; result = {content:[{type:'text',text:JSON.stringify({calls,query:request.params.arguments.query,time_range:request.params.arguments.time_range,leaked:!!process.env.MORDE_SEARCH_PRIVATE_TEST})}]}; }
+	else if (request.method === 'tools/call') { calls++; result = {content:[{type:'text',text:JSON.stringify({calls,query:request.params.arguments.query,time_range:request.params.arguments.time_range,categories:request.params.arguments.categories,leaked:!!process.env.MORDE_SEARCH_PRIVATE_TEST})}]}; }
   else result = {};
   process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:request.id,result})+'\n');
 });`
@@ -110,17 +121,18 @@ readline.createInterface({input:process.stdin}).on('line', line => {
 		t.Fatal(err)
 	}
 	for range 2 {
-		result, err := client.CallTool(context.Background(), "searxng_web_search", json.RawMessage(`{"query":"synthetic","time_range":"week"}`))
+		result, err := client.CallTool(context.Background(), "searxng_web_search", json.RawMessage(`{"query":"synthetic","time_range":"week","categories":"news"}`))
 		if err != nil || result.IsError || result.UnsupportedContent || len(result.Text) != 1 {
 			t.Fatalf("call result = %#v, err = %v", result, err)
 		}
 		var reply struct {
-			Calls     int    `json:"calls"`
-			Query     string `json:"query"`
-			TimeRange string `json:"time_range"`
-			Leaked    bool   `json:"leaked"`
+			Calls      int    `json:"calls"`
+			Query      string `json:"query"`
+			TimeRange  string `json:"time_range"`
+			Categories string `json:"categories"`
+			Leaked     bool   `json:"leaked"`
 		}
-		if json.Unmarshal([]byte(result.Text[0]), &reply) != nil || reply.Calls != 1 || reply.Query != "synthetic" || reply.TimeRange != "week" || reply.Leaked {
+		if json.Unmarshal([]byte(result.Text[0]), &reply) != nil || reply.Calls != 1 || reply.Query != "synthetic" || reply.TimeRange != "week" || reply.Categories != "news" || reply.Leaked {
 			t.Fatalf("unexpected isolated response: %#v", reply)
 		}
 	}
@@ -181,9 +193,9 @@ func TestBuiltinSearchWithLocalSearxng(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := client.CallTool(context.Background(), "searxng_web_search", json.RawMessage(`{"query":"latest AI news","time_range":"week"}`))
+	result, err := client.CallTool(context.Background(), "searxng_web_search", json.RawMessage(`{"query":"!mgn artificial intelligence news","time_range":"week"}`))
 	if err != nil || result.IsError || result.UnsupportedContent || len(result.Text) == 0 || !strings.Contains(strings.Join(result.Text, "\n"), "https://") {
-		t.Fatalf("public news search failed or returned no source links: err=%v isError=%t unsupported=%t", err, result.IsError, result.UnsupportedContent)
+		t.Fatalf("public news search failed or returned no source links: err=%v isError=%t unsupported=%t text=%q", err, result.IsError, result.UnsupportedContent, strings.Join(result.Text, "\n"))
 	}
 	blocked, err := client.CallTool(context.Background(), "web_url_read", json.RawMessage(`{"url":"http://127.0.0.1:8189/"}`))
 	if err == nil && !blocked.IsError {

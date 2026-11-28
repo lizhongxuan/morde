@@ -388,7 +388,7 @@ func newCloudDSHT08WorkspaceTools(t *testing.T, files []workspace.File, emptyDir
 	revision := int64(0)
 	expires := time.Now().Add(time.Minute).UTC()
 	current := task.Task{ID: "q1234567", OwnerID: "u1234567", InitiatorID: "u1234567", WorkspaceID: "w1234567",
-		ExecutionLocation: "server", Status: task.StatusRunning, InputRevision: &revision, WorkspaceCheckpointRevision: &revision,
+		ExecutionLocation: "server", Status: task.StatusRunning, FileDeliveryIntent: task.FileDeliveryNone, InputRevision: &revision, WorkspaceCheckpointRevision: &revision,
 		CurrentRevision: &revision, DesiredRevision: &revision,
 		ContextDigest: contextDigest, Lease: task.Lease{Owner: "worker-1", Version: 1, ExpiresAt: &expires},
 		Budget: task.Budget{ActiveSeconds: 1800, ToolCalls: 100, ModelTokens: 50000}}
@@ -441,6 +441,9 @@ func TestCloudDSHWorkspaceToolsReadOwnerSnapshotAndRejectTraversal(t *testing.T)
 	if err != nil || result.Status != AgentToolSucceeded || decodeStrictRuntimeResult([]byte(result.Output), &decoded) != nil ||
 		decoded.WorkspaceID != current.WorkspaceID || decoded.Revision != 0 || decoded.Content != "untrusted note" || decoded.SHA256 != file.SHA256 {
 		t.Fatalf("Workspace read = %#v, %#v, %v", result, decoded, err)
+	}
+	if decoded.SourceMode != cloudDSHWorkspaceSourceModeImmutableRevision || !validSyncDigest(decoded.ManifestSHA256) {
+		t.Fatalf("snapshot read did not identify its immutable revision: %+v", decoded)
 	}
 	for _, path := range []string{"../outside", "/etc/passwd", "notes/../../outside", ".env", ".env.local/private.txt", "settings/.env.production/key", ".ssh/id_rsa"} {
 		call := workspaceToolCall(t, cloudDSHWorkspaceReadToolName, "bad-read-"+path, cloudDSHWorkspaceReadArguments{ExpectedRevision: 0, Path: path})
@@ -499,8 +502,12 @@ func TestCloudDSHWorkspaceReadDoesNotPersistContentForExternalReview(t *testing.
 		t.Fatal(err)
 	}
 	var detail TaskStepDetailDocument
-	if err := json.Unmarshal(plain, &detail); err != nil || detail.ContentEvidence != nil || bytes.Contains(plain, []byte(content)) {
-		t.Fatalf("encrypted Workspace detail included file bytes for external review: %+v, err=%v", detail.ContentEvidence, err)
+	if err := json.Unmarshal(plain, &detail); err != nil || detail.ContentEvidence != nil || bytes.Contains(plain, []byte(content)) ||
+		len(detail.SourceLocations) != 1 || !validTaskStepSourceLocationID(detail.SourceLocations[0].ID) ||
+		detail.SourceLocations[0].Kind != taskStepSourceLocationKindWorkspaceFile || detail.SourceLocations[0].Path != "docs/readme.md" ||
+		detail.SourceLocations[0].State != taskStepSourceLocationStateWorkspaceRevision ||
+		detail.SourceLocations[0].ContentSHA256 != file.SHA256 || !validSyncDigest(detail.SourceLocations[0].ManifestSHA256) {
+		t.Fatalf("encrypted Workspace detail omitted safe source metadata or included file bytes: %+v, err=%v", detail, err)
 	}
 }
 
@@ -519,12 +526,17 @@ func TestCloudDSHWorkspaceToolsReadLiveDirectoryInsteadOfSnapshot(t *testing.T) 
 	}
 	read, err := tools.read(context.Background(), current, cloudDSHWorkspaceReadArguments{ExpectedRevision: 0, Path: "live.txt"})
 	var readValue cloudDSHWorkspaceReadOutput
-	if err != nil || read.Status != AgentToolSucceeded || json.Unmarshal([]byte(read.Output), &readValue) != nil || readValue.Content != "host wrote this" {
+	if err != nil || read.Status != AgentToolSucceeded || json.Unmarshal([]byte(read.Output), &readValue) != nil ||
+		readValue.Content != "host wrote this" || readValue.SourceMode != cloudDSHWorkspaceSourceModeLiveDirectory || readValue.ManifestSHA256 != "" {
 		t.Fatalf("live Workspace read = %#v, err=%v", read, err)
 	}
 	search, err := tools.search(context.Background(), current, cloudDSHWorkspaceSearchArguments{ExpectedRevision: 0, Query: "HOST WROTE", MaxResults: 10})
 	var searchValue cloudDSHWorkspaceSearchOutput
-	if err != nil || search.Status != AgentToolSucceeded || json.Unmarshal([]byte(search.Output), &searchValue) != nil || len(searchValue.Matches) != 1 || searchValue.Matches[0].Path != "live.txt" {
+	liveDigest := sha256.Sum256([]byte("host wrote this"))
+	if err != nil || search.Status != AgentToolSucceeded || json.Unmarshal([]byte(search.Output), &searchValue) != nil ||
+		len(searchValue.Matches) != 1 || searchValue.Matches[0].Path != "live.txt" ||
+		searchValue.SourceMode != cloudDSHWorkspaceSourceModeLiveDirectory || searchValue.ManifestSHA256 != "" ||
+		searchValue.Matches[0].ContentSHA256 != hex.EncodeToString(liveDigest[:]) {
 		t.Fatalf("live Workspace search = %#v, err=%v", search, err)
 	}
 }
@@ -615,7 +627,9 @@ func TestCloudDSHWorkspaceSearchIsBoundedRevisionScopedAndOmitsRestrictedFiles(t
 	var found cloudDSHWorkspaceSearchOutput
 	if err != nil || result.Status != AgentToolSucceeded || decodeStrictRuntimeResult([]byte(result.Output), &found) != nil ||
 		found.WorkspaceID != current.WorkspaceID || found.Revision != 0 || !found.Complete || found.FilesScanned != 1 ||
-		len(found.Matches) != 1 || found.Matches[0].Path != file.Path || found.Matches[0].Line != 2 || found.Matches[0].Text != "AI news from the report" {
+		found.SourceMode != cloudDSHWorkspaceSourceModeImmutableRevision || !validSyncDigest(found.ManifestSHA256) ||
+		len(found.Matches) != 1 || found.Matches[0].Path != file.Path || found.Matches[0].Line != 2 ||
+		found.Matches[0].ContentSHA256 != file.SHA256 || found.Matches[0].Text != "AI news from the report" {
 		t.Fatalf("Workspace search = %#v, %#v, %v", result, found, err)
 	}
 
@@ -984,6 +998,27 @@ func TestCloudDSHWorkspaceWriteExpiredApprovalDoesNotCommit(t *testing.T) {
 		workspaceStore.commits != 0 || workspaceStore.workspace.Revision != 0 || len(workspaceStore.snapshots[0]) != 0 {
 		t.Fatalf("expired Workspace write = %#v err=%v commits=%d revision=%d files=%#v",
 			result, err, workspaceStore.commits, workspaceStore.workspace.Revision, workspaceStore.snapshots[0])
+	}
+}
+
+func TestCloudDSHWorkspaceWriteApprovalCarriesEvidenceFields(t *testing.T) {
+	_, store, broker, _, current := newCloudDSHT08WorkspaceBroker(t)
+	call := workspaceToolCall(t, cloudDSHWorkspaceWriteToolName, "write-evidence", cloudDSHWorkspaceWriteArguments{
+		ExpectedRevision: 0, Path: "reports/evidence.txt", Content: "evidence content",
+	})
+	result, err := broker.Execute(context.Background(), current, call)
+	pending := store.details.PendingRequest
+	if err != nil || result.Status != AgentToolNeedsUser || pending == nil {
+		t.Fatalf("Workspace write before approval = %#v, err=%v; pending=%#v", result, err, pending)
+	}
+	if pending.TriggerRule != task.ApprovalTriggerWorkspaceLiveWrite || pending.RejectionConsequence == "" {
+		t.Fatalf("Workspace approval trigger or rejection consequence missing: %#v", pending)
+	}
+	if !strings.HasPrefix(pending.EvidencePointer, "step:") {
+		t.Fatalf("Workspace write approval evidence pointer = %q, want a step: pointer", pending.EvidencePointer)
+	}
+	if pending.ThisCostMicros != nil || pending.TotalCostMicros != nil {
+		t.Fatalf("Workspace write approval costs must stay unknown (nil), got current=%+v total=%+v", pending.ThisCostMicros, pending.TotalCostMicros)
 	}
 }
 

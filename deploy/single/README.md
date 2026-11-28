@@ -79,7 +79,9 @@ Host 入口会在 Morde Runtime 进程意外退出后采用 1–30 秒有界退�
    deploy/single/install-portal-service.sh "$PORTAL_USER"
    ```
 
-   空库首次启动会初始化超级管理员 `admin`，默认密码为 `admin`。首次修改密码前只通过本机回环地址或受信任的 SSH 本地隧道访问 `/admin/`；不要在仍使用默认密码时开放公网入口。改密完成后再开放正常访问，后续重启不会恢复默认密码。普通用户在 `morde-client` 内注册，初始状态为待审核；管理员通过审核后才能登录。管理员凭据文件同步和 `portal user add` 入口均已移除。新目录只在不存在时创建并明确归属于 Portal 账户；现有目录不自动改属主或递归改数据。迁移由同一个账户执行。已有服务账户应是非 root、禁止 shell 登录的专用账户；不要另建第二套数据目录。安装脚本要求 Workspace / Site 根目录为该账户所有且权限 0700，两份 32 字节密钥为该账户所有且权限 0600，并检查该账户可访问 Docker 和只读 nftables 检查。Docker socket/组权限等同 root，须限制该账户的其他用途。仓库放在 `/opt` 或 `/srv` 等非 home 目录，确保服务账户可读取仓库、前端构建物和 Portal 二进制；服务启用后不要移动仓库。安装脚本不复制代码或创建账户。真实密码不要放命令行或日志。
+   PostgreSQL 容器设置 2 GiB 内存上限，且不预留容器 swap；这是面向 8 GiB 主机的最低运行预算。发生 OOM 时应先检查数据库连接数、查询内存和主机可用内存，不要通过重启 Portal 掩盖数据库进程被杀的问题。
+
+   空库首次启动会初始化超级管理员 `admin`，默认密码为 `admin`。初始密码可通过正常 Portal/PC 网络入口登录，不要求服务器 loopback；账号会获得受限改密会话，在改密前只能读取本人资料、修改密码或退出，不能访问其他 API，也不会触发默认云电脑初始化。请立即在 `/admin/change-password` 或 PC 的密码设置页修改默认密码；改密完成后再正常使用账号，后续重启不会恢复默认密码。普通用户在 `morde-client` 内注册，初始状态为待审核；管理员通过审核后才能登录。管理员凭据文件同步和 `portal user add` 入口均已移除。新目录只在不存在时创建并明确归属于 Portal 账户；现有目录不自动改属主或递归改数据。迁移由同一个账户执行。已有服务账户应是非 root、禁止 shell 登录的专用账户；不要另建第二套数据目录。安装脚本要求 Workspace / Site 根目录为该账户所有且权限 0700，两份 32 字节密钥为该账户所有且权限 0600，并检查该账户可访问 Docker 和只读 nftables 检查。Docker socket/组权限等同 root，须限制该账户的其他用途。仓库放在 `/opt` 或 `/srv` 等非 home 目录，确保服务账户可读取仓库、前端构建物和 Portal 二进制；服务启用后不要移动仓库。安装脚本不复制代码或创建账户。真实密码不要放命令行或日志。
 
    安装脚本注册三个 systemd 单元和一个 Docker 服务依赖：Docker 启动前 root 预装载 `cloudhost` nftables 规则，Docker 启动后 root 重新核对网桥并应用相同规则，Portal 以指定账户启动并在异常退出后重启。人工重启 Docker 会按“预装载 → Docker → 后置应用 → Portal”顺序重启；网络策略单元也会在 Docker 或预装载单元重启后重放，Portal 随策略重启并恢复全部账号授权快照。策略单元重载通过重启处理，避免只清空动态 allow-set 而漏掉 Portal 恢复。安装脚本会为受支持的发行版 nftables unit 安装生命周期 drop-in：stop 前停止 Portal/托管节点并清空 relay allow-set，保留默认拒绝规则；reload 前停服务，并将基础配置和 Morde policy 一次提交，成功后才排队恢复 Portal。若生命周期动作失败，节点恢复不会排队，当前 Morde 规则保留。安装时会先停止 Portal，再装载或重载 nftables 策略，最后重启 Portal；门户会短暂不可用。安装脚本在 Docker 已运行时重装策略并重启 Portal 以重放授权，不为此主动重启 Docker。`systemctl daemon-reload` 只更新单元定义，不清空已装载的 nftables 表。若预装载失败，Docker 不启动，也不会自动恢复旧 Host。数据库或 OpenSandbox 尚未就绪时 Portal 会重试启动；网络策略检查失败则拒绝服务。安装前先停止旧的手工 `portal serve` 进程，避免端口冲突；如果已有非本脚本管理的同名 systemd 单元或 Docker drop-in，脚本会拒绝覆盖，需先核对旧配置再迁移。使用 `systemctl status morde-portal.service` 和 `curl -fsS http://127.0.0.1:7080/readyz` 检查状态；配置或二进制更新后先运行迁移，再执行 `sudo systemctl restart morde-portal.service`。备份 / 恢复前使用 `sudo systemctl stop morde-portal.service` 并保持停止，结束后再启动。
 
@@ -99,6 +101,14 @@ Host 入口会在 Morde Runtime 进程意外退出后采用 1–30 秒有界退�
 本机没有额外数据盘时，不要把同一根分区上的不同目录当作磁盘隔离或备份。达到停创阈值后，先迁移数据或清理经确认可删除的数据；不要对 Docker 执行自动 prune。正式多用户开放前还需要独立数据库/容器存储、可用的备份目标及恢复演练。
 
 验证脚本在 `verify/`。只配置指向本机的测试服务，使用合成数据；测试输出保存在本地。runsc 不可用或真实 OpenSandbox 缺失时，应记录未完成，禁止将 mock UI 结果当作真实主机验收。首版没有暂停/唤醒、直连令牌、公开预览、VSCode、通知及一键安装器。
+
+## Harness 可观测系统发布
+
+可观测系统继续运行在现有 Portal 与 PostgreSQL 上：不新增容器、服务、对外端口或数据库连接池。Portal 使用本地 OpenTelemetry Go SDK 和有界 PostgreSQL span exporter；span、消息关联和 trace 关联日志保留 7 天，DSH 事件只读现有加密 checkpoint，清理任务不会触碰 checkpoint。Span 队列上限 512、单批最多 128 spans、单 span payload 上限 64 KiB、单批 4 MiB；zap 日志镜像队列上限 512、单批最多 64 条、单条属性不超过 8 KiB。导出或日志写入失败时业务继续，管理页显示采集缺口。
+
+发布时按常规单机升级顺序先完成本地 PostgreSQL 备份，再构建目标 Linux 架构的 Portal，运行 `portal migrate up` 应用 `00258_observability_spans.sql`、`00259_observability_trace_links.sql`、`00260_observability_logs.sql` 和 `00261_observability_task_attempt_links.sql`，然后安装并重启 Portal。迁移为追加表和索引；迁移不创建其他进程。新服务就绪后以管理员检查 `/admin/observability` 的来源状态、span 树与跨 attempt link、关联日志和 DSH checkpoint 详情。4 核 / 8 GiB 单机继续受现有 PostgreSQL 内存限制；发布后观察 Portal 延迟、PostgreSQL 内存和磁盘增长，确认所有 7 天观测保留清理持续运行。
+
+回滚时停止 Portal、恢复上一版 Portal 二进制并重启；保留四张观测表及迁移版本。旧版会忽略这些追加表，保留历史诊断数据。不要为应用回滚执行 Goose Down：它会删除 Span、消息/attempt 关联和日志数据；DSH checkpoint 不属于这些迁移，也不得清理或重建。若数据库恢复需要回退，使用同一时点的数据库与既有密文备份流程并遵循下方恢复步骤。
 
 ## 离线备份与恢复
 

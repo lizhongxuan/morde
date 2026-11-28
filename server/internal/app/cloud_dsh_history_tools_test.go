@@ -53,6 +53,108 @@ type cloudDSHCurrentMessageChunkTestStore struct {
 	afterRead     func()
 }
 
+type cloudDSHAgentMessageSourceReaderTestStub struct {
+	reference       AgentMessageSourceReference
+	content         string
+	pageCorrupt     bool
+	revokeAfterPage bool
+	revoked         bool
+	referenceCalls  int
+	pageCalls       int
+	pageOffsets     []int64
+	fences          []AgentCheckpointFence
+}
+
+func (s *cloudDSHAgentMessageSourceReaderTestStub) ReadMessageSourceReference(_ context.Context, fence AgentCheckpointFence,
+	messageID string) (AgentMessageSourceReference, error) {
+	s.referenceCalls++
+	s.fences = append(s.fences, fence)
+	if s.revoked || messageID != s.reference.Envelope.MessageID {
+		return AgentMessageSourceReference{}, domain.NewError(domain.CodeForbidden, "message source was revoked")
+	}
+	return s.reference, nil
+}
+
+func (s *cloudDSHAgentMessageSourceReaderTestStub) ReadMessageSourcePage(_ context.Context, fence AgentCheckpointFence,
+	messageID string, expectedSourceSHA256 []byte, runeOffset int64) (AgentMessageSourcePageRead, error) {
+	s.pageCalls++
+	s.pageOffsets = append(s.pageOffsets, runeOffset)
+	s.fences = append(s.fences, fence)
+	expectedDigest, digestErr := hex.DecodeString(s.reference.Envelope.SourceSHA256)
+	if digestErr != nil || s.revoked || messageID != s.reference.Envelope.MessageID || !bytes.Equal(expectedSourceSHA256, expectedDigest) {
+		return AgentMessageSourcePageRead{}, domain.NewError(domain.CodeForbidden, "message source page was revoked")
+	}
+	envelope := s.reference.Envelope
+	for _, page := range envelope.Pages {
+		if page.RuneOffset != runeOffset {
+			continue
+		}
+		runes := []rune(s.content)
+		content := string(runes[page.RuneOffset:page.NextRuneOffset])
+		pageDigest, _ := hex.DecodeString(page.SHA256)
+		fragmentDigest := sha256.Sum256([]byte(content))
+		if s.pageCorrupt && len(content) > 0 {
+			content = "corrupt " + content
+		}
+		read := AgentMessageSourcePageRead{MessageID: messageID, SourceSHA256: append([]byte(nil), expectedSourceSHA256...),
+			PageSHA256: pageDigest, PageRuneOffset: page.RuneOffset, PageNextRuneOffset: page.NextRuneOffset,
+			FragmentSHA256: append([]byte(nil), fragmentDigest[:]...), RuneOffset: page.RuneOffset,
+			NextRuneOffset: page.NextRuneOffset, TotalRunes: envelope.TotalRunes, Content: content}
+		if s.revokeAfterPage {
+			s.revoked = true
+		}
+		return read, nil
+	}
+	return AgentMessageSourcePageRead{}, domain.NewError(domain.CodeNotFound, "message source page was not found")
+}
+
+func cloudDSHTestAgentMessageSourceReference(t *testing.T, current task.Task, messageID, content string) AgentMessageSourceReference {
+	t.Helper()
+	manifest, err := BuildConversationMessageSourceManifest(messageID, 3, content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pages := make([]AgentMessageSourcePage, 0, len(manifest.Pages))
+	for _, page := range manifest.Pages {
+		pages = append(pages, AgentMessageSourcePage{RuneOffset: page.RuneOffset, NextRuneOffset: page.NextRuneOffset,
+			SHA256: hex.EncodeToString(page.SHA256)})
+	}
+	envelope := AgentMessageReferenceEnvelope{Version: AgentMessageReferenceEnvelopeVersion, TaskID: current.ID,
+		TaskRevision: *current.CurrentRevision, OwnerID: current.OwnerID, ConversationID: current.ConversationID,
+		MessageID: messageID, MessageSequence: manifest.Sequence, AuthorizationVersion: current.Authorization.Version,
+		AgentGeneration: current.AgentGeneration, RootSessionID: current.AgentSessionID, Mode: AgentMessageDeliverySteer,
+		AttachmentIDs: []string{}, ContentBytes: manifest.ContentBytes, SourceSHA256: hex.EncodeToString(manifest.SHA256),
+		ManifestVersion: AgentMessageManifestVersion, TotalRunes: manifest.TotalRunes, Pages: pages}
+	cloudDSHResealTestAgentMessageReference(t, &envelope)
+	representationSHA256, err := hex.DecodeString(envelope.RepresentationSHA256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return AgentMessageSourceReference{Envelope: envelope, RepresentationKind: "reference", RepresentationVersion: 1,
+		RepresentationSHA256: representationSHA256, AppliedCheckpointThrough: 2,
+		AuthorizedAgentGeneration: current.AgentGeneration}
+}
+
+func cloudDSHResealTestAgentMessageReference(t *testing.T, envelope *AgentMessageReferenceEnvelope) {
+	t.Helper()
+	sourceSHA256, err := hex.DecodeString(envelope.SourceSHA256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestSHA256, err := ComputeAgentMessageManifestSHA256(envelope.MessageID, envelope.MessageSequence,
+		envelope.ContentBytes, sourceSHA256, envelope.TotalRunes, envelope.Pages)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope.ManifestSHA256 = hex.EncodeToString(manifestSHA256)
+	envelope.RepresentationSHA256 = ""
+	representationSHA256, err := ComputeAgentMessageReferenceRepresentationSHA256(*envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelope.RepresentationSHA256 = hex.EncodeToString(representationSHA256)
+}
+
 func (s *cloudDSHCurrentMessageChunkTestStore) ReadCurrentConversationMessageChunk(_ context.Context, current task.Task,
 	messageID string, runeOffset int64, maxRunes int) (CurrentConversationMessageChunk, error) {
 	if s.readErr != nil {
@@ -439,6 +541,253 @@ func TestCloudDSHCurrentMessageSearchDefinitionRequiresBoundedQueryAndSource(t *
 		!strings.Contains(definition.Description, "half-open original-message rune ranges") ||
 		!strings.Contains(definition.Description, "every canonical page each excerpt spans") {
 		t.Fatalf("message search schema did not bind a bounded query to the authorized source: definition=%+v schema=%+v", definition, schema)
+	}
+}
+
+func cloudDSHAgentMessageSourceTestFixture(t *testing.T, content string) (*CloudDSHToolBroker, *cloudDSHBrokerTaskStore,
+	task.Task, *cloudDSHAgentMessageSourceReaderTestStub, string) {
+	t.Helper()
+	broker, baseStore, claimed, _, _ := cloudDSHGoalScheduleTaskFixture(t)
+	claimed.AgentInstanceID = "agent_history_source"
+	claimed.AgentGeneration = 1
+	claimed.AgentEngineVersion = "engine_history_source"
+	claimed.AgentProfileVersion = "profile_history_source"
+	claimed.ConversationContext.ThroughSequence = 0
+	configureCloudDSHCurrentHistory(t, broker, baseStore, &claimed)
+	baseStore.details.Task = claimed
+	messageID, err := domain.NewMessageID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := &cloudDSHAgentMessageSourceReaderTestStub{content: content,
+		reference: cloudDSHTestAgentMessageSourceReference(t, claimed, messageID, content)}
+	if err := broker.SetAgentMessageSourceReader(reader); err != nil {
+		t.Fatal(err)
+	}
+	return broker, baseStore, claimed, reader, messageID
+}
+
+func cloudDSHAgentMessageSourceCall(current task.Task, callID, name, arguments string) ModelToolCall {
+	return ModelToolCall{CallID: callID, Name: name, Arguments: arguments,
+		TaskFence: &ModelTaskFence{TaskID: current.ID, OwnerID: current.OwnerID, InitiatorID: current.InitiatorID,
+			LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version, AgentInstanceID: current.AgentInstanceID,
+			AgentGeneration: current.AgentGeneration, AgentSessionID: current.AgentSessionID,
+			AgentRootSessionID: current.AgentSessionID, AuthorizationVersion: current.Authorization.Version,
+			ThroughSequence: 5, EngineVersion: current.AgentEngineVersion, ProfileVersion: current.AgentProfileVersion}}
+}
+
+func TestCloudDSHAgentMessageSourceReferenceSelectionAndSearch(t *testing.T) {
+	const content = "The earlier requirement says cedar must stay private; the matching value is 842."
+	broker, baseStore, claimed, reader, messageID := cloudDSHAgentMessageSourceTestFixture(t, content)
+	definitions, err := broker.Definitions(context.Background(), claimed)
+	if err != nil || !containsAgentTool(definitions, cloudDSHCurrentMessageReadToolName) ||
+		!containsAgentTool(definitions, cloudDSHCurrentMessageSearchToolName) {
+		t.Fatalf("receipt-backed definitions=%+v err=%v", definitions, err)
+	}
+
+	digest := reader.reference.Envelope.SourceSHA256
+	read, err := broker.execute(context.Background(), claimed, cloudDSHAgentMessageSourceCall(claimed, "read_source_ref",
+		cloudDSHCurrentMessageReadToolName, fmt.Sprintf(`{"message_id":%q,"sha256":%q,"rune_offset":0}`, messageID, digest)), false, nil)
+	if err != nil || read.Status != AgentToolSucceeded {
+		t.Fatalf("receipt-backed read=%+v err=%v", read, err)
+	}
+	var readOutput cloudDSHCurrentMessageReadResult
+	if json.Unmarshal([]byte(read.Output), &readOutput) != nil || readOutput.MessageID != messageID ||
+		readOutput.Sequence != reader.reference.Envelope.MessageSequence || readOutput.Content != content ||
+		readOutput.SHA256 != digest || readOutput.RuneOffset != 0 || !readOutput.Complete {
+		t.Fatalf("receipt-backed read returned unexpected bounded chunk: %+v", readOutput)
+	}
+	if reader.referenceCalls != 2 || reader.pageCalls != 1 || len(reader.pageOffsets) != 1 || reader.pageOffsets[0] != 0 {
+		t.Fatalf("read did not select and recheck the receipt source: references=%d pages=%d offsets=%v",
+			reader.referenceCalls, reader.pageCalls, reader.pageOffsets)
+	}
+	for _, fence := range reader.fences {
+		if fence.TaskID != claimed.ID || fence.OwnerID != claimed.OwnerID || fence.AgentSessionID != claimed.AgentSessionID ||
+			fence.AgentRootSessionID != claimed.AgentSessionID || fence.LeaseVersion != claimed.Lease.Version {
+			t.Fatalf("receipt/page call did not carry the current Task fence: %+v", fence)
+		}
+	}
+
+	search, err := broker.execute(context.Background(), claimed, cloudDSHAgentMessageSourceCall(claimed, "search_source_ref",
+		cloudDSHCurrentMessageSearchToolName, fmt.Sprintf(`{"message_id":%q,"sha256":%q,"query":"cedar private"}`, messageID, digest)), false, nil)
+	if err != nil || search.Status != AgentToolSucceeded {
+		t.Fatalf("receipt-backed search=%+v err=%v", search, err)
+	}
+	var searchOutput cloudDSHCurrentMessageSearchResult
+	if json.Unmarshal([]byte(search.Output), &searchOutput) != nil || !searchOutput.Complete || searchOutput.MessageID != messageID ||
+		len(searchOutput.Matches) != 1 || !strings.Contains(searchOutput.Matches[0].Content, "cedar must stay private") ||
+		searchOutput.Matches[0].PageSHA256 != reader.reference.Envelope.Pages[0].SHA256 {
+		t.Fatalf("receipt-backed search returned unexpected result: %+v", searchOutput)
+	}
+	if len(baseStore.events) != 2 {
+		t.Fatalf("successful receipt read/search progress events=%d, want 2", len(baseStore.events))
+	}
+}
+
+func TestCloudDSHAgentMessageSourceAllowsValidatedHistoricalGeneration(t *testing.T) {
+	broker, baseStore, claimed, reader, messageID := cloudDSHAgentMessageSourceTestFixture(t, "generation-bound historical body")
+	claimed.AgentGeneration = 2
+	baseStore.details.Task.AgentGeneration = 2
+	reader.reference.Envelope.AgentGeneration = 1
+	cloudDSHResealTestAgentMessageReference(t, &reader.reference.Envelope)
+	reader.reference.RepresentationSHA256, _ = hex.DecodeString(reader.reference.Envelope.RepresentationSHA256)
+	reader.reference.AuthorizedAgentGeneration = 2
+	call := cloudDSHAgentMessageSourceCall(claimed, "read_historical_generation", cloudDSHCurrentMessageReadToolName,
+		fmt.Sprintf(`{"message_id":%q,"sha256":%q,"rune_offset":0}`, messageID, reader.reference.Envelope.SourceSHA256))
+	result, err := broker.execute(context.Background(), claimed, call, false, nil)
+	if err != nil || result.Status != AgentToolSucceeded || reader.pageCalls != 1 || len(baseStore.events) != 1 {
+		t.Fatalf("validated historical generation could not read its receipt: result=%+v page_calls=%d events=%d err=%v",
+			result, reader.pageCalls, len(baseStore.events), err)
+	}
+}
+
+func TestCloudDSHAgentMessageSourceAcceptsZeroAppliedCheckpointTail(t *testing.T) {
+	broker, baseStore, claimed, reader, messageID := cloudDSHAgentMessageSourceTestFixture(t, "initial checkpoint tail zero")
+	reader.reference.AppliedCheckpointThrough = 0
+	call := cloudDSHAgentMessageSourceCall(claimed, "read_zero_checkpoint_tail", cloudDSHCurrentMessageReadToolName,
+		fmt.Sprintf(`{"message_id":%q,"sha256":%q,"rune_offset":0}`, messageID, reader.reference.Envelope.SourceSHA256))
+	result, err := broker.execute(context.Background(), claimed, call, false, nil)
+	if err != nil || result.Status != AgentToolSucceeded || reader.pageCalls != 1 || len(baseStore.events) != 1 {
+		t.Fatalf("zero applied checkpoint tail was rejected: result=%+v page_calls=%d events=%d err=%v",
+			result, reader.pageCalls, len(baseStore.events), err)
+	}
+}
+
+func TestCloudDSHMessageSourceToolDefinitionsRequireConfiguredSource(t *testing.T) {
+	broker, baseStore, claimed, _, _ := cloudDSHGoalScheduleTaskFixture(t)
+	definitions, err := broker.Definitions(context.Background(), claimed)
+	if err != nil || containsAgentTool(definitions, cloudDSHCurrentMessageReadToolName) ||
+		containsAgentTool(definitions, cloudDSHCurrentMessageSearchToolName) {
+		t.Fatalf("long-message tools were exposed without an available source: definitions=%+v err=%v", definitions, err)
+	}
+	broker.store = &cloudDSHCurrentMessageChunkTestStore{TaskStore: broker.store}
+	definitions, err = broker.Definitions(context.Background(), claimed)
+	if err != nil || containsAgentTool(definitions, cloudDSHCurrentMessageReadToolName) ||
+		containsAgentTool(definitions, cloudDSHCurrentMessageSearchToolName) {
+		t.Fatalf("long-message tools were exposed without a manifest: definitions=%+v err=%v", definitions, err)
+	}
+
+	messageID, err := domain.NewMessageID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := BuildConversationMessageSourceManifest(messageID, 1, "existing inline source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed.ConversationContext.CurrentMessageSource = source
+	baseStore.details.Task.ConversationContext = claimed.ConversationContext
+	broker.store = &cloudDSHCurrentMessageChunkTestStore{TaskStore: broker.store, messageID: messageID, taskID: claimed.ID,
+		content: "existing inline source", runes: []rune("existing inline source")}
+	definitions, err = broker.Definitions(context.Background(), claimed)
+	if err != nil || !containsAgentTool(definitions, cloudDSHCurrentMessageReadToolName) ||
+		!containsAgentTool(definitions, cloudDSHCurrentMessageSearchToolName) {
+		t.Fatalf("existing inline source definitions=%+v err=%v", definitions, err)
+	}
+}
+
+func TestCloudDSHAgentMessageSourceReceiptRejectsTamperingAndMismatches(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, *AgentMessageReferenceEnvelope)
+	}{
+		{name: "tampered representation", mutate: func(_ *testing.T, envelope *AgentMessageReferenceEnvelope) {
+			envelope.RepresentationSHA256 = strings.Repeat("0", sha256.Size*2)
+		}},
+		{name: "wrong owner", mutate: func(t *testing.T, envelope *AgentMessageReferenceEnvelope) {
+			envelope.OwnerID = "u8765432"
+			cloudDSHResealTestAgentMessageReference(t, envelope)
+		}},
+		{name: "wrong task revision", mutate: func(t *testing.T, envelope *AgentMessageReferenceEnvelope) {
+			envelope.TaskRevision++
+			cloudDSHResealTestAgentMessageReference(t, envelope)
+		}},
+		{name: "wrong conversation", mutate: func(t *testing.T, envelope *AgentMessageReferenceEnvelope) {
+			envelope.ConversationID = "c8765432"
+			cloudDSHResealTestAgentMessageReference(t, envelope)
+		}},
+		{name: "wrong authorization generation or root", mutate: func(t *testing.T, envelope *AgentMessageReferenceEnvelope) {
+			envelope.AgentGeneration++
+			cloudDSHResealTestAgentMessageReference(t, envelope)
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			broker, baseStore, claimed, reader, messageID := cloudDSHAgentMessageSourceTestFixture(t, "a bounded source body")
+			test.mutate(t, &reader.reference.Envelope)
+			if representationSHA256, decodeErr := hex.DecodeString(reader.reference.Envelope.RepresentationSHA256); decodeErr == nil {
+				reader.reference.RepresentationSHA256 = representationSHA256
+			}
+			call := cloudDSHAgentMessageSourceCall(claimed, "reject_source_ref", cloudDSHCurrentMessageReadToolName,
+				fmt.Sprintf(`{"message_id":%q,"sha256":%q,"rune_offset":0}`, messageID,
+					cloudDSHTestAgentMessageSourceReference(t, claimed, messageID, "a bounded source body").Envelope.SourceSHA256))
+			if result, err := broker.execute(context.Background(), claimed, call, false, nil); err == nil || result.Output != "" ||
+				reader.pageCalls != 0 || len(baseStore.events) != 0 {
+				t.Fatalf("broker accepted invalid source receipt: result=%+v pages=%d events=%d err=%v",
+					result, reader.pageCalls, len(baseStore.events), err)
+			}
+		})
+	}
+}
+
+func TestCloudDSHAgentMessageSourceRejectsCorruptionAndRevocation(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*cloudDSHAgentMessageSourceReaderTestStub)
+	}{
+		{name: "corrupt page", mutate: func(reader *cloudDSHAgentMessageSourceReaderTestStub) { reader.pageCorrupt = true }},
+		{name: "revoked after page", mutate: func(reader *cloudDSHAgentMessageSourceReaderTestStub) { reader.revokeAfterPage = true }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			broker, baseStore, claimed, reader, messageID := cloudDSHAgentMessageSourceTestFixture(t, "a page that must not escape")
+			test.mutate(reader)
+			call := cloudDSHAgentMessageSourceCall(claimed, "reject_source_page", cloudDSHCurrentMessageReadToolName,
+				fmt.Sprintf(`{"message_id":%q,"sha256":%q,"rune_offset":0}`, messageID, reader.reference.Envelope.SourceSHA256))
+			if result, err := broker.execute(context.Background(), claimed, call, false, nil); err == nil || result.Output != "" ||
+				len(baseStore.events) != 0 {
+				t.Fatalf("broker returned or committed changed source content: result=%+v events=%d err=%v",
+					result, len(baseStore.events), err)
+			}
+		})
+	}
+}
+
+func TestCloudDSHCurrentMessageSourceKeepsInlineReaderSelection(t *testing.T) {
+	const content = "current inline source remains on its existing reader"
+	broker, baseStore, claimed, _, _ := cloudDSHGoalScheduleTaskFixture(t)
+	claimed.AgentGeneration = 1
+	claimed.AgentInstanceID = "agent_inline_source"
+	claimed.ConversationContext.ThroughSequence = 0
+	messageID, err := domain.NewMessageID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := BuildConversationMessageSourceManifest(messageID, 1, content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed.ConversationContext.CurrentMessageSource = source
+	authorizer := configureCloudDSHCurrentHistory(t, broker, baseStore, &claimed)
+	baseStore.details.Task = claimed
+	reader := &cloudDSHAgentMessageSourceReaderTestStub{content: "wrong receipt body",
+		reference: cloudDSHTestAgentMessageSourceReference(t, claimed, messageID, "wrong receipt body")}
+	if err := broker.SetAgentMessageSourceReader(reader); err != nil {
+		t.Fatal(err)
+	}
+	chunkStore := &cloudDSHCurrentMessageChunkTestStore{TaskStore: broker.store, messageID: messageID,
+		taskID: claimed.ID, content: content, runes: []rune(content)}
+	broker.store = chunkStore
+	result, err := broker.execute(context.Background(), claimed, ModelToolCall{CallID: "read_inline_source",
+		Name:      cloudDSHCurrentMessageReadToolName,
+		Arguments: fmt.Sprintf(`{"message_id":%q,"sha256":%q,"rune_offset":0}`, messageID, hex.EncodeToString(source.SHA256))}, false, nil)
+	if err != nil || result.Status != AgentToolSucceeded || reader.referenceCalls != 0 || reader.pageCalls != 0 ||
+		authorizer.calls < 2 || len(baseStore.events) != 1 {
+		t.Fatalf("inline source selection changed: result=%+v references=%d pages=%d auth_checks=%d events=%d err=%v",
+			result, reader.referenceCalls, reader.pageCalls, authorizer.calls, len(baseStore.events), err)
+	}
+	var output cloudDSHCurrentMessageReadResult
+	if json.Unmarshal([]byte(result.Output), &output) != nil || output.Content != content {
+		t.Fatalf("inline source output changed: %+v", output)
 	}
 }
 

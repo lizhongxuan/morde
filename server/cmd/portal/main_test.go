@@ -24,7 +24,162 @@ import (
 	"morde/server/internal/domain/project"
 	"morde/server/internal/domain/schedule"
 	"morde/server/internal/domain/task"
+	"morde/server/internal/worker"
 )
+
+type expiredTaskModelBudgetPreparationCleanerProbe struct {
+	ctx   context.Context
+	limit int32
+	count int32
+	err   error
+	calls int
+}
+
+type cloudDSHModelBudgetPreparationServiceProbe struct {
+	calls                int
+	eligibilityCalls     int
+	eligible             bool
+	eligibilityErr       error
+	eligibilityTaskValue task.Task
+}
+
+func (probe *cloudDSHModelBudgetPreparationServiceProbe) PrepareTaskModelBudget(context.Context,
+	app.TaskModelBudgetPrepareRequest) (app.TaskModelBudgetPlan, error) {
+	probe.calls++
+	return app.TaskModelBudgetPlan{PlanID: "plan_test_123", MaxTokens: 4096}, nil
+}
+
+func (probe *cloudDSHModelBudgetPreparationServiceProbe) SupportsTaskModelBudgetAdmission(_ context.Context, value task.Task) (bool, error) {
+	probe.eligibilityCalls++
+	probe.eligibilityTaskValue = value
+	return probe.eligible, probe.eligibilityErr
+}
+
+func TestCloudDSHModelBudgetPlannerBootstrapIsOptIn(t *testing.T) {
+	planner, err := cloudDSHModelBudgetPlannerFor(false, nil)
+	if err != nil || planner != nil {
+		t.Fatalf("default-off planner = %v, err=%v", planner, err)
+	}
+	if _, err := cloudDSHModelBudgetPlannerFor(true, nil); err == nil {
+		t.Fatal("enabled admission accepted a missing preparation service")
+	}
+
+	service := &cloudDSHModelBudgetPreparationServiceProbe{eligible: true}
+	planner, err = cloudDSHModelBudgetPlannerFor(true, service)
+	if err != nil || planner == nil {
+		t.Fatalf("enabled planner = %v, err=%v", planner, err)
+	}
+	plan, err := planner.PrepareModelBudget(context.Background(), worker.CloudDSHModelBudgetPlanRequest{})
+	if err != nil || plan.PlanID != "plan_test_123" || plan.MaxTokens != 4096 || service.calls != 1 {
+		t.Fatalf("planner result=%+v calls=%d err=%v", plan, service.calls, err)
+	}
+	taskValue := task.Task{ID: "q1234567", InitiatorID: "u1234567", ModelID: "p1234567"}
+	if eligible, err := planner.SupportsTaskModelBudgetAdmission(context.Background(), taskValue); err != nil || !eligible ||
+		service.eligibilityCalls != 1 || service.eligibilityTaskValue.ID != taskValue.ID ||
+		service.eligibilityTaskValue.InitiatorID != taskValue.InitiatorID || service.eligibilityTaskValue.ModelID != taskValue.ModelID {
+		t.Fatalf("planner eligibility=%t task=%+v calls=%d err=%v", eligible, service.eligibilityTaskValue, service.eligibilityCalls, err)
+	}
+
+	service.eligible = false
+	if eligible, err := planner.SupportsTaskModelBudgetAdmission(context.Background(), taskValue); err != nil || eligible || service.eligibilityCalls != 2 {
+		t.Fatalf("unlisted route eligibility=%t calls=%d err=%v, want false without error", eligible, service.eligibilityCalls, err)
+	}
+
+	service.eligibilityErr = errors.New("endpoint unavailable")
+	if eligible, err := planner.SupportsTaskModelBudgetAdmission(context.Background(), taskValue); err == nil || eligible || service.eligibilityCalls != 3 {
+		t.Fatalf("eligibility resolver failure=%t calls=%d err=%v, want propagated error", eligible, service.eligibilityCalls, err)
+	}
+}
+
+type modelOutputBudgetStrategyInstallerProbe struct {
+	calls      int
+	definition app.ModelOutputBudgetStrategyDefinition
+	err        error
+}
+
+func (probe *modelOutputBudgetStrategyInstallerProbe) SetModelOutputBudgetStrategy(
+	definition app.ModelOutputBudgetStrategyDefinition,
+) error {
+	probe.calls++
+	probe.definition = definition
+	return probe.err
+}
+
+func TestPortalLoadsLongFormStrategyWithoutTaskAdmissionOrShadow(t *testing.T) {
+	defaultOff := config.Models{}
+	installer := &modelOutputBudgetStrategyInstallerProbe{}
+	if err := configureModelOutputBudgetStrategy(installer, defaultOff); err != nil || installer.calls != 0 {
+		t.Fatalf("empty default-off strategy calls=%d err=%v", installer.calls, err)
+	}
+
+	models := config.Models{OutputBudgetShadow: config.OutputBudgetShadow{
+		StrategyVersion: "route-strategy-v1",
+		Routes: []config.OutputBudgetShadowRoute{{
+			BaseURL: "https://api.openai.com/v1", Model: "deepseek-chat",
+			Stages: []config.OutputBudgetShadowStage{
+				{Stage: "short_answer", GoalTokens: 101, MinimumTokens: 51},
+				{Stage: "tool_step", GoalTokens: 102, MinimumTokens: 52},
+				{Stage: "subtask", GoalTokens: 103, MinimumTokens: 53},
+				{Stage: "summary", GoalTokens: 104, MinimumTokens: 54},
+				{Stage: "long_form", GoalTokens: 105, MinimumTokens: 55},
+				{Stage: "text_continuation", GoalTokens: 106, MinimumTokens: 56},
+			},
+		}},
+	}}
+	if err := configureModelOutputBudgetStrategy(installer, models); err != nil {
+		t.Fatalf("configure route-only strategy: %v", err)
+	}
+	if installer.calls != 1 || installer.definition.Version != "route-strategy-v1" || len(installer.definition.Models) != 1 {
+		t.Fatalf("installed route strategy = calls:%d definition:%+v", installer.calls, installer.definition)
+	}
+	model := installer.definition.Models[0]
+	if model.BaseURL != "https://api.openai.com/v1" || model.Model != "deepseek-chat" || len(model.Stages) != 6 ||
+		model.Stages[4].Stage != "long_form" || model.Stages[4].GoalTokens != 105 || model.Stages[4].MinimumTokens != 55 {
+		t.Fatalf("installed exact-route stage strategy = %+v", model)
+	}
+	if models.OutputBudgetAdmissionEnabled || models.OutputBudgetShadow.Enabled {
+		t.Fatal("loading a route strategy must not enable Task admission or shadow metrics")
+	}
+
+	installer.err = errors.New("strategy rejected")
+	if err := configureModelOutputBudgetStrategy(installer, models); err == nil || !strings.Contains(err.Error(), "strategy rejected") {
+		t.Fatalf("strategy installation error = %v, want wrapped installer error", err)
+	}
+}
+
+func (probe *expiredTaskModelBudgetPreparationCleanerProbe) CleanupExpiredTaskModelBudgetPreparations(ctx context.Context,
+	limit int32) (int32, error) {
+	probe.calls++
+	probe.ctx, probe.limit = ctx, limit
+	return probe.count, probe.err
+}
+
+func TestCleanupExpiredTaskModelBudgetPreparationsDelegatesBoundedBatch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	probe := &expiredTaskModelBudgetPreparationCleanerProbe{count: 3}
+
+	count, err := cleanupExpiredTaskModelBudgetPreparations(ctx, probe, 1000)
+	if err != nil {
+		t.Fatalf("clean expired Task model budget preparations: %v", err)
+	}
+	if count != 3 || probe.calls != 1 || probe.ctx != ctx || probe.limit != 1000 {
+		t.Fatalf("cleanup delegation = count %d, probe %#v", count, probe)
+	}
+}
+
+func TestCleanupExpiredTaskModelBudgetPreparationsHandlesUnavailableCleanerAndError(t *testing.T) {
+	ctx := context.Background()
+	if count, err := cleanupExpiredTaskModelBudgetPreparations(ctx, nil, 1000); count != 0 || err != nil {
+		t.Fatalf("nil cleaner result = (%d, %v), want (0, nil)", count, err)
+	}
+
+	wantErr := errors.New("database unavailable")
+	probe := &expiredTaskModelBudgetPreparationCleanerProbe{err: wantErr}
+	if _, err := cleanupExpiredTaskModelBudgetPreparations(ctx, probe, 1000); !errors.Is(err, wantErr) {
+		t.Fatalf("cleanup error = %v, want %v", err, wantErr)
+	}
+}
 
 type cloudDSHTaskServiceProbe struct {
 	api.TaskService
@@ -280,7 +435,8 @@ func (s *cloudDSHTaskServiceProbe) RespondToPendingRequest(_ context.Context, _ 
 	return nil
 }
 
-func (s *cloudDSHTaskServiceProbe) AnswerClarificationRequest(context.Context, identity.Principal, string, string, int64, string, string) error {
+func (s *cloudDSHTaskServiceProbe) AnswerClarificationRequest(context.Context, identity.Principal, string, string, int64, string,
+	task.FileDeliveryIntent, string) error {
 	s.answers++
 	return nil
 }
@@ -348,7 +504,7 @@ func TestCloudDSHDisabledKeepsReadsAndRejectsNewExecution(t *testing.T) {
 	if err := services.tasks.RespondToPendingRequest(context.Background(), principal, "t1234567", "p1234567", 1, task.PendingDecisionReject, "reject-key"); err != nil || len(tasks.decisions) != 1 || tasks.decisions[0] != task.PendingDecisionReject {
 		t.Fatalf("pending rejection = %v, underlying decisions = %v", err, tasks.decisions)
 	}
-	if err := services.tasks.AnswerClarificationRequest(context.Background(), principal, "t1234567", "p1234567", 1, "answer", "answer-key"); domain.CodeOf(err) != domain.CodeHostNotReady || tasks.answers != 0 {
+	if err := services.tasks.AnswerClarificationRequest(context.Background(), principal, "t1234567", "p1234567", 1, "answer", task.FileDeliveryNone, "answer-key"); domain.CodeOf(err) != domain.CodeHostNotReady || tasks.answers != 0 {
 		t.Fatalf("clarification answer = %v, underlying calls = %d", err, tasks.answers)
 	}
 
@@ -490,6 +646,44 @@ func TestModelUsageMetricsUseBoundedLabelsAndCountSettledUsage(t *testing.T) {
 	}
 }
 
+func TestModelBudgetShadowMetricsUseBoundedLabelsAndKeepRouteOutOfLabels(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	metrics, err := newModelBudgetShadowMetrics(registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics.observe(app.ModelOutputBudgetShadowObservation{Phase: "plan", Stage: "subtask", Outcome: "calculated",
+		RouteFingerprint: "sha256:private-route-fingerprint", StrategyVersion: "private-strategy-version",
+		CurrentOutputCap: 2048, GoalTokens: 4096, MinimumTokens: 512, SafeTokens: 3072, SendTokens: 3072})
+	metrics.observe(app.ModelOutputBudgetShadowObservation{Phase: "result", Stage: "subtask", Outcome: "calculated",
+		FailureClass: "timeout", UsageKnown: true, ActualOutputTokens: 2876})
+	metrics.observe(app.ModelOutputBudgetShadowObservation{Phase: "result", Stage: "long_form", Outcome: "calculated",
+		FailureClass: "content_filtered"})
+	metrics.observe(app.ModelOutputBudgetShadowObservation{Phase: "plan", Stage: "model-provider-secret", Outcome: "user-prompt-secret",
+		BlockReason: "private-request-text", RouteFingerprint: "private-route", StrategyVersion: "private-version"})
+
+	response := httptest.NewRecorder()
+	metricsHandler(registry).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := response.Body.String()
+	for _, expected := range []string{
+		`cloudhost_model_budget_shadow_observations_total{outcome="calculated",phase="plan",reason="none",stage="subtask"} 1`,
+		`cloudhost_model_budget_shadow_failures_total{failure_class="timeout",stage="subtask"} 1`,
+		`cloudhost_model_budget_shadow_failures_total{failure_class="content_filtered",stage="long_form"} 1`,
+		`cloudhost_model_budget_shadow_output_tokens_count{field="current_cap",stage="subtask"} 1`,
+		`cloudhost_model_budget_shadow_output_tokens_count{field="actual",stage="subtask"} 1`,
+		`cloudhost_model_budget_shadow_observations_total{outcome="unknown",phase="plan",reason="unknown",stage="unknown"} 1`,
+	} {
+		if !strings.Contains(body, expected) {
+			t.Errorf("model budget shadow metrics missing %q:\n%s", expected, body)
+		}
+	}
+	for _, secret := range []string{"private-route-fingerprint", "private-strategy-version", "model-provider-secret", "user-prompt-secret", "private-request-text"} {
+		if strings.Contains(body, secret) {
+			t.Fatalf("unbounded or private shadow value escaped into metrics: %s", body)
+		}
+	}
+}
+
 func TestPortalCommandUsageErrors(t *testing.T) {
 	for _, args := range [][]string{nil, {"unknown"}, {"migrate"}, {"user"}, {"user", "add"}} {
 		var stdout, stderr bytes.Buffer
@@ -597,5 +791,17 @@ func TestParseLegacyPCPortalEnabled(t *testing.T) {
 				t.Fatalf("parseLegacyPCPortalEnabled() = (%t, %v), want (%t, nil)", enabled, err, test.wantEnabled)
 			}
 		})
+	}
+}
+
+func TestParseTaskModelRecoveryAutoDefaultsOff(t *testing.T) {
+	if enabled, err := parseTaskModelRecoveryAuto("", false); err != nil || enabled {
+		t.Fatalf("unset task model recovery auto = (%t, %v), want false", enabled, err)
+	}
+	if enabled, err := parseTaskModelRecoveryAuto("true", true); err != nil || !enabled {
+		t.Fatalf("explicit task model recovery auto = (%t, %v), want true", enabled, err)
+	}
+	if _, err := parseTaskModelRecoveryAuto("later", true); err == nil || !strings.Contains(err.Error(), taskModelRecoveryAutoEnv) {
+		t.Fatalf("invalid task model recovery auto value error = %v", err)
 	}
 }

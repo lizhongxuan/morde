@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { isAbsolute, join, resolve } from "node:path";
 
 export type Credentials = {
@@ -84,11 +85,50 @@ export function checkedId(kind: keyof typeof IDS, value: unknown): string {
   return value;
 }
 
-function requestFailure(response: Response, method: string, path: string, unauthorized: string): Error {
-  if (response.status === 401) return new Error(unauthorized);
+function responseReference(response: Response): string {
   const requestID = response.headers.get("x-request-id");
-  const reference = requestID && REQUEST_ID.test(requestID) ? `; request ID ${requestID}` : "";
+  const traceID = response.headers.get("x-trace-id");
+  const references = [requestID && REQUEST_ID.test(requestID) ? `request ID ${requestID}` : "",
+    traceID && /^[0-9a-f]{32}$/.test(traceID) ? `trace ID ${traceID}` : ""].filter(Boolean);
+  return references.length ? `; ${references.join(", ")}` : "";
+}
+
+function requestFailure(response: Response, method: string, path: string, unauthorized: string): Error {
+  const reference = responseReference(response);
+  if (response.status === 401) return new Error(`${unauthorized}${reference}`);
   return new Error(`Morde returned HTTP ${response.status} (${method} ${path})${reference}`);
+}
+
+function traceParent(): string {
+  const traceID = randomUUID().replaceAll("-", "");
+  let spanID = randomUUID().replaceAll("-", "").slice(-16);
+  if (/^0+$/.test(spanID)) spanID = `${spanID.slice(0, -1)}1`;
+  return `00-${traceID}-${spanID}-01`;
+}
+
+export function tracedFetch(fetcher: typeof fetch, input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  const headers = new Headers(input instanceof Request ? input.headers : undefined);
+  new Headers(init?.headers).forEach((value, key) => headers.set(key, value));
+  const suppliedHeaders = init?.headers;
+  if (suppliedHeaders !== undefined && !(suppliedHeaders instanceof Headers) && !Array.isArray(suppliedHeaders) &&
+    typeof suppliedHeaders === "object" && suppliedHeaders !== null) {
+    const outgoing: Record<string, string> = {};
+    if (input instanceof Request) new Headers(input.headers).forEach((value, name) => { outgoing[name] = value; });
+    for (const [name, value] of Object.entries(suppliedHeaders)) {
+      const existing = Object.keys(outgoing).find((key) => key.toLowerCase() === name.toLowerCase());
+      outgoing[existing ?? name] = String(value);
+    }
+    const setHeader = (name: string, value: string) => {
+      const existing = Object.keys(outgoing).find((key) => key.toLowerCase() === name.toLowerCase());
+      outgoing[existing ?? name] = value;
+    };
+    setHeader("X-Request-Id", headers.get("X-Request-Id") ?? randomUUID());
+    setHeader("traceparent", headers.get("traceparent") ?? traceParent());
+    return fetcher(input, { ...init, headers: outgoing });
+  }
+  headers.set("X-Request-Id", headers.get("X-Request-Id") ?? randomUUID());
+  headers.set("traceparent", headers.get("traceparent") ?? traceParent());
+  return fetcher(input, { ...init, headers });
 }
 
 export function portalOrigin(input: unknown): string {
@@ -245,11 +285,11 @@ export class MordeAPI {
   private async checkCapabilities(origin: string): Promise<{ serviceInstanceID: string; supportedFeatures: string[] }> {
     let response: Response;
     try {
-      response = await this.fetcher(`${origin}/api/capabilities`, {
+      response = await tracedFetch(this.fetcher, `${origin}/api/capabilities`, {
         headers: { accept: "application/json" }, cache: "no-store", redirect: "error", signal: AbortSignal.timeout(20_000),
       });
     } catch { throw new Error("无法确认 Morde 服务版本，请检查网络和服务地址后重试。未发送账号信息。"); }
-    if (!response.ok) throw new Error("Morde 服务不支持客户端登录或暂不可用，请升级服务后重试。未发送账号信息。");
+    if (!response.ok) throw new Error(`Morde 服务不支持客户端登录或暂不可用，请升级服务后重试。未发送账号信息。${responseReference(response)}`);
     const value = await response.json().catch(() => null) as Record<string, unknown> | null;
     const features = value?.supported_features;
     if (!value || typeof value.service_instance_id !== "string" ||
@@ -310,7 +350,7 @@ export class MordeAPI {
     const renewalInstallationID = renewal?.serviceInstanceID === serviceInstanceID ? renewal.installationID : undefined;
     let response: Response;
     try {
-      response = await this.fetcher(`${origin}/api/auth/client-login`, {
+      response = await tracedFetch(this.fetcher, `${origin}/api/auth/client-login`, {
         method: "POST",
         headers: { "content-type": "application/json", accept: "application/json", "Idempotency-Key": attempt.idempotencyKey },
         body: (() => {
@@ -330,9 +370,9 @@ export class MordeAPI {
         account_rejected: "账号审核未通过，请联系管理员。",
         account_disabled: "账号已被禁用，请联系管理员。",
         rate_limited: "登录尝试过于频繁，请稍后重试。",
-        forbidden: "请先在管理后台修改密码，再登录客户端。",
+        forbidden: "请先修改密码，再继续使用客户端。",
       };
-      const error = new Error(messages[body?.error?.code ?? ""] ?? (response.status === 401 ? messages.unauthenticated : `Morde 登录失败（HTTP ${response.status}）。`));
+      const error = new Error(`${messages[body?.error?.code ?? ""] ?? (response.status === 401 ? messages.unauthenticated : `Morde 登录失败（HTTP ${response.status}）。`)}${responseReference(response)}`);
       Object.assign(error, { code: body?.error?.code, reason: body?.error?.details?.reason });
       throw error;
     }
@@ -357,7 +397,7 @@ export class MordeAPI {
   private async request(path: string, method = "GET", body?: unknown, idempotencyKey?: string): Promise<unknown> {
     const auth = this.credentials();
     if (!auth || credentialExpired(auth.clientExpiresAt)) throw new Error("Log in to Morde again");
-    const response = await this.fetcher(`${auth.origin}${path}`, {
+    const response = await tracedFetch(this.fetcher, `${auth.origin}${path}`, {
       method, headers: {
         authorization: `Bearer ${auth.clientCredential}`, accept: "application/json",
         ...(body === undefined ? {} : { "content-type": "application/json" }),
@@ -550,7 +590,7 @@ export class MordeAPI {
     if (!session || typeof session.credential !== "string" || !session.credential || credentialExpired(session.expiresAt)) {
       throw new Error("Portal session expired; retry the operation");
     }
-    const response = await this.fetcher(`${auth.origin}${path}`, {
+    const response = await tracedFetch(this.fetcher, `${auth.origin}${path}`, {
       method, headers: {
         cookie: `ch_portal=${session.credential}`, accept: "application/json",
         ...(requestOrigin ? { origin: requestOrigin } : {}),
@@ -644,7 +684,9 @@ export class MordeAPI {
     if (typeof projectName !== "string" || !validProjectFolderName(projectName) || typeof idempotencyKey !== "string" || !/^[A-Za-z0-9._~-]{1,128}$/.test(idempotencyKey)) {
       throw new Error("Invalid Morde project folder registration request");
     }
-    const value = await this.portalRequest(`/api/hosts/${host}/sync-folders`, session, "POST", { project_name: projectName }, idempotencyKey);
+    const origin = this.credentials()?.origin;
+    if (!origin) throw new Error("Log in to Morde again");
+    const value = await this.portalRequest(`/api/hosts/${host}/sync-folders`, session, "POST", { project_name: projectName }, idempotencyKey, origin);
     return parseProjectSyncFolder(value);
   }
 

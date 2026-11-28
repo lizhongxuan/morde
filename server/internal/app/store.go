@@ -299,6 +299,12 @@ type UserStore interface {
 	UpdateUserWithAudit(context.Context, string, identity.AccountStatus, identity.User, audit.Entry, func(context.Context) error) (identity.User, error)
 }
 
+// UserPasswordResetStore commits an administrator-initiated password reset,
+// credential revocation, and audit entry as one operation.
+type UserPasswordResetStore interface {
+	ResetUserPasswordWithAudit(context.Context, string, identity.AccountStatus, string, string, audit.Entry, func(context.Context) error) error
+}
+
 type invitedUserStore interface {
 	CreateInvitedUser(context.Context, identity.User, string) (identity.User, error)
 }

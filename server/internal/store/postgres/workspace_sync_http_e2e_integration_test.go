@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -353,10 +354,21 @@ func TestWorkspaceSyncClientThroughHTTPAndPostgres(t *testing.T) {
 		t.Fatalf("register project folder for HTTP upload: %v", err)
 	}
 	projectSource := t.TempDir()
+	projectRootInfo, err := os.Stat(projectSource)
+	if err != nil {
+		t.Fatalf("stat selected project source root: %v", err)
+	}
+	projectRootStat, ok := projectRootInfo.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatalf("selected project source root has unsupported identity metadata %T", projectRootInfo.Sys())
+	}
+	projectSourceDevice := strconv.FormatUint(uint64(projectRootStat.Dev), 10)
+	projectSourceInode := strconv.FormatUint(uint64(projectRootStat.Ino), 10)
 	projectContent := []byte("synthetic project upload through the local Portal API\n")
 	writeWorkspaceSyncE2EFile(t, projectSource, "nested/readme.md", projectContent)
 	projectUpload, err := syncClient.Sync(ctx, client.SyncOptions{
 		WorkspaceID: projectWorkspace.ID, FolderID: projectFolder.FolderID, SourceBindingID: "12345678-1234-4234-8234-123456789abd",
+		SourceDevice: projectSourceDevice, SourceInode: projectSourceInode,
 		Directory: projectSource, Direction: "upload", Policy: "compare_merge", BaseRevision: &zeroRevision, Scope: []string{},
 	})
 	if err != nil || projectUpload.Session.State != "completed" {
@@ -386,6 +398,7 @@ func TestWorkspaceSyncClientThroughHTTPAndPostgres(t *testing.T) {
 	applySyntheticProjectMutationForTest(t, store, projectWorkspace.ID, cloudOnly.Path, &cloudOnly, nil)
 	projectUpload, err = syncClient.Sync(ctx, client.SyncOptions{
 		WorkspaceID: projectWorkspace.ID, FolderID: projectFolder.FolderID, SourceBindingID: "12345678-1234-4234-8234-123456789abd",
+		SourceDevice: projectSourceDevice, SourceInode: projectSourceInode,
 		Directory: projectSource, Direction: "upload", Policy: "compare_merge", BaseRevision: &zeroRevision, Scope: []string{},
 	})
 	if err != nil || projectUpload.Session.State != "completed" {

@@ -77,10 +77,11 @@ func (s *Store) LoadConversationSummaryInputPage(ctx context.Context, request ap
 			}
 		}
 
-		previousMessageID, err := conversationSummaryPredecessorMessageID(ctx, tx, request.Claim, identity)
+		previousMessageID, pendingPredecessor, err := conversationSummaryPredecessorMessageID(ctx, tx, request.Claim, identity)
 		if err != nil {
 			return err
 		}
+		page.PendingPredecessor = pendingPredecessor
 		descendants, err := conversationRouteDescendantIDs(ctx, tx, request.Claim)
 		if err != nil {
 			return err
@@ -180,25 +181,34 @@ func (s *Store) LoadConversationSummaryInputPage(ctx context.Context, request ap
 }
 
 func conversationSummaryPredecessorMessageID(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim,
-	identity app.ConversationSummaryIdentity) (string, error) {
+	identity app.ConversationSummaryIdentity) (string, bool, error) {
 	if claim.Input.PreviousClientMessageID == "" {
-		return "", nil
+		return "", false, nil
 	}
-	var state, messageID string
-	err := tx.QueryRow(ctx, `SELECT route.state,message.id FROM conversation_message_routes route
+	var state, deliveryStatus, taskID, taskStatus string
+	var messageID string
+	var awaitingPredecessor bool
+	err := tx.QueryRow(ctx, `SELECT route.state,route.awaiting_predecessor,message.id,message.delivery_status,
+COALESCE(message.task_id,''),COALESCE(task.status,'') FROM conversation_message_routes route
 JOIN conversation_messages message ON message.id=route.message_id AND message.owner_id=route.owner_id
  AND message.actor_id=route.actor_id AND message.conversation_id=route.conversation_id
- AND message.role='user' AND message.delivery_status='applied'
+ AND message.role='user'
+LEFT JOIN tasks task ON task.id=message.task_id AND task.owner_id=message.owner_id
+ AND task.initiator_id=message.actor_id AND task.conversation_id=message.conversation_id
 WHERE route.service_instance_id=$1::uuid AND route.owner_id=$2 AND route.actor_id=$3 AND route.conversation_id=$4
- AND route.client_message_id=$5`, identity.ServiceInstanceID, identity.OwnerID, identity.ActorID,
-		identity.ConversationID, claim.Input.PreviousClientMessageID).Scan(&state, &messageID)
-	if errors.Is(err, pgx.ErrNoRows) || err == nil && state != "routed" {
-		return "", domain.NewError(domain.CodeConflict, "conversation predecessor is not ready for summary input")
+	 AND route.client_message_id=$5`, identity.ServiceInstanceID, identity.OwnerID, identity.ActorID,
+		identity.ConversationID, claim.Input.PreviousClientMessageID).
+		Scan(&state, &awaitingPredecessor, &messageID, &deliveryStatus, &taskID, &taskStatus)
+	if errors.Is(err, pgx.ErrNoRows) || err == nil && (awaitingPredecessor ||
+		(state != "routed" && state != "waiting_user" && state != "waiting_adjustment") ||
+		(deliveryStatus != "applied" && deliveryStatus != "pending") || (taskID != "" && taskStatus == "")) {
+		return "", false, domain.NewError(domain.CodeConflict, "conversation predecessor is not ready for summary input")
 	}
 	if err != nil {
-		return "", fmt.Errorf("read predecessor for conversation summary: %w", err)
+		return "", false, fmt.Errorf("read predecessor for conversation summary: %w", err)
 	}
-	return messageID, nil
+	pending := state != "routed" || deliveryStatus != "applied" || taskID != "" && taskStatus != "completed"
+	return messageID, pending, nil
 }
 
 func readConversationSummaryForInputPage(ctx context.Context, tx pgx.Tx, head app.ConversationSummaryHead) (app.StoredConversationSummary, error) {
@@ -309,7 +319,13 @@ const conversationSummaryInputPageSQL = `WITH source_rows AS (
   FROM conversation_messages m
   LEFT JOIN tasks t ON t.id=m.task_id AND t.owner_id=m.owner_id AND t.conversation_id=m.conversation_id
   WHERE m.owner_id=$1 AND m.conversation_id=$2 AND (m.sequence<=$3 OR m.id=$8)
-    AND m.source_kind<>'task_result_review' AND m.delivery_status='applied' AND m.id<>ALL($7::text[])
+    AND m.source_kind<>'task_result_review' AND
+      (m.delivery_status='applied' OR (m.id=$8 AND m.role='user' AND m.delivery_status='pending' AND EXISTS (
+        SELECT 1 FROM conversation_message_routes predecessor WHERE predecessor.message_id=m.id
+          AND predecessor.service_instance_id=$5::uuid AND predecessor.owner_id=m.owner_id
+          AND predecessor.actor_id=m.actor_id AND predecessor.conversation_id=m.conversation_id
+          AND predecessor.state IN ('routed','waiting_user','waiting_adjustment') AND predecessor.awaiting_predecessor=false
+      ))) AND m.id<>ALL($7::text[])
     AND NOT EXISTS (SELECT 1 FROM personal_history_suppressions suppressed
       WHERE suppressed.service_instance_id=$5::uuid AND suppressed.owner_id=m.owner_id AND suppressed.message_id=m.id)
     AND ($9=0 OR NOT EXISTS (SELECT 1 FROM conversation_summary_sources covered

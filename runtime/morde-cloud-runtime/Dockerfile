@@ -9,6 +9,7 @@ RUN npm ci --ignore-scripts --no-audit --no-fund
 COPY bin.mjs ./bin.mjs
 COPY bin-account.mjs ./bin-account.mjs
 COPY src ./src
+COPY scripts ./scripts
 COPY vendor ./vendor
 COPY test ./test
 RUN npm test && npm prune --omit=dev --ignore-scripts --no-audit --no-fund

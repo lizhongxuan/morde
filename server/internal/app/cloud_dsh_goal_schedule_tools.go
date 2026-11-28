@@ -99,17 +99,19 @@ type cloudDSHScheduleListArguments struct {
 }
 
 type cloudDSHScheduleCreateArguments struct {
-	Title     string          `json:"title"`
-	Objective string          `json:"objective"`
-	Timing    schedule.Timing `json:"timing"`
+	Title              string          `json:"title"`
+	Objective          string          `json:"objective"`
+	FileDeliveryIntent json.RawMessage `json:"file_delivery_intent"`
+	Timing             schedule.Timing `json:"timing"`
 }
 
 type cloudDSHScheduleUpdateArguments struct {
-	ScheduleID      string           `json:"schedule_id"`
-	ExpectedVersion int64            `json:"expected_version"`
-	Title           *string          `json:"title"`
-	Objective       *string          `json:"objective"`
-	Timing          *schedule.Timing `json:"timing"`
+	ScheduleID         string           `json:"schedule_id"`
+	ExpectedVersion    int64            `json:"expected_version"`
+	Title              *string          `json:"title"`
+	Objective          *string          `json:"objective"`
+	FileDeliveryIntent json.RawMessage  `json:"file_delivery_intent"`
+	Timing             *schedule.Timing `json:"timing"`
 }
 
 type cloudDSHScheduleActionArguments struct {
@@ -148,11 +150,11 @@ func cloudDSHScheduleToolDefinitions() []AgentToolDefinition {
 			"List this user's schedules. Use status all to include enabled, disabled, and completed schedules.",
 			`{"type":"object","properties":{"status":{"type":"string","enum":["all","enabled","disabled","completed"]},"limit":{"type":"integer","minimum":1,"maximum":20},"cursor":{"type":"string","maxLength":1024}},"required":["status","limit","cursor"],"additionalProperties":false}`, identity.ScopeScheduleRead),
 		cloudDSHScheduleTool(cloudDSHScheduleCreateToolName,
-			"Create a recurring or one-time personal schedule. It runs using this conversation task's selected model and Host (if any), with the same budget. Always include an IANA time_zone; ask the user if the intended timezone is unclear. Hostless schedules cannot request computer or workspace work.",
-			`{"type":"object","properties":{"title":{"type":"string","maxLength":32768},"objective":{"type":"string","minLength":1,"maxLength":32768},"timing":{"type":"object","properties":{"kind":{"type":"string","enum":["once","daily","weekly","every_n_hours"]},"run_at":{"type":"string"},"starts_on":{"type":"string"},"local_time":{"type":"string"},"time_zone":{"type":"string","minLength":1,"maxLength":64},"weekdays":{"type":"array","items":{"type":"integer"}},"interval_hours":{"type":"integer"},"anchor_at":{"type":"string"}},"required":["kind","run_at","starts_on","local_time","time_zone","weekdays","interval_hours","anchor_at"],"additionalProperties":false}},"required":["title","objective","timing"],"additionalProperties":false}`, identity.ScopeScheduleManage),
+			"Create a recurring or one-time personal schedule. It runs using this conversation task's selected model and Host (if any), with the same budget. Always include an IANA time_zone; ask the user if the intended timezone is unclear. Set file_delivery_intent from the user's explicit request, never by classifying objective text; omission defaults to none. This intent does not grant computer or Workspace capability; the service enforces those requirements.",
+			`{"type":"object","properties":{"title":{"type":"string","maxLength":32768},"objective":{"type":"string","minLength":1,"maxLength":32768},"file_delivery_intent":{"type":"string","enum":["none","required","unclear"]},"timing":{"type":"object","properties":{"kind":{"type":"string","enum":["once","daily","weekly","every_n_hours"]},"run_at":{"type":"string"},"starts_on":{"type":"string"},"local_time":{"type":"string"},"time_zone":{"type":"string","minLength":1,"maxLength":64},"weekdays":{"type":"array","items":{"type":"integer"}},"interval_hours":{"type":"integer"},"anchor_at":{"type":"string"}},"required":["kind","run_at","starts_on","local_time","time_zone","weekdays","interval_hours","anchor_at"],"additionalProperties":false}},"required":["title","objective","timing"],"additionalProperties":false}`, identity.ScopeScheduleManage),
 		cloudDSHScheduleTool(cloudDSHScheduleUpdateToolName,
-			"Update a schedule with its current version. Set title, objective, or timing to null to leave it unchanged. The owner, model, and Host binding cannot be changed here.",
-			`{"type":"object","properties":{"schedule_id":{"type":"string","minLength":8,"maxLength":8},"expected_version":{"type":"integer","minimum":1},"title":{"type":["string","null"],"maxLength":32768},"objective":{"type":["string","null"],"maxLength":32768},"timing":{"type":["object","null"],"properties":{"kind":{"type":"string","enum":["once","daily","weekly","every_n_hours"]},"run_at":{"type":"string"},"starts_on":{"type":"string"},"local_time":{"type":"string"},"time_zone":{"type":"string","minLength":1,"maxLength":64},"weekdays":{"type":"array","items":{"type":"integer"}},"interval_hours":{"type":"integer"},"anchor_at":{"type":"string"}},"required":["kind","run_at","starts_on","local_time","time_zone","weekdays","interval_hours","anchor_at"],"additionalProperties":false}},"required":["schedule_id","expected_version","title","objective","timing"],"additionalProperties":false}`, identity.ScopeScheduleManage),
+			"Update a schedule with its current version. Set title, objective, or timing to null to leave it unchanged. Set file_delivery_intent explicitly to none, required, or unclear to change it; omission preserves its current value. Base the value on the user's explicit request, never objective text. This intent does not grant computer or Workspace capability; the service enforces those requirements. The owner, model, and Host binding cannot be changed here.",
+			`{"type":"object","properties":{"schedule_id":{"type":"string","minLength":8,"maxLength":8},"expected_version":{"type":"integer","minimum":1},"title":{"type":["string","null"],"maxLength":32768},"objective":{"type":["string","null"],"maxLength":32768},"file_delivery_intent":{"type":"string","enum":["none","required","unclear"]},"timing":{"type":["object","null"],"properties":{"kind":{"type":"string","enum":["once","daily","weekly","every_n_hours"]},"run_at":{"type":"string"},"starts_on":{"type":"string"},"local_time":{"type":"string"},"time_zone":{"type":"string","minLength":1,"maxLength":64},"weekdays":{"type":"array","items":{"type":"integer"}},"interval_hours":{"type":"integer"},"anchor_at":{"type":"string"}},"required":["kind","run_at","starts_on","local_time","time_zone","weekdays","interval_hours","anchor_at"],"additionalProperties":false}},"required":["schedule_id","expected_version","title","objective","timing"],"additionalProperties":false}`, identity.ScopeScheduleManage),
 		cloudDSHScheduleTool(cloudDSHScheduleActionToolName,
 			"Enable or disable a schedule using its current version. current_run_action may be empty, continue, or cancel; choose cancel only when the user asks to stop an active run.",
 			`{"type":"object","properties":{"schedule_id":{"type":"string","minLength":8,"maxLength":8},"expected_version":{"type":"integer","minimum":1},"action":{"type":"string","enum":["enable","disable"]},"current_run_action":{"type":"string","enum":["","continue","cancel"]}},"required":["schedule_id","expected_version","action","current_run_action"],"additionalProperties":false}`, identity.ScopeScheduleManage),
@@ -499,6 +501,10 @@ func (b *CloudDSHToolBroker) executeScheduleServiceTool(ctx context.Context, cur
 		if decodeStrictRuntimeResult(raw, &args) != nil {
 			return nil, "", domain.InvalidArgument("schedule_create", "schedule creation arguments are invalid")
 		}
+		fileDeliveryIntent, valid := cloudDSHParseScheduleFileDeliveryIntent(args.FileDeliveryIntent)
+		if !valid {
+			return nil, "", domain.InvalidArgument("schedule.file_delivery_intent", "schedule file delivery intent is invalid")
+		}
 		budget := task.Budget{
 			ActiveSeconds: current.Budget.ActiveSeconds,
 			ToolCalls:     current.Budget.ToolCalls,
@@ -513,7 +519,7 @@ func (b *CloudDSHToolBroker) executeScheduleServiceTool(ctx context.Context, cur
 		}
 		value, err := b.schedules.Create(ctx, principal, CreateScheduleCommand{
 			HostID: current.HostID, ModelID: current.ModelID, Title: title, Objective: args.Objective,
-			Timing: args.Timing, Budget: budget, MisfirePolicy: schedule.MisfireSkip,
+			FileDeliveryIntent: fileDeliveryIntent, Timing: args.Timing, Budget: budget, MisfirePolicy: schedule.MisfireSkip,
 		}, idempotencyKey)
 		if err != nil {
 			return nil, "", err
@@ -521,12 +527,16 @@ func (b *CloudDSHToolBroker) executeScheduleServiceTool(ctx context.Context, cur
 		return cloudDSHScheduleSummary(value), "Create schedule", nil
 	case cloudDSHScheduleUpdateToolName:
 		var args cloudDSHScheduleUpdateArguments
-		if decodeStrictRuntimeResult(raw, &args) != nil || args.ExpectedVersion < 1 ||
-			(args.Title == nil && args.Objective == nil && args.Timing == nil) {
+		if decodeStrictRuntimeResult(raw, &args) != nil || args.ExpectedVersion < 1 {
+			return nil, "", domain.InvalidArgument("schedule_update", "schedule update arguments are invalid")
+		}
+		fileDeliveryIntent, valid := cloudDSHParseOptionalScheduleFileDeliveryIntent(args.FileDeliveryIntent)
+		if !valid || (args.Title == nil && args.Objective == nil && args.Timing == nil && fileDeliveryIntent == nil) {
 			return nil, "", domain.InvalidArgument("schedule_update", "schedule update arguments are invalid")
 		}
 		value, err := b.schedules.Update(ctx, principal, args.ScheduleID, UpdateScheduleCommand{
-			ExpectedVersion: args.ExpectedVersion, Title: args.Title, Objective: args.Objective, Timing: args.Timing,
+			ExpectedVersion: args.ExpectedVersion, Title: args.Title, Objective: args.Objective,
+			FileDeliveryIntent: fileDeliveryIntent, Timing: args.Timing,
 		}, idempotencyKey)
 		if err != nil {
 			return nil, "", err
@@ -570,9 +580,33 @@ func cloudDSHScheduleSummary(value schedule.Schedule) map[string]any {
 		"title":     cloudDSHClipText(value.Title, cloudDSHScheduleTextLimit),
 		"objective": cloudDSHClipText(value.Objective, cloudDSHScheduleTextLimit),
 		"host_id":   value.HostID, "model_id": value.ModelID, "timing": value.Timing,
-		"next_run_at": value.NextRunAt, "last_run": cloudDSHRunSummary(value.LastRun),
+		"file_delivery_intent": value.FileDeliveryIntent,
+		"next_run_at":          value.NextRunAt, "last_run": cloudDSHRunSummary(value.LastRun),
 		"current_run": cloudDSHRunSummary(value.CurrentRun),
 	}
+}
+
+func cloudDSHParseOptionalScheduleFileDeliveryIntent(raw json.RawMessage) (*task.FileDeliveryIntent, bool) {
+	if len(raw) == 0 {
+		return nil, true
+	}
+	intent, valid := cloudDSHParseScheduleFileDeliveryIntent(raw)
+	if !valid {
+		return nil, false
+	}
+	return &intent, true
+}
+
+func cloudDSHParseScheduleFileDeliveryIntent(raw json.RawMessage) (task.FileDeliveryIntent, bool) {
+	if len(raw) == 0 {
+		return task.FileDeliveryNone, true
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return "", false
+	}
+	intent := task.FileDeliveryIntent(value)
+	return intent, intent.Valid()
 }
 
 func cloudDSHRunSummary(value *schedule.Run) map[string]any {

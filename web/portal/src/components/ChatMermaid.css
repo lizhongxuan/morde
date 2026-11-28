@@ -1,0 +1,20 @@
+.chat-markdown-mermaid { min-width: 0; margin: .8em 0; }
+.chat-markdown-mermaid-diagram { max-width: 100%; overflow-x: auto; }
+.chat-markdown-mermaid-diagram svg { display: block; width: auto; max-width: 100%; height: auto; color: var(--ink, #334155); }
+.chat-markdown-mermaid-diagram .node rect,
+.chat-markdown-mermaid-diagram .node polygon,
+.chat-markdown-mermaid-diagram .node circle,
+.chat-markdown-mermaid-diagram .node ellipse,
+.chat-markdown-mermaid-diagram .cluster rect { fill: var(--side, #eff6ff); stroke: var(--brand, #60a5fa); stroke-width: 1.5px; }
+.chat-markdown-mermaid-diagram .edgePath path,
+.chat-markdown-mermaid-diagram .edgePaths path,
+.chat-markdown-mermaid-diagram .flowchart-link { fill: none; stroke: var(--muted-strong, #64748b); stroke-width: 1.5px; }
+.chat-markdown-mermaid-diagram .arrowheadPath { fill: var(--muted-strong, #64748b); }
+.chat-markdown-mermaid-diagram text { fill: var(--ink, #334155); font-family: inherit; }
+.chat-markdown-mermaid-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 8px; color: var(--muted-strong, #64748b); font-size: .85em; }
+.chat-markdown-mermaid-tools button,
+.chat-markdown-mermaid-tools summary { color: var(--brand-ink, #2563eb); cursor: pointer; }
+.chat-markdown-mermaid-tools button { padding: 3px 8px; border: 1px solid var(--line, #dbeafe); border-radius: 8px; background: var(--surface, #fff); font: inherit; }
+.chat-markdown-mermaid-tools details { min-width: 0; }
+.chat-markdown-mermaid-tools pre { width: 100%; margin: 0; }
+.chat-markdown-mermaid-status { margin: 0; color: var(--muted-strong, #64748b); font-size: .9em; }

@@ -77,8 +77,10 @@ func (s *modelConnectionManagerStub) Check(context.Context, identity.Principal, 
 func TestModelConnectionAPIAllowsClientPersonalCreateAndNeverReturnsAPIKey(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	window := 32_768
+	maxOutput := 65_536
 	manager := &modelConnectionManagerStub{created: app.ModelConnectionView{
 		ID: "p1234567", Name: "OpenAI", BaseURL: "https://api.openai.com/v1", ModelName: "gpt-test",
+		MaxOutputTokens: &maxOutput, MaxOutputOverrideTokens: &maxOutput, MaxOutputSource: app.ModelMaxOutputOverride,
 		ContextWindowTokens: &window,
 		Shared:              false, HasAPIKey: true, CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
 	}}
@@ -93,14 +95,18 @@ func TestModelConnectionAPIAllowsClientPersonalCreateAndNeverReturnsAPIKey(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	body := `{"name":"OpenAI","base_url":"https://api.openai.com/v1","model_name":"gpt-test","context_window_tokens":32768,"api_key":"secret-model-key","shared":false}`
+	body := `{"name":"OpenAI","base_url":"https://api.openai.com/v1","model_name":"gpt-test","max_output_override_tokens":65536,"context_window_tokens":32768,"api_key":"secret-model-key","shared":false}`
 	response := request(router, http.MethodPost, "/api/model-connections", body, "Bearer "+clientCredential, "")
 	if response.Code != http.StatusCreated || strings.Contains(response.Body.String(), "secret-model-key") || strings.Contains(response.Body.String(), `"api_key"`) ||
-		!strings.Contains(response.Body.String(), `"context_window_tokens":32768`) {
+		!strings.Contains(response.Body.String(), `"context_window_tokens":32768`) ||
+		!strings.Contains(response.Body.String(), `"max_output_tokens":65536`) ||
+		!strings.Contains(response.Body.String(), `"max_output_override_tokens":65536`) ||
+		!strings.Contains(response.Body.String(), `"max_output_source":"override"`) {
 		t.Fatalf("create response = %d %s", response.Code, response.Body)
 	}
 	if manager.calls != 1 || manager.command.APIKey != "secret-model-key" || !manager.command.LegacyContextWindowPresent || manager.command.LegacyContextWindowTokens == nil ||
-		*manager.command.LegacyContextWindowTokens != window || manager.principal.Kind != identity.KindClient || manager.command.Shared {
+		*manager.command.LegacyContextWindowTokens != window || !manager.command.MaxOutputOverridePresent || manager.command.MaxOutputOverrideTokens == nil ||
+		*manager.command.MaxOutputOverrideTokens != maxOutput || manager.principal.Kind != identity.KindClient || manager.command.Shared {
 		t.Fatalf("create command not forwarded: calls=%d command=%+v", manager.calls, manager.command)
 	}
 
@@ -113,13 +119,18 @@ func TestModelConnectionAPIAllowsClientPersonalCreateAndNeverReturnsAPIKey(t *te
 	if conflictingFields.Code != http.StatusBadRequest || manager.calls != 2 {
 		t.Fatalf("conflicting capacity fields = %d %s calls=%d", conflictingFields.Code, conflictingFields.Body, manager.calls)
 	}
-	cleared := request(router, http.MethodPut, "/api/model-connections/p1234567", `{"name":"OpenAI","base_url":"https://api.openai.com/v1","model_name":"gpt-test","context_window_override_tokens":null}`, "Bearer "+clientCredential, "")
-	if cleared.Code != http.StatusOK || manager.calls != 3 || !manager.command.ContextWindowOverridePresent || manager.command.ContextWindowOverrideTokens != nil {
+	cleared := request(router, http.MethodPut, "/api/model-connections/p1234567", `{"name":"OpenAI","base_url":"https://api.openai.com/v1","model_name":"gpt-test","context_window_override_tokens":null,"max_output_override_tokens":null}`, "Bearer "+clientCredential, "")
+	if cleared.Code != http.StatusOK || manager.calls != 3 || !manager.command.ContextWindowOverridePresent || manager.command.ContextWindowOverrideTokens != nil ||
+		!manager.command.MaxOutputOverridePresent || manager.command.MaxOutputOverrideTokens != nil {
 		t.Fatalf("null override did not reach update command: %d %s calls=%d command=%+v", cleared.Code, cleared.Body, manager.calls, manager.command)
 	}
 	omitted := request(router, http.MethodPut, "/api/model-connections/p1234567", `{"name":"OpenAI","base_url":"https://api.openai.com/v1","model_name":"gpt-test"}`, "Bearer "+clientCredential, "")
-	if omitted.Code != http.StatusOK || manager.calls != 4 || manager.command.ContextWindowOverridePresent || manager.command.LegacyContextWindowPresent {
+	if omitted.Code != http.StatusOK || manager.calls != 4 || manager.command.ContextWindowOverridePresent || manager.command.LegacyContextWindowPresent || manager.command.MaxOutputOverridePresent {
 		t.Fatalf("omitted override was not distinguishable: %d %s calls=%d command=%+v", omitted.Code, omitted.Body, manager.calls, manager.command)
+	}
+	invalidOutput := request(router, http.MethodPost, "/api/model-connections", `{"name":"OpenAI 4","base_url":"https://api.openai.com/v1","model_name":"gpt-test","max_output_override_tokens":0,"api_key":"secret-model-key","shared":false}`, "Bearer "+clientCredential, "")
+	if invalidOutput.Code != http.StatusBadRequest || manager.calls != 4 {
+		t.Fatalf("invalid max output override = %d %s calls=%d", invalidOutput.Code, invalidOutput.Body, manager.calls)
 	}
 
 	unknown := request(router, http.MethodPost, "/api/model-connections", `{"name":"OpenAI","base_url":"https://api.openai.com/v1","model_name":"gpt-test","api_key":"secret-model-key","unknown":true}`, "Bearer "+clientCredential, "")

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/rand"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -25,19 +26,21 @@ import (
 type ModelCallSource string
 
 const (
-	ModelCallClient     ModelCallSource = "client"
-	ModelCallChat       ModelCallSource = "chat"
-	ModelCallTask       ModelCallSource = "task"
-	ModelCallProbe      ModelCallSource = "probe"
-	ModelCallRoute      ModelCallSource = "route"
-	ModelCallCompaction ModelCallSource = "compaction"
-	ModelCallReview     ModelCallSource = "review"
+	ModelCallClient           ModelCallSource = "client"
+	ModelCallChat             ModelCallSource = "chat"
+	ModelCallTask             ModelCallSource = "task"
+	ModelCallProbe            ModelCallSource = "probe"
+	ModelCallRoute            ModelCallSource = "route"
+	ModelCallCompaction       ModelCallSource = "compaction"
+	ModelCallReview           ModelCallSource = "review"
+	ModelCallTerminalDelivery ModelCallSource = "terminal_delivery"
 )
 
 type ModelTaskFence struct {
 	TaskID               string
 	OwnerID              string
 	InitiatorID          string
+	TaskRevision         int64
 	LeaseOwner           string
 	LeaseVersion         int64
 	AgentInstanceID      string
@@ -48,6 +51,11 @@ type ModelTaskFence struct {
 	ThroughSequence      int64
 	EngineVersion        string
 	ProfileVersion       string
+	// RecoveryCallID is the durable model-call ledger identity for the one
+	// scheduled recovery. RecoveryDSHCallID is a separate DSH frame identity;
+	// neither reuses the failed call's identity.
+	RecoveryCallID    string
+	RecoveryDSHCallID string
 }
 
 // ModelTaskProjectResolver reads the project scope from the persisted Task so
@@ -57,39 +65,88 @@ type ModelTaskProjectResolver interface {
 }
 
 type ModelCall struct {
-	Source        ModelCallSource
-	Principal     identity.Principal
-	Task          *ModelTaskFence
-	Review        *TaskValidationReviewModelFence
-	Summary       *ConversationSummaryModelFence
-	ModelID       string
-	CallID        string
-	RawRequest    json.RawMessage
-	ImageResolver TaskModelImageResolver
-	Request       ModelRequest
+	Source           ModelCallSource
+	Principal        identity.Principal
+	Task             *ModelTaskFence
+	Review           *TaskValidationReviewModelFence
+	TerminalDelivery *TaskTerminalDeliveryModelFence
+	Summary          *ConversationSummaryModelFence
+	ModelID          string
+	CallID           string
+	// LedgerCallID selects the durable Task model-call ledger row for an
+	// adaptive-budgeted DSH frame. It is empty for every legacy call.
+	LedgerCallID                string
+	BudgetPlanID                string
+	BudgetCallID                string
+	BudgetRequestDigest         string
+	RawRequest                  json.RawMessage
+	ImageResolver               TaskModelImageResolver
+	Request                     ModelRequest
+	ReplayTaskModelResponseOnly bool
 }
 
 type ModelCallReservation struct {
-	Source            ModelCallSource
-	Principal         identity.Principal
-	Task              *ModelTaskFence
-	Review            *TaskValidationReviewModelFence
-	Summary           *ConversationSummaryModelFence
-	Route             *ConversationRouteModelFence
-	ProjectID         string
-	PersonalModel     bool
-	OwnerID           string
-	ModelID           string
-	ProviderEndpoint  string
-	ProviderModel     string
-	ConnectionVersion time.Time
-	NeedsTools        bool
-	NeedsVision       bool
-	CallID            string
-	RequestDigest     []byte
-	LegacyCallID      string
-	LegacyDigest      []byte
-	ReservedTokens    int64
+	Source                  ModelCallSource
+	Principal               identity.Principal
+	Task                    *ModelTaskFence
+	Review                  *TaskValidationReviewModelFence
+	TerminalDelivery        *TaskTerminalDeliveryModelFence
+	Summary                 *ConversationSummaryModelFence
+	Route                   *ConversationRouteModelFence
+	ProjectID               string
+	PersonalModel           bool
+	OwnerID                 string
+	ModelID                 string
+	ProviderEndpoint        string
+	ProviderModel           string
+	ConnectionVersion       time.Time
+	NeedsTools              bool
+	NeedsVision             bool
+	CallID                  string
+	BudgetPlanID            string
+	BudgetCallID            string
+	BudgetRequestDigest     string
+	BudgetCapabilityVersion string
+	DSHCallID               string
+	RequestDigest           []byte
+	LegacyCallID            string
+	LegacyDigest            []byte
+	ReservedTokens          int64
+	RouteOutputBudget       *ConversationRouteOutputBudgetPlan
+}
+
+// ConversationRouteOutputBudgetPlan binds a long-form conversation route
+// call to the reviewed output policy and the verified capabilities used to
+// calculate its exact provider output cap and ledger reservation.
+type ConversationRouteOutputBudgetPlan struct {
+	Stage                        string
+	StrategyVersion              string
+	CapabilityVersion            string
+	ModelMaxOutputTokens         int64
+	ContextWindowTokens          int64
+	ContextInputUpperBoundTokens int64
+	ContextSafetyMarginTokens    int64
+	ContextSafeTokens            int64
+	AccountSafeTokens            int64
+	ProjectSafeTokens            int64
+	GoalTokens                   int64
+	MinimumTokens                int64
+	SafeTokens                   int64
+	SendTokens                   int64
+	InputReservedTokens          int64
+}
+
+// ConversationRouteOutputBudgetLimits returns current account and project
+// headroom before a long-form route is signed. Prepare rechecks both limits
+// under the same locks as its durable reservation.
+type ConversationRouteOutputBudgetLimits struct {
+	AccountSafeTokens int64
+	ProjectSafeTokens int64
+}
+
+type ConversationRouteOutputBudgetLimiter interface {
+	LimitConversationRouteOutputBudget(context.Context, ModelCallReservation,
+		*project.RateSnapshot) (ConversationRouteOutputBudgetLimits, error)
 }
 
 type ModelCallSettlement struct {
@@ -102,10 +159,126 @@ type ModelCallSettlement struct {
 	Summary               *ConversationSummaryModelFence
 	TaskCall              *ModelCallReservation
 	ReviewCall            *ModelCallReservation
+	TerminalDeliveryCall  *ModelCallReservation
 	ResponseCiphertext    []byte
 	ResponseDigest        []byte
 	ResponseTextDigest    []byte
 	ResponseInvalid       bool
+}
+
+// TaskModelNoDispatchEvidence is proof that a specific Task model call did not
+// reach the provider. The Model Gateway creates it only after a failed
+// BeginModelCallDispatch is followed by a successful reservation abandonment.
+// A provider error, settlement error, or failed abandonment must never create
+// this evidence.
+type TaskModelNoDispatchEvidence struct {
+	TaskFence     ModelTaskFence
+	CallID        string
+	ModelID       string
+	RequestDigest []byte
+	UsageKnown    bool
+	InputTokens   int64
+	OutputTokens  int64
+}
+
+type TaskModelRecoveryFailureKind string
+
+const (
+	TaskModelRecoveryFailureNoDispatch     TaskModelRecoveryFailureKind = "no_dispatch"
+	TaskModelRecoveryFailureProviderReject TaskModelRecoveryFailureKind = "provider_reject"
+)
+
+// TaskModelRecoveryFailureEvidence is bounded proof that a model call failed
+// in a way that can be considered once by the read-only recovery path.
+type TaskModelRecoveryFailureEvidence struct {
+	Kind              TaskModelRecoveryFailureKind
+	TaskFence         ModelTaskFence
+	CallID            string
+	ModelID           string
+	RequestDigest     []byte
+	UsageKnown        bool
+	InputTokens       int64
+	OutputTokens      int64
+	ProviderErrorKind ModelClientErrorKind
+}
+
+type TaskModelRecoveryFailure interface {
+	TaskModelRecoveryFailureEvidence() TaskModelRecoveryFailureEvidence
+}
+
+// TaskModelNoDispatchError carries bounded identity evidence while keeping the
+// underlying persistence error out of Error().
+type TaskModelNoDispatchError struct {
+	evidence TaskModelNoDispatchEvidence
+	cause    error
+}
+
+func (e *TaskModelNoDispatchError) Error() string {
+	return "task model request was confirmed not dispatched"
+}
+
+func (e *TaskModelNoDispatchError) Unwrap() error { return e.cause }
+
+func (e *TaskModelNoDispatchError) TaskModelNoDispatchEvidence() TaskModelNoDispatchEvidence {
+	if e == nil {
+		return TaskModelNoDispatchEvidence{}
+	}
+	return e.evidence
+}
+
+func (e *TaskModelNoDispatchError) TaskModelRecoveryFailureEvidence() TaskModelRecoveryFailureEvidence {
+	if e == nil {
+		return TaskModelRecoveryFailureEvidence{}
+	}
+	return TaskModelRecoveryFailureEvidence{Kind: TaskModelRecoveryFailureNoDispatch, TaskFence: e.evidence.TaskFence,
+		CallID: e.evidence.CallID, ModelID: e.evidence.ModelID, RequestDigest: append([]byte(nil), e.evidence.RequestDigest...),
+		UsageKnown: e.evidence.UsageKnown, InputTokens: e.evidence.InputTokens,
+		OutputTokens: e.evidence.OutputTokens}
+}
+
+// TaskModelRetryableFailureError is returned only after a bounded provider
+// rejection and its known usage have been durably settled.
+type TaskModelRetryableFailureError struct {
+	evidence TaskModelRecoveryFailureEvidence
+	cause    error
+}
+
+func (e *TaskModelRetryableFailureError) Error() string {
+	return "task model request was rejected with confirmed zero usage"
+}
+
+func (e *TaskModelRetryableFailureError) Unwrap() error { return e.cause }
+
+func (e *TaskModelRetryableFailureError) TaskModelRecoveryFailureEvidence() TaskModelRecoveryFailureEvidence {
+	if e == nil {
+		return TaskModelRecoveryFailureEvidence{}
+	}
+	result := e.evidence
+	result.RequestDigest = append([]byte(nil), e.evidence.RequestDigest...)
+	return result
+}
+
+func (e *TaskModelRetryableFailureError) ModelFailureCategory() string {
+	if e == nil {
+		return "unknown"
+	}
+	return string(e.evidence.ProviderErrorKind)
+}
+
+func (e *TaskModelRetryableFailureError) ModelFailureDiagnostic() AgentModelFailureDiagnostic {
+	return AgentModelFailureDiagnostic{Stage: "model_gateway", Category: e.ModelFailureCategory(),
+		ReasonCode: "provider_rejected_request"}
+}
+
+func confirmedTaskModelProviderRejection(err error, usage ModelUsage) bool {
+	if err == nil || usage.Known && (usage.InputTokens != 0 || usage.OutputTokens != 0) {
+		return false
+	}
+	var providerErr *ModelClientError
+	if !errors.As(err, &providerErr) || providerErr.Stage != "provider_status" || !providerErr.ConfirmedNoUsage {
+		return false
+	}
+	return providerErr.Kind == ModelErrorRateLimited || providerErr.Kind == ModelErrorUnavailable
 }
 
 type ModelUsageObservation struct {
@@ -134,14 +307,19 @@ type ModelGatewayResolver interface {
 }
 
 type ModelGatewayService struct {
-	store                ModelCallStore
-	models               ModelGatewayResolver
-	client               ModelClient
-	projectBudget        *ProjectBudgetService
-	responseSealer       *Sealer
-	gpt6LunaMaxReasoning bool
-	usageObserverMu      sync.RWMutex
-	usageObserver        func(ModelUsageObservation)
+	store                     ModelCallStore
+	models                    ModelGatewayResolver
+	client                    ModelClient
+	projectBudget             *ProjectBudgetService
+	responseSealer            *Sealer
+	gpt6LunaMaxReasoning      bool
+	usageObserverMu           sync.RWMutex
+	usageObserver             func(ModelUsageObservation)
+	modelBudgetStrategyMu     sync.RWMutex
+	modelBudgetStrategy       *modelOutputBudgetStrategySnapshot
+	modelBudgetShadowMu       sync.RWMutex
+	modelBudgetShadow         *modelOutputBudgetShadowSnapshot
+	modelBudgetShadowObserver func(ModelOutputBudgetShadowObservation)
 }
 
 func (s *ModelGatewayService) SetModelUsageObserver(observer func(ModelUsageObservation)) {
@@ -179,7 +357,7 @@ const modelConcurrencyReservationRetryMaxDelay = time.Second
 // MaxDSHModelResponseTextBytes is the maximum response text accepted by the cloud DSH worker.
 // MaxDSHModelResponseToolCalls is the maximum tool-call count accepted by the cloud DSH worker.
 const (
-	MaxDSHModelResponseTextBytes  = 256 << 10
+	MaxDSHModelResponseTextBytes  = MaxAssistantReplyBytes
 	MaxDSHModelResponseToolCalls  = 64
 	maxDSHModelResponseTokenCount = 1<<53 - 1
 	// OpenAI recommends reserving at least 25,000 tokens for max reasoning and output.
@@ -198,10 +376,16 @@ func normalizedModelTaskFence(value *ModelTaskFence) *ModelTaskFence {
 }
 
 type ModelGatewayEndpoint struct {
-	Endpoint            ModelEndpoint
-	Version             time.Time
-	Personal            bool
-	ContextWindowTokens *int
+	Endpoint                    ModelEndpoint
+	Version                     time.Time
+	Personal                    bool
+	ContextWindowTokens         *int
+	ContextWindowSource         ModelContextWindowSource
+	ContextWindowCatalogVersion *string
+	MaxOutputTokens             *int
+	MaxOutputSource             ModelMaxOutputSource
+	MaxOutputResolvedAt         *time.Time
+	MaxOutputCatalogVersion     *string
 }
 
 func isFirstPartyGPT6Luna(endpoint ModelEndpoint) bool {
@@ -243,25 +427,38 @@ func modelConcurrencyReservationLimited(err error) bool {
 
 // reserveModelCall retries only a typed, pre-dispatch account concurrency limit.
 // Other rate limits, uncertain reservations, and provider errors remain terminal.
+// The wait between attempts is the shared jittered backoff with this path's
+// own policy (100ms base, 1s cap): a local concurrency slot is not a provider
+// error, so the E12 provider ladder (base 5s / max 120s, 3 retries) does not
+// apply here. Task calls wait until their context ends, as before. Summary
+// and review calls retry at most ModelRetryMaxRetries times so they cannot
+// hold a lease indefinitely. A single wait stays bounded (base cap 1s plus
+// at most 50% jitter).
 func (s *ModelGatewayService) reserveModelCall(ctx context.Context, source ModelCallSource, projectCall bool, projectID string,
 	reservation ModelCallReservation, usage project.Usage) error {
-	delay := 100 * time.Millisecond
+	attempt := 0
 	for {
 		var err error
 		if projectCall {
-			if source == ModelCallCompaction {
+			switch source {
+			case ModelCallCompaction:
 				_, _, err = s.projectBudget.reserveConversationSummaryModelCall(ctx, projectID, reservation, usage)
-			} else if source == ModelCallReview {
+			case ModelCallReview:
 				_, _, err = s.projectBudget.reserveTaskValidationReviewModelCall(ctx, projectID, reservation, usage)
-			} else {
+			case ModelCallTerminalDelivery:
+				_, _, err = s.projectBudget.reserveTaskTerminalDeliveryModelCall(ctx, projectID, reservation, usage)
+			default:
 				_, _, err = s.projectBudget.reserveTaskModelCall(ctx, projectID, reservation, usage)
 			}
 		} else {
 			err = s.store.ReserveModelCall(ctx, reservation)
 		}
-		if err == nil || source != ModelCallTask || !modelConcurrencyReservationLimited(err) {
+		if err == nil || (source != ModelCallTask && source != ModelCallCompaction && source != ModelCallReview) ||
+			!modelConcurrencyReservationLimited(err) || (source != ModelCallTask && attempt >= ModelRetryMaxRetries) {
 			return err
 		}
+		attempt++
+		delay := JitteredBackoff(attempt, 100*time.Millisecond, modelConcurrencyReservationRetryMaxDelay, ModelRetryJitterRatio, rand.Float64)
 		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
@@ -273,11 +470,6 @@ func (s *ModelGatewayService) reserveModelCall(ctx context.Context, source Model
 			}
 			return context.Cause(ctx)
 		case <-timer.C:
-		}
-		if delay < modelConcurrencyReservationRetryMaxDelay/2 {
-			delay *= 2
-		} else {
-			delay = modelConcurrencyReservationRetryMaxDelay
 		}
 	}
 }
@@ -377,9 +569,24 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 	if ctx == nil {
 		return ModelResponse{}, domain.InvalidArgument("model_call", "model call context is required")
 	}
+	if call.ReplayTaskModelResponseOnly && call.Source != ModelCallTask {
+		return ModelResponse{}, domain.InvalidArgument("model_call", "replay-only model recovery requires a Task call")
+	}
 	call.Task = normalizedModelTaskFence(call.Task)
-	if (call.Source == ModelCallCompaction || call.Source == ModelCallTask || call.Source == ModelCallReview) && s.responseSealer == nil {
+	if (call.Source == ModelCallCompaction || call.Source == ModelCallTask || call.Source == ModelCallReview || call.Source == ModelCallTerminalDelivery) && s.responseSealer == nil {
 		return ModelResponse{}, domain.NewError(domain.CodeUnsupported, "model response encryption is unavailable")
+	}
+	if call.Source == ModelCallTerminalDelivery {
+		if call.TerminalDelivery == nil {
+			return ModelResponse{}, domain.InvalidArgument("model_call", "invalid terminal delivery model call")
+		}
+		stored, found, err := s.RecoverTaskTerminalDeliveryDSHModelResponse(ctx, *call.TerminalDelivery, call.RawRequest)
+		if err != nil {
+			return ModelResponse{}, err
+		}
+		if found {
+			return stored, nil
+		}
 	}
 	if call.Source == ModelCallTask {
 		if call.Task == nil || call.Request.Endpoint != (ModelEndpoint{}) {
@@ -396,6 +603,11 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 	if call.Source == ModelCallReview && (call.Review == nil || call.Task != nil || call.Summary != nil ||
 		len(call.Request.Tools) != 0 || call.Request.RequiredTool != "") {
 		return ModelResponse{}, domain.InvalidArgument("model_call", "invalid Task validation review model call")
+	}
+	if call.Source == ModelCallTerminalDelivery && (call.TerminalDelivery == nil || !ValidTaskTerminalDeliveryModelDispatchFence(*call.TerminalDelivery) || call.Task != nil || call.Review != nil ||
+		call.Summary != nil || call.Principal.UserID != "" || call.Principal.TokenID != "" ||
+		call.Principal.ClientInstallationID != "" || len(call.Request.Tools) != 0 || call.Request.RequiredTool != "") {
+		return ModelResponse{}, domain.InvalidArgument("model_call", "invalid terminal delivery model call")
 	}
 	ownerID, digest, reserve, err := validateModelCall(call)
 	if err != nil {
@@ -433,6 +645,15 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 		if err != nil {
 			return ModelResponse{}, err
 		}
+	} else if call.Source == ModelCallTerminalDelivery {
+		resolver, ok := s.store.(TaskTerminalDeliveryModelProjectResolver)
+		if !ok {
+			return ModelResponse{}, domain.NewError(domain.CodeUnsupported, "terminal delivery project scope is unavailable")
+		}
+		projectID, err = resolver.ModelTaskProjectIDForTerminalDelivery(ctx, *call.TerminalDelivery)
+		if err != nil {
+			return ModelResponse{}, err
+		}
 	} else if call.Source == ModelCallCompaction && call.Summary != nil {
 		projectID = call.Summary.Claim.Input.ProjectID
 	}
@@ -454,9 +675,23 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 	if err != nil {
 		return ModelResponse{}, err
 	}
+	adaptiveTaskBudget := call.Source == ModelCallTask && call.BudgetPlanID != ""
+	if adaptiveTaskBudget && (endpoint.MaxOutputTokens == nil || *endpoint.MaxOutputTokens < 1 ||
+		*endpoint.MaxOutputTokens > MaxModelOutputTokens || call.Request.MaxOutputTokens > *endpoint.MaxOutputTokens ||
+		(endpoint.MaxOutputSource != ModelMaxOutputModelCatalog && endpoint.MaxOutputSource != ModelMaxOutputOverride)) {
+		return ModelResponse{}, domain.NewError(domain.CodeUnsupported, "verified adaptive model output capacity is unavailable")
+	}
 	if call.Source == ModelCallTask || call.Source == ModelCallCompaction || call.Source == ModelCallReview {
 		request := call.Request
-		s.applyGPT6LunaReasoning(endpoint.Endpoint, &request, call.Source != ModelCallCompaction)
+		if call.Source == ModelCallCompaction {
+			// Summary requests have a small, strict output budget. Do not spend it
+			// on hidden reasoning, even when the account-wide GPT-6 setting asks
+			// normal Task calls to use maximum reasoning.
+			request.DisableThinking = true
+			request.ReasoningEffort = ""
+		} else {
+			s.applyGPT6LunaReasoning(endpoint.Endpoint, &request, true)
+		}
 		call.Request = request
 		ownerID, digest, reserve, err = validateModelCall(call)
 		if err != nil {
@@ -476,11 +711,38 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 	if projectID != "" && !endpoint.Personal && s.projectBudget == nil {
 		return ModelResponse{}, domain.NewError(domain.CodeUnsupported, "project model budget is unavailable")
 	}
+	ledgerCallID := call.CallID
+	if call.Source == ModelCallTask && call.Task.RecoveryCallID != "" {
+		if !idempotencyKeyPattern.MatchString(call.Task.RecoveryCallID) ||
+			!idempotencyKeyPattern.MatchString(call.Task.RecoveryDSHCallID) || call.Task.RecoveryCallID == call.CallID ||
+			call.Task.RecoveryDSHCallID != call.CallID ||
+			call.LedgerCallID != "" && call.LedgerCallID != call.Task.RecoveryCallID {
+			return ModelResponse{}, domain.InvalidArgument("model_call", "invalid task recovery call identity")
+		}
+		ledgerCallID = call.Task.RecoveryCallID
+	} else if call.Source == ModelCallTask && call.Task.RecoveryDSHCallID != "" {
+		return ModelResponse{}, domain.InvalidArgument("model_call", "incomplete task recovery call identity")
+	} else if call.Source == ModelCallTask && call.LedgerCallID != "" {
+		ledgerCallID = call.LedgerCallID
+	}
 	reservation := ModelCallReservation{
-		Source: call.Source, Principal: call.Principal, Task: call.Task, Review: call.Review, Summary: call.Summary, OwnerID: ownerID,
+		Source: call.Source, Principal: call.Principal, Task: call.Task, Review: call.Review,
+		TerminalDelivery: call.TerminalDelivery, Summary: call.Summary, OwnerID: ownerID,
 		ProjectID: projectID, PersonalModel: endpoint.Personal,
 		ModelID: call.ModelID, ProviderEndpoint: endpoint.Endpoint.BaseURL, ProviderModel: endpoint.Endpoint.ModelID, ConnectionVersion: endpoint.Version,
-		NeedsTools: needsTools, NeedsVision: needsVision, CallID: call.CallID, RequestDigest: digest[:], ReservedTokens: reserve,
+		BudgetCapabilityVersion: modelBudgetCapabilityVersion(endpoint),
+		NeedsTools:              needsTools, NeedsVision: needsVision, CallID: ledgerCallID, DSHCallID: call.CallID,
+		BudgetPlanID: call.BudgetPlanID, BudgetCallID: call.BudgetCallID, BudgetRequestDigest: call.BudgetRequestDigest,
+		RequestDigest: digest[:], ReservedTokens: reserve,
+	}
+	if call.BudgetPlanID != "" {
+		preparations, ok := s.store.(ModelBudgetPreparationValidator)
+		if !ok {
+			return ModelResponse{}, domain.NewError(domain.CodeUnsupported, "adaptive model budget ledger is unavailable")
+		}
+		if err := preparations.ValidateTaskModelBudgetPreparation(ctx, reservation); err != nil {
+			return ModelResponse{}, err
+		}
 	}
 	if call.Source == ModelCallCompaction {
 		if recovery, ok := s.store.(ConversationSummaryModelOutputStore); ok {
@@ -510,6 +772,17 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 			if err != nil {
 				return ModelResponse{}, err
 			}
+			attachCurrentTaskTurnMessageID(&response, call.Request.CurrentTaskTurnMessageID)
+			if validTaskModelTruncatedTextForRequest(call.Request, response) {
+				if err := taskDelivery.ValidateTaskModelDelivery(ctx, reservation); err != nil {
+					return ModelResponse{}, err
+				}
+				if adaptiveTaskBudget {
+					response.KnownTextTruncation = true
+					return response, nil
+				}
+				return ModelResponse{}, invalidTaskModelResponseError(response, "model provider truncated the task text response")
+			}
 			if err := taskDelivery.ValidateTaskModelDelivery(ctx, reservation); err != nil {
 				return ModelResponse{}, err
 			}
@@ -517,6 +790,9 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 				return ModelResponse{}, err
 			}
 			return response, nil
+		}
+		if call.ReplayTaskModelResponseOnly {
+			return ModelResponse{}, domain.NewError(domain.CodeInvalidState, "task model recovery response is not available")
 		}
 	}
 	if call.Source == ModelCallReview {
@@ -543,12 +819,24 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 		}
 	}
 	projectCall := projectID != "" && !endpoint.Personal
-	if err := s.reserveModelCall(ctx, call.Source, projectCall, projectID, reservation, projectUsageReservation(call.Request, reserve)); err != nil {
-		return ModelResponse{}, err
+	budgetShadowPlan := s.planTaskModelBudgetShadow(ctx, call, call.Request, endpoint, projectID)
+	if call.BudgetPlanID == "" {
+		if err := s.reserveModelCall(ctx, call.Source, projectCall, projectID, reservation, projectUsageReservation(call.Request, reserve)); err != nil {
+			return ModelResponse{}, err
+		}
 	}
 	request := call.Request
+	currentTaskTurnMessageID := request.CurrentTaskTurnMessageID
+	request.CurrentTaskTurnMessageID = ""
 	request.Endpoint = endpoint.Endpoint
-	dispatchCtx, cancelDispatch := context.WithTimeout(ctx, ModelCallTimeout)
+	if adaptiveTaskBudget {
+		request.Endpoint.VerifiedMaxOutputTokens = *endpoint.MaxOutputTokens
+	}
+	dispatchTimeout := ModelCallTimeout
+	if call.Source == ModelCallTask {
+		dispatchTimeout = TaskModelCallTimeout
+	}
+	dispatchCtx, cancelDispatch := context.WithTimeout(ctx, dispatchTimeout)
 	defer cancelDispatch()
 	var dispatchErr error
 	if call.Source == ModelCallTask && request.OnTextDelta != nil {
@@ -571,6 +859,12 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 		if abandonErr := s.store.AbandonModelCallReservation(abandonCtx, reservation); abandonErr != nil {
 			return ModelResponse{}, errors.Join(dispatchErr, fmt.Errorf("release undispatched model reservation: %w", abandonErr))
 		}
+		if call.Source == ModelCallTask && reservation.Task != nil {
+			return ModelResponse{}, &TaskModelNoDispatchError{evidence: TaskModelNoDispatchEvidence{
+				TaskFence: *reservation.Task, CallID: reservation.DSHCallID, ModelID: reservation.ModelID,
+				RequestDigest: append([]byte(nil), reservation.RequestDigest...), UsageKnown: true,
+			}, cause: dispatchErr}
+		}
 		return ModelResponse{}, dispatchErr
 	}
 	dispatchErr = dispatchCtx.Err()
@@ -582,7 +876,7 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 			dispatchErr = explicit.Err()
 		}
 	}
-	if call.Source == ModelCallTask && dispatchErr != nil {
+	if (call.Source == ModelCallTask || call.Source == ModelCallTerminalDelivery) && dispatchErr != nil {
 		abandonCtx, cancelAbandon := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancelAbandon()
 		if abandonErr := s.store.AbandonModelCallReservation(abandonCtx, reservation); abandonErr != nil {
@@ -609,7 +903,7 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 			}
 		}
 	}
-	if call.Source == ModelCallTask && providerCtx.Err() != nil {
+	if (call.Source == ModelCallTask || call.Source == ModelCallTerminalDelivery) && providerCtx.Err() != nil {
 		err := providerCtx.Err()
 		finishProvider()
 		abandonCtx, cancelAbandon := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
@@ -621,28 +915,81 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 	}
 	response, callErr := s.client.Complete(providerCtx, request)
 	finishProvider()
-	settlement := ModelCallSettlement{Source: call.Source, OwnerID: ownerID, CallID: call.CallID, Usage: response.Usage,
+	response.KnownTextTruncation = false
+	observeTaskModelBudgetShadowResult(s, budgetShadowPlan, response, callErr)
+	if call.Source == ModelCallTask {
+		attachCurrentTaskTurnMessageID(&response, currentTaskTurnMessageID)
+	}
+	retryableFailure := false
+	var retryableFailureKind ModelClientErrorKind
+	if call.Source == ModelCallTask && confirmedTaskModelProviderRejection(callErr, response.Usage) {
+		var providerErr *ModelClientError
+		if errors.As(callErr, &providerErr) {
+			retryableFailure = true
+			retryableFailureKind = providerErr.Kind
+			response.Usage = ModelUsage{Known: true}
+		}
+	}
+	settlement := ModelCallSettlement{Source: call.Source, OwnerID: ownerID, CallID: reservation.CallID, Usage: response.Usage,
 		ProviderReportedModel: response.ProviderReportedModel,
-		Unknown:               callErr != nil || !response.Usage.Known, Summary: call.Summary}
+		Unknown:               callErr != nil && !retryableFailure || !response.Usage.Known, Summary: call.Summary}
+	if call.Source == ModelCallTerminalDelivery {
+		settlement.TerminalDeliveryCall = &reservation
+	}
 	if response.Usage.Known && (response.Usage.InputTokens < 0 || response.Usage.OutputTokens < 0 || response.Usage.InputTokens > math.MaxInt64-response.Usage.OutputTokens) {
 		settlement.Unknown = true
 		settlement.Usage = ModelUsage{}
 		callErr = &ModelClientError{Kind: ModelErrorInvalidResponse}
 	}
+	if call.BudgetPlanID != "" && callErr == nil && !settlement.Unknown {
+		reservedOutput := int64(request.MaxOutputTokens)
+		reservedInput := reservation.ReservedTokens - reservedOutput
+		if response.Usage.InputTokens > reservedInput || response.Usage.OutputTokens > reservedOutput {
+			overageErr := domain.NewError(domain.CodeQuotaExceeded, "provider usage exceeded the signed model budget; reconciliation is required")
+			overageErr.Details["reason"] = "model_usage_exceeded_reservation"
+			overageCtx, cancelOverage := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancelOverage()
+			recorder, ok := s.store.(ModelBudgetOverageRecorder)
+			var recordErr error
+			if ok {
+				recordErr = recorder.RecordTaskModelBudgetOverage(overageCtx, reservation, response.Usage)
+			} else {
+				recordErr = domain.NewError(domain.CodeUnsupported, "adaptive model overage reconciliation is unavailable")
+			}
+			if recordErr != nil {
+				var freezeErr error
+				if projectCall {
+					freezeErr = s.projectBudget.SettleModelCall(overageCtx, SettleProjectModelCallCommand{
+						ProjectID: projectID, Source: call.Source, CallID: reservation.CallID, Unknown: true,
+					})
+				} else {
+					freezeErr = s.store.SettleModelCall(overageCtx, ModelCallSettlement{
+						Source: call.Source, OwnerID: ownerID, CallID: reservation.CallID, Unknown: true,
+					})
+				}
+				if freezeErr != nil {
+					freezeErr = fmt.Errorf("freeze adaptive model overage: %w", freezeErr)
+				}
+				return ModelResponse{}, errors.Join(overageErr, fmt.Errorf("persist adaptive model overage: %w", recordErr), freezeErr)
+			}
+			s.observeModelUsage(ModelCallSettlement{Source: call.Source, Usage: response.Usage})
+			return ModelResponse{}, overageErr
+		}
+	}
 	var summaryOutputErr error
 	var reviewOutputErr error
+	var terminalDeliveryOutputErr error
 	if call.Source == ModelCallCompaction && !settlement.Unknown {
-		if response.StopReason != "stop" || len(response.ToolCalls) != 0 || strings.TrimSpace(response.Text) == "" ||
-			!utf8.ValidString(response.Text) || strings.ContainsRune(response.Text, '\x00') || len(response.Text) > MaxConversationSummaryBytes {
+		if failure := ValidateConversationSummaryModelResponse(response); failure != nil {
 			settlement.ResponseInvalid = true
-			summaryOutputErr = domain.NewError(domain.CodeUpstreamError, "model provider returned an invalid conversation summary")
+			summaryOutputErr = domain.NewError(domain.CodeUpstreamError, "model provider returned an invalid conversation summary: "+failure.Error())
 		} else {
 			settlement.ResponseCiphertext, settlement.ResponseDigest, err = SealConversationSummaryModelOutput(s.responseSealer,
 				ConversationSummaryModelOutput{Identity: call.Summary.Identity, OperationID: call.Summary.OperationID,
 					CallID: call.CallID, ModelID: call.ModelID, Text: response.Text, Usage: response.Usage})
 			if err != nil {
 				settlement.ResponseInvalid = true
-				summaryOutputErr = domain.NewError(domain.CodeInvalidState, "conversation summary model result could not be stored safely")
+				summaryOutputErr = domain.NewError(domain.CodeInvalidState, "conversation summary model result could not be stored safely: "+err.Error())
 			}
 		}
 	}
@@ -662,23 +1009,66 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 			}
 		}
 	}
-	var taskOutputErr error
-	if call.Source == ModelCallTask && !settlement.Unknown {
-		taskOutputErr = validateTaskModelResponse(call.Request, response)
-		if taskOutputErr == nil {
-			taskOutputErr = taskDelivery.ValidateTaskModelDelivery(ctx, reservation)
-		}
-		if taskOutputErr == nil {
-			stored, sealErr := SealTaskModelResponse(s.responseSealer, reservation, response)
+	if call.Source == ModelCallTerminalDelivery && !settlement.Unknown {
+		if !validTaskTerminalDeliveryModelResponse(response) {
+			settlement.ResponseInvalid = true
+			terminalDeliveryOutputErr = domain.NewError(domain.CodeUpstreamError, "model provider returned an invalid terminal delivery response")
+		} else {
+			ciphertext, sealErr := sealTaskTerminalDeliveryModelResponse(s.responseSealer, *call.TerminalDelivery,
+				call.ModelID, reservation.RequestDigest, response)
 			if sealErr != nil {
 				settlement.ResponseInvalid = true
-				taskOutputErr = domain.NewError(domain.CodeInvalidState, "task model response could not be stored safely")
+				terminalDeliveryOutputErr = domain.NewError(domain.CodeInvalidState, "terminal delivery model result could not be stored safely")
 			} else {
-				settlement.TaskCall = &reservation
-				settlement.ResponseCiphertext, settlement.ResponseDigest = stored.Ciphertext, stored.Digest
+				cipherDigest := sha256.Sum256(ciphertext)
+				textDigest := sha256.Sum256([]byte(response.Text))
+				settlement.ResponseCiphertext = ciphertext
+				settlement.ResponseDigest = append([]byte(nil), cipherDigest[:]...)
+				settlement.ResponseTextDigest = append([]byte(nil), textDigest[:]...)
+			}
+		}
+	}
+	var taskOutputErr error
+	if call.Source == ModelCallTask && !settlement.Unknown && !retryableFailure {
+		if validTaskModelTruncatedTextForRequest(call.Request, response) {
+			taskOutputErr = taskDelivery.ValidateTaskModelDelivery(ctx, reservation)
+			if taskOutputErr == nil {
+				partial := response
+				partial.Reasoning = "" // Do not retain provider reasoning with a partial user-visible result.
+				stored, sealErr := SealTaskModelResponse(s.responseSealer, reservation, partial)
+				if sealErr != nil {
+					settlement.ResponseInvalid = true
+					taskOutputErr = domain.NewError(domain.CodeInvalidState, "partial task model response could not be stored safely")
+				} else {
+					settlement.TaskCall = &reservation
+					settlement.ResponseCiphertext, settlement.ResponseDigest = stored.Ciphertext, stored.Digest
+					if adaptiveTaskBudget {
+						partial.KnownTextTruncation = true
+						response = partial
+					} else {
+						taskOutputErr = invalidTaskModelResponseError(partial, "model provider truncated the task text response")
+					}
+				}
+			} else {
+				settlement.ResponseInvalid = true
 			}
 		} else {
-			settlement.ResponseInvalid = true
+			taskOutputErr = validateTaskModelResponse(call.Request, response)
+			if taskOutputErr == nil {
+				taskOutputErr = taskDelivery.ValidateTaskModelDelivery(ctx, reservation)
+			}
+			if taskOutputErr == nil {
+				stored, sealErr := SealTaskModelResponse(s.responseSealer, reservation, response)
+				if sealErr != nil {
+					settlement.ResponseInvalid = true
+					taskOutputErr = domain.NewError(domain.CodeInvalidState, "task model response could not be stored safely")
+				} else {
+					settlement.TaskCall = &reservation
+					settlement.ResponseCiphertext, settlement.ResponseDigest = stored.Ciphertext, stored.Digest
+				}
+			} else {
+				settlement.ResponseInvalid = true
+			}
 		}
 	}
 	settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
@@ -686,22 +1076,23 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 	var settleErr error
 	if projectCall {
 		settleErr = s.projectBudget.SettleModelCall(settleCtx, SettleProjectModelCallCommand{
-			ProjectID: projectID, Source: call.Source, CallID: call.CallID,
+			ProjectID: projectID, Source: call.Source, CallID: reservation.CallID,
 			Usage: project.Usage{InputTokens: response.Usage.InputTokens, OutputTokens: response.Usage.OutputTokens}, Unknown: settlement.Unknown,
 			ProviderReportedModel: settlement.ProviderReportedModel,
 			Summary:               call.Summary, TaskCall: settlement.TaskCall, ResponseCiphertext: settlement.ResponseCiphertext,
 			ReviewCall: settlement.ReviewCall, ResponseDigest: settlement.ResponseDigest, ResponseInvalid: settlement.ResponseInvalid,
-			ResponseTextDigest: settlement.ResponseTextDigest,
+			TerminalDeliveryCall: settlement.TerminalDeliveryCall, ResponseTextDigest: settlement.ResponseTextDigest,
 		})
 	} else {
 		settleErr = s.store.SettleModelCall(settleCtx, settlement)
 	}
 	if settleErr != nil {
-		if call.Source == ModelCallReview && projectCall && !settlement.Unknown {
+		if (call.Source == ModelCallReview || call.Source == ModelCallTerminalDelivery) && projectCall && !settlement.Unknown {
 			unknownCtx, cancelUnknown := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			defer cancelUnknown()
 			unknownErr := s.projectBudget.SettleModelCall(unknownCtx, SettleProjectModelCallCommand{
 				ProjectID: projectID, Source: call.Source, CallID: call.CallID, Unknown: true,
+				TerminalDeliveryCall: settlement.TerminalDeliveryCall,
 			})
 			if unknownErr != nil {
 				return ModelResponse{}, errors.Join(fmt.Errorf("settle project review model call: %w", settleErr),
@@ -711,11 +1102,12 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 			return ModelResponse{}, fmt.Errorf("settle project review model call: %w", settleErr)
 		}
 		if (call.Source == ModelCallTask && !settlement.Unknown ||
-			call.Source == ModelCallCompaction || call.Source == ModelCallReview) && !projectCall {
+			call.Source == ModelCallCompaction || call.Source == ModelCallReview || call.Source == ModelCallTerminalDelivery) && !projectCall {
 			unknownCtx, cancelUnknown := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			defer cancelUnknown()
 			unknownErr := s.store.SettleModelCall(unknownCtx, ModelCallSettlement{Source: call.Source, OwnerID: ownerID,
-				CallID: call.CallID, Unknown: true, Summary: call.Summary})
+				CallID: reservation.CallID, Unknown: true, Summary: call.Summary,
+				TerminalDeliveryCall: settlement.TerminalDeliveryCall})
 			if unknownErr != nil {
 				return ModelResponse{}, errors.Join(fmt.Errorf("settle model call: %w", settleErr),
 					fmt.Errorf("preserve unknown model usage: %w", unknownErr))
@@ -737,6 +1129,12 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 		}
 	}
 	if callErr != nil {
+		if retryableFailure && reservation.Task != nil {
+			return ModelResponse{}, &TaskModelRetryableFailureError{evidence: TaskModelRecoveryFailureEvidence{
+				Kind: TaskModelRecoveryFailureProviderReject, TaskFence: *reservation.Task, CallID: reservation.DSHCallID,
+				ModelID: reservation.ModelID, RequestDigest: append([]byte(nil), reservation.RequestDigest...), UsageKnown: true,
+				ProviderErrorKind: retryableFailureKind}, cause: callErr}
+		}
 		return ModelResponse{}, modelConnectionCheckError(callErr)
 	}
 	if summaryOutputErr != nil {
@@ -747,6 +1145,9 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 	}
 	if taskOutputErr != nil {
 		return ModelResponse{}, taskOutputErr
+	}
+	if terminalDeliveryOutputErr != nil {
+		return ModelResponse{}, terminalDeliveryOutputErr
 	}
 	if !response.Usage.Known {
 		return ModelResponse{}, domain.NewError(domain.CodeInvalidState, "model usage is unknown and requires reconciliation")
@@ -759,7 +1160,7 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 			return ModelResponse{}, err
 		}
 	}
-	if call.Source == ModelCallTask && !ValidDSHModelResponse(response) {
+	if call.Source == ModelCallTask && !ValidDSHModelResponse(response) && !ValidTaskModelTextTruncation(response) {
 		return ModelResponse{}, domain.NewError(domain.CodeUpstreamError, "model provider returned an invalid task response")
 	}
 	seenCallIDs := make(map[string]struct{}, len(response.ToolCalls))
@@ -793,6 +1194,18 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 	return response, nil
 }
 
+func attachCurrentTaskTurnMessageID(response *ModelResponse, messageID string) {
+	if response == nil {
+		return
+	}
+	if !domain.ValidMessageID(messageID) {
+		messageID = ""
+	}
+	for index := range response.ToolCalls {
+		response.ToolCalls[index].CurrentTaskTurnMessageID = messageID
+	}
+}
+
 func projectUsageReservation(request ModelRequest, reservedTokens int64) project.Usage {
 	output := int64(request.MaxOutputTokens)
 	return project.Usage{InputTokens: reservedTokens - output, OutputTokens: output}
@@ -805,6 +1218,13 @@ func validateModelCall(call ModelCall) (string, [32]byte, int64, error) {
 	}
 	if !domain.ValidModelConnectionID(call.ModelID) || !idempotencyKeyPattern.MatchString(call.CallID) || call.Request.Endpoint != (ModelEndpoint{}) {
 		return "", empty, 0, domain.InvalidArgument("model_call", "invalid model call")
+	}
+	adaptiveBudget := call.BudgetPlanID != "" || call.BudgetCallID != "" || call.BudgetRequestDigest != ""
+	if adaptiveBudget && (call.Source != ModelCallTask || !idempotencyKeyPattern.MatchString(call.BudgetPlanID) ||
+		!idempotencyKeyPattern.MatchString(call.BudgetCallID) || !modelBudgetDigestPattern.MatchString(call.BudgetRequestDigest) ||
+		!idempotencyKeyPattern.MatchString(call.LedgerCallID)) ||
+		!adaptiveBudget && call.LedgerCallID != "" {
+		return "", empty, 0, domain.InvalidArgument("model_call", "invalid adaptive model budget identity")
 	}
 	ownerID := call.Principal.UserID
 	switch call.Source {
@@ -823,8 +1243,23 @@ func validateModelCall(call ModelCall) (string, [32]byte, int64, error) {
 			return "", empty, 0, domain.InvalidArgument("model_call", "invalid task execution fence")
 		}
 		id, err := DSHModelCallID(call.Task.TaskID, call.Task.AgentSessionID, call.Task.ThroughSequence)
-		if err != nil || id != call.CallID || len(call.RawRequest) == 0 || !json.Valid(call.RawRequest) {
+		if err != nil || len(call.RawRequest) == 0 || !json.Valid(call.RawRequest) {
 			return "", empty, 0, domain.InvalidArgument("model_call", "invalid task model call identity or request")
+		}
+		if call.Task.RecoveryCallID == "" && call.Task.RecoveryDSHCallID == "" {
+			if id != call.CallID || call.Task.RecoveryDSHCallID != "" ||
+				adaptiveBudget && !strings.HasPrefix(call.LedgerCallID, "mdl_") {
+				return "", empty, 0, domain.InvalidArgument("model_call", "invalid task model call identity")
+			}
+		} else {
+			recoveryDSHCallID, dshErr := TaskModelRecoveryDSHCallID(call.Task.TaskID, call.Task.TaskRevision, id, call.Task.ThroughSequence)
+			recoveryLedgerCallID, ledgerErr := TaskModelRecoveryCallID(call.Task.TaskID, call.Task.TaskRevision, id, call.Task.ThroughSequence)
+			if dshErr != nil || ledgerErr != nil || call.Task.RecoveryDSHCallID != recoveryDSHCallID ||
+				call.Task.RecoveryCallID != recoveryLedgerCallID || call.CallID != recoveryDSHCallID ||
+				call.Task.RecoveryDSHCallID == call.Task.RecoveryCallID || call.Task.RecoveryCallID == id ||
+				adaptiveBudget && call.LedgerCallID != recoveryLedgerCallID {
+				return "", empty, 0, domain.InvalidArgument("model_call", "invalid task recovery call identity")
+			}
 		}
 		ownerID = call.Task.InitiatorID
 	case ModelCallReview:
@@ -875,10 +1310,36 @@ func validateModelCall(call ModelCall) (string, [32]byte, int64, error) {
 		if err != nil || expectedCallID != call.CallID {
 			return "", empty, 0, domain.InvalidArgument("model_call", "invalid conversation summary model call identity")
 		}
+	case ModelCallTerminalDelivery:
+		if call.TerminalDelivery == nil || call.Task != nil || call.Review != nil || call.Summary != nil ||
+			call.Principal.UserID != "" || call.Principal.TokenID != "" || call.Principal.ClientInstallationID != "" ||
+			call.Request.RequiredTool != "" || len(call.Request.Tools) != 0 || len(call.RawRequest) == 0 || !json.Valid(call.RawRequest) ||
+			!ValidTaskTerminalDeliveryModelFence(*call.TerminalDelivery) {
+			return "", empty, 0, domain.InvalidArgument("model_call", "invalid terminal delivery model fence")
+		}
+		for _, input := range call.Request.Input {
+			if input.Type != "message" || len(input.Images) != 0 || input.CallID != "" || input.Name != "" || input.Arguments != "" || input.Output != "" {
+				return "", empty, 0, domain.InvalidArgument("model_call", "terminal delivery model call must be text-only")
+			}
+			for _, part := range input.Parts {
+				if part.Type == "image" || part.Image != nil {
+					return "", empty, 0, domain.InvalidArgument("model_call", "terminal delivery model call must be text-only")
+				}
+			}
+		}
+		id, err := DSHTerminalDeliveryModelCallID(*call.TerminalDelivery)
+		if err != nil || id != call.CallID {
+			return "", empty, 0, domain.InvalidArgument("model_call", "invalid terminal delivery model call identity")
+		}
+		ownerID = call.TerminalDelivery.InitiatorID
 	default:
 		return "", empty, 0, domain.InvalidArgument("model_call", "invalid model call source")
 	}
-	if call.Request.MaxOutputTokens < 1 || call.Request.MaxOutputTokens > 32768 {
+	maxOutputTokens := 32_768
+	if adaptiveBudget {
+		maxOutputTokens = MaxModelOutputTokens
+	}
+	if call.Request.MaxOutputTokens < 1 || call.Request.MaxOutputTokens > maxOutputTokens {
 		return "", empty, 0, domain.InvalidArgument("model_call", "model token limit is invalid")
 	}
 	inputReservation := modelRequestInputTokenReservation(call.Request)
@@ -938,6 +1399,13 @@ func validateModelCall(call ModelCall) (string, [32]byte, int64, error) {
 		}
 	}
 	digest := sha256.Sum256(raw)
+	if adaptiveBudget {
+		boundDigest, err := ModelBudgetFinalRequestDigest(call.BudgetRequestDigest, int64(call.Request.MaxOutputTokens))
+		if err != nil {
+			return "", empty, 0, err
+		}
+		copy(digest[:], boundDigest)
+	}
 	return ownerID, digest, reserve, nil
 }
 

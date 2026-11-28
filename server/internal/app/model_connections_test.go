@@ -808,6 +808,136 @@ func TestModelConnectionContextWindowIsBoundToConfiguredModel(t *testing.T) {
 	}
 }
 
+func TestModelMaxOutputCapacityUsesExactCatalogAndCustomOverride(t *testing.T) {
+	openAILuna, ok := lookupModelMaxOutputCapacity("https://api.openai.com/v1/", "gpt-6-luna")
+	if !ok || openAILuna.maxOutput != 128_000 || openAILuna.catalogVersion != "2026-11-27" || openAILuna.sourceURL == "" {
+		t.Fatalf("OpenAI catalog entry = %+v, found=%t", openAILuna, ok)
+	}
+	deepSeekFlash, ok := lookupModelMaxOutputCapacity("https://api.deepseek.com/", "deepseek-flash")
+	if !ok || deepSeekFlash.maxOutput != 393_216 || deepSeekFlash.catalogVersion != "2026-11-27" ||
+		deepSeekFlash.sourceURL != "https://api-docs.deepseek.com/api/create-chat-completion/" {
+		t.Fatalf("DeepSeek catalog entry = %+v, found=%t", deepSeekFlash, ok)
+	}
+	for _, route := range []struct{ baseURL, model string }{
+		{baseURL: "https://api.openai.com/v1", model: "gpt-6-luna-preview"},
+		{baseURL: "https://api.openai.com/v2", model: "gpt-6-luna"},
+		{baseURL: "https://api.z.ai/api/paas/v4", model: "glm-5.1"},
+	} {
+		if _, ok := lookupModelMaxOutputCapacity(route.baseURL, route.model); ok {
+			t.Errorf("unverified route %s/%s received a catalog output capacity", route.baseURL, route.model)
+		}
+	}
+
+	store := &modelConnectionStoreStub{values: make(map[string]ModelConnectionRecord)}
+	service := modelConnectionTestService(t, store, &modelClientStub{})
+	principal := identity.Principal{UserID: "u7654321", Role: identity.RoleUser, Kind: identity.KindSession, TokenID: "t1234567"}
+	created, err := service.Create(context.Background(), principal, ModelConnectionCommand{
+		Name: "verified luna", BaseURL: "https://api.openai.com/v1", ModelName: "gpt-6-luna", APIKey: "secret-value",
+	})
+	if err != nil || created.MaxOutputTokens == nil || *created.MaxOutputTokens != 128_000 ||
+		created.MaxOutputOverrideTokens != nil || created.MaxOutputSource != ModelMaxOutputModelCatalog ||
+		created.MaxOutputResolvedAt == nil || created.MaxOutputCatalogVersion == nil || *created.MaxOutputCatalogVersion != "2026-11-27" ||
+		created.MaxOutputSourceURL == nil || *created.MaxOutputSourceURL != openAILuna.sourceURL {
+		t.Fatalf("catalog-resolved output capacity = %+v, %v", created, err)
+	}
+	staleVersion := "2026-11-26"
+	staleOutput := 64_000
+	stale := store.values[created.ID]
+	stale.MaxOutputTokens = &staleOutput
+	stale.MaxOutputCatalogVersion = &staleVersion
+	store.values[created.ID] = stale
+	staleGet, err := service.Get(context.Background(), principal, created.ID)
+	if err != nil || staleGet.MaxOutputTokens != nil || staleGet.MaxOutputOverrideTokens != nil || staleGet.MaxOutputSource != ModelMaxOutputUnknown ||
+		staleGet.MaxOutputResolvedAt != nil || staleGet.MaxOutputCatalogVersion != nil || staleGet.MaxOutputSourceURL != nil {
+		t.Fatalf("Get exposed stale catalog output capacity: %+v, %v", staleGet, err)
+	}
+	listed, err := service.List(context.Background(), principal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundStale := false
+	for _, item := range listed {
+		if item.ID != created.ID {
+			continue
+		}
+		foundStale = true
+		if item.MaxOutputTokens != nil || item.MaxOutputOverrideTokens != nil || item.MaxOutputSource != ModelMaxOutputUnknown ||
+			item.MaxOutputResolvedAt != nil || item.MaxOutputCatalogVersion != nil || item.MaxOutputSourceURL != nil {
+			t.Fatalf("List exposed stale catalog output capacity: %+v", item)
+		}
+	}
+	if !foundStale {
+		t.Fatalf("List omitted model connection %s", created.ID)
+	}
+	refreshed, err := service.Update(context.Background(), principal, created.ID, ModelConnectionCommand{
+		Name: "verified luna renamed", BaseURL: created.BaseURL, ModelName: created.ModelName,
+	})
+	if err != nil || refreshed.MaxOutputTokens == nil || *refreshed.MaxOutputTokens != 128_000 ||
+		refreshed.MaxOutputCatalogVersion == nil || *refreshed.MaxOutputCatalogVersion != modelMaxOutputCapacityCatalogVersion {
+		t.Fatalf("stale catalog version was not refreshed on update: %+v, %v", refreshed, err)
+	}
+
+	unknown, err := service.Create(context.Background(), principal, ModelConnectionCommand{
+		Name: "unknown glm", BaseURL: "https://api.openai.com/v1", ModelName: "glm-5.1", APIKey: "secret-value",
+	})
+	if err != nil || unknown.MaxOutputTokens != nil || unknown.MaxOutputOverrideTokens != nil || unknown.MaxOutputSource != ModelMaxOutputUnknown {
+		t.Fatalf("unverified output capacity did not remain unknown: %+v, %v", unknown, err)
+	}
+
+	cap := 12_345
+	overridden, err := service.Create(context.Background(), principal, ModelConnectionCommand{
+		Name: "custom output", BaseURL: "https://api.openai.com/v1", ModelName: "custom-model", APIKey: "secret-value",
+		MaxOutputOverrideTokens: &cap, MaxOutputOverridePresent: true,
+	})
+	if err != nil || overridden.MaxOutputTokens == nil || *overridden.MaxOutputTokens != cap ||
+		overridden.MaxOutputOverrideTokens == nil || *overridden.MaxOutputOverrideTokens != cap || overridden.MaxOutputSource != ModelMaxOutputOverride ||
+		overridden.MaxOutputResolvedAt != nil || overridden.MaxOutputCatalogVersion != nil || overridden.MaxOutputSourceURL != nil {
+		t.Fatalf("custom output override = %+v, %v", overridden, err)
+	}
+
+	keyUpdated, err := service.Update(context.Background(), principal, overridden.ID, ModelConnectionCommand{
+		Name: overridden.Name, BaseURL: overridden.BaseURL, ModelName: overridden.ModelName, APIKey: "replacement-secret",
+	})
+	if err != nil || keyUpdated.MaxOutputTokens == nil || *keyUpdated.MaxOutputTokens != cap || keyUpdated.MaxOutputSource != ModelMaxOutputOverride {
+		t.Fatalf("credential change discarded explicit route metadata: %+v, %v", keyUpdated, err)
+	}
+	changedRoute, err := service.Update(context.Background(), principal, overridden.ID, ModelConnectionCommand{
+		Name: overridden.Name, BaseURL: overridden.BaseURL, ModelName: "custom-model-v2",
+	})
+	if err != nil || changedRoute.MaxOutputTokens != nil || changedRoute.MaxOutputOverrideTokens != nil || changedRoute.MaxOutputSource != ModelMaxOutputUnknown {
+		t.Fatalf("route change retained stale output metadata: %+v, %v", changedRoute, err)
+	}
+
+	for _, invalid := range []int{0, MaxModelOutputTokens + 1} {
+		invalidCap := invalid
+		if _, err := service.Create(context.Background(), principal, ModelConnectionCommand{
+			Name: "invalid output", BaseURL: "https://api.openai.com/v1", ModelName: "custom-invalid", APIKey: "secret-value",
+			MaxOutputOverrideTokens: &invalidCap, MaxOutputOverridePresent: true,
+		}); err == nil {
+			t.Errorf("max output override %d was accepted", invalid)
+		}
+	}
+	if _, err := service.Create(context.Background(), principal, ModelConnectionCommand{
+		Name: "preset override", BaseURL: "https://api.openai.com/v1", ModelName: "gpt-6-luna", APIKey: "secret-value",
+		MaxOutputOverrideTokens: &cap, MaxOutputOverridePresent: true,
+	}); err == nil {
+		t.Fatal("system model output capacity accepted a user override")
+	}
+}
+
+func TestSharedCustomModelCannotSaveMaxOutputOverride(t *testing.T) {
+	store := &modelConnectionStoreStub{values: make(map[string]ModelConnectionRecord)}
+	service := modelConnectionTestService(t, store, &modelClientStub{})
+	principal := identity.Principal{UserID: "u7654321", Role: identity.RoleAdmin, Kind: identity.KindSession, TokenID: "t1234567"}
+	maxOutput := 4096
+	if _, err := service.Create(context.Background(), principal, ModelConnectionCommand{
+		Name: "shared custom", BaseURL: "https://api.openai.com/v1", ModelName: "custom-shared", APIKey: "secret-value", Shared: true,
+		MaxOutputOverrideTokens: &maxOutput, MaxOutputOverridePresent: true,
+	}); err == nil {
+		t.Fatal("shared custom route accepted a personal max output override")
+	}
+}
+
 func TestModelConnectionRejectsSingleLabelAllowlist(t *testing.T) {
 	sealer, err := NewSealer(make([]byte, 32))
 	if err != nil {
@@ -866,6 +996,26 @@ func cloneModelConnection(value ModelConnectionRecord) ModelConnectionRecord {
 	if value.ContextWindowCatalogVersion != nil {
 		version := *value.ContextWindowCatalogVersion
 		value.ContextWindowCatalogVersion = &version
+	}
+	if value.MaxOutputTokens != nil {
+		maxOutput := *value.MaxOutputTokens
+		value.MaxOutputTokens = &maxOutput
+	}
+	if value.MaxOutputOverrideTokens != nil {
+		maxOutput := *value.MaxOutputOverrideTokens
+		value.MaxOutputOverrideTokens = &maxOutput
+	}
+	if value.MaxOutputResolvedAt != nil {
+		resolved := *value.MaxOutputResolvedAt
+		value.MaxOutputResolvedAt = &resolved
+	}
+	if value.MaxOutputCatalogVersion != nil {
+		version := *value.MaxOutputCatalogVersion
+		value.MaxOutputCatalogVersion = &version
+	}
+	if value.MaxOutputSourceURL != nil {
+		sourceURL := *value.MaxOutputSourceURL
+		value.MaxOutputSourceURL = &sourceURL
 	}
 	if value.CheckedAt != nil {
 		checked := *value.CheckedAt

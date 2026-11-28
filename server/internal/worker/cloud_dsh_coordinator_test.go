@@ -34,6 +34,15 @@ type coordinatorTestModels struct {
 	summaryRequest   json.RawMessage
 }
 
+func TestConversationSummarySystemPromptPreservesPendingWork(t *testing.T) {
+	ordinary := conversationSummarySystemPrompt(false)
+	pending := conversationSummarySystemPrompt(true)
+	if strings.Contains(ordinary, "前序用户请求") || !strings.Contains(pending, "前序用户请求") ||
+		!strings.Contains(pending, "不得推断已执行或已解决") {
+		t.Fatalf("pending predecessor safeguard is missing or applied to the wrong prompt: ordinary=%q pending=%q", ordinary, pending)
+	}
+}
+
 func (m *coordinatorTestModels) ClassifyConversationRoute(context.Context, app.ConversationRouteClaim,
 	app.ConversationRouteContext) (app.ConversationRouteDecision, error) {
 	m.directCalls++
@@ -544,7 +553,7 @@ func TestCloudDSHCoordinatorRunsBoundedSummarySessionThroughDSH(t *testing.T) {
 	}
 	previousSummary := "The user prefers concise Chinese responses."
 	previousDigest := sha256.Sum256([]byte(previousSummary))
-	inputDigest, err := conversationSummaryOperationInputDigest(scope, 1, 1, previousDigest[:], "p1234567", 32_768, sources)
+	inputDigest, err := conversationSummaryOperationInputDigest(scope, 1, 1, previousDigest[:], "p1234567", 32_768, false, sources)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -605,7 +614,9 @@ func TestCloudDSHCoordinatorRunsBoundedSummarySessionThroughDSH(t *testing.T) {
 			result, models.summaryCalls, runtime.startCalls, runtime.stopCalls, runtime.writeCalls)
 	}
 	if runtime.startRequest["purpose"] != "compaction" || runtime.startRequest["operation_id"] != operation.OperationID ||
-		runtime.startRequest["context_window_tokens"] != 32_768 || len(runtime.startRequest["tools"].([]any)) != 0 ||
+		runtime.startRequest["context_window_tokens"] != 32_768 ||
+		runtime.startRequest["max_tokens"] != conversationSummaryMaintenanceOutputTokens(32_768) ||
+		len(runtime.startRequest["tools"].([]any)) != 0 ||
 		len(runtime.startRequest["source_messages"].([]map[string]any)) != len(sources) {
 		t.Fatalf("summary session start was not strictly fenced: %+v", runtime.startRequest)
 	}

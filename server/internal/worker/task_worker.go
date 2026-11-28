@@ -14,6 +14,7 @@ import (
 	"go.uber.org/zap"
 
 	"morde/server/internal/app"
+	"morde/server/internal/domain"
 	"morde/server/internal/domain/task"
 )
 
@@ -380,7 +381,14 @@ func (w *TaskWorker) runClaimed(ctx context.Context, claimed task.Task) error {
 			if err == nil {
 				if monitor, ok := w.store.(TaskAgentStallMonitor); ok {
 					checkCtx, cancelCheck := context.WithTimeout(ctx, w.renewInterval)
-					if checkErr := checkTaskAgentStallSafely(checkCtx, monitor, renewed, taskAgentStallNoticeAfter); checkErr != nil && ctx.Err() == nil {
+					checkErr := checkTaskAgentStallSafely(checkCtx, monitor, renewed, taskAgentStallNoticeAfter)
+					if confirmedTaskAgentRootRuntimeUnavailable(checkErr) && ctx.Err() == nil {
+						cancelCheck()
+						cancelExecute(context.Canceled)
+						w.waitForExecution(executeDone, claimed.ID)
+						return nil
+					}
+					if checkErr != nil && ctx.Err() == nil {
 						w.logger.Warn("observe Task agent activity failed", zap.String("task_id", claimed.ID),
 							zap.String("error_type", fmt.Sprintf("%T", checkErr)))
 					}
@@ -408,10 +416,16 @@ func (w *TaskWorker) runClaimed(ctx context.Context, claimed task.Task) error {
 	}
 }
 
+func confirmedTaskAgentRootRuntimeUnavailable(err error) bool {
+	var domainErr *domain.Error
+	return errors.As(err, &domainErr) && domainErr.Code == domain.CodeInvalidState &&
+		domainErr.Details["task_agent_stall"] == "root_runtime_unavailable"
+}
+
 func checkTaskAgentStallSafely(ctx context.Context, monitor TaskAgentStallMonitor, value task.Task, staleAfter time.Duration) (err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			err = errors.New("Task agent activity monitor panicked")
+			err = errors.New("task agent activity monitor panicked")
 		}
 	}()
 	return monitor.CheckTaskAgentStall(ctx, value, staleAfter)

@@ -64,6 +64,7 @@ func (h *api) registerAdmin(group *gin.RouterGroup) {
 	group.GET("/admin/workspaces/:id", h.getAdminWorkspace)
 	group.GET("/admin/users", h.listUsers)
 	group.PATCH("/admin/users/:id", h.updateUser)
+	group.POST("/admin/users/:id/password", h.resetUserPassword)
 	group.GET("/admin/capacity", h.getCapacity)
 	group.GET("/admin/audit", h.listAudit)
 }
@@ -228,6 +229,47 @@ func (h *api) updateUser(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, view)
+}
+
+func (h *api) resetUserPassword(c *gin.Context) {
+	principal, ok := requireAdmin(c)
+	if !ok {
+		return
+	}
+	id, ok := safeID(c, "id", domain.ValidUserID)
+	if !ok {
+		return
+	}
+	service, ok := h.deps.Admin.(AdminUserPasswordResetService)
+	if !ok {
+		serviceUnavailable(c)
+		return
+	}
+	var raw map[string]json.RawMessage
+	if !decodeJSON(c, &raw) {
+		return
+	}
+	for name := range raw {
+		if name != "expected_status" && name != "new_password" {
+			writeError(c, domain.InvalidArgument("body", "contains an unsupported password reset field"))
+			return
+		}
+	}
+	var expectedStatus identity.AccountStatus
+	if data, exists := raw["expected_status"]; !exists || json.Unmarshal(data, &expectedStatus) != nil || !expectedStatus.Valid() {
+		writeError(c, domain.InvalidArgument("expected_status", "valid expected_status is required"))
+		return
+	}
+	var newPassword string
+	if data, exists := raw["new_password"]; !exists || json.Unmarshal(data, &newPassword) != nil || len(newPassword) < 8 || len(newPassword) > 72 {
+		writeError(c, domain.InvalidArgument("new_password", "password must contain 8 to 72 bytes"))
+		return
+	}
+	if err := service.ResetPassword(c.Request.Context(), principal, id, expectedStatus, newPassword); err != nil {
+		writeError(c, err)
+		return
+	}
+	c.Status(http.StatusNoContent)
 }
 
 func (h *api) getCapacity(c *gin.Context) {

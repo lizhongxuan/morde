@@ -249,7 +249,7 @@ WHERE task_id=$1 AND owner_id=$2 AND session_id=$3 FOR UPDATE`, value.Fence.Task
 	return belongs, nil
 }
 
-var errTaskAgentRequestObservationOutOfOrder = errors.New("Task agent request reconciliation observation is out of order")
+var errTaskAgentRequestObservationOutOfOrder = errors.New("task agent request reconciliation observation is out of order")
 
 func advanceTaskAgentRequestObservation(ctx context.Context, tx pgx.Tx, value app.TaskAgentRequestReconciliation) error {
 	var priorGeneration, priorSequence int64

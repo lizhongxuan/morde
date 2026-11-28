@@ -401,21 +401,22 @@ func TestTaskWorkspacePublishRejectsNonApprovedMediaBeforeReservationAndCommit(t
 			ctx := context.Background()
 			_, workspaceValue, _, _, command := newTaskWorkspacePublishTask(t, ctx, store, "task-publish-media-"+status)
 			command = bindTaskWorkspacePublishApproval(t, ctx, store, command)
-			if status == "rejected" {
+			switch status {
+			case "rejected":
 				if _, err := store.pool.Exec(ctx, `UPDATE task_pending_requests SET status='rejected',decision='reject',responded_at=clock_timestamp() WHERE id=$1`, command.ApprovalID); err != nil {
 					t.Fatal(err)
 				}
-			} else if status == "expired" {
+			case "expired":
 				if _, err := store.pool.Exec(ctx, `UPDATE task_pending_requests SET status='expired',decision='reject',created_at=clock_timestamp()-interval '2 hours',
 expires_at=clock_timestamp()-interval '1 hour',responded_at=clock_timestamp() WHERE id=$1`, command.ApprovalID); err != nil {
 					t.Fatal(err)
 				}
-			} else if status == "response-after-expiry" {
+			case "response-after-expiry":
 				if _, err := store.pool.Exec(ctx, `UPDATE task_pending_requests SET created_at=clock_timestamp()-interval '2 hours',
 expires_at=clock_timestamp()-interval '1 hour',responded_at=clock_timestamp() WHERE id=$1`, command.ApprovalID); err != nil {
 					t.Fatal(err)
 				}
-			} else {
+			default:
 				if _, err := store.pool.Exec(ctx, `UPDATE task_pending_requests SET responded_by_user_id=NULL WHERE id=$1`, command.ApprovalID); err != nil {
 					t.Fatal(err)
 				}

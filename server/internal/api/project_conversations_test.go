@@ -158,14 +158,14 @@ func TestProjectConversationMessageIsAcceptedWithoutStartingTask(t *testing.T) {
 	tasks := &taskServiceStub{}
 	router := projectConversationAPIRouter(&principal, service, tasks)
 	got := projectConversationAPIRequest(router, http.MethodPost, "/api/projects/j1234567/conversations/c1234567/messages",
-		`{"client_message_id":"project-msg-0001","previous_client_message_id":"project-prev-0001","reference_task_id":"q1234567","change_task_target":true,"model_id":"p1234567","time_zone":"America/Los_Angeles","content":"hello"}`, "project-msg-0001")
+		`{"client_message_id":"project-msg-0001","previous_client_message_id":"project-prev-0001","reference_task_id":"q1234567","change_task_target":true,"model_id":"p1234567","time_zone":"America/Los_Angeles","response_mode":"long_form","content":"hello"}`, "project-msg-0001")
 	var response acceptedProjectConversationMessageResponse
 	if err := json.Unmarshal(got.Body.Bytes(), &response); err != nil || got.Code != http.StatusAccepted ||
 		service.acceptCalls != 1 || service.projectID != "j1234567" || service.conversationID != "c1234567" ||
 		service.acceptCommand.ProjectID != "j1234567" || service.acceptCommand.ClientMessageID != "project-msg-0001" ||
 		service.acceptCommand.PreviousClientMessageID != "project-prev-0001" || service.acceptCommand.ReferenceTaskID != "q1234567" ||
 		!service.acceptCommand.ChangeTaskTarget ||
-		service.acceptCommand.ModelID != "p1234567" || service.acceptCommand.TimeZone != "America/Los_Angeles" || service.acceptCommand.Content != "hello" ||
+		service.acceptCommand.ModelID != "p1234567" || service.acceptCommand.TimeZone != "America/Los_Angeles" || service.acceptCommand.ResponseMode != "long_form" || service.acceptCommand.Content != "hello" ||
 		service.acceptCommand.ServiceInstanceID != "11111111-1111-4111-8111-111111111111" ||
 		service.acceptCommand.IdempotencyKey != "project-msg-0001" ||
 		response.Message.ActorID != principal.UserID || response.Message.OwnerID != "u1234567" ||
@@ -193,6 +193,8 @@ func TestProjectConversationRoutesRejectMissingIdentityOrInvalidInput(t *testing
 		{method: http.MethodPost, path: base + "/c1234567/messages", body: `{"client_message_id":"project-msg-3","content":"hello"}`},
 		{method: http.MethodPost, path: base + "/c1234567/messages", body: `{"client_message_id":"project-msg-4","mode":"new","content":"hello"}`, key: "project-msg-4"},
 		{method: http.MethodPost, path: base + "/c1234567/messages", body: `{"client_message_id":"project-msg-5","expected_task_id":"q1234567","content":"hello"}`, key: "project-msg-5"},
+		{method: http.MethodPost, path: base + "/c1234567/messages", body: `{"client_message_id":"project-msg-6","response_mode":"unbounded","content":"hello"}`, key: "project-msg-6"},
+		{method: http.MethodPost, path: base + "/c1234567/messages", body: `{"client_message_id":"project-msg-7","response_mode":null,"content":"hello"}`, key: "project-msg-7"},
 	} {
 		if got := projectConversationAPIRequest(projectConversationAPIRouter(&principal, service, tasks), test.method, test.path, test.body, test.key); got.Code != http.StatusBadRequest {
 			t.Fatalf("invalid project conversation request %q = %d %s", test.path, got.Code, got.Body)

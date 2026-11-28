@@ -27,12 +27,13 @@
 }
 
 .morde-shell:not(.morde-admin-shell) .reviews-list {
+  width: min(100%, 980px);
   min-width: 0;
   flex: 1 0 auto;
   display: grid;
   align-content: start;
   gap: 10px;
-  margin: 0;
+  margin: 0 auto;
   padding-bottom: 14px;
 }
 
@@ -354,4 +355,21 @@
   .morde-shell:not(.morde-admin-shell) .reviews-pagination-controls,
   .morde-shell:not(.morde-admin-shell) .reviews-pagination-number { gap: 4px; }
   .morde-shell:not(.morde-admin-shell) .reviews-pagination-controls .button { min-width: 34px; padding-inline: 9px; }
+}
+
+.morde-shell:not(.morde-admin-shell) .reviews-list > .task-approval-review-card--interactive {
+  padding: 0;
+  overflow: hidden;
+  gap: 0;
+  border-radius: 18px;
+}
+
+.morde-shell:not(.morde-admin-shell) .task-approval-review-card--interactive .task-approval-mcp-app {
+  width: 100%;
+  flex: 1 1 auto;
+}
+
+.morde-shell:not(.morde-admin-shell) .task-approval-review-card--interactive .task-approval-mcp-app iframe {
+  min-height: 0;
+  border-radius: 0;
 }

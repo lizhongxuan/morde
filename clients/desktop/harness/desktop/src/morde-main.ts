@@ -4,7 +4,7 @@ import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync, rmSync 
 import { access, lstat, realpath } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { basename, dirname, isAbsolute, join, posix, resolve, win32 } from "node:path";
-import { MordeAPI, checkedId, credentialExpired, credentialExpiresSoon, gatewayURL, localGatewayOrigin, mordeUserDataDirectory, portalOrigin, withTimeout, type ClientLoginAttempt, type Credentials, type HostEmbedTarget, type ProjectSyncFolder, type WebSession } from "./morde-core";
+import { MordeAPI, checkedId, credentialExpired, credentialExpiresSoon, gatewayURL, localGatewayOrigin, mordeUserDataDirectory, portalOrigin, tracedFetch, withTimeout, type ClientLoginAttempt, type Credentials, type HostEmbedTarget, type ProjectSyncFolder, type WebSession } from "./morde-core";
 import { checkedDirectory, MordeSync, pathsOverlap, SyncRunError, validateSyncScope, type HandoffRecord, type HandoffTarget, type Mapping, type PreservedFile, type ProjectHostApplicationStatus, type SyncCheckpoint } from "./morde-sync";
 import { MordeSyncthingNode, type ManagedWorkspaceFolder } from "./morde-node";
 import { MordeCodexRuntime, type CodexPersistentState } from "./morde-codex";
@@ -16,7 +16,33 @@ app.setName("Morde");
 const userData = mordeUserDataDirectory(app.getPath("appData"), process.env.MORDE_TEST_USER_DATA);
 mkdirSync(userData, { recursive: true, mode: 0o700 });
 app.setPath("userData", userData);
-const systemFetch: typeof fetch = (input, init) => net.fetch(typeof input === "string" ? input : input instanceof URL ? input.href : input.url, init);
+function outgoingHeaders(input: RequestInfo | URL, init?: RequestInit): Headers {
+  const headers = new Headers(input instanceof Request ? input.headers : undefined);
+  new Headers(init?.headers).forEach((value, key) => headers.set(key, value));
+  return headers;
+}
+function recordRequestTrace(requestHeaders: Headers, responseHeaders: Headers | undefined, status: number): void {
+  const requestID = requestHeaders.get("X-Request-Id");
+  const parentTraceID = requestHeaders.get("traceparent")?.split("-")[1];
+  const responseTraceID = responseHeaders?.get("X-Trace-Id");
+  const traceID = responseTraceID && /^[0-9a-f]{32}$/.test(responseTraceID) ? responseTraceID : parentTraceID;
+  console.info("Morde HTTP trace", {
+    request_id: requestID && /^[A-Za-z0-9._:-]{1,128}$/.test(requestID) ? requestID : undefined,
+    trace_id: traceID && /^[0-9a-f]{32}$/.test(traceID) ? traceID : undefined,
+    status,
+  });
+}
+const systemFetch: typeof fetch = (input, init) => tracedFetch(async (requestInput, requestInit) => {
+  const headers = outgoingHeaders(requestInput, requestInit);
+  try {
+    const response = await net.fetch(typeof requestInput === "string" ? requestInput : requestInput instanceof URL ? requestInput.href : requestInput.url, requestInit);
+    recordRequestTrace(headers, response.headers, response.status);
+    return response;
+  } catch (error) {
+    recordRequestTrace(headers, undefined, 0);
+    throw error;
+  }
+}, input, init);
 const hostEmbedFetch: typeof fetch = (input, init) => {
   const options = init;
   const body = options?.body;
@@ -25,6 +51,7 @@ const hostEmbedFetch: typeof fetch = (input, init) => {
   const requestSession = session.fromPartition(`morde-host-embed-${randomUUID()}`);
   const headers: Record<string, string> = {};
   new Headers(options.headers).forEach((value, name) => { headers[name] = value; });
+  const requestHeaders = new Headers(options.headers);
   const request = net.request({
     url, method: options.method ?? "GET", headers, redirect: "manual", session: requestSession, credentials: "omit",
   });
@@ -39,7 +66,11 @@ const hostEmbedFetch: typeof fetch = (input, init) => {
       void requestSession.clearStorageData().catch(() => undefined);
       callback();
     };
-    const onAbort = () => finish(() => { request.abort(); reject(new Error("Host embed exchange timed out")); });
+    const onAbort = () => finish(() => {
+      recordRequestTrace(requestHeaders, undefined, 0);
+      request.abort();
+      reject(new Error("Host embed exchange timed out"));
+    });
     const headersFrom = (source: Record<string, string | string[] | undefined>) => {
       const headers = new Headers();
       for (const [name, value] of Object.entries(source)) {
@@ -53,14 +84,29 @@ const hostEmbedFetch: typeof fetch = (input, init) => {
       callback({});
     });
     request.on("redirect", (statusCode, _method, _redirectUrl, headers) => {
-      finish(() => resolve(new Response(null, { status: statusCode, headers: headersFrom(exchangeHeaders ?? headers) })));
+      finish(() => {
+        const responseHeaders = headersFrom(exchangeHeaders ?? headers);
+        recordRequestTrace(requestHeaders, responseHeaders, statusCode);
+        resolve(new Response(null, { status: statusCode, headers: responseHeaders }));
+      });
     });
     request.on("response", (response) => {
       response.on("data", () => undefined);
-      response.on("error", (error) => finish(() => reject(error)));
-      finish(() => resolve(new Response(null, { status: response.statusCode ?? 500, headers: headersFrom(exchangeHeaders ?? response.headers) })));
+      response.on("error", (error) => finish(() => {
+        recordRequestTrace(requestHeaders, undefined, 0);
+        reject(error);
+      }));
+      finish(() => {
+        const status = response.statusCode ?? 500;
+        const responseHeaders = headersFrom(exchangeHeaders ?? response.headers);
+        recordRequestTrace(requestHeaders, responseHeaders, status);
+        resolve(new Response(null, { status, headers: responseHeaders }));
+      });
     });
-    request.on("error", (error) => finish(() => reject(error)));
+    request.on("error", (error) => finish(() => {
+      recordRequestTrace(requestHeaders, undefined, 0);
+      reject(error);
+    }));
     options.signal?.addEventListener("abort", onAbort, { once: true });
     if (options.signal?.aborted) onAbort();
     else request.end(body.toString());
@@ -196,6 +242,17 @@ let localPortalServerClose: Promise<void> | null = null;
 let webAttached = false;
 let webOpenTask: { window: BrowserWindow; promise: Promise<void> } | null = null;
 let view: "connecting" | "web" | "offline" = "connecting";
+type PortalOfflineReason = "session" | "proxy" | "assistant" | "unavailable";
+class PortalConnectionFailure extends Error {
+  constructor(readonly offlineReason: PortalOfflineReason) {
+    super("Morde connection step failed");
+    this.name = "PortalConnectionFailure";
+  }
+}
+function portalOfflineReason(error: unknown): PortalOfflineReason {
+  return error instanceof PortalConnectionFailure ? error.offlineReason : "unavailable";
+}
+let offlineReason: PortalOfflineReason | null = null;
 let webRefreshTimer: NodeJS.Timeout | null = null;
 let credentialExpiryTimer: NodeJS.Timeout | null = null;
 let authorizationCheckTimer: NodeJS.Timeout | null = null;
@@ -1547,6 +1604,7 @@ function publicState(): unknown {
     authenticated: Boolean(credentials), accountName: credentials?.accountName ?? null, origin: credentials?.origin ?? lastOrigin,
     installationId: credentials?.installationId ?? null, expiresAt: credentials?.clientExpiresAt ?? null,
     expiresSoon: credentials ? credentialExpiresSoon(credentials.clientExpiresAt) : false,
+    offlineReason: view === "offline" ? offlineReason : null,
     mappings: credentials ? mappings.map(publicMapping) : [], projectMappings: credentials ? projectMappings.map(publicProjectMapping) : [], syncState: sync.snapshot(),
     syncCheckpoint: credentials && syncCheckpoint ? { workspaceId: syncCheckpoint.workspaceId, mode: syncCheckpoint.mode, installationId: syncCheckpoint.installationId, scope: syncCheckpoint.scope,
       ...(syncCheckpoint.projectSelectionID ? { projectSelectionID: syncCheckpoint.projectSelectionID, projectName: syncCheckpoint.projectName } : {}),
@@ -1589,6 +1647,16 @@ function closeHostWindows(): void { void closeNativeWorkbenchEmbed().catch(() =>
 
 type HostProjectUploadContext = { host: Record<string, unknown>; workspaceBinding: Record<string, unknown> };
 
+function projectHostUnavailableMessage(host: Record<string, unknown>): string {
+  if (host.state_reason === "restore_failed") {
+    return "默认云端电脑恢复失败，项目同步已暂停。请联系管理员检查失败原因；不会自动重试或切换到其他电脑。";
+  }
+  if (host.state_reason === "restore_unknown") {
+    return "默认云端电脑恢复结果待核对，项目同步已暂停。请先核实当前运行状态；确认前不要重试，也不会切换到其他电脑。";
+  }
+  return "默认云端电脑未运行，项目同步已暂停；启动后可重试，不会切换到其他电脑。";
+}
+
 async function checkedOwnedHostWorkspace(auth: Credentials, hostIDInput: unknown, workspaceIDInput: unknown, requireRunning = false): Promise<HostProjectUploadContext> {
   const hostID = checkedId("host", hostIDInput);
   const workspaceID = checkedId("workspace", workspaceIDInput);
@@ -1599,7 +1667,7 @@ async function checkedOwnedHostWorkspace(auth: Credentials, hostIDInput: unknown
     !["running", "stopped"].includes(String(hostValue.state)) || !Array.isArray(workspaces) || workspaces.length !== 1) {
     throw new Error("请选择自己拥有且文件目录已就绪的云端电脑");
   }
-  if (requireRunning && hostValue.state !== "running") throw new Error("默认云端电脑未运行，项目同步已暂停；启动后可重试。");
+  if (requireRunning && hostValue.state !== "running") throw new Error(projectHostUnavailableMessage(hostValue));
   if (requireRunning && hostValue.workspace_runtime_online !== true) throw new Error("默认云端电脑的文件服务未确认在线，项目同步已暂停。");
   const binding = workspaces[0] as Record<string, unknown> | null;
   const workspace = binding?.workspace as Record<string, unknown> | null;
@@ -1643,7 +1711,7 @@ async function listProjectUploadTargets(): Promise<ProjectTarget[]> {
       folderID: folder.folderID, projectName: folder.projectName!, relativePath: folder.relativePath, state: folder.state,
     }));
     const blockedMessages = [
-      ...(host.state === "running" ? [] : ["默认云端电脑未运行，当前已暂停项目同步。启动后可重试；不会切换到其他电脑。"]),
+      ...(host.state === "running" ? [] : [projectHostUnavailableMessage(host)]),
       ...(host.state !== "running" || host.workspace_runtime_online === true ? [] : ["默认云端电脑的文件服务未确认在线，当前已暂停项目同步。"]),
       ...(rootFolder ? ["此电脑仍有旧版整目录同步，不能同时启用项目同步。"] : []),
     ];
@@ -2222,7 +2290,8 @@ function trustedPortalBridgeEvent(event: { sender: WebContents; senderFrame: { u
 
 const documentLoadOptions = { extraHeaders: "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" };
 async function loadAssistantPage(contents: WebContents, url: string): Promise<void> {
-  await withTimeout(contents.loadURL(url, documentLoadOptions), 20_000, () => contents.stop());
+  try { await withTimeout(contents.loadURL(url, documentLoadOptions), 20_000, () => contents.stop()); }
+  catch { throw new PortalConnectionFailure("assistant"); }
 }
 function installDocumentErrorRecovery(partition: Session, origin?: string): (contents: WebContents, fallbackURL: string, fallbackLabel: string) => (value: string) => boolean {
   type RecoveryPage = { contents: WebContents; fallbackURL: string; fallbackLabel: string; recoveryPageURL: string | null; blockedDocumentURL: string | null };
@@ -2657,6 +2726,7 @@ function positionWeb(): void {
 function showView(next: "web" | "offline"): void {
   if (next === "offline") void closeNativeWorkbenchEmbed().catch(() => undefined);
   view = next;
+  if (next === "web") offlineReason = null;
   if (mainWindow && webView) {
     if (next === "web") {
       if (!webAttached) { mainWindow.contentView.addChildView(webView); webAttached = true; webView.webContents.focus(); }
@@ -2668,36 +2738,60 @@ function showView(next: "web" | "offline"): void {
 }
 function showConnecting(): void {
   view = "connecting";
+  offlineReason = null;
   if (mainWindow && webAttached && webView) {
     mainWindow.contentView.removeChildView(webView);
     webAttached = false;
   }
   notifyState();
 }
-function showOffline(): void {
+function showOffline(reason: PortalOfflineReason = "unavailable"): void {
+  offlineReason = reason;
   showView("offline");
-  mainWindow?.webContents.send("morde:sync-state", { state: "offline", message: "Morde 云端页面暂时无法连接；本机同步状态未改变。" });
+  mainWindow?.webContents.send("morde:sync-state", {
+    state: "offline", offlineReason: reason,
+    message: "Morde 云端页面暂时无法连接；本机同步状态未改变。",
+  });
+}
+
+function scheduleWebSessionRetry(auth: Credentials): void {
+  webRefreshTimer = clearTimer(webRefreshTimer);
+  webRefreshTimer = setTimeout(() => {
+    void refreshWebSession(auth).catch((error: unknown) => {
+      if (credentials === auth) showOffline(portalOfflineReason(error));
+    });
+  }, 30_000);
+  webRefreshTimer.unref();
 }
 
 async function refreshWebSession(auth: Credentials, initial?: WebSession): Promise<void> {
   if (credentials !== auth || !webPartition) return;
+  let next: WebSession;
   try {
-    const next = initial ?? await api.webSession();
+    next = initial ?? await api.webSession();
+  } catch (error) {
+    if (credentials !== auth) return;
+    if (String(error).includes("Authorization expired or revoked")) { clearAuthorization(); return; }
+    scheduleWebSessionRetry(auth);
+    throw new PortalConnectionFailure("session");
+  }
+  try {
     if (credentials !== auth || !webPartition) return;
     const localPortal = await ensureLocalPortalServer(auth.origin, next.hostFrameSource);
     if (credentials !== auth || !webPartition) return;
     await webPartition.cookies.set({ url: localPortal.origin, name: "ch_portal", value: next.credential, path: "/", httpOnly: true, secure: false, sameSite: "strict", expirationDate: Date.parse(next.expiresAt) / 1000 });
-    webRefreshTimer = clearTimer(webRefreshTimer);
-    webRefreshTimer = setTimeout(() => { void refreshWebSession(auth).catch(() => undefined); }, Math.max(1000, Math.min(Date.parse(next.expiresAt) - Date.now() - 60_000, 2_147_483_647)));
-    webRefreshTimer.unref();
-  } catch (error) {
+  } catch {
     if (credentials !== auth) return;
-    if (String(error).includes("Authorization expired or revoked")) { clearAuthorization(); return; }
-    webRefreshTimer = clearTimer(webRefreshTimer);
-    webRefreshTimer = setTimeout(() => { void refreshWebSession(auth).catch(() => undefined); }, 30_000);
-    webRefreshTimer.unref();
-    throw error;
+    scheduleWebSessionRetry(auth);
+    throw new PortalConnectionFailure("proxy");
   }
+  webRefreshTimer = clearTimer(webRefreshTimer);
+  webRefreshTimer = setTimeout(() => {
+    void refreshWebSession(auth).catch((error: unknown) => {
+      if (credentials === auth) showOffline(portalOfflineReason(error));
+    });
+  }, Math.max(1000, Math.min(Date.parse(next.expiresAt) - Date.now() - 60_000, 2_147_483_647)));
+  webRefreshTimer.unref();
 }
 
 async function openWeb(initial: WebSession | undefined, owner: BrowserWindow): Promise<void> {
@@ -2712,7 +2806,7 @@ async function openWeb(initial: WebSession | undefined, owner: BrowserWindow): P
   await refreshWebSession(auth, initial);
   if (credentials !== auth || mainWindow !== owner || owner.isDestroyed() || webPartition !== partition) return;
   const appOrigin = portalOriginFor(auth);
-  if (!appOrigin) throw new Error("Local Portal is unavailable");
+  if (!appOrigin) throw new PortalConnectionFailure("proxy");
   const assistantURL = `${appOrigin}/assistant`;
   installDownloadAndClipboard(partition, appOrigin);
   if (!webLogoutWatchers.has(partition)) {
@@ -2743,7 +2837,7 @@ async function openWeb(initial: WebSession | undefined, owner: BrowserWindow): P
         if (refreshedOrigin && credentials === auth && mainWindow === owner && webPartition === partition && !content.webContents.isDestroyed()) {
           return loadAssistantPage(content.webContents, `${refreshedOrigin}${route}`);
         }
-      }).catch(() => { if (credentials === auth && mainWindow === owner) showOffline(); });
+      }).catch((error: unknown) => { if (credentials === auth && mainWindow === owner) showOffline(portalOfflineReason(error)); });
     };
     content.webContents.setWindowOpenHandler((details) => {
       const entry = hostEntryURL(details.url, appOrigin);
@@ -2793,7 +2887,7 @@ async function openWeb(initial: WebSession | undefined, owner: BrowserWindow): P
       if (target?.pathname === "/login") restoreFromLogin(target);
       if (target?.pathname.startsWith("/admin")) {
         void shell.openExternal(new URL(`${target.pathname}${target.search}${target.hash}`, auth.origin).href);
-        void loadAssistantPage(content.webContents, assistantURL).catch(() => { if (credentials === auth && mainWindow === owner) showOffline(); });
+        void loadAssistantPage(content.webContents, assistantURL).catch((error: unknown) => { if (credentials === auth && mainWindow === owner) showOffline(portalOfflineReason(error)); });
       }
     });
     await loadAssistantPage(content.webContents, assistantURL);
@@ -2865,7 +2959,7 @@ async function login(origin: unknown, name: unknown, password: unknown): Promise
     void refreshLiveSyncCapability(result.credentials);
     showConnecting();
     try { await openAssistant(result.webSession); }
-    catch { showOffline(); }
+    catch (error) { showOffline(portalOfflineReason(error)); }
     void restoreWorkspaceNode(result.credentials);
     return publicState();
   } catch (error) {
@@ -3073,7 +3167,10 @@ function register(): void {
   ipcMain.handle("morde:host-workbench-ready", (event, nonce) => notifyNativeWorkbenchReady(event, nonce));
   ipcMain.handle("morde:host-workbench-state", (event, state) => notifyNativeWorkbenchState(event, state));
   handler("morde:state", () => publicState());
-  handler("morde:open-assistant", async () => { await openAssistant(); return { opened: true }; });
+  handler("morde:open-assistant", async () => {
+    try { await openAssistant(); return { opened: true }; }
+    catch (error) { showOffline(portalOfflineReason(error)); return { opened: false }; }
+  });
   codexBridgeHandler("morde:codex-state", () => ({ authenticated: Boolean(credentials), codex: credentials ? codex.publicState() : null }));
   codexBridgeHandler("morde:codex-add-profile", async () => {
     if (!credentials || !safeStorageReady()) throw new Error("Codex 需要有效的 morde-pc 授权和系统安全存储");
@@ -3666,9 +3763,9 @@ function showWindow(): void {
     else {
       showConnecting();
       const owner = mainWindow;
-      void openAssistant().catch(() => {
+      void openAssistant().catch((error: unknown) => {
         if (!owner || mainWindow !== owner || owner.isDestroyed()) return;
-        showOffline();
+        showOffline(portalOfflineReason(error));
       });
     }
   }

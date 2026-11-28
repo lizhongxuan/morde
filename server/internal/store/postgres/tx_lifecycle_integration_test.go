@@ -571,6 +571,152 @@ func TestRestoreRefusesLegacyHostWithMultipleActiveBindings(t *testing.T) {
 	}
 }
 
+func TestBeginHostRestoreFailedLostRequiresExactCASAndNoOutstandingLease(t *testing.T) {
+	store, pool := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createTestUser(t, store, 3, 20_000, 40_000)
+	capacity := app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}
+	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "failed-lost-restore")
+	created := createTestHost(t, ctx, store, owner.ID, capacity, []string{workspaceValue.ID})
+	const generation int64 = 5
+	const sandboxID = "lost-sandbox-generation-5"
+	if _, err := pool.Exec(ctx, `UPDATE hosts
+SET state='failed', state_reason='lost', runtime_generation=$2, sandbox_id=$3,
+    runtime_instance_id=NULL, control_state='ai', control_actor_id=NULL, control_lease_expires_at=NULL
+WHERE id=$1`, created.ID, generation, sandboxID); err != nil {
+		t.Fatalf("seed failed/lost Host: %v", err)
+	}
+	workspaceBefore, err := store.GetWorkspace(ctx, workspaceValue.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restore := app.RestoreHostParams{
+		HostID: created.ID, RuntimeCredentialEnc: []byte("new runtime credential"),
+		ExpiresAt: time.Now().UTC().Add(time.Hour), Capacity: capacity,
+		RecoveryFromFailed: true, ExpectedGeneration: generation,
+		ExpectedReason: "lost", ExpectedSandboxID: sandboxID,
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO host_activity_leases
+(host_id, lease_id, runtime_generation, control_version, kind, expires_at)
+VALUES ($1, 'lost-host-session', $2, 0, 'preview', clock_timestamp()+interval '30 seconds')`, created.ID, generation); err != nil {
+		t.Fatalf("seed outstanding Host activity lease: %v", err)
+	}
+	if _, _, err := store.BeginHostRestore(ctx, restore); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("failed/lost restore with outstanding lease error = %v, want conflict", err)
+	}
+	unchanged, err := store.GetHost(ctx, created.ID)
+	if err != nil || unchanged.State != host.StateFailed || unchanged.StateReason != "lost" ||
+		unchanged.RuntimeGeneration != generation || unchanged.SandboxID != sandboxID {
+		t.Fatalf("Host after lease-blocked restore = %#v, %v", unchanged, err)
+	}
+	workspaceAfter, err := store.GetWorkspace(ctx, workspaceValue.ID)
+	if err != nil || workspaceAfter != workspaceBefore {
+		t.Fatalf("Workspace after lease-blocked restore = %#v, err=%v; before %#v", workspaceAfter, err, workspaceBefore)
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM host_activity_leases WHERE host_id=$1 AND lease_id='lost-host-session'`, created.ID); err != nil {
+		t.Fatalf("remove test activity lease: %v", err)
+	}
+
+	for _, mismatch := range []struct {
+		name    string
+		gen     int64
+		reason  string
+		sandbox string
+	}{
+		{name: "generation", gen: generation - 1, reason: "lost", sandbox: sandboxID},
+		{name: "reason", gen: generation, reason: "ready_timeout", sandbox: sandboxID},
+		{name: "sandbox id", gen: generation, reason: "lost", sandbox: "different-sandbox"},
+	} {
+		t.Run("reject stale "+mismatch.name, func(t *testing.T) {
+			attempt := restore
+			attempt.ExpectedGeneration = mismatch.gen
+			attempt.ExpectedReason = mismatch.reason
+			attempt.ExpectedSandboxID = mismatch.sandbox
+			if _, _, err := store.BeginHostRestore(ctx, attempt); domain.CodeOf(err) != domain.CodeConflict {
+				t.Fatalf("restore with stale %s error = %v, want conflict", mismatch.name, err)
+			}
+		})
+	}
+
+	restored, changed, err := store.BeginHostRestore(ctx, restore)
+	if err != nil || !changed || restored.ID != created.ID || restored.State != host.StateCreating ||
+		restored.StateReason != "restore_pending" || restored.RuntimeGeneration != generation+1 ||
+		restored.SandboxID != "" || len(restored.Workspaces) != 1 || restored.Workspaces[0].Workspace.ID != workspaceValue.ID {
+		t.Fatalf("BeginHostRestore(lost) = %#v, changed=%t, err=%v", restored, changed, err)
+	}
+	workspaceAfter, err = store.GetWorkspace(ctx, workspaceValue.ID)
+	if err != nil || workspaceAfter != workspaceBefore {
+		t.Fatalf("Workspace after lost Host restore = %#v, err=%v; before %#v", workspaceAfter, err, workspaceBefore)
+	}
+}
+
+func TestAdoptFailedHostRestoreAcceptsLostWithExactSandboxIdentity(t *testing.T) {
+	store, pool := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createTestUser(t, store, 3, 20_000, 40_000)
+	capacity := app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}
+	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "failed-lost-adopt")
+	created := createTestHost(t, ctx, store, owner.ID, capacity, []string{workspaceValue.ID})
+	const generation int64 = 5
+	const sandboxID = "lost-sandbox-generation-5-adopt"
+	if _, err := pool.Exec(ctx, `UPDATE hosts
+SET state='failed', state_reason='lost', runtime_generation=$2, sandbox_id=$3,
+    runtime_instance_id=NULL, control_state='ai', control_actor_id=NULL, control_lease_expires_at=NULL
+WHERE id=$1`, created.ID, generation, sandboxID); err != nil {
+		t.Fatalf("seed failed/lost Host: %v", err)
+	}
+	workspaceBefore, err := store.GetWorkspace(ctx, workspaceValue.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO host_activity_leases
+(host_id, lease_id, runtime_generation, control_version, kind, expires_at)
+VALUES ($1, 'lost-host-adopt-session', $2, 0, 'preview', clock_timestamp()+interval '30 seconds')`, created.ID, generation); err != nil {
+		t.Fatalf("seed outstanding Host activity lease: %v", err)
+	}
+	if err := store.AdoptFailedHostRestore(ctx, created.ID, generation, "lost", sandboxID); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("adopt failed/lost Host with outstanding lease error = %v, want conflict", err)
+	}
+	blocked, err := store.GetHost(ctx, created.ID)
+	if err != nil || blocked.State != host.StateFailed || blocked.StateReason != "lost" ||
+		blocked.RuntimeGeneration != generation || blocked.SandboxID != sandboxID || blocked.ControlState != host.ControlAI {
+		t.Fatalf("Host after lease-blocked adoption = %#v, %v", blocked, err)
+	}
+	workspaceAfter, err := store.GetWorkspace(ctx, workspaceValue.ID)
+	if err != nil || workspaceAfter != workspaceBefore {
+		t.Fatalf("Workspace after lease-blocked adoption = %#v, err=%v; before %#v", workspaceAfter, err, workspaceBefore)
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM host_activity_leases WHERE host_id=$1 AND lease_id='lost-host-adopt-session'`, created.ID); err != nil {
+		t.Fatalf("remove test activity lease: %v", err)
+	}
+	if err := store.AdoptFailedHostRestore(ctx, created.ID, generation, "lost", "different-sandbox"); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("adopt failed/lost Host with stale sandbox id error = %v, want conflict", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE hosts SET control_state='user' WHERE id=$1`, created.ID); err != nil {
+		t.Fatalf("set user Host control: %v", err)
+	}
+	if err := store.AdoptFailedHostRestore(ctx, created.ID, generation, "lost", sandboxID); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("adopt failed/lost Host while user-controlled error = %v, want conflict", err)
+	}
+	userControlled, err := store.GetHost(ctx, created.ID)
+	if err != nil || userControlled.State != host.StateFailed || userControlled.RuntimeGeneration != generation ||
+		userControlled.SandboxID != sandboxID || userControlled.ControlState != host.ControlUser {
+		t.Fatalf("Host after user-control-blocked adoption = %#v, %v", userControlled, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE hosts SET control_state='ai' WHERE id=$1`, created.ID); err != nil {
+		t.Fatalf("restore AI Host control: %v", err)
+	}
+	if err := store.AdoptFailedHostRestore(ctx, created.ID, generation, "lost", sandboxID); err != nil {
+		t.Fatalf("adopt matching failed/lost Host sandbox: %v", err)
+	}
+	adopted, err := store.GetHost(ctx, created.ID)
+	if err != nil || adopted.State != host.StateCreating || adopted.StateReason != "restore_pending" ||
+		adopted.RuntimeGeneration != generation || adopted.SandboxID != sandboxID || len(adopted.Workspaces) != 1 ||
+		adopted.Workspaces[0].Workspace.ID != workspaceValue.ID {
+		t.Fatalf("Host after lost sandbox adoption = %#v, %v", adopted, err)
+	}
+}
+
 func TestBeginHostReleaseChecksControlTasksAndActiveSessions(t *testing.T) {
 	store, pool := newTemporaryStore(t)
 	ctx := context.Background()

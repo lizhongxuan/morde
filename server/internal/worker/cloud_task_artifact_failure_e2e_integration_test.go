@@ -387,7 +387,7 @@ func TestCloudTaskArtifactCommitFailureRecoversWithoutRedispatch(t *testing.T) {
 		for _, step := range afterFirstCompletion.Steps {
 			if step.Kind == "verification" {
 				verificationOperation, verificationOperationErr = store.GetOperation(ctx, owner.ID, claimed.ID,
-					fmt.Sprintf("agent:verify:%s:%s:%d", step.ID, workspaceValue.ID, binding.BindingVersion))
+					fmt.Sprintf("agent:verify:v2:%s:%s:%d", step.ID, workspaceValue.ID, binding.BindingVersion))
 			}
 		}
 		t.Fatalf("first completion error = %v, want injected transient artifact commit error; task=%s waiting=%s steps=%#v verify_operation=%#v verify_operation_error=%v inputs=%#v read_error=%v",

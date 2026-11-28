@@ -3,6 +3,8 @@ package task
 import (
 	"errors"
 	"time"
+
+	"morde/server/internal/domain"
 )
 
 type Status string
@@ -172,6 +174,7 @@ type Task struct {
 	AgentEngineVersion          string
 	AgentProfileVersion         string
 	StepRetry                   *StepRetryIntent
+	ModelRecovery               *ModelRecoveryIntent `json:"-"`
 	CheckpointDigest            []byte
 	CheckpointThroughSequence   int64
 	EventSequence               int64
@@ -396,16 +399,17 @@ type Operation struct {
 }
 
 type BatchItem struct {
-	ID        string
-	TaskID    string
-	Key       string
-	Input     string
-	Status    BatchItemStatus
-	Attempt   int32
-	Result    string
-	Error     string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	ID                 string
+	TaskID             string
+	Key                string
+	Input              string
+	FileDeliveryIntent FileDeliveryIntent
+	Status             BatchItemStatus
+	Attempt            int32
+	Result             string
+	Error              string
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
 }
 
 type Artifact struct {
@@ -452,6 +456,8 @@ const (
 
 type ClarificationStatus string
 
+const RouteFileDeliveryIntentClarificationCallID = "morde-route-file-delivery-intent"
+
 const (
 	ClarificationPending   ClarificationStatus = "pending"
 	ClarificationAnswered  ClarificationStatus = "answered"
@@ -461,21 +467,30 @@ const (
 // ClarificationRequest is an Agent question awaiting a free-form user answer.
 // It is separate from PendingRequest, which represents an exact tool approval.
 type ClarificationRequest struct {
-	ID          string
-	TaskID      string
-	Version     int64
-	ModelStepID string
-	CallID      string
-	Question    string
-	Status      ClarificationStatus
-	Answer      string
-	CreatedAt   time.Time
-	RespondedAt *time.Time
+	ID           string
+	TaskID       string
+	Version      int64
+	ModelStepID  string
+	CallID       string
+	Question     string
+	BatchItemID  string
+	BatchAttempt int32
+	Status       ClarificationStatus
+	Answer       string
+	CreatedAt    time.Time
+	RespondedAt  *time.Time
 }
 
 // PendingRequest is an immutable, versioned user approval bound to one exact
 // Agent tool call and Host control fence. RequestHash is internal and omitted
 // from API responses.
+//
+// Evidence fields (E05): EvidencePointer names the in-task step whose
+// command and output justify the action ("step:<step-id>"); ThisCostMicros
+// and TotalCostMicros are micro-units of the task's cost, nil when no trusted
+// source exists (never 0 as a fabricated placeholder); TriggerRule names the
+// action-matrix category that required approval; RejectionConsequence states
+// in plain text what happens if the user rejects.
 type PendingRequest struct {
 	ID      string
 	TaskID  string
@@ -500,6 +515,61 @@ type PendingRequest struct {
 	CreatedAt               time.Time
 	ExpiresAt               *time.Time
 	RespondedAt             *time.Time
+	// EvidencePointer is "step:<step-id>" of the step whose evidence justifies
+	// the action, or "" when no step is attached (legacy rows).
+	EvidencePointer string
+	// ThisCostMicros is the trusted cost of this exact action in micro-units,
+	// or nil when no trusted per-action cost source exists. There is no such
+	// source today: tool calls carry no price declaration, so this is nil at
+	// creation and the API renders it unknown.
+	ThisCostMicros *int64
+	// TotalCostMicros is the trusted cumulative cost of the task in
+	// micro-units at the moment the card was created, or nil when any cost
+	// component is unknown. It is a snapshot, not a live total.
+	TotalCostMicros *int64
+	// TriggerRule names the action-matrix category that required approval,
+	// or "" for legacy rows. See ApprovalTrigger* constants.
+	TriggerRule string
+	// RejectionConsequence states what happens if the user rejects, or ""
+	// when the approval text did not state one (legacy rows).
+	RejectionConsequence string
+}
+
+// Approval trigger rules: the action-matrix categories (TODO 05 M05-05)
+// that require a per-action approval card.
+const (
+	// ApprovalTriggerHostSensitiveTool is a sensitive Host tool: shell,
+	// browser/desktop input, Enter/Backspace/Delete, or an unknown tool.
+	ApprovalTriggerHostSensitiveTool = "host_sensitive_tool"
+	// ApprovalTriggerExternalMCPTool is an external MCP tool call.
+	ApprovalTriggerExternalMCPTool = "external_mcp_tool"
+	// ApprovalTriggerWorkspaceLiveWrite is a live Workspace file write.
+	ApprovalTriggerWorkspaceLiveWrite = "workspace_live_write"
+	// ApprovalTriggerMediaPublish is a media publish action. Reserved for
+	// the publish path when it mints its own card; no creation site uses it
+	// yet (publish approvals currently reuse the Workspace write path).
+	ApprovalTriggerMediaPublish = "media_publish"
+)
+
+// ValidApprovalTriggerRule reports whether value is an empty (legacy) or a
+// known approval trigger rule.
+func ValidApprovalTriggerRule(value string) bool {
+	switch value {
+	case "", ApprovalTriggerHostSensitiveTool, ApprovalTriggerExternalMCPTool,
+		ApprovalTriggerWorkspaceLiveWrite, ApprovalTriggerMediaPublish:
+		return true
+	default:
+		return false
+	}
+}
+
+// EvidencePointerForStep returns the evidence pointer for a step, or "" when
+// the step ID is invalid. The second result reports validity.
+func EvidencePointerForStep(stepID string) (string, bool) {
+	if !domain.ValidStepID(stepID) {
+		return "", false
+	}
+	return "step:" + stepID, true
 }
 
 // StopRequest is the durable task-level request that prevents new operations
@@ -536,6 +606,17 @@ func CanTransition(from, to Status) bool {
 	default:
 		return false
 	}
+}
+
+// CanTransitionWithReason permits workflow-specific transitions only when the
+// persisted reason names the workflow that owns the edge. Generic Task state
+// transitions remain conservative for all other waiting_user reasons.
+func CanTransitionWithReason(from, to Status, reason string) bool {
+	if from == StatusWaitingUser && reason == "model_budget_capacity" &&
+		(to == StatusQueued || to == StatusPaused) {
+		return true
+	}
+	return CanTransition(from, to)
 }
 
 func CanTransitionOperation(from, to OperationStatus) bool {

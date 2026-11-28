@@ -12,6 +12,7 @@ import (
 	"go.uber.org/zap/zaptest/observer"
 
 	"morde/server/internal/app"
+	"morde/server/internal/domain"
 	"morde/server/internal/domain/task"
 )
 
@@ -464,6 +465,51 @@ func TestTaskWorkerStallMonitorFailureDoesNotCancelTask(t *testing.T) {
 	waitTaskWorkerSignal(t, executorCanceled)
 	if err := waitTaskWorkerResult(t, done); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run() error = %v, want context.Canceled", err)
+	}
+}
+
+func TestTaskWorkerCancelsExecutionAfterConfirmedRootRuntimeLoss(t *testing.T) {
+	base := &taskLeaseStoreStub{}
+	base.renew = func(_ context.Context, taskID, workerID string, version int64, _ time.Duration) (task.Task, error) {
+		value := validTaskClaim(workerID)
+		value.ID = taskID
+		value.Lease.Version = version
+		return value, nil
+	}
+	signal := domain.NewError(domain.CodeInvalidState, "Task Agent root Runtime is confirmed unavailable")
+	signal.Details["task_agent_stall"] = "root_runtime_unavailable"
+	monitorCalls := 0
+	monitorContexts := make(chan context.Context, 1)
+	store := &monitoredTaskLeaseStore{taskLeaseStoreStub: base, check: func(ctx context.Context, _ task.Task, _ time.Duration) error {
+		monitorCalls++
+		monitorContexts <- ctx
+		return fmt.Errorf("committed recovery wait: %w", signal)
+	}}
+	executorStarted := make(chan struct{})
+	executorCanceled := make(chan struct{})
+	worker := newTestTaskWorker(t, store, taskExecutorFunc(func(ctx context.Context, _ task.Task) error {
+		close(executorStarted)
+		<-ctx.Done()
+		close(executorCanceled)
+		return ctx.Err()
+	}), 90*time.Millisecond, 5*time.Millisecond)
+	done := make(chan error, 1)
+	go func() { done <- worker.runClaimed(context.Background(), validTaskClaim("worker-test")) }()
+	waitTaskWorkerSignal(t, executorStarted)
+	waitTaskWorkerSignal(t, executorCanceled)
+	if err := waitTaskWorkerResult(t, done); err != nil {
+		t.Fatalf("runClaimed() error = %v, want nil after durable recovery wait", err)
+	}
+	if monitorCalls != 1 {
+		t.Fatalf("stall monitor calls = %d, want one before stopping this execution", monitorCalls)
+	}
+	monitorCtx := <-monitorContexts
+	if err := monitorCtx.Err(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("stall monitor context error = %v, want immediate context.Canceled", err)
+	}
+	_, renewals := base.counts()
+	if renewals != 1 {
+		t.Fatalf("Task lease renewals after confirmed root Runtime loss = %d, want one", renewals)
 	}
 }
 

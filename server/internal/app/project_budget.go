@@ -92,6 +92,7 @@ type SettleProjectModelCallCommand struct {
 	Summary               *ConversationSummaryModelFence
 	TaskCall              *ModelCallReservation
 	ReviewCall            *ModelCallReservation
+	TerminalDeliveryCall  *ModelCallReservation
 	ResponseCiphertext    []byte
 	ResponseDigest        []byte
 	ResponseTextDigest    []byte
@@ -126,6 +127,31 @@ func NewProjectBudgetService(store ProjectBudgetStore, access ProjectAccessCheck
 		return nil, domain.InvalidArgument("dependencies", "project budget dependencies are required")
 	}
 	return &ProjectBudgetService{store: store, access: access, rates: rates}, nil
+}
+
+func (s *ProjectBudgetService) projectRateSnapshot(ctx context.Context, modelID string) (project.RateSnapshot, error) {
+	if s == nil || ctx == nil || !domain.ValidModelConnectionID(modelID) {
+		return project.RateSnapshot{}, domain.NewError(domain.CodeUnsupported, "project model rate is unavailable")
+	}
+	rate, err := s.rates.ProjectRateSnapshot(ctx, modelID)
+	if err != nil || rate.Validate() != nil || rate.ModelID != modelID {
+		return project.RateSnapshot{}, domain.NewError(domain.CodeInvalidState, "project model rate is unavailable")
+	}
+	return rate, nil
+}
+
+func ProjectModelCallRequestDigest(projectID, actorID, taskID string, source ModelCallSource, callID, modelID string,
+	usage project.Usage, requestDigest []byte) ([]byte, error) {
+	return hashIdempotencyRequest(struct {
+		ProjectID string
+		ActorID   string
+		TaskID    string
+		Source    ModelCallSource
+		CallID    string
+		ModelID   string
+		Usage     project.Usage
+		Request   []byte
+	}{projectID, actorID, taskID, source, callID, modelID, usage, requestDigest})
 }
 
 func (s *ProjectBudgetService) GetBudget(ctx context.Context, principal identity.Principal, projectID string) (ProjectBudgetView, error) {
@@ -205,8 +231,8 @@ func (s *ProjectBudgetService) ListLedger(ctx context.Context, principal identit
 func (s *ProjectBudgetService) ReserveModelCall(ctx context.Context, principal identity.Principal, command ReserveProjectModelCallCommand) (ProjectModelReservation, bool, error) {
 	if ctx == nil || command.Source == ModelCallRoute || !project.ValidID(command.ProjectID) || !validProjectBudgetSource(command.Source) ||
 		!idempotencyKeyPattern.MatchString(command.CallID) || !domain.ValidModelConnectionID(command.ModelID) ||
-		((command.Source == ModelCallTask || command.Source == ModelCallReview) && !domain.ValidTaskID(command.TaskID)) ||
-		(command.Source != ModelCallTask && command.Source != ModelCallReview && command.TaskID != "") || !validProjectTokenUsage(command.Usage) {
+		((command.Source == ModelCallTask || command.Source == ModelCallReview || command.Source == ModelCallTerminalDelivery) && !domain.ValidTaskID(command.TaskID)) ||
+		(command.Source != ModelCallTask && command.Source != ModelCallReview && command.Source != ModelCallTerminalDelivery && command.TaskID != "") || !validProjectTokenUsage(command.Usage) {
 		return ProjectModelReservation{}, false, domain.InvalidArgument("project_model_call", "project model call reservation is invalid")
 	}
 	reservedTokens := command.Usage.InputTokens + command.Usage.OutputTokens
@@ -273,16 +299,8 @@ func (s *ProjectBudgetService) reserveTaskModelCall(ctx context.Context, project
 	if err != nil || reservedMicros < 1 {
 		return ProjectModelReservation{}, false, domain.NewError(domain.CodeInvalidState, "project model rate is unavailable")
 	}
-	digest, err := hashIdempotencyRequest(struct {
-		ProjectID string
-		ActorID   string
-		TaskID    string
-		Source    ModelCallSource
-		CallID    string
-		ModelID   string
-		Usage     project.Usage
-		Request   []byte
-	}{projectID, call.OwnerID, call.Task.TaskID, call.Source, call.CallID, call.ModelID, usage, call.RequestDigest})
+	digest, err := ProjectModelCallRequestDigest(projectID, call.OwnerID, call.Task.TaskID, call.Source, call.CallID,
+		call.ModelID, usage, call.RequestDigest)
 	if err != nil {
 		return ProjectModelReservation{}, false, err
 	}
@@ -349,6 +367,59 @@ func (s *ProjectBudgetService) reserveTaskValidationReviewModelCall(ctx context.
 		!sameProjectAccountCall(reservation.AccountCall, call) {
 		return ProjectModelReservation{}, false, fmt.Errorf("reserve project review model call: %w", domain.NewError(domain.CodeInternal,
 			"project budget store returned an invalid account reservation"))
+	}
+	return reservation, replay, nil
+}
+
+// reserveTaskTerminalDeliveryModelCall records the conversation-delivery
+// charge against the initiating user's account/project budgets without
+// consuming the Task execution-token ceiling.
+func (s *ProjectBudgetService) reserveTaskTerminalDeliveryModelCall(ctx context.Context, projectID string,
+	call ModelCallReservation, usage project.Usage) (ProjectModelReservation, bool, error) {
+	fence := call.TerminalDelivery
+	if ctx == nil || !project.ValidID(projectID) || call.Source != ModelCallTerminalDelivery || fence == nil ||
+		!ValidTaskTerminalDeliveryModelDispatchFence(*fence) || call.Task != nil || call.Review != nil || call.Summary != nil ||
+		call.OwnerID != fence.InitiatorID || !domain.ValidModelConnectionID(call.ModelID) ||
+		!idempotencyKeyPattern.MatchString(call.CallID) || len(call.RequestDigest) != 32 || !validProjectTokenUsage(usage) ||
+		call.ReservedTokens != usage.InputTokens+usage.OutputTokens {
+		return ProjectModelReservation{}, false, domain.InvalidArgument("project_model_call", "project terminal delivery model call is invalid")
+	}
+	rate, err := s.rates.ProjectRateSnapshot(ctx, call.ModelID)
+	if err != nil || rate.Validate() != nil || rate.ModelID != call.ModelID || rate.Model != call.ProviderModel {
+		return ProjectModelReservation{}, false, domain.NewError(domain.CodeInvalidState, "project model rate is unavailable")
+	}
+	reservedMicros, err := rate.EstimateTokenCost(usage)
+	if err != nil || reservedMicros < 1 {
+		return ProjectModelReservation{}, false, domain.NewError(domain.CodeInvalidState, "project model rate is unavailable")
+	}
+	digest, err := hashIdempotencyRequest(struct {
+		ProjectID  string
+		ActorID    string
+		TaskID     string
+		DeliveryID int64
+		Source     ModelCallSource
+		CallID     string
+		ModelID    string
+		Usage      project.Usage
+		Request    []byte
+	}{projectID, call.OwnerID, fence.TaskID, fence.DeliveryID, call.Source, call.CallID, call.ModelID, usage, call.RequestDigest})
+	if err != nil {
+		return ProjectModelReservation{}, false, err
+	}
+	reservation, replay, err := s.store.ReserveProjectModelCall(ctx, ProjectModelReservation{
+		ProjectID: projectID, ActorID: call.OwnerID, TaskID: fence.TaskID, Source: call.Source,
+		CallID: call.CallID, ModelID: call.ModelID, Usage: usage, ReservedTokens: call.ReservedTokens,
+		Rate: rate, ReservedMicros: reservedMicros, RequestDigest: digest, AccountCall: call,
+	})
+	if err != nil {
+		return ProjectModelReservation{}, false, err
+	}
+	command := ReserveProjectModelCallCommand{ProjectID: projectID, TaskID: fence.TaskID, Source: call.Source,
+		CallID: call.CallID, ModelID: call.ModelID, Usage: usage, AccountCall: call}
+	if err := validateProjectModelReservation(reservation, command, call.OwnerID, digest); err != nil ||
+		!sameProjectAccountCall(reservation.AccountCall, call) {
+		return ProjectModelReservation{}, false, fmt.Errorf("reserve project terminal delivery model call: %w",
+			domain.NewError(domain.CodeInternal, "project budget store returned an invalid account reservation"))
 	}
 	return reservation, replay, nil
 }
@@ -421,6 +492,11 @@ func projectAccountCallMatchesCommand(call ModelCallReservation, principal ident
 			call.Review.InitiatorID == principal.UserID &&
 			call.Review.Claim.TaskID == command.TaskID && call.Principal.UserID == ""
 	}
+	if command.Source == ModelCallTerminalDelivery {
+		return call.Task == nil && call.Summary == nil && call.Review == nil && call.TerminalDelivery != nil &&
+			ValidTaskTerminalDeliveryModelDispatchFence(*call.TerminalDelivery) && call.TerminalDelivery.InitiatorID == principal.UserID &&
+			call.TerminalDelivery.TaskID == command.TaskID && call.Principal.UserID == ""
+	}
 	return call.Task == nil && call.Principal.UserID == principal.UserID
 }
 
@@ -444,7 +520,31 @@ func sameProjectAccountCall(value, expected ModelCallReservation) bool {
 	if !sameTaskValidationReviewModelFence(value.Review, expected.Review) {
 		return false
 	}
+	if !sameTaskTerminalDeliveryModelFence(value.TerminalDelivery, expected.TerminalDelivery) {
+		return false
+	}
 	return sameConversationSummaryModelFence(value.Summary, expected.Summary)
+}
+
+func sameTaskTerminalDeliveryModelFence(value, expected *TaskTerminalDeliveryModelFence) bool {
+	if value == nil || expected == nil {
+		return value == expected
+	}
+	return value.DeliveryID == expected.DeliveryID && value.TaskID == expected.TaskID && value.OwnerID == expected.OwnerID &&
+		value.ConversationID == expected.ConversationID && value.InitiatorID == expected.InitiatorID &&
+		value.TaskRevision == expected.TaskRevision && value.AuthorizationVersion == expected.AuthorizationVersion &&
+		value.SourceKind == expected.SourceKind && value.SourceEventSequence == expected.SourceEventSequence &&
+		value.SourceEventType == expected.SourceEventType && bytes.Equal(value.SourceSHA256, expected.SourceSHA256) &&
+		bytes.Equal(value.ResultSHA256, expected.ResultSHA256) && nullableTerminalDeliveryGenerationEqual(value.ValidationClaimGeneration, expected.ValidationClaimGeneration) &&
+		bytes.Equal(value.VerdictSHA256, expected.VerdictSHA256) && value.ClaimGeneration == expected.ClaimGeneration &&
+		value.LeaseOwner == expected.LeaseOwner && value.LeaseExpiresAt.Equal(expected.LeaseExpiresAt) && value.ModelCallID == expected.ModelCallID
+}
+
+func nullableTerminalDeliveryGenerationEqual(left, right *int64) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
 }
 
 func sameTaskValidationReviewModelFence(value, expected *TaskValidationReviewModelFence) bool {
@@ -495,13 +595,19 @@ func (s *ProjectBudgetService) SettleModelCall(ctx context.Context, command Sett
 		command.ReviewCall.ProjectID == command.ProjectID && domain.ValidUserID(command.ReviewCall.OwnerID) &&
 		len(command.ReviewCall.RequestDigest) == 32 && ValidTaskValidationReviewModelFence(*command.ReviewCall.Review) &&
 		command.ReviewCall.Review.Claim.InitiatorID == command.ReviewCall.Review.InitiatorID
+	terminalDeliveryCallValid := command.TerminalDeliveryCall != nil && command.TerminalDeliveryCall.Source == ModelCallTerminalDelivery &&
+		command.TerminalDeliveryCall.TerminalDelivery != nil && command.TerminalDeliveryCall.OwnerID == command.TerminalDeliveryCall.TerminalDelivery.InitiatorID &&
+		command.TerminalDeliveryCall.CallID == command.CallID && command.TerminalDeliveryCall.ProjectID == command.ProjectID &&
+		domain.ValidUserID(command.TerminalDeliveryCall.OwnerID) && len(command.TerminalDeliveryCall.RequestDigest) == 32 &&
+		ValidTaskTerminalDeliveryModelDispatchFence(*command.TerminalDeliveryCall.TerminalDelivery)
 	if ctx == nil || command.Source == ModelCallRoute || !project.ValidID(command.ProjectID) || !validProjectBudgetSource(command.Source) ||
 		!idempotencyKeyPattern.MatchString(command.CallID) || (!command.Unknown && !validProjectTokenUsage(command.Usage)) ||
 		(command.Source == ModelCallCompaction) != (command.Summary != nil) || command.Unknown && (len(command.ResponseCiphertext) != 0 || len(command.ResponseDigest) != 0 || len(command.ResponseTextDigest) != 0) ||
 		(command.Source == ModelCallReview && !command.Unknown && !command.ResponseInvalid && command.ReviewCall == nil) ||
+		(command.Source == ModelCallTerminalDelivery && !terminalDeliveryCallValid) ||
 		(command.Source == ModelCallTask && !command.Unknown && !command.ResponseInvalid && command.TaskCall != nil && !ValidProviderReportedModel(command.ProviderReportedModel)) ||
 		command.ReviewCall != nil && !reviewCallValid ||
-		command.Source != ModelCallCompaction && command.Source != ModelCallTask && command.Source != ModelCallReview &&
+		command.Source != ModelCallCompaction && command.Source != ModelCallTask && command.Source != ModelCallReview && command.Source != ModelCallTerminalDelivery &&
 			(len(command.ResponseCiphertext) != 0 || len(command.ResponseDigest) != 0 || len(command.ResponseTextDigest) != 0 || command.ResponseInvalid) ||
 		command.Source == ModelCallReview && ((len(command.ResponseCiphertext) != 0) != (len(command.ResponseDigest) != 0) ||
 			len(command.ResponseCiphertext) > MaxTaskValidationReviewModelResponseCiphertext || len(command.ResponseDigest) != 0 && len(command.ResponseDigest) != 32 ||
@@ -509,6 +615,13 @@ func (s *ProjectBudgetService) SettleModelCall(ctx context.Context, command Sett
 			command.Unknown && len(command.ResponseCiphertext) != 0 || command.ResponseInvalid && len(command.ResponseCiphertext) != 0 ||
 			(command.Unknown || command.ResponseInvalid) && len(command.ResponseTextDigest) != 0 ||
 			!command.Unknown && !command.ResponseInvalid && (len(command.ResponseCiphertext) == 0 || len(command.ResponseTextDigest) != 32)) ||
+		command.Source == ModelCallTerminalDelivery && ((len(command.ResponseCiphertext) != 0) != (len(command.ResponseDigest) != 0) ||
+			len(command.ResponseCiphertext) > MaxTaskTerminalDeliveryModelResponseCiphertext ||
+			len(command.ResponseDigest) != 0 && len(command.ResponseDigest) != 32 ||
+			len(command.ResponseTextDigest) != 0 && len(command.ResponseTextDigest) != 32 ||
+			command.Unknown && len(command.ResponseCiphertext) != 0 || command.ResponseInvalid && len(command.ResponseCiphertext) != 0 ||
+			(command.Unknown || command.ResponseInvalid) && len(command.ResponseTextDigest) != 0 ||
+			!command.Unknown && !command.ResponseInvalid && (!terminalDeliveryCallValid || len(command.ResponseCiphertext) == 0 || len(command.ResponseTextDigest) != 32)) ||
 		command.TaskCall != nil && (taskCallErr != nil || command.Source != ModelCallTask || command.TaskCall.CallID != command.CallID || command.TaskCall.ProjectID != command.ProjectID || len(command.ResponseCiphertext) == 0) ||
 		command.Source == ModelCallTask && (len(command.ResponseTextDigest) != 0 ||
 			((len(command.ResponseCiphertext) == 0) != (len(command.ResponseDigest) == 0) ||
@@ -517,7 +630,8 @@ func (s *ProjectBudgetService) SettleModelCall(ctx context.Context, command Sett
 		!command.Unknown && !command.ResponseInvalid && command.Source == ModelCallCompaction &&
 			(len(command.ResponseCiphertext) == 0 || len(command.ResponseCiphertext) > MaxConversationSummaryCiphertext || len(command.ResponseDigest) != 32 || len(command.ResponseTextDigest) != 0) ||
 		command.Source == ModelCallTask && len(command.ResponseCiphertext) != 0 && (command.TaskCall == nil || command.ResponseInvalid) ||
-		command.Unknown && command.TaskCall != nil || command.ReviewCall != nil && command.TaskCall != nil {
+		command.Unknown && command.TaskCall != nil || command.ReviewCall != nil && command.TaskCall != nil ||
+		command.TerminalDeliveryCall != nil && (!terminalDeliveryCallValid || command.TaskCall != nil || command.ReviewCall != nil) {
 		return domain.InvalidArgument("project_model_settlement", "project model call settlement is invalid")
 	}
 	return s.store.SettleProjectModelCall(ctx, command)
@@ -541,7 +655,8 @@ func validateProjectLedgerEntry(value ProjectLedgerEntry) error {
 	if !idempotencyKeyPattern.MatchString(value.CallID) || !domain.ValidUserID(value.ActorID) ||
 		!validProjectBudgetSource(value.Source) ||
 		((value.Source == ModelCallTask || value.Source == ModelCallReview) && !domain.ValidTaskID(value.TaskID)) ||
-		(value.Source != ModelCallTask && value.Source != ModelCallReview && value.TaskID != "") || !domain.ValidModelConnectionID(value.ModelID) ||
+		(value.Source == ModelCallTerminalDelivery && !domain.ValidTaskID(value.TaskID)) ||
+		(value.Source != ModelCallTask && value.Source != ModelCallReview && value.Source != ModelCallTerminalDelivery && value.TaskID != "") || !domain.ValidModelConnectionID(value.ModelID) ||
 		value.RateVersion < 1 || (project.Budget{Currency: value.Currency, LimitMicros: 1, Version: 1}).Validate() != nil ||
 		value.ReservedMicros < 1 || !validProjectTokenUsage(value.ReservedUsage) || value.CreatedAt.IsZero() {
 		return domain.NewError(domain.CodeInternal, "project ledger store returned an invalid entry")
@@ -563,7 +678,7 @@ func validateProjectLedgerEntry(value ProjectLedgerEntry) error {
 
 func validProjectBudgetSource(source ModelCallSource) bool {
 	return source == ModelCallClient || source == ModelCallChat || source == ModelCallTask || source == ModelCallRoute ||
-		source == ModelCallCompaction || source == ModelCallReview
+		source == ModelCallCompaction || source == ModelCallReview || source == ModelCallTerminalDelivery
 }
 
 func validProjectTokenUsage(value project.Usage) bool {
@@ -574,8 +689,8 @@ func validProjectTokenUsage(value project.Usage) bool {
 func validateProjectModelReservation(value ProjectModelReservation, command ReserveProjectModelCallCommand, actorID string, requestDigest []byte) error {
 	if !project.ValidID(value.ProjectID) || !domain.ValidUserID(value.ActorID) || !validProjectBudgetSource(value.Source) ||
 		!idempotencyKeyPattern.MatchString(value.CallID) || !domain.ValidModelConnectionID(value.ModelID) ||
-		((value.Source == ModelCallTask || value.Source == ModelCallReview) && !domain.ValidTaskID(value.TaskID)) ||
-		(value.Source != ModelCallTask && value.Source != ModelCallReview && value.TaskID != "") || !validProjectTokenUsage(value.Usage) ||
+		((value.Source == ModelCallTask || value.Source == ModelCallReview || value.Source == ModelCallTerminalDelivery) && !domain.ValidTaskID(value.TaskID)) ||
+		(value.Source != ModelCallTask && value.Source != ModelCallReview && value.Source != ModelCallTerminalDelivery && value.TaskID != "") || !validProjectTokenUsage(value.Usage) ||
 		value.Usage.InputTokens+value.Usage.OutputTokens != value.ReservedTokens || value.ReservedMicros < 1 ||
 		value.Rate.Validate() != nil || value.Rate.ModelID != value.ModelID || len(value.RequestDigest) != 32 ||
 		!bytes.Equal(value.RequestDigest, requestDigest) || value.ProjectID != command.ProjectID || value.ActorID != actorID ||

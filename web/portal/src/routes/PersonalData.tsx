@@ -29,8 +29,12 @@ type ProfileBody = { name: string; avatar: 'dragon' | 'emoji'; emoji?: string; c
 type SoulBody = { name: string; emoji?: string; style?: string; lang?: string; content: string };
 type MemoryBody = { content: string; category?: string };
 type RuleCandidateBody = {
-  scope: 'personal'; status: 'candidate' | 'active';
+  scope: 'personal'; status: 'candidate' | 'validated' | 'active';
   source_memory_id: string; source_memory_revision: number;
+};
+type SkillCandidateBody = {
+  scope: 'personal'; status: 'candidate' | 'validated' | 'active';
+  name: string; description: string; content: string;
 };
 type FeedPostBody = { title: string; type: string; emoji?: string; created_at?: string; liked?: boolean; body: string };
 type LibraryBody = { name: string; kind: 'artifact' | 'media'; mime?: string; size_bytes?: number; attachment_id?: string };
@@ -143,6 +147,16 @@ function randomRuleCandidateID(existing: Set<string>): string {
   return candidate;
 }
 
+function randomSkillCandidateID(existing: Set<string>): string {
+  let candidate: string;
+  do {
+    const bytes = new Uint8Array(4);
+    globalThis.crypto.getRandomValues(bytes);
+    candidate = `sk_${[...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('')}`;
+  } while (existing.has(candidate));
+  return candidate;
+}
+
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -201,6 +215,9 @@ export function PersonalData() {
   const [memoryContent, setMemoryContent] = useState('');
   const [memoryCategory, setMemoryCategory] = useState('');
   const [ruleDraft, setRuleDraft] = useState<{ memoryID: string; revision: number } | null>(null);
+  const [skillName, setSkillName] = useState('');
+  const [skillDescription, setSkillDescription] = useState('');
+  const [skillContent, setSkillContent] = useState('');
   const [feedTitle, setFeedTitle] = useState('');
   const [feedBody, setFeedBody] = useState('');
   const [libraryKind, setLibraryKind] = useState<'artifact' | 'media'>('artifact');
@@ -304,6 +321,7 @@ export function PersonalData() {
   const soulObject = objectOf<SoulBody>(allObjects, 'soul', 'default');
   const memoryObjects = allObjects.filter((item) => item.object_type === 'memory');
   const ruleCandidateObjects = allObjects.filter((item) => item.object_type === 'rule_candidate');
+  const skillCandidateObjects = allObjects.filter((item) => item.object_type === 'skill_candidate');
   // Show the confirmed server value, not an offline draft, for this consent.
   const memorySetting = state?.objects[personalObjectKey('skill_setting', 'builtin_memory')];
   const memoryEnabled = memorySetting ? memorySetting.body.enabled === true : state?.snapshotComplete === true;
@@ -397,6 +415,10 @@ export function PersonalData() {
 
   const activateRuleCandidate = (item: PersonalObject) => {
     const body = item.body as RuleCandidateBody;
+    if (body.status !== 'validated') {
+      setActionError('请先完成来源版本校验，再单独确认启用。');
+      return;
+    }
     const source = state?.objects[personalObjectKey('memory', body.source_memory_id)];
     if (!source || source.revision !== body.source_memory_revision) {
       setActionError('来源记忆已变化；此候选不会生效，请从当前记忆重新提议。');
@@ -406,11 +428,63 @@ export function PersonalData() {
     void saveObject('rule_candidate', item.object_id, { ...body, status: 'active' });
   };
 
+  const validateRuleCandidate = (item: PersonalObject) => {
+    const body = item.body as RuleCandidateBody;
+    const source = state?.objects[personalObjectKey('memory', body.source_memory_id)];
+    if (!source || source.revision !== body.source_memory_revision) {
+      setActionError('来源记忆已变化；请从当前版本重新提议规则。');
+      return;
+    }
+    if (window.confirm('服务端会在保存验证状态的同一事务中复核来源记忆仍是指定版本。之后仍需单独确认启用。继续吗？')) {
+      void saveObject('rule_candidate', item.object_id, { ...body, status: 'validated' });
+    }
+  };
+
   const deleteRuleCandidate = (item: PersonalObject) => {
     if (window.confirm('删除此规则候选后，Morde 将不再在个人对话中使用它。确定删除吗？')) {
       void deleteObject('rule_candidate', item.object_id);
     }
   };
+
+  const addSkillCandidate = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const name = skillName.trim();
+    const description = skillDescription.trim();
+    const content = skillContent.trim();
+    if (!name || !description || !content) return;
+    const id = randomSkillCandidateID(new Set(skillCandidateObjects.map((item) => item.object_id)));
+    const saved = await saveObject('skill_candidate', id, {
+      scope: 'personal', status: 'candidate', name, description, content,
+    });
+    if (saved) {
+      setSkillName('');
+      setSkillDescription('');
+      setSkillContent('');
+    }
+  };
+
+  const validateSkillCandidate = (item: PersonalObject) => {
+    const body = item.body as SkillCandidateBody;
+    if (window.confirm('服务端会检查候选字段、文本大小和格式。通过只表示结构有效，不代表工作流已经实测。继续校验吗？')) {
+      void saveObject('skill_candidate', item.object_id, { ...body, status: 'validated' });
+    }
+  };
+
+  const activateSkillCandidate = (item: PersonalObject) => {
+    const body = item.body as SkillCandidateBody;
+    if (window.confirm('启用后，Morde 可在你的个人对话中按需读取此工作流。它只提供文字指引，不会授予工具权限、跳过审批或增加预算；你可以随时撤销。确认启用吗？')) {
+      void saveObject('skill_candidate', item.object_id, { ...body, status: 'active' });
+    }
+  };
+
+  const revokeSkillCandidate = (item: PersonalObject) => {
+    if (window.confirm('撤销后，新的 Skill 读取会立即被拒绝。已完成的读取保留其任务审计记录。确认撤销吗？')) {
+      void deleteObject('skill_candidate', item.object_id);
+    }
+  };
+
+  const skillCandidatePending = (id: string) => state?.outbox.some((item) =>
+    item.objectType === 'skill_candidate' && item.objectID === id && !item.resolutionQueued) ?? false;
 
   const addFeedPost = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -540,7 +614,7 @@ export function PersonalData() {
 
   return <section className="personal-data-page design-panel" data-layout="viewport-fit">
     <div className="design-panel-header">
-      <div><h2>我的数据</h2><p>管理个人资料、AI 个性、记忆、动态、灵感和资源库。</p></div>
+      <div><h2>我的数据</h2><p>管理个人资料、AI 个性、记忆与受控工作流、动态、灵感和资源库。</p></div>
     </div>
     <nav className="personal-data-tabs" aria-label="个人数据分类">
       {sections.filter(({ id }) => id === 'feed' || id === 'ideas' || id === 'preferences').map((section) => <Link
@@ -661,17 +735,46 @@ export function PersonalData() {
       </form>}
       <section className="personal-data-setting" aria-labelledby="personal-rule-candidates-title">
         <h3 id="personal-rule-candidates-title">规则候选</h3>
-        <p className="muted">候选不会自动生效。启用前会检查来源记忆仍是同一版本；启用后可指导个人对话，但不能扩展现有权限或绕过审批。</p>
+        <p className="muted">候选不会自动生效。先验证来源记忆版本，再单独确认启用；启用后可指导个人对话，但不能扩展现有权限或绕过审批。</p>
         {ruleCandidateObjects.length === 0 ? <p className="muted">暂无规则候选。</p> : ruleCandidateObjects.map((item) => {
           const body = item.body as RuleCandidateBody;
           const source = state.objects[personalObjectKey('memory', body.source_memory_id)];
           const sourceCurrent = Boolean(source && source.revision === body.source_memory_revision);
           return <article className="model-connection-card" key={`${item.object_id}:${item.revision}`}>
             <div className="model-connection-main"><p>{sourceCurrent ? asString(source?.body.content) : '来源记忆已变化或不可用。'}</p><small>来源记忆：{body.source_memory_id} 第 {body.source_memory_revision} 版 · 范围：仅个人对话</small>
-              <p className="muted">{!sourceCurrent ? '来源已变化或不可用；此候选不会进入对话上下文。' : body.status === 'active' ? '已确认并启用' : '待你审核'}</p></div>
+              <p className="muted">{!sourceCurrent ? '来源已变化或不可用；此候选不会进入对话上下文。' : body.status === 'active' ? '已确认并启用' : body.status === 'validated' ? '来源版本已校验，待你确认' : '待来源版本校验'}</p></div>
             <div className="inline-actions">{body.status === 'candidate' && <button type="button" className="button button-primary"
-              disabled={!sourceCurrent || syncing} onClick={() => activateRuleCandidate(item)}>确认并启用</button>}
-              <button type="button" className="button button-secondary" disabled={syncing} onClick={() => deleteRuleCandidate(item)}>删除候选</button></div>
+              disabled={!sourceCurrent || syncing} onClick={() => validateRuleCandidate(item)}>验证来源版本</button>}
+              {body.status === 'validated' && <button type="button" className="button button-primary"
+                disabled={!sourceCurrent || syncing} onClick={() => activateRuleCandidate(item)}>确认并启用</button>}
+              <button type="button" className="button button-secondary" disabled={syncing} onClick={() => deleteRuleCandidate(item)}>{body.status === 'active' ? '撤销启用并删除' : '删除候选'}</button></div>
+          </article>;
+        })}
+      </section>
+      <section className="personal-data-setting" aria-labelledby="personal-skill-candidates-title">
+        <h3 id="personal-skill-candidates-title">受控工作流 Skill</h3>
+        <p className="muted">Skill 只保存你提供的文字流程。候选默认不可读取；服务端格式校验后还需你单独确认启用。工作流不会获得额外工具或操作权限，仍受当前 Task 授权、预算与审批限制。结构校验不等于实际效果评测。</p>
+        <form className="form-card form-stack" onSubmit={addSkillCandidate}>
+          <label>名称<input value={skillName} maxLength={80} required onChange={(event) => setSkillName(event.target.value)} /></label>
+          <label>用途说明<input value={skillDescription} maxLength={240} required onChange={(event) => setSkillDescription(event.target.value)} /></label>
+          <label>工作流内容<textarea value={skillContent} maxLength={8192} required onChange={(event) => setSkillContent(event.target.value)} /></label>
+          <button className="button button-primary" type="submit" disabled={!state?.snapshotComplete || syncing}>保存为未启用候选</button>
+        </form>
+        {skillCandidateObjects.length === 0 ? <p className="muted">暂无自定义 Skill 候选。</p> : skillCandidateObjects.map((item) => {
+          const body = item.body as SkillCandidateBody;
+          const pending = skillCandidatePending(item.object_id);
+          return <article className="model-connection-card" key={`${item.object_id}:${item.revision}`}>
+            <div className="model-connection-main"><h4>{body.name}</h4><p className="muted">{body.description}</p><pre>{body.content}</pre>
+              <small>仅个人对话 · 修订 {item.revision} · {body.status === 'candidate' ? '未启用候选' : body.status === 'validated' ? '格式校验通过，待你确认' : '已启用'}</small>
+            </div>
+            <div className="inline-actions">{body.status === 'candidate' && <button type="button" className="button button-secondary"
+              disabled={!state.snapshotComplete || syncing || pending} onClick={() => validateSkillCandidate(item)}>运行格式校验</button>}
+              {body.status === 'validated' && <button type="button" className="button button-primary"
+                disabled={!state.snapshotComplete || syncing || pending} onClick={() => activateSkillCandidate(item)}>确认并启用</button>}
+              <button type="button" className="button button-secondary" disabled={syncing || pending} onClick={() => revokeSkillCandidate(item)}>
+                {body.status === 'active' ? '撤销启用并删除' : '删除候选'}
+              </button>
+            </div>
           </article>;
         })}
       </section>

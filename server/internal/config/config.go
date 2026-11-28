@@ -3,6 +3,7 @@ package config
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"net"
 	"net/url"
 	"os"
@@ -170,10 +171,34 @@ type SiteStorage struct {
 }
 
 type Models struct {
-	AllowedHosts         []string           `yaml:"allowed_hosts"`
-	ProxyURL             string             `yaml:"proxy_url"`
-	ProjectRates         []ProjectModelRate `yaml:"project_rates"`
-	GPT6LunaMaxReasoning bool               `yaml:"gpt6_luna_max_reasoning"`
+	AllowedHosts                 []string           `yaml:"allowed_hosts"`
+	ProxyURL                     string             `yaml:"proxy_url"`
+	ProjectRates                 []ProjectModelRate `yaml:"project_rates"`
+	GPT6LunaMaxReasoning         bool               `yaml:"gpt6_luna_max_reasoning"`
+	OutputBudgetAdmissionEnabled bool               `yaml:"output_budget_admission_enabled"`
+	OutputBudgetShadow           OutputBudgetShadow `yaml:"output_budget_shadow"`
+}
+
+// OutputBudgetShadow carries a reviewed per-route output-budget strategy.
+// When Enabled is false, a populated Routes table remains inert for Task
+// admission and shadow metrics, but can supply the explicit long_form goal.
+type OutputBudgetShadow struct {
+	Enabled         bool                      `yaml:"enabled"`
+	SampleRate      float64                   `yaml:"sample_rate"`
+	StrategyVersion string                    `yaml:"strategy_version"`
+	Routes          []OutputBudgetShadowRoute `yaml:"routes"`
+}
+
+type OutputBudgetShadowRoute struct {
+	BaseURL string                    `yaml:"base_url"`
+	Model   string                    `yaml:"model"`
+	Stages  []OutputBudgetShadowStage `yaml:"stages"`
+}
+
+type OutputBudgetShadowStage struct {
+	Stage         string `yaml:"stage"`
+	GoalTokens    int64  `yaml:"goal_tokens"`
+	MinimumTokens int64  `yaml:"minimum_tokens"`
 }
 
 type ProjectModelRate struct {
@@ -320,6 +345,84 @@ func convertDurations(node *yaml.Node, path string) error {
 var rateLimitPattern = regexp.MustCompile(`^[1-9][0-9]*/min$`)
 var cloudDSHImagePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:/-]*@sha256:[a-f0-9]{64}$`)
 var cloudDSHSupervisorIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
+var outputBudgetShadowVersionPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
+
+const maxOutputBudgetShadowTokens int64 = 2_000_000
+
+var outputBudgetShadowStages = [...]string{
+	"short_answer", "tool_step", "subtask", "summary", "long_form", "text_continuation",
+}
+
+func (strategy OutputBudgetShadow) validate(admissionEnabled ...bool) error {
+	adaptiveAdmissionEnabled := len(admissionEnabled) == 1 && admissionEnabled[0]
+	hasStrategyConfig := strategy.StrategyVersion != "" || len(strategy.Routes) > 0
+	if !strategy.Enabled && !adaptiveAdmissionEnabled && !hasStrategyConfig {
+		return nil
+	}
+	if strategy.Enabled {
+		if math.IsNaN(strategy.SampleRate) || math.IsInf(strategy.SampleRate, 0) || strategy.SampleRate <= 0 || strategy.SampleRate > 1 {
+			return fmt.Errorf("sample_rate must be greater than 0 and at most 1 when shadow is enabled")
+		}
+	} else if math.IsNaN(strategy.SampleRate) || math.IsInf(strategy.SampleRate, 0) || strategy.SampleRate < 0 || strategy.SampleRate > 1 {
+		return fmt.Errorf("sample_rate must be between 0 and 1")
+	}
+	if !outputBudgetShadowVersionPattern.MatchString(strategy.StrategyVersion) || strings.TrimSpace(strategy.StrategyVersion) != strategy.StrategyVersion {
+		return fmt.Errorf("strategy_version is invalid")
+	}
+	if len(strategy.Routes) == 0 {
+		return fmt.Errorf("routes must contain at least one exact HTTPS model route")
+	}
+
+	seenRoutes := make(map[string]struct{}, len(strategy.Routes))
+	for _, route := range strategy.Routes {
+		parsed, err := url.Parse(route.BaseURL)
+		if err != nil || strings.TrimSpace(route.BaseURL) != route.BaseURL || parsed == nil || !strings.EqualFold(parsed.Scheme, "https") ||
+			parsed.Opaque != "" || parsed.Host == "" || parsed.Hostname() == "" || parsed.User != nil || parsed.RawQuery != "" ||
+			parsed.ForceQuery || parsed.Fragment != "" || parsed.RawFragment != "" || strings.Contains(route.BaseURL, "#") {
+			return fmt.Errorf("routes must use an exact HTTPS base_url without userinfo, query, or fragment")
+		}
+		if strings.TrimSpace(route.Model) == "" || strings.TrimSpace(route.Model) != route.Model {
+			return fmt.Errorf("routes must define a non-empty exact model")
+		}
+		routeKey := strings.ToLower(parsed.Scheme) + "://" + strings.ToLower(parsed.Host) + strings.TrimRight(parsed.EscapedPath(), "/") + "\x00" + route.Model
+		if _, exists := seenRoutes[routeKey]; exists {
+			return fmt.Errorf("routes contain a duplicate exact base_url and model")
+		}
+		seenRoutes[routeKey] = struct{}{}
+		if len(route.Stages) != len(outputBudgetShadowStages) {
+			return fmt.Errorf("route %q must define all six supported stages exactly once", route.Model)
+		}
+		seenStages := make(map[string]struct{}, len(route.Stages))
+		for _, stage := range route.Stages {
+			if !containsOutputBudgetShadowStage(stage.Stage) {
+				return fmt.Errorf("route %q contains an unsupported stage %q", route.Model, stage.Stage)
+			}
+			if _, exists := seenStages[stage.Stage]; exists {
+				return fmt.Errorf("route %q contains a duplicate stage %q", route.Model, stage.Stage)
+			}
+			if stage.MinimumTokens < 1 || stage.MinimumTokens > stage.GoalTokens || stage.GoalTokens < 1 || stage.GoalTokens > maxOutputBudgetShadowTokens {
+				return fmt.Errorf("route %q stage %q requires 1 <= minimum_tokens <= goal_tokens <= %d",
+					route.Model, stage.Stage, maxOutputBudgetShadowTokens)
+			}
+			seenStages[stage.Stage] = struct{}{}
+		}
+		for _, stage := range outputBudgetShadowStages {
+			if _, exists := seenStages[stage]; !exists {
+				return fmt.Errorf("route %q is missing stage %q", route.Model, stage)
+			}
+		}
+	}
+	return nil
+}
+
+func containsOutputBudgetShadowStage(value string) bool {
+	for _, stage := range outputBudgetShadowStages {
+		if value == stage {
+			return true
+		}
+	}
+	return false
+}
 
 func (c Config) validate() error {
 	if c.CloudDSH.BuiltinSearch.Enabled {
@@ -416,6 +519,9 @@ func (c Config) validate() error {
 			return fmt.Errorf("config.models.project_rates contains a duplicate model_id")
 		}
 		seenProjectRates[rate.ModelID] = struct{}{}
+	}
+	if err := c.Models.OutputBudgetShadow.validate(c.Models.OutputBudgetAdmissionEnabled); err != nil {
+		return fmt.Errorf("config.models.output_budget_shadow: %w", err)
 	}
 	if len(c.Orchestrator.Profiles) == 0 {
 		return fmt.Errorf("config.orchestrator.profiles must not be empty")

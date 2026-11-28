@@ -248,6 +248,35 @@ avail_kb="$(df --output=avail -k /opt | tail -1 | tr -d ' ')"
 [[ -f "$CONFIG" ]] || die "missing portal config: $CONFIG"
 [[ -x "$BIN" ]] || die "missing running binary: $BIN"
 
+# --- E10: environment-down detection ---
+# The DSH daemon (cloud-computer tasks cannot spawn without it) and the
+# workspace-sync mount (the portal requires it) are checked here, before
+# any deploy work. A failure stops the deploy with the cause named,
+# instead of deploying a release that silently cannot run tasks.
+# This is the deploy-level exception gate: when the environment is down
+# the deploy stops and says why, instead of blaming the code in the
+# smoke record. The smoke gate below has its own gate-level exception
+# (cases the environment cannot run, e.g. T10/T43 needing a real PC);
+# those are notices, not failures, and the deploy proceeds with the
+# reduced evidence on record.
+# R20's full runtime interruption-delivery chain is a separate,
+# contract-blocked piece and is not part of this preflight.
+dsh_enabled="$(sed -n '/^cloud_dsh:/,/^[^[:space:]]/p' "$CONFIG" | awk '/^[[:space:]]*enabled:/ {print $2; exit}')"
+dsh_host="$(sed -n '/^cloud_dsh:/,/^[^[:space:]]/p' "$CONFIG" | awk '/^[[:space:]]*docker_host:/ {print $2; exit}')"
+dsh_host="${dsh_host:-unix:///run/morde-dsh-docker/docker.sock}"
+if [[ "${dsh_enabled:-true}" != "false" ]]; then
+  dsh_sock="${dsh_host#unix://}"
+  if [[ ! -S "$dsh_sock" ]]; then
+    die "cloud DSH daemon is not reachable: socket $dsh_sock is missing (docker_host=$dsh_host). Cloud-computer tasks cannot spawn after a deploy; check the DSH daemon (systemctl status morde-dsh-docker) and retry. Deploy aborted."
+  fi
+  if ! docker -H "$dsh_host" info >/dev/null 2>&1; then
+    die "cloud DSH daemon at $dsh_host does not answer docker info. Cloud-computer tasks cannot spawn after a deploy; check the DSH daemon and retry. Deploy aborted."
+  fi
+fi
+if ! grep -q " /srv/morde-acceptance " /proc/mounts; then
+  die "workspace-sync mount /srv/morde-acceptance is not mounted (the portal requires it). Check /etc/fstab and run: mount /srv/morde-acceptance. Deploy aborted."
+fi
+
 CURRENT_SHA="$(sha256sum "$BIN" | awk '{print $1}')"
 log "running binary: $BIN sha256=$CURRENT_SHA"
 if systemctl is-active --quiet "$SERVICE"; then
@@ -332,6 +361,23 @@ if [[ -n "${OLD_SRC_HEAD:-}" ]]; then
   if git -C "$SRC_DIR" diff --name-only "$OLD_SRC_HEAD" "$NEW_HEAD" -- web/portal web/workbench | grep -q .; then
     log "WARNING: web/portal or web/workbench changed in this update; web assets are NOT rebuilt by this script — rebuild and redeploy them separately"
   fi
+fi
+
+# ---------------- P0 smoke gate (E10) ----------------
+# No deploy without a passing smoke record. The gate runs the ten P0
+# smoke cases (T01/T04/T06/T10/T13/T19/T22/T26/T36/T43) against the new
+# head; any failure aborts before the build, so a broken head never
+# reaches the swap. The gate is fail-closed: a case that produces no
+# evidence fails, unless the environment itself cannot run it — then
+# it is recorded as an exception-gate notice, not a failure (T10/T43
+# need a real PC; PostgreSQL cases without CH_TEST_DATABASE_URL).
+# Environment-down (dead DSH daemon, missing workspace-sync mount)
+# was already caught by the preflight above, which aborts with the
+# cause named before this gate runs. The record is the deploy evidence.
+SMOKE_RECORD="$MORDE_DIR/smoke-record.json"
+log "running P0 smoke gate for $NEW_HEAD (record: $SMOKE_RECORD)"
+if ! bash "$SRC_DIR/deploy/single/smoke.sh" --src "$SRC_DIR" --record "$SMOKE_RECORD"; then
+  die "P0 smoke gate failed for $NEW_HEAD — see $SMOKE_RECORD; deploy aborted, current release untouched"
 fi
 
 # ---------------- build ----------------

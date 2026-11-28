@@ -180,9 +180,10 @@ func (s RunStatus) Active() bool {
 type SkipReason string
 
 const (
-	SkipDSTGap             SkipReason = "dst_gap"
-	SkipOverlap            SkipReason = "overlap"
-	SkipAuthorizationEnded SkipReason = "authorization_ended"
+	SkipDSTGap              SkipReason = "dst_gap"
+	SkipOverlap             SkipReason = "overlap"
+	SkipAuthorizationEnded  SkipReason = "authorization_ended"
+	SkipPersonalRuleRevoked SkipReason = "personal_rule_revoked"
 )
 
 type Action string
@@ -199,6 +200,31 @@ const (
 	CurrentRunCancel   CurrentRunAction = "cancel"
 )
 
+// PersonalRuleBinding records explicit reuse of one active personal rule and
+// the exact personal memory revision that authorized it. Source fields are
+// derived by the server and are never accepted as authority from a caller.
+type PersonalRuleBinding struct {
+	CandidateID          string `json:"candidate_id"`
+	CandidateRevision    int64  `json:"candidate_revision"`
+	SourceMemoryID       string `json:"source_memory_id"`
+	SourceMemoryRevision int64  `json:"source_memory_revision"`
+}
+
+// PersonalRuleSelection is the client-supplied portion of a binding. The
+// store resolves and verifies the candidate's current source memory revision.
+type PersonalRuleSelection struct {
+	CandidateID       string `json:"candidate_id"`
+	CandidateRevision int64  `json:"candidate_revision"`
+}
+
+type PersonalRuleValidationStatus string
+
+const (
+	PersonalRuleNotBound  PersonalRuleValidationStatus = "not_bound"
+	PersonalRuleValidated PersonalRuleValidationStatus = "validated"
+	PersonalRuleRevoked   PersonalRuleValidationStatus = "revoked"
+)
+
 type Schedule struct {
 	ID                    string
 	OwnerID               string
@@ -208,6 +234,7 @@ type Schedule struct {
 	ModelID               string
 	Title                 string
 	Objective             string
+	FileDeliveryIntent    task.FileDeliveryIntent `json:"file_delivery_intent"`
 	Timing                Timing
 	Budget                task.Budget
 	Authorization         task.Authorization
@@ -216,6 +243,7 @@ type Schedule struct {
 	Observation           *ObservationSpec
 	ObservationConfigHash string
 	BaselineFingerprint   string
+	PersonalRule          *PersonalRuleBinding
 	// ExecutionPolicy is an internal control-plane policy and is omitted from
 	// public JSON responses. Blank values from legacy callers mean standard.
 	ExecutionPolicy   ExecutionPolicy `json:"-"`
@@ -230,23 +258,27 @@ type Schedule struct {
 }
 
 type Run struct {
-	ID                     string
-	ScheduleID             string
-	ScheduleVersion        int64
-	OccurrenceKey          string
-	ScheduledAt            *time.Time
-	CoalescedCount         int64
-	Status                 RunStatus
-	SkipReason             *SkipReason
-	TaskID                 *string
-	NotificationEvents     []NotificationEvent
-	Observation            *ObservationSpec
-	ObservationConfigHash  string
-	ObservationOutcome     ObservationOutcome
-	ObservationFingerprint string
-	CreatedAt              time.Time
-	UpdatedAt              time.Time
-	FinishedAt             *time.Time
+	ID                           string
+	ScheduleID                   string
+	ScheduleVersion              int64
+	OccurrenceKey                string
+	ScheduledAt                  *time.Time
+	CoalescedCount               int64
+	Status                       RunStatus
+	SkipReason                   *SkipReason
+	TaskID                       *string
+	NotificationEvents           []NotificationEvent
+	Observation                  *ObservationSpec
+	PersonalRule                 *PersonalRuleBinding
+	PersonalRuleValidationStatus PersonalRuleValidationStatus
+	PersonalRuleValidatedAt      *time.Time
+	PersonalRuleRevokedAt        *time.Time
+	ObservationConfigHash        string
+	ObservationOutcome           ObservationOutcome
+	ObservationFingerprint       string
+	CreatedAt                    time.Time
+	UpdatedAt                    time.Time
+	FinishedAt                   *time.Time
 }
 
 func IsMisfire(scheduledAt, observedAt time.Time) bool {
@@ -263,10 +295,13 @@ type Occurrence struct {
 }
 
 var (
-	datePattern      = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
-	localTimePattern = regexp.MustCompile(`^(?:[01][0-9]|2[0-3]):[0-5][0-9]$`)
-	idAlphabet       = "abcdefghijklmnopqrstuvwxyz0123456789"
+	datePattern          = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
+	localTimePattern     = regexp.MustCompile(`^(?:[01][0-9]|2[0-3]):[0-5][0-9]$`)
+	ruleCandidatePattern = regexp.MustCompile(`^r_[a-z0-9]{8}$`)
+	idAlphabet           = "abcdefghijklmnopqrstuvwxyz0123456789"
 )
+
+func validRuleBindingID(value string) bool { return ruleCandidatePattern.MatchString(value) }
 
 func NewID() (string, error)    { return newID('j') }
 func NewRunID() (string, error) { return newID('y') }
@@ -367,6 +402,7 @@ func Validate(s Schedule) error {
 		(s.HostID != "" && !domain.ValidHostID(s.HostID)) || s.ModelID == "" ||
 		strings.TrimSpace(s.Title) == "" || len(strings.TrimSpace(s.Title)) > 32768 ||
 		strings.TrimSpace(s.Objective) == "" || len(strings.TrimSpace(s.Objective)) > 32768 || !s.ExecutionPolicy.Valid() ||
+		!s.FileDeliveryIntent.Valid() ||
 		s.Authorization.Kind == "" || !s.MisfirePolicy.Valid() || s.ExecutionEpoch < 1 {
 		return errors.New("schedule fields are invalid")
 	}
@@ -381,6 +417,13 @@ func Validate(s Schedule) error {
 	}
 	if err := s.Budget.Validate(); err != nil {
 		return err
+	}
+	if s.PersonalRule != nil {
+		if !validRuleBindingID(s.PersonalRule.CandidateID) || s.PersonalRule.CandidateRevision < 1 ||
+			(s.PersonalRule.SourceMemoryID == "") != (s.PersonalRule.SourceMemoryRevision == 0) ||
+			(s.PersonalRule.SourceMemoryID != "" && s.PersonalRule.SourceMemoryRevision < 1) {
+			return errors.New("schedule personal rule binding is invalid")
+		}
 	}
 	seen := make(map[NotificationEvent]struct{}, len(s.NotificationEvents))
 	for _, event := range s.NotificationEvents {

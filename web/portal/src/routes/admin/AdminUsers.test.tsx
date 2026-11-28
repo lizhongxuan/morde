@@ -40,11 +40,12 @@ function setup(records: AdminUser[]) {
     rows[index] = next;
     return next;
   });
+  const resetPassword = vi.spyOn(portalApi, 'resetAdminUserPassword').mockResolvedValue(undefined);
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter /><MemoryRouter initialEntries={['/admin/users']}><Routes>
     <Route path="/admin/users" element={<AdminUsers />} />
   </Routes></MemoryRouter></ToastProvider></QueryClientProvider>);
-  return { list, update };
+  return { list, update, resetPassword };
 }
 
 describe('admin account management', () => {
@@ -60,12 +61,64 @@ describe('admin account management', () => {
     expect(await screen.findByText('受保护的超级管理员')).toBeInTheDocument();
     const protectedRow = screen.getByRole('row', { name: /admin.*超级管理员/ });
     expect(protectedRow).toHaveTextContent('受保护的超级管理员');
-    expect(within(protectedRow).queryByRole('button')).not.toBeInTheDocument();
+    expect(within(protectedRow).getByRole('button', { name: '修改密码' })).toBeInTheDocument();
     await input.selectOptions(screen.getByLabelText('账号状态'), 'pending');
     expect(await screen.findByRole('row', { name: /alice.*待审核/ })).toBeInTheDocument();
     expect(list).toHaveBeenLastCalledWith('pending', 0);
     const currentRow = screen.getByRole('row', { name: /alice.*待审核/ });
     expect(within(currentRow).getByRole('button', { name: '通过审核' })).toBeInTheDocument();
+  });
+
+  it('lets the super administrator reset another super administrator password after confirmation', async () => {
+    const input = userEvent.setup();
+    const { resetPassword } = setup([
+      userRecord('uadmin01', 'admin', 'super_admin', 'approved'),
+      userRecord('uadmin02', 'second-admin', 'super_admin', 'approved'),
+      userRecord('u0000001', 'alice', 'user', 'pending'),
+    ]);
+
+    const otherAdmin = await screen.findByRole('row', { name: /second-admin.*超级管理员.*已通过/ });
+    await input.click(within(otherAdmin).getByRole('button', { name: '修改密码' }));
+    expect(screen.getByRole('heading', { name: '修改 second-admin 的密码' })).toBeInTheDocument();
+
+    await input.type(screen.getByLabelText('新密码'), 'safe-test-password');
+    await input.type(screen.getByLabelText('再次输入新密码'), 'different-test-password');
+    await input.click(screen.getByRole('button', { name: '重置密码' }));
+
+    expect(await screen.findByText('两次输入的密码不一致。')).toBeInTheDocument();
+    expect(resetPassword).not.toHaveBeenCalled();
+
+    const confirmation = screen.getByLabelText('再次输入新密码');
+    await input.clear(confirmation);
+    await input.type(confirmation, 'safe-test-password');
+    await input.click(screen.getByRole('button', { name: '重置密码' }));
+
+    expect(resetPassword).toHaveBeenCalledWith('uadmin02', {
+      expected_status: 'approved',
+      new_password: 'safe-test-password',
+    });
+    expect(await screen.findByText('密码已重置。用户下次可在 PC 或 Portal 登录，并按提示完成密码修改后继续使用。')).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: '修改 second-admin 的密码' })).not.toBeInTheDocument();
+  });
+
+  it('keeps the reset dialog open and does not report success when the API rejects the reset', async () => {
+    const input = userEvent.setup();
+    const { resetPassword } = setup([userRecord('u0000001', 'alice', 'user', 'pending')]);
+    resetPassword.mockRejectedValueOnce(Object.assign(new Error('账号状态已变化，请刷新用户列表。'), { code: 'conflict', status: 409 }));
+
+    const row = await screen.findByRole('row', { name: /alice.*普通用户.*待审核/ });
+    await input.click(within(row).getByRole('button', { name: '修改密码' }));
+    await input.type(screen.getByLabelText('新密码'), 'safe-test-password');
+    await input.type(screen.getByLabelText('再次输入新密码'), 'safe-test-password');
+    await input.click(screen.getByRole('button', { name: '重置密码' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('账号状态已变化，请刷新用户列表。');
+    expect(screen.getByRole('heading', { name: '修改 alice 的密码' })).toBeInTheDocument();
+    expect(screen.queryByText('密码已重置。用户下次可在 PC 或 Portal 登录，并按提示完成密码修改后继续使用。')).not.toBeInTheDocument();
+    expect(resetPassword).toHaveBeenCalledWith('u0000001', {
+      expected_status: 'pending',
+      new_password: 'safe-test-password',
+    });
   });
 
   it('approves a pending registration using its expected status', async () => {

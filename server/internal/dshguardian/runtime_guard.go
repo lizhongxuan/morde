@@ -407,6 +407,45 @@ func (s *Service) StartedTaskProcess(ctx context.Context, guard TaskProcessGuard
 	return nil
 }
 
+// SnapshotTaskProcess returns a bounded process-tree snapshot only while the
+// exact account Runtime and Task Agent fences still identify a live process
+// lease. It never mutates the Guardian lease or process cgroup.
+func (s *Service) SnapshotTaskProcess(ctx context.Context, runtimeFence app.AccountAgentRuntimeFence,
+	taskFence app.AgentInstanceFence) (TaskProcessSnapshot, error) {
+	if ctx == nil || ctx.Err() != nil || runtimeFence.Validate() != nil || taskFence.Validate() != nil ||
+		runtimeFence.OwnerID != taskFence.OwnerID {
+		return TaskProcessSnapshot{}, errors.New("task process snapshot identity or context is invalid")
+	}
+	release, err := s.lockRuntimeTask(ctx, runtimeFence, taskFence)
+	if err != nil {
+		return TaskProcessSnapshot{}, err
+	}
+	defer release()
+	value, ok, err := s.store.findTaskByFences(runtimeFence, taskFence)
+	if err != nil || !ok {
+		return TaskProcessSnapshot{}, errors.New("guardian task process lease for the exact runtime and agent fences is unavailable")
+	}
+	if value.Guard.RuntimeFence != runtimeFence || value.Guard.TaskFence != taskFence || value.Destroyed ||
+		value.UnprovenRunning || !value.Armed || !value.Started || !value.Guard.ExpiresAt.After(s.now()) {
+		return TaskProcessSnapshot{}, errors.New("guardian task process lease is expired, unstarted, or destroyed")
+	}
+	runtimeLease, err := s.activeAccountRuntime(ctx, runtimeFence, value.Guard.RuntimeContainerID)
+	if err != nil {
+		return TaskProcessSnapshot{}, errors.New("guardian account runtime process identity is unavailable")
+	}
+	inspector, ok := s.processes.(taskProcessSnapshotInspector)
+	if !ok {
+		return TaskProcessSnapshot{}, errors.New("read-only Task process snapshot is unsupported on this host")
+	}
+	processes, err := inspector.SnapshotTaskProcess(value.Guard.RuntimeContainerID, runtimeLease.Process, value.Process, value.Key)
+	if err != nil {
+		return TaskProcessSnapshot{}, fmt.Errorf("capture exact Guardian Task process snapshot: %w", err)
+	}
+	return newTaskProcessSnapshot(runtimeFence, taskFence, value.Guard.RuntimeContainerID,
+		value.Process.ContainerPID, value.Process.StartTimeTick,
+		processes, s.now())
+}
+
 func (s *Service) RenewTaskProcess(ctx context.Context, guard TaskProcessGuard) error {
 	if ctx == nil || ctx.Err() != nil || guard.validateNew(s.now()) != nil {
 		return errors.New("task process renewal identity or context is invalid")

@@ -25,10 +25,6 @@ func (s *Store) AcceptConversationMessage(ctx context.Context, receipt app.Conve
 		receipt.ClientID == "" || receipt.Authorization.Kind == "" || receipt.Authorization.Version < 1 {
 		return conversation.Message{}, false, domain.InvalidArgument("message", "conversation receipt fields are invalid")
 	}
-	metadata, err := json.Marshal(receipt.Input)
-	if err != nil {
-		return conversation.Message{}, false, fmt.Errorf("encode conversation routing input: %w", err)
-	}
 	authorization, err := json.Marshal(receipt.Authorization)
 	if err != nil {
 		return conversation.Message{}, false, fmt.Errorf("encode conversation authorization: %w", err)
@@ -36,13 +32,13 @@ func (s *Store) AcceptConversationMessage(ctx context.Context, receipt app.Conve
 	var result conversation.Message
 	var replayed bool
 	err = s.WithTx(ctx, func(tx pgx.Tx) error {
-		return s.acceptConversationMessageInTx(ctx, tx, receipt, metadata, authorization, &result, &replayed)
+		return s.acceptConversationMessageInTx(ctx, tx, receipt, nil, authorization, &result, &replayed)
 	})
 	return result, replayed, err
 }
 
 func (s *Store) acceptConversationMessageInTx(ctx context.Context, tx pgx.Tx, receipt app.ConversationMessageReceipt,
-	metadata, authorization []byte, result *conversation.Message, replayed *bool) error {
+	_ []byte, authorization []byte, result *conversation.Message, replayed *bool) error {
 	message := receipt.Message
 	if err := lockConversationReceiptScopeInTx(ctx, tx, receipt); err != nil {
 		return err
@@ -57,6 +53,13 @@ func (s *Store) acceptConversationMessageInTx(ctx context.Context, tx pgx.Tx, re
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return err
+	}
+	if err := captureConversationProjectWorkspaceSnapshot(ctx, tx, &receipt.Input, message.ActorID); err != nil {
+		return err
+	}
+	metadata, err := json.Marshal(receipt.Input)
+	if err != nil {
+		return fmt.Errorf("encode conversation routing input: %w", err)
 	}
 	message.ModelID = receipt.Input.ModelID
 	message.SourceKind = "conversation"
@@ -86,6 +89,77 @@ FROM service_identity WHERE singleton=true`, message.OwnerID, message.ActorID, m
 	}
 	*result, _, err = loadConversationReceipt(ctx, tx, message.ActorID, message.ConversationID, receipt.ClientID)
 	return err
+}
+
+// captureConversationProjectWorkspaceSnapshot records the project resource and
+// Workspace state under the same locks that serialize receipt acceptance. The
+// caller-provided owner and resource version are never trusted. Existing
+// revision/digest values are retained so an already stale internal snapshot
+// remains fail-closed when the route is applied; ordinary App submissions do
+// not provide these values and receive the current snapshot here.
+func captureConversationProjectWorkspaceSnapshot(ctx context.Context, tx pgx.Tx, input *app.ConversationRoutingInput, actorID string) error {
+	input.WorkspaceOwnerID = ""
+	input.WorkspaceProjectResourceVersion = nil
+	if input.ProjectID == "" {
+		return nil
+	}
+	if input.WorkspaceID == "" {
+		input.WorkspaceInputRevision = nil
+		input.WorkspaceContextDigest = nil
+		return nil
+	}
+
+	ownerID, resourceVersion, err := lockProjectTaskWorkspaceAccess(contextWithoutProjectWorkspacePermit(ctx), tx,
+		input.ProjectID, actorID, input.WorkspaceID, false)
+	if err != nil {
+		input.WorkspaceInputRevision = nil
+		input.WorkspaceContextDigest = nil
+		if domain.CodeOf(err) == domain.CodeInternal {
+			return err
+		}
+		// A regular conversation can still be received when the selected
+		// Workspace is unavailable. A later file-delivery route will reject
+		// the missing snapshot rather than treating the selection as access.
+		return nil
+	}
+
+	var currentOwnerID, state string
+	var revision int64
+	var deleted bool
+	err = tx.QueryRow(ctx, `SELECT owner_id,state,revision,deleted_at IS NOT NULL
+FROM workspaces WHERE id=$1 FOR SHARE`, input.WorkspaceID).Scan(&currentOwnerID, &state, &revision, &deleted)
+	if errors.Is(err, pgx.ErrNoRows) {
+		input.WorkspaceInputRevision = nil
+		input.WorkspaceContextDigest = nil
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("lock project Workspace for conversation receipt: %w", err)
+	}
+	if currentOwnerID != ownerID || state != "ready" || deleted {
+		input.WorkspaceInputRevision = nil
+		input.WorkspaceContextDigest = nil
+		return nil
+	}
+
+	input.WorkspaceOwnerID = ownerID
+	version := resourceVersion
+	input.WorkspaceProjectResourceVersion = &version
+	if input.WorkspaceInputRevision == nil && len(input.WorkspaceContextDigest) == 0 {
+		digest, err := conversationRouteWorkspaceManifestDigest(ctx, tx, input.WorkspaceID, revision)
+		if err != nil {
+			return fmt.Errorf("capture project Workspace manifest for conversation receipt: %w", err)
+		}
+		input.WorkspaceInputRevision = &revision
+		input.WorkspaceContextDigest = digest
+	}
+	return nil
+}
+
+// Conversation receipt and route acceptance must hold the current database
+// authorization locks; a Task-scoped execution permit is not applicable here.
+func contextWithoutProjectWorkspacePermit(ctx context.Context) context.Context {
+	return context.WithValue(ctx, workspaceMutationPermitKey{}, (*workspaceMutationPermit)(nil))
 }
 
 func lockConversationReceiptScopeInTx(ctx context.Context, tx pgx.Tx, receipt app.ConversationMessageReceipt) error {
@@ -142,8 +216,8 @@ func loadConversationReceipt(ctx context.Context, tx pgx.Tx, actorID, conversati
 	err := tx.QueryRow(ctx, `SELECT m.id,m.conversation_id,m.owner_id,m.actor_id,m.role,m.content,
 COALESCE(m.task_id,''),m.model_id,m.sequence,
 CASE WHEN r.duplicate_of_message_id IS NOT NULL THEN original_message.delivery_status ELSE m.delivery_status END,
-m.created_at,r.client_message_id,COALESCE(original_route.state,r.state),r.request_hash,r.service_instance_id::text,
-COALESCE(original_route.failure_reason,r.failure_reason),COALESCE(c.project_id,''),
+m.created_at,r.client_message_id,CASE WHEN COALESCE(original_route.state,r.state)='processing' AND COALESCE(original_route.cancel_requested_at,r.cancel_requested_at) IS NOT NULL THEN 'cancel_requested' ELSE COALESCE(original_route.state,r.state) END,r.request_hash,r.service_instance_id::text,
+COALESCE(original_route.failure_reason,r.failure_reason),COALESCE(c.project_id,''),COALESCE(r.request_metadata->>'response_mode','short'),
 COALESCE(r.agent_acknowledged,false),
 COALESCE(r.duplicate_of_message_id,''),COALESCE(original_message.task_id,'')
 FROM conversation_message_routes r
@@ -157,7 +231,7 @@ LEFT JOIN conversation_messages original_message ON original_message.id=original
 WHERE r.actor_id=$1 AND r.conversation_id=$2 AND r.client_message_id=$3`, actorID, conversationID, clientID).Scan(
 		&value.ID, &value.ConversationID, &value.OwnerID, &value.ActorID, &role, &value.Content, &value.TaskID,
 		&value.ModelID, &value.Sequence, &delivery, &value.CreatedAt, &value.ClientMessageID, &routing, &hash, &instanceID, &routingFailure, &projectID,
-		&value.AgentAcknowledged, &value.DuplicateOfMessageID, &value.RelatedTaskID)
+		&value.ResponseMode, &value.AgentAcknowledged, &value.DuplicateOfMessageID, &value.RelatedTaskID)
 	if err != nil {
 		return conversation.Message{}, nil, err
 	}
@@ -180,7 +254,7 @@ WHERE r.actor_id=$1 AND r.conversation_id=$2 AND r.client_message_id=$3`, actorI
 // and rechecks project membership in the same query as the lookup.
 func (s *Store) FindConversationMessageByClientID(ctx context.Context, actorID, projectID, conversationID, clientID, instanceID string) (conversation.Message, bool, error) {
 	var value conversation.Message
-	var role, delivery, routing, routingFailure string
+	var role, delivery, routing, routingFailure, responseMode string
 	var internalToolName, internalTaskStatus, internalStepStatus string
 	var internalDispatched, internalUnknown bool
 	var found bool
@@ -200,7 +274,7 @@ CASE WHEN r.duplicate_of_message_id IS NOT NULL THEN original_message.delivery_s
 m.created_at,r.client_message_id,COALESCE(r.duplicate_of_message_id,''),
 CASE WHEN EXISTS (SELECT 1 FROM conversation_route_internal_tool_calls hidden WHERE hidden.task_id=original_message.task_id)
  THEN '' ELSE COALESCE(original_message.task_id,'') END,
-COALESCE(original_route.state,r.state),COALESCE(original_route.failure_reason,r.failure_reason),
+CASE WHEN COALESCE(original_route.state,r.state)='processing' AND COALESCE(original_route.cancel_requested_at,r.cancel_requested_at) IS NOT NULL THEN 'cancel_requested' ELSE COALESCE(original_route.state,r.state) END,COALESCE(original_route.failure_reason,r.failure_reason),COALESCE(r.request_metadata->>'response_mode','short'),
 COALESCE(r.agent_acknowledged,false),
 CASE WHEN internal_task.id IS NOT NULL THEN internal_tool.tool_name ELSE '' END,
 COALESCE(internal_task.status,''),COALESCE(internal_step.status,''),
@@ -227,7 +301,7 @@ WHERE r.actor_id=$1 AND r.conversation_id=$3 AND r.client_message_id=$4 AND c.ar
        ($2<>'' AND c.project_id=$2 AND EXISTS (SELECT 1 FROM project_members pm WHERE pm.project_id=$2 AND pm.user_id=$1)))`,
 			actorID, projectID, conversationID, clientID).Scan(&value.ID, &value.ConversationID, &value.OwnerID,
 			&value.ActorID, &role, &value.Content, &value.TaskID, &value.ModelID, &value.Sequence, &delivery,
-			&value.CreatedAt, &value.ClientMessageID, &value.DuplicateOfMessageID, &value.RelatedTaskID, &routing, &routingFailure,
+			&value.CreatedAt, &value.ClientMessageID, &value.DuplicateOfMessageID, &value.RelatedTaskID, &routing, &routingFailure, &responseMode,
 			&value.AgentAcknowledged, &internalToolName, &internalTaskStatus, &internalStepStatus, &internalDispatched, &internalUnknown)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
@@ -256,6 +330,7 @@ WHERE r.actor_id=$1 AND r.conversation_id=$3 AND r.client_message_id=$4 AND c.ar
 	value.DeliveryStatus = conversation.DeliveryStatus(delivery)
 	value.RoutingStatus = conversation.RoutingStatus(routing)
 	value.RoutingFailureReason = conversation.RoutingFailureReason(routingFailure)
+	value.ResponseMode = responseMode
 	value.ToolActivity = conversationToolActivity(internalToolName, internalTaskStatus, internalStepStatus, internalDispatched, internalUnknown)
 	return value, found, nil
 }

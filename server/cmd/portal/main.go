@@ -24,6 +24,10 @@ import (
 	"github.com/pressly/goose/v3"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
@@ -34,6 +38,7 @@ import (
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/project"
 	"morde/server/internal/domain/workspace"
+	"morde/server/internal/dshguardian"
 	"morde/server/internal/gateway"
 	"morde/server/internal/httpserver"
 	"morde/server/internal/mcp"
@@ -44,12 +49,17 @@ import (
 	"morde/server/internal/storage/workspacecurrent"
 	"morde/server/internal/storage/workspacefs"
 	"morde/server/internal/store/postgres"
+	"morde/server/internal/tracing"
 	"morde/server/internal/worker"
 	"morde/server/migrations"
 )
 
 const defaultConfigPath = "/etc/cloudhost/portal.yaml"
 const legacyPCPortalEnabledEnv = "CH_PORTAL_LEGACY_PC_ENABLED"
+const taskModelRecoveryAutoEnv = "MORDE_TASK_MODEL_RECOVERY_AUTO"
+
+var _ api.TaskRequirementConfirmationService = (*app.TaskService)(nil)
+var _ api.TaskModelRecoveryRetryService = (*app.TaskService)(nil)
 
 func parseLegacyPCPortalEnabled(value string, set bool) (bool, error) {
 	if !set {
@@ -58,6 +68,17 @@ func parseLegacyPCPortalEnabled(value string, set bool) (bool, error) {
 	enabled, err := strconv.ParseBool(value)
 	if err != nil {
 		return false, fmt.Errorf("%s must be a boolean: %w", legacyPCPortalEnabledEnv, err)
+	}
+	return enabled, nil
+}
+
+func parseTaskModelRecoveryAuto(value string, set bool) (bool, error) {
+	if !set {
+		return false, nil
+	}
+	enabled, err := strconv.ParseBool(value)
+	if err != nil {
+		return false, fmt.Errorf("%s must be a boolean: %w", taskModelRecoveryAutoEnv, err)
 	}
 	return enabled, nil
 }
@@ -161,6 +182,10 @@ func serve(ctx context.Context, configPath string) error {
 	if err != nil {
 		return err
 	}
+	taskModelRecoveryAutoEnabled, err := parseTaskModelRecoveryAuto(os.LookupEnv(taskModelRecoveryAutoEnv))
+	if err != nil {
+		return err
+	}
 	if configuredRoot := os.Getenv("CH_WORKSPACE_SYNC_DATA_ROOT_DIR"); configuredRoot != "" && configuredRoot != cfg.WorkspaceSyncNode.DataRoot {
 		return fmt.Errorf("config.workspace_sync_node.data_root must match CH_WORKSPACE_SYNC_DATA_ROOT_DIR")
 	}
@@ -206,6 +231,45 @@ func serve(ctx context.Context, configPath string) error {
 	if err := postgres.CheckSchema(ctx, pool); err != nil {
 		return err
 	}
+	correlatedLogs, err := tracing.NewPostgresCorrelatedLogStore(pool, logger)
+	if err != nil {
+		return fmt.Errorf("initialize correlated observability log store: %w", err)
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := correlatedLogs.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("shutdown correlated observability log store failed", zap.Error(err))
+		}
+	}()
+	logger = logger.WithOptions(zap.WrapCore(func(core zapcore.Core) zapcore.Core {
+		return tracing.NewCorrelatedLogCore(core, correlatedLogs)
+	}))
+	spanExporter, err := tracing.NewPostgresSpanExporterWithLogger(pool, logger)
+	if err != nil {
+		return fmt.Errorf("initialize observability span exporter: %w", err)
+	}
+	tracerProvider := sdktrace.NewTracerProvider(
+		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+		sdktrace.WithBatcher(spanExporter,
+			sdktrace.WithMaxQueueSize(512),
+			sdktrace.WithMaxExportBatchSize(128),
+			sdktrace.WithBatchTimeout(time.Second),
+			sdktrace.WithExportTimeout(4*time.Second)),
+		sdktrace.WithResource(resource.NewSchemaless(attribute.String("service.name", "morde-portal"))),
+	)
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := tracerProvider.Shutdown(shutdownCtx); err != nil {
+			logger.Error("shutdown observability tracer provider failed", zap.Error(err))
+		}
+	}()
+	retentionStop, retentionDone := startObservabilityRetention(ctx, spanExporter, correlatedLogs, logger)
+	defer func() {
+		retentionStop()
+		<-retentionDone
+	}()
 	store := postgres.New(pool)
 	serviceInstanceID, err := store.ServiceInstanceID(ctx)
 	if err != nil {
@@ -356,6 +420,47 @@ func serve(ctx context.Context, configPath string) error {
 		return err
 	}
 	modelGateway.SetModelUsageObserver(modelUsageMetrics.observe)
+	if err := configureModelOutputBudgetStrategy(modelGateway, cfg.Models); err != nil {
+		return fmt.Errorf("configure model output budget strategy: %w", err)
+	}
+	if cfg.Models.OutputBudgetShadow.Enabled {
+		definition := modelOutputBudgetShadowStrategy(cfg.Models.OutputBudgetShadow)
+		if err := modelGateway.SetModelOutputBudgetShadow(definition, cfg.Models.OutputBudgetShadow.SampleRate); err != nil {
+			return fmt.Errorf("configure model output budget shadow: %w", err)
+		}
+		shadowMetrics, err := newModelBudgetShadowMetrics(registry)
+		if err != nil {
+			return err
+		}
+		modelGateway.SetModelOutputBudgetShadowObserver(func(value app.ModelOutputBudgetShadowObservation) {
+			shadowMetrics.observe(value)
+			span := trace.SpanFromContext(value.Context)
+			if !span.IsRecording() {
+				return
+			}
+			attributes := []attribute.KeyValue{attribute.String("morde.budget.stage", value.Stage)}
+			if value.Phase == "plan" {
+				attributes = append(attributes,
+					attribute.String("morde.budget.route_fingerprint", value.RouteFingerprint),
+					attribute.String("morde.budget.strategy_version", value.StrategyVersion),
+					attribute.String("morde.budget.outcome", value.Outcome),
+					attribute.String("morde.budget.block_reason", value.BlockReason),
+					attribute.StringSlice("morde.budget.limiting_dimensions", value.LimitingDimensions),
+					attribute.Int64("morde.budget.goal_tokens", value.GoalTokens),
+					attribute.Int64("morde.budget.minimum_tokens", value.MinimumTokens),
+					attribute.Int64("morde.budget.safe_tokens", value.SafeTokens),
+					attribute.Int64("morde.budget.send_tokens", value.SendTokens),
+					attribute.Int64("morde.budget.current_output_cap", value.CurrentOutputCap))
+			} else {
+				attributes = append(attributes,
+					attribute.Bool("morde.budget.usage_known", value.UsageKnown),
+					attribute.Int64("morde.budget.actual_output_tokens", value.ActualOutputTokens),
+					attribute.String("morde.budget.stop_reason", value.StopReason),
+					attribute.String("morde.budget.failure_class", value.FailureClass))
+			}
+			span.AddEvent("model_budget_shadow_"+value.Phase, trace.WithTimestamp(value.CapturedAt), trace.WithAttributes(attributes...))
+		})
+	}
 	modelGateway.SetGPT6LunaMaxReasoning(cfg.Models.GPT6LunaMaxReasoning)
 	if err := modelGateway.SetModelResponseSealer(sealer); err != nil {
 		return fmt.Errorf("initialize model response encryption: %w", err)
@@ -723,7 +828,9 @@ func serve(ctx context.Context, configPath string) error {
 	var taskWorker *worker.TaskWorker
 	var routeWorker *worker.ConversationRouteWorker
 	var taskValidationReviewWorker *worker.TaskValidationReviewWorker
+	var taskTerminalDeliveryWorker *worker.TaskTerminalDeliveryWorker
 	var taskAgentStopReconciler worker.TaskAgentStopReconciler
+	var checkpoints *app.AgentCheckpointService
 	if cfg.CloudDSH.Enabled {
 		executionControlService, err = app.NewExecutionControlService(store, countedAudit)
 		if err != nil {
@@ -732,12 +839,14 @@ func serve(ctx context.Context, configPath string) error {
 		cloudDSHWorkers, workerErr := newCloudDSHTaskWorker(cfg.CloudDSH, store, credentials, runtimeControl, workspaceSync, resolveAgentWorkspacePath,
 			modelGateway, sealer, mcpConnectors, recordCapture, personalDataService, personalSyncService,
 			personalAttachmentService, goalService, schedules, projects,
-			hubService, workerSuffix, serviceInstanceID, dataKey, logger, registry)
+			hubService, workerSuffix, serviceInstanceID, dataKey, tracerProvider, taskModelRecoveryAutoEnabled,
+			cfg.Models.OutputBudgetAdmissionEnabled, logger, registry)
 		if workerErr != nil {
 			return fmt.Errorf("initialize cloud dsh task worker: %w", workerErr)
 		}
 		taskWorker = cloudDSHWorkers.taskWorker
 		taskAgentStopReconciler = cloudDSHWorkers.accountRuntimes
+		checkpoints = cloudDSHWorkers.checkpoints
 		coordinatorCheckpoints, err := app.NewConversationCoordinatorCheckpointService(store, sealer)
 		if err != nil {
 			return err
@@ -757,13 +866,25 @@ func serve(ctx context.Context, configPath string) error {
 		if err != nil {
 			return fmt.Errorf("initialize conversation routing worker: %w", err)
 		}
+		validationWorkspaceReader, err := app.NewRuntimeTaskValidationFinalWorkspaceSnapshotReader(runtimeControl)
+		if err != nil {
+			return fmt.Errorf("initialize Task validation Workspace snapshot reader: %w", err)
+		}
 		taskValidationReviewWorker, err = worker.NewTaskValidationReviewWorker(worker.TaskValidationReviewWorkerOptions{
-			Queue: store, Snapshots: tasks, AccountRuntime: cloudDSHWorkers.accountRuntimes, Models: modelGateway,
+			Queue: store, Snapshots: tasks, FinalWorkspaceSnapshots: validationWorkspaceReader,
+			AccountRuntime: cloudDSHWorkers.accountRuntimes, Models: modelGateway,
 			WorkerID: workerSuffix + "-review", LeaseDuration: 5 * time.Minute, PollInterval: 500 * time.Millisecond,
 			MaxConcurrent: cfg.CloudDSH.MaxConcurrentRoutes, Logger: logger,
 		})
 		if err != nil {
 			return fmt.Errorf("initialize Task validation review worker: %w", err)
+		}
+		taskTerminalDeliveryWorker, err = worker.NewTaskTerminalDeliveryWorker(worker.TaskTerminalDeliveryWorkerOptions{
+			Store: store, Models: modelGateway, ReplySealer: sealer, WorkerID: workerSuffix + "-terminal-delivery",
+			LeaseDuration: 30 * time.Second, PollInterval: 500 * time.Millisecond, Logger: logger,
+		})
+		if err != nil {
+			return fmt.Errorf("initialize Task terminal delivery worker: %w", err)
 		}
 	}
 	mcpRuntimeTools, err := app.NewMCPRuntimeToolExecutor(store, mcpHosts, credentials, store, runtimeControl)
@@ -796,7 +917,7 @@ func serve(ctx context.Context, configPath string) error {
 		Hosts: hosts, HostSharing: hostSharing, HostEmbedTickets: embedTicketExchanger, ServiceInstanceID: serviceInstanceID,
 		WorkspaceFiles: workspaceSync, TaskObservation: tasks, Control: controlService, Runtime: runtime, ActivityLeases: store, InputPermits: store,
 		TerminalSessions: store, TerminalAIO: aioClient, Auth: credentials, Audit: auditService,
-		Logger: logger, Metrics: registry,
+		Logger: logger, Metrics: registry, TracerProvider: tracerProvider,
 	})
 	if err != nil {
 		return err
@@ -811,7 +932,7 @@ func serve(ctx context.Context, configPath string) error {
 		Tokens: tokenAdapter{service: tokens}, ClientLogin: clientLogin,
 		Notifications: notificationService,
 		Control:       controlService, ExecutionControl: executionControlService, Tasks: executionAdapters.tasks, TaskArtifactContent: tasks, TaskFileFetch: tasks,
-		TaskObservationTickets: tasks, Conversations: conversations, Codex: codexService,
+		TaskObservationTickets: tasks, TaskPCDeliveryObservations: tasks, Conversations: conversations, Codex: codexService,
 		ProjectConversations:           projectConversations,
 		ProjectConversationAttachments: projectConversationAttachments,
 		ProjectWorkItems:               projectWorkItems,
@@ -824,12 +945,16 @@ func serve(ctx context.Context, configPath string) error {
 		Projects:               projects, ProjectContent: projects,
 		ModelConnections: modelConnections, MCPConnectors: mcpConnectors, ModelGateway: modelGateway, ModelUsageAdmin: modelUsageAdmin,
 		BlindEvaluations: blindEvaluations,
+		WorkflowTraces:   store,
 		Hub:              hubService, Devices: deviceService, PersonalData: personalDataService, PersonalSync: personalSyncService,
 		Goals: goalService, Schedules: executionAdapters.schedules,
 		PersonalDataQuota: personalDataQuotaService, PersonalDataQuotaUser: personalDataQuotaUserService,
 		PersonalAttachments: personalAttachmentService, PersonalHistoryImport: personalHistoryImportService,
 		Onboarding: onboardingService, Admin: admin, AdminConsole: adminConsole, AdminQualityActivity: adminQualityActivity, AdminControls: adminControls,
-		AdminOperations:          adminOperations,
+		AdminOperations: adminOperations,
+		Observability: api.AdminObservabilityDeps{Reader: store, LinkWriter: store,
+			Logs: store, LogHealth: portalCorrelatedLogHealth{store: correlatedLogs},
+			ExportHealth: portalSpanExportHealth{exporter: spanExporter}, AgentCheckpoints: checkpoints},
 		AdminModelBudgetDefaults: adminModelBudgetDefaults,
 		AdminModelDefaults:       adminModelDefaults,
 		RecordConsents:           recordConsents, RecordAccess: recordAccess, RecordCaptureStatus: recordCapture,
@@ -838,7 +963,7 @@ func serve(ctx context.Context, configPath string) error {
 		Readiness:  readiness{pool: pool, clients: router, profiles: cfg.Orchestrator.Profiles, instance: cfg.Instance}, MCP: mcpHandler,
 		MCPDisabled: !cfg.MCP.Enabled,
 	}, api.Options{
-		Logger: logger, Metrics: registry, ServiceInstanceID: serviceInstanceID, APIMaxBodyBytes: cfg.HTTP.APIMaxBodyBytes,
+		Logger: logger, Metrics: registry, TracerProvider: tracerProvider, ServiceInstanceID: serviceInstanceID, APIMaxBodyBytes: cfg.HTTP.APIMaxBodyBytes,
 		MCPMaxBodyBytes: cfg.HTTP.MCPMaxBodyBytes, CookieSecure: cfg.Domains.CookieSecure,
 		SessionTTL: cfg.Security.SessionTTL,
 		HostScheme: cfg.Domains.Scheme, PortalDomain: cfg.Domains.Portal, HostSuffix: cfg.Domains.HostSuffix,
@@ -858,7 +983,8 @@ func serve(ctx context.Context, configPath string) error {
 	}
 	background, err := worker.New(worker.Options{
 		Application: workerApplicationAdapter{WorkerApp: workerApp, workspaceBlockGC: workspaceBlockGC,
-			workspaceSyncNodeProvisioner: workspaceSyncNodeProvisioner, hostUsage: hostUsageService, logger: logger}, CreateQueue: queue, Interval: cfg.Reconciler.Interval,
+			workspaceSyncNodeProvisioner: workspaceSyncNodeProvisioner, modelBudgetCapacityWaits: store,
+			hostUsage: hostUsageService, logger: logger}, CreateQueue: queue, Interval: cfg.Reconciler.Interval,
 		ActivityFlushInterval: cfg.Reconciler.ActivityFlushInterval, HostUsageInterval: worker.HostUsageSampleInterval,
 		Logger: logger, Registerer: registry,
 	})
@@ -901,12 +1027,12 @@ func serve(ctx context.Context, configPath string) error {
 	logger.Info("portal starting", zap.String("instance", cfg.Instance), zap.Int64("migration_version", migrationVersion), zap.String("api", cfg.Listen.API), zap.String("gateway", cfg.Listen.Gateway), zap.String("metrics", cfg.Listen.Metrics))
 	personalCleanupCtx, stopPersonalCleanup := context.WithCancel(ctx)
 	defer stopPersonalCleanup()
-	go runPersonalDataCleanup(personalCleanupCtx, personalAttachmentService, personalDataQuotaService, tasks, logger)
+	go runPersonalDataCleanup(personalCleanupCtx, personalAttachmentService, personalDataQuotaService, tasks, store, logger)
 	fileFetchCleanupCtx, stopFileFetchCleanup := context.WithCancel(ctx)
 	defer stopFileFetchCleanup()
 	go runTaskFileFetchCleanup(fileFetchCleanupCtx, tasks, logger)
 	return runServers(ctx, logger, cfg.HTTP.ShutdownTimeout, background, taskStopWorker, notificationWorker, taskWorker, routeWorker,
-		taskValidationReviewWorker, resultWorker, recordWorker, scheduleWorker, goalAgentTriggerWorker, runtime,
+		taskValidationReviewWorker, taskTerminalDeliveryWorker, resultWorker, recordWorker, scheduleWorker, goalAgentTriggerWorker, runtime,
 		gatewayHandler, apiServer, gatewayServer, metricsServer)
 }
 
@@ -934,8 +1060,20 @@ func runTaskFileFetchCleanup(ctx context.Context, tasks *app.TaskService, logger
 	}
 }
 
+type expiredTaskModelBudgetPreparationCleaner interface {
+	CleanupExpiredTaskModelBudgetPreparations(context.Context, int32) (int32, error)
+}
+
+func cleanupExpiredTaskModelBudgetPreparations(ctx context.Context, cleaner expiredTaskModelBudgetPreparationCleaner,
+	limit int32) (int32, error) {
+	if cleaner == nil {
+		return 0, nil
+	}
+	return cleaner.CleanupExpiredTaskModelBudgetPreparations(ctx, limit)
+}
+
 func runPersonalDataCleanup(ctx context.Context, attachments *app.PersonalAttachmentService, quota *app.PersonalDataQuotaService,
-	tasks *app.TaskService, logger *zap.Logger) {
+	tasks *app.TaskService, budgetPreparations expiredTaskModelBudgetPreparationCleaner, logger *zap.Logger) {
 	const (
 		batchLimit int32 = 1000
 		interval         = time.Minute
@@ -957,6 +1095,11 @@ func runPersonalDataCleanup(ctx context.Context, attachments *app.PersonalAttach
 		if _, err := tasks.CleanupExpiredConversationMessageUploads(cleanupCtx, time.Now().UTC(), batchLimit); err != nil && logger != nil {
 			logger.Warn("expired conversation message upload cleanup failed", zap.Error(err))
 		}
+		if count, err := cleanupExpiredTaskModelBudgetPreparations(cleanupCtx, budgetPreparations, batchLimit); err != nil && logger != nil {
+			logger.Warn("expired adaptive model budget cleanup failed", zap.Error(err))
+		} else if count > 0 && logger != nil {
+			logger.Info("expired adaptive model budget cleanup completed", zap.Int32("records", count))
+		}
 		cancel()
 		select {
 		case <-ctx.Done():
@@ -969,6 +1112,7 @@ func runPersonalDataCleanup(ctx context.Context, attachments *app.PersonalAttach
 type cloudDSHTaskWorkerBundle struct {
 	taskWorker      *worker.TaskWorker
 	accountRuntimes *worker.CloudDSHAccountRuntimeManager
+	checkpoints     *app.AgentCheckpointService
 }
 
 func newCloudDSHTaskWorker(cfg config.CloudDSH, store *postgres.Store, authorizer app.TaskAuthorizer,
@@ -977,7 +1121,9 @@ func newCloudDSHTaskWorker(cfg config.CloudDSH, store *postgres.Store, authorize
 	sealer *app.Sealer, mcpConnectors *app.MCPConnectorService, recordCapture *app.RecordCaptureService,
 	personalData *app.PersonalMutationService, personalSync *app.PersonalSyncService,
 	personalFiles *app.PersonalAttachmentService, goals *app.GoalService, schedules *app.ScheduleService, projects *app.ProjectService, hubService *app.HubService,
-	workerID, serviceInstanceID string, historyCursorKey []byte, logger *zap.Logger, metrics prometheus.Registerer) (*cloudDSHTaskWorkerBundle, error) {
+	workerID, serviceInstanceID string, historyCursorKey []byte, tracerProvider *sdktrace.TracerProvider,
+	taskModelRecoveryAutoEnabled bool, modelBudgetAdmissionEnabled bool, logger *zap.Logger,
+	metrics prometheus.Registerer) (*cloudDSHTaskWorkerBundle, error) {
 	supervisorKey, err := readProtectedKey(cfg.SupervisorKeyFile)
 	if err != nil {
 		return nil, fmt.Errorf("read cloud_dsh.supervisor_key_file: %w", err)
@@ -1024,6 +1170,12 @@ func newCloudDSHTaskWorker(cfg config.CloudDSH, store *postgres.Store, authorize
 	if err != nil {
 		return nil, err
 	}
+	if err := tools.SetTaskModelRecoveryAutoEnabled(taskModelRecoveryAutoEnabled); err != nil {
+		return nil, err
+	}
+	if err := tools.SetAgentMessageSourceReader(checkpoints); err != nil {
+		return nil, err
+	}
 	if err := tools.SetTaskStepDetailSealer(sealer); err != nil {
 		return nil, err
 	}
@@ -1046,6 +1198,9 @@ func newCloudDSHTaskWorker(cfg config.CloudDSH, store *postgres.Store, authorize
 	guardian, err := worker.NewUnixSocketDockerCloudDSHGuardian(cfg.GuardianSocket)
 	if err != nil {
 		return nil, err
+	}
+	if snapshotReader, ok := guardian.(dshguardian.TaskProcessSnapshotReader); ok {
+		store.SetWorkflowTraceTaskProcessSnapshotReader(snapshotReader)
 	}
 	supervisor, err := worker.NewDockerCloudDSHSupervisor(worker.DockerCloudDSHSupervisorOptions{
 		DockerHost: cfg.DockerHost, Image: cfg.Image, NodePath: cfg.NodePath, ScriptPath: cfg.ScriptPath,
@@ -1070,9 +1225,15 @@ func newCloudDSHTaskWorker(cfg config.CloudDSH, store *postgres.Store, authorize
 	if err != nil {
 		return nil, err
 	}
+	modelBudgetPlanner, err := cloudDSHModelBudgetPlannerFor(modelBudgetAdmissionEnabled, models)
+	if err != nil {
+		return nil, fmt.Errorf("configure cloud DSH model budget planner: %w", err)
+	}
 	executor, err := worker.NewCloudDSHExecutor(worker.CloudDSHExecutorOptions{
-		SupervisorID: cfg.SupervisorID, Logger: logger, SummarySealer: sealer, AccountRuntimes: accountRuntimes,
-		Instances: instances, Checkpoints: checkpoints, Models: models, Tools: tools, AgentActivity: store,
+		SupervisorID: cfg.SupervisorID, Logger: logger, TracerProvider: tracerProvider,
+		ObservabilityContext: store, AttemptTraceLinker: store, SummarySealer: sealer, AccountRuntimes: accountRuntimes,
+		Instances: instances, Checkpoints: checkpoints, Models: models, ModelBudgetPlanner: modelBudgetPlanner,
+		Tools: tools, AgentActivity: store,
 		Children: childSessions, Completion: tools, RevisionStops: store, TextStreams: store, ProjectContexts: store,
 	})
 	if err != nil {
@@ -1091,7 +1252,14 @@ func newCloudDSHTaskWorker(cfg config.CloudDSH, store *postgres.Store, authorize
 	if err != nil {
 		return nil, err
 	}
-	return &cloudDSHTaskWorkerBundle{taskWorker: taskWorker, accountRuntimes: accountRuntimes}, nil
+	return &cloudDSHTaskWorkerBundle{taskWorker: taskWorker, accountRuntimes: accountRuntimes, checkpoints: checkpoints}, nil
+}
+
+func cloudDSHModelBudgetPlannerFor(enabled bool, service worker.CloudDSHModelBudgetPreparationService) (worker.CloudDSHModelBudgetPlanner, error) {
+	if !enabled {
+		return nil, nil
+	}
+	return worker.NewCloudDSHModelBudgetPlanner(service)
 }
 
 func migrate(ctx context.Context, configPath, action string, stdout io.Writer) error {
@@ -1375,6 +1543,81 @@ func newLogger(cfg config.Log) (*zap.Logger, error) {
 	return options.Build()
 }
 
+func startObservabilityRetention(parent context.Context, exporter *tracing.PostgresSpanExporter,
+	logs *tracing.PostgresCorrelatedLogStore, logger *zap.Logger) (context.CancelFunc, <-chan struct{}) {
+	ctx, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		purge := func() {
+			for batch := 0; batch < 10; batch++ {
+				cutoff := time.Now().UTC().Add(-7 * 24 * time.Hour)
+				deleted, err := exporter.PurgeExpiredSpans(ctx, cutoff, 1000)
+				if err != nil {
+					if ctx.Err() == nil {
+						logger.Warn("purge observability spans failed", zap.Error(err))
+					}
+					break
+				}
+				if deleted < 1000 {
+					break
+				}
+			}
+			for batch := 0; batch < 10; batch++ {
+				cutoff := time.Now().UTC().Add(-7 * 24 * time.Hour)
+				deleted, err := logs.PurgeExpired(ctx, cutoff, 1000)
+				if err != nil {
+					if ctx.Err() == nil {
+						logger.Warn("purge correlated observability logs failed", zap.Error(err))
+					}
+					break
+				}
+				if deleted < 1000 {
+					break
+				}
+			}
+		}
+		purge()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				purge()
+			}
+		}
+	}()
+	return cancel, done
+}
+
+type portalSpanExportHealth struct {
+	exporter *tracing.PostgresSpanExporter
+}
+
+type portalCorrelatedLogHealth struct {
+	store *tracing.PostgresCorrelatedLogStore
+}
+
+func (h portalCorrelatedLogHealth) Health() app.AdminObservabilityLogHealth {
+	if h.store == nil {
+		return app.AdminObservabilityLogHealth{Status: "unavailable", ReasonCode: "log_store_unavailable"}
+	}
+	value := h.store.Health()
+	return app.AdminObservabilityLogHealth{Status: value.Status, DroppedRecords: value.DroppedRecords,
+		FailedBatches: value.FailedBatches, ReasonCode: value.ReasonCode, LastSuccessAt: value.LastSuccessAt}
+}
+
+func (h portalSpanExportHealth) Health() app.AdminObservabilityExportHealth {
+	if h.exporter == nil {
+		return app.AdminObservabilityExportHealth{Status: "unavailable", ReasonCode: "exporter_unconfigured"}
+	}
+	value := h.exporter.Health()
+	return app.AdminObservabilityExportHealth{Status: value.Status, ReasonCode: value.ReasonCode,
+		FailedBatches: value.FailedBatches, LastSuccessAt: value.LastSuccessAt}
+}
+
 func readKey(path string) ([]byte, error) {
 	key, err := os.ReadFile(path)
 	if err != nil {
@@ -1488,6 +1731,111 @@ func newModelUsageMetrics(registerer prometheus.Registerer) (*modelUsageMetrics,
 	return result, nil
 }
 
+func modelOutputBudgetShadowStrategy(value config.OutputBudgetShadow) app.ModelOutputBudgetStrategyDefinition {
+	definition := app.ModelOutputBudgetStrategyDefinition{Version: value.StrategyVersion, Models: make([]app.ModelOutputBudgetModelDefinition, 0, len(value.Routes))}
+	for _, route := range value.Routes {
+		model := app.ModelOutputBudgetModelDefinition{BaseURL: route.BaseURL, Model: route.Model,
+			Stages: make([]app.ModelOutputBudgetStageDefinition, 0, len(route.Stages))}
+		for _, stage := range route.Stages {
+			model.Stages = append(model.Stages, app.ModelOutputBudgetStageDefinition{
+				Stage: stage.Stage, GoalTokens: stage.GoalTokens, MinimumTokens: stage.MinimumTokens,
+			})
+		}
+		definition.Models = append(definition.Models, model)
+	}
+	return definition
+}
+
+type modelOutputBudgetStrategyInstaller interface {
+	SetModelOutputBudgetStrategy(app.ModelOutputBudgetStrategyDefinition) error
+}
+
+// configureModelOutputBudgetStrategy loads a reviewed route strategy when it
+// is present. Merely loading the immutable strategy does not enable DSH Task
+// admission or shadow sampling; those remain controlled by their own flags.
+func configureModelOutputBudgetStrategy(installer modelOutputBudgetStrategyInstaller, models config.Models) error {
+	if !models.OutputBudgetAdmissionEnabled && len(models.OutputBudgetShadow.Routes) == 0 {
+		return nil
+	}
+	if installer == nil {
+		return errors.New("model output budget strategy installer is unavailable")
+	}
+	return installer.SetModelOutputBudgetStrategy(modelOutputBudgetShadowStrategy(models.OutputBudgetShadow))
+}
+
+type modelBudgetShadowMetrics struct {
+	observations *prometheus.CounterVec
+	failures     *prometheus.CounterVec
+	tokens       *prometheus.HistogramVec
+}
+
+func newModelBudgetShadowMetrics(registerer prometheus.Registerer) (*modelBudgetShadowMetrics, error) {
+	result := &modelBudgetShadowMetrics{
+		observations: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "cloudhost_model_budget_shadow_observations_total",
+			Help: "Sampled model output budget shadow planning and result observations.",
+		}, []string{"phase", "stage", "outcome", "reason"}),
+		failures: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "cloudhost_model_budget_shadow_failures_total",
+			Help: "Sampled model call failures associated with shadow output budget plans.",
+		}, []string{"stage", "failure_class"}),
+		tokens: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "cloudhost_model_budget_shadow_output_tokens",
+			Help: "Output token limits and usage observed by the model budget shadow path.",
+			Buckets: []float64{0, 512, 1024, 2048, 4096, 8192, 16_384, 25_000, 32_768, 65_536,
+				128_000, 256_000, 393_216, 524_288, 1_000_000, 2_000_000},
+		}, []string{"stage", "field"}),
+	}
+	for _, collector := range []prometheus.Collector{result.observations, result.failures, result.tokens} {
+		if err := registerer.Register(collector); err != nil {
+			return nil, fmt.Errorf("register model budget shadow metric: %w", err)
+		}
+	}
+	return result, nil
+}
+
+func (m *modelBudgetShadowMetrics) observe(value app.ModelOutputBudgetShadowObservation) {
+	if m == nil {
+		return
+	}
+	phase := allowedModelBudgetShadowValue(value.Phase, "plan", "result")
+	stage := allowedModelBudgetShadowValue(value.Stage, "short_answer", "tool_step", "subtask", "summary", "long_form", "text_continuation", "stage_unknown")
+	outcome := allowedModelBudgetShadowValue(value.Outcome, "calculated", "blocked")
+	reason := allowedModelBudgetShadowValue(value.BlockReason, "", "none", "stage_unknown", "strategy_unavailable", "reasoning_minimum_exceeds_goal",
+		"model_capability_unknown", "context_input_bound_unknown", "token_budget_unknown", "budget_limit_unknown", "below_stage_minimum",
+		"budget_snapshot_unavailable", "budget_snapshot_partial", "project_rate_unknown", "calculation_invalid")
+	if reason == "" {
+		reason = "none"
+	}
+	m.observations.WithLabelValues(phase, stage, outcome, reason).Inc()
+	if phase == "plan" {
+		for name, tokens := range map[string]int64{"current_cap": value.CurrentOutputCap, "goal": value.GoalTokens,
+			"minimum": value.MinimumTokens, "safe": value.SafeTokens, "send": value.SendTokens} {
+			if tokens >= 0 {
+				m.tokens.WithLabelValues(stage, name).Observe(float64(tokens))
+			}
+		}
+	} else {
+		failure := allowedModelBudgetShadowValue(value.FailureClass, "none", "access_rejected", "quota_exhausted", "invalid_request", "rate_limited", "content_filtered",
+			"unavailable", "timeout", "transport", "invalid_response", "empty_response", "truncated", "cancelled", "provider_error")
+		if failure != "none" {
+			m.failures.WithLabelValues(stage, failure).Inc()
+		}
+		if value.UsageKnown && value.ActualOutputTokens >= 0 {
+			m.tokens.WithLabelValues(stage, "actual").Observe(float64(value.ActualOutputTokens))
+		}
+	}
+}
+
+func allowedModelBudgetShadowValue(value string, allowed ...string) string {
+	for _, candidate := range allowed {
+		if value == candidate {
+			return candidate
+		}
+	}
+	return "unknown"
+}
+
 func (m *modelUsageMetrics) observe(value app.ModelUsageObservation) {
 	source := ""
 	switch value.Source {
@@ -1535,7 +1883,7 @@ func registerHistogram(reg prometheus.Registerer, opts prometheus.HistogramOpts,
 	return collector, nil
 }
 
-func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Duration, background *worker.Worker, taskStopWorker *worker.TaskStopWorker, notificationWorker *worker.NotificationWorker, taskWorker *worker.TaskWorker, routeWorker *worker.ConversationRouteWorker, taskValidationReviewWorker *worker.TaskValidationReviewWorker, resultWorker *worker.ConversationResultReviewWorker, recordWorker *worker.RecordCaptureWorker, scheduleWorker *worker.ScheduleWorker, goalAgentTriggerWorker *worker.GoalAgentTriggerWorker, runtime *app.Runtime, gatewayHandler http.Handler, servers ...*http.Server) error {
+func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Duration, background *worker.Worker, taskStopWorker *worker.TaskStopWorker, notificationWorker *worker.NotificationWorker, taskWorker *worker.TaskWorker, routeWorker *worker.ConversationRouteWorker, taskValidationReviewWorker *worker.TaskValidationReviewWorker, taskTerminalDeliveryWorker *worker.TaskTerminalDeliveryWorker, resultWorker *worker.ConversationResultReviewWorker, recordWorker *worker.RecordCaptureWorker, scheduleWorker *worker.ScheduleWorker, goalAgentTriggerWorker *worker.GoalAgentTriggerWorker, runtime *app.Runtime, gatewayHandler http.Handler, servers ...*http.Server) error {
 	listeners := make([]net.Listener, 0, len(servers))
 	for _, server := range servers {
 		listener, err := net.Listen("tcp", server.Addr)
@@ -1595,6 +1943,14 @@ func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Du
 		taskValidationReviewWorkerDone = make(chan error, 1)
 		go func() { taskValidationReviewWorkerDone <- taskValidationReviewWorker.Run(reviewWorkerCtx) }()
 	}
+	var taskTerminalDeliveryWorkerDone chan error
+	var cancelTaskTerminalDeliveryWorker context.CancelFunc
+	if taskTerminalDeliveryWorker != nil {
+		deliveryWorkerCtx, cancel := context.WithCancel(context.Background())
+		cancelTaskTerminalDeliveryWorker = cancel
+		taskTerminalDeliveryWorkerDone = make(chan error, 1)
+		go func() { taskTerminalDeliveryWorkerDone <- taskTerminalDeliveryWorker.Run(deliveryWorkerCtx) }()
+	}
 	serverErrors := make(chan error, len(servers))
 	var serverWG sync.WaitGroup
 	for index, server := range servers {
@@ -1613,6 +1969,7 @@ func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Du
 	taskWorkerExited := false
 	routeWorkerExited := false
 	taskValidationReviewWorkerExited := false
+	taskTerminalDeliveryWorkerExited := false
 	resultWorkerExited := false
 	select {
 	case <-ctx.Done():
@@ -1634,9 +1991,16 @@ func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Du
 	case err := <-taskValidationReviewWorkerDone:
 		taskValidationReviewWorkerExited = true
 		if err == nil {
-			runErr = errors.New("Task validation review worker stopped unexpectedly")
+			runErr = errors.New("task validation review worker stopped unexpectedly")
 		} else {
-			runErr = fmt.Errorf("Task validation review worker stopped unexpectedly: %w", err)
+			runErr = fmt.Errorf("task validation review worker stopped unexpectedly: %w", err)
+		}
+	case err := <-taskTerminalDeliveryWorkerDone:
+		taskTerminalDeliveryWorkerExited = true
+		if err == nil {
+			runErr = errors.New("task terminal delivery worker stopped unexpectedly")
+		} else {
+			runErr = fmt.Errorf("task terminal delivery worker stopped unexpectedly: %w", err)
 		}
 	case err := <-resultWorkerDone:
 		resultWorkerExited = true
@@ -1697,7 +2061,22 @@ func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Du
 				}
 			case <-shutdownCtx.Done():
 				if runErr == nil {
-					runErr = errors.New("Task validation review worker did not stop before shutdown timeout")
+					runErr = errors.New("task validation review worker did not stop before shutdown timeout")
+				}
+			}
+		}
+	}
+	if cancelTaskTerminalDeliveryWorker != nil {
+		cancelTaskTerminalDeliveryWorker()
+		if !taskTerminalDeliveryWorkerExited {
+			select {
+			case err := <-taskTerminalDeliveryWorkerDone:
+				if err != nil && !errors.Is(err, context.Canceled) && runErr == nil {
+					runErr = fmt.Errorf("stop Task terminal delivery worker: %w", err)
+				}
+			case <-shutdownCtx.Done():
+				if runErr == nil {
+					runErr = errors.New("task terminal delivery worker did not stop before shutdown timeout")
 				}
 			}
 		}

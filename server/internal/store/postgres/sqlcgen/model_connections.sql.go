@@ -15,14 +15,18 @@ const createModelConnection = `-- name: CreateModelConnection :one
 INSERT INTO model_connections (
   id, owner_id, name, base_url, model_name, context_window_tokens, context_window_override_tokens,
   context_window_source, context_window_resolved_at, context_window_catalog_version, api_key_cipher,
+  max_output_tokens, max_output_override_tokens, max_output_source, max_output_resolved_at,
+  max_output_catalog_version, max_output_source_url,
   capability_text, capability_tools, capability_vision, checked_at
 ) VALUES (
   $1, $2, $3, $4, $5, $6,
   $7, $8, $9,
   $10, $11,
+  $12, $13, $14,
+  $15, $16, $17,
   false, false, false, NULL
 )
-RETURNING id, owner_id, name, base_url, model_name, api_key_cipher, capability_text, capability_tools, capability_vision, checked_at, created_at, updated_at, capability_media_image_generation, capability_media_video_generation, capability_media_speech_generation, context_window_tokens, context_window_override_tokens, context_window_source, context_window_resolved_at, context_window_catalog_version
+RETURNING id, owner_id, name, base_url, model_name, api_key_cipher, capability_text, capability_tools, capability_vision, checked_at, created_at, updated_at, capability_media_image_generation, capability_media_video_generation, capability_media_speech_generation, context_window_tokens, context_window_override_tokens, context_window_source, context_window_resolved_at, context_window_catalog_version, max_output_tokens, max_output_override_tokens, max_output_source, max_output_resolved_at, max_output_catalog_version, max_output_source_url
 `
 
 type CreateModelConnectionParams struct {
@@ -37,6 +41,12 @@ type CreateModelConnectionParams struct {
 	ContextWindowResolvedAt     pgtype.Timestamptz `json:"context_window_resolved_at"`
 	ContextWindowCatalogVersion pgtype.Text        `json:"context_window_catalog_version"`
 	ApiKeyCipher                []byte             `json:"api_key_cipher"`
+	MaxOutputTokens             pgtype.Int4        `json:"max_output_tokens"`
+	MaxOutputOverrideTokens     pgtype.Int4        `json:"max_output_override_tokens"`
+	MaxOutputSource             string             `json:"max_output_source"`
+	MaxOutputResolvedAt         pgtype.Timestamptz `json:"max_output_resolved_at"`
+	MaxOutputCatalogVersion     pgtype.Text        `json:"max_output_catalog_version"`
+	MaxOutputSourceUrl          pgtype.Text        `json:"max_output_source_url"`
 }
 
 func (q *Queries) CreateModelConnection(ctx context.Context, arg CreateModelConnectionParams) (ModelConnection, error) {
@@ -52,6 +62,12 @@ func (q *Queries) CreateModelConnection(ctx context.Context, arg CreateModelConn
 		arg.ContextWindowResolvedAt,
 		arg.ContextWindowCatalogVersion,
 		arg.ApiKeyCipher,
+		arg.MaxOutputTokens,
+		arg.MaxOutputOverrideTokens,
+		arg.MaxOutputSource,
+		arg.MaxOutputResolvedAt,
+		arg.MaxOutputCatalogVersion,
+		arg.MaxOutputSourceUrl,
 	)
 	var i ModelConnection
 	err := row.Scan(
@@ -75,6 +91,12 @@ func (q *Queries) CreateModelConnection(ctx context.Context, arg CreateModelConn
 		&i.ContextWindowSource,
 		&i.ContextWindowResolvedAt,
 		&i.ContextWindowCatalogVersion,
+		&i.MaxOutputTokens,
+		&i.MaxOutputOverrideTokens,
+		&i.MaxOutputSource,
+		&i.MaxOutputResolvedAt,
+		&i.MaxOutputCatalogVersion,
+		&i.MaxOutputSourceUrl,
 	)
 	return i, err
 }
@@ -91,7 +113,7 @@ func (q *Queries) DeleteModelConnection(ctx context.Context, id string) (string,
 }
 
 const getModelConnection = `-- name: GetModelConnection :one
-SELECT id, owner_id, name, base_url, model_name, api_key_cipher, capability_text, capability_tools, capability_vision, checked_at, created_at, updated_at, capability_media_image_generation, capability_media_video_generation, capability_media_speech_generation, context_window_tokens, context_window_override_tokens, context_window_source, context_window_resolved_at, context_window_catalog_version FROM model_connections WHERE id = $1
+SELECT id, owner_id, name, base_url, model_name, api_key_cipher, capability_text, capability_tools, capability_vision, checked_at, created_at, updated_at, capability_media_image_generation, capability_media_video_generation, capability_media_speech_generation, context_window_tokens, context_window_override_tokens, context_window_source, context_window_resolved_at, context_window_catalog_version, max_output_tokens, max_output_override_tokens, max_output_source, max_output_resolved_at, max_output_catalog_version, max_output_source_url FROM model_connections WHERE id = $1
 `
 
 func (q *Queries) GetModelConnection(ctx context.Context, id string) (ModelConnection, error) {
@@ -118,12 +140,18 @@ func (q *Queries) GetModelConnection(ctx context.Context, id string) (ModelConne
 		&i.ContextWindowSource,
 		&i.ContextWindowResolvedAt,
 		&i.ContextWindowCatalogVersion,
+		&i.MaxOutputTokens,
+		&i.MaxOutputOverrideTokens,
+		&i.MaxOutputSource,
+		&i.MaxOutputResolvedAt,
+		&i.MaxOutputCatalogVersion,
+		&i.MaxOutputSourceUrl,
 	)
 	return i, err
 }
 
 const listModelConnections = `-- name: ListModelConnections :many
-SELECT id, owner_id, name, base_url, model_name, api_key_cipher, capability_text, capability_tools, capability_vision, checked_at, created_at, updated_at, capability_media_image_generation, capability_media_video_generation, capability_media_speech_generation, context_window_tokens, context_window_override_tokens, context_window_source, context_window_resolved_at, context_window_catalog_version FROM model_connections
+SELECT id, owner_id, name, base_url, model_name, api_key_cipher, capability_text, capability_tools, capability_vision, checked_at, created_at, updated_at, capability_media_image_generation, capability_media_video_generation, capability_media_speech_generation, context_window_tokens, context_window_override_tokens, context_window_source, context_window_resolved_at, context_window_catalog_version, max_output_tokens, max_output_override_tokens, max_output_source, max_output_resolved_at, max_output_catalog_version, max_output_source_url FROM model_connections
 WHERE owner_id IS NULL OR owner_id = $1
 ORDER BY owner_id NULLS FIRST, lower(name), id
 `
@@ -158,6 +186,12 @@ func (q *Queries) ListModelConnections(ctx context.Context, ownerID pgtype.Text)
 			&i.ContextWindowSource,
 			&i.ContextWindowResolvedAt,
 			&i.ContextWindowCatalogVersion,
+			&i.MaxOutputTokens,
+			&i.MaxOutputOverrideTokens,
+			&i.MaxOutputSource,
+			&i.MaxOutputResolvedAt,
+			&i.MaxOutputCatalogVersion,
+			&i.MaxOutputSourceUrl,
 		); err != nil {
 			return nil, err
 		}
@@ -177,14 +211,20 @@ UPDATE model_connections SET
   context_window_source = $6,
   context_window_resolved_at = $7,
   context_window_catalog_version = $8,
-  api_key_cipher = $9, capability_text = $10,
-  capability_tools = $11, capability_vision = $12,
-  capability_media_image_generation = COALESCE($13, capability_media_image_generation),
-  capability_media_video_generation = COALESCE($14, capability_media_video_generation),
-  capability_media_speech_generation = COALESCE($15, capability_media_speech_generation),
-  checked_at = $16, updated_at = clock_timestamp()
-WHERE id = $17 AND updated_at = $18
-RETURNING id, owner_id, name, base_url, model_name, api_key_cipher, capability_text, capability_tools, capability_vision, checked_at, created_at, updated_at, capability_media_image_generation, capability_media_video_generation, capability_media_speech_generation, context_window_tokens, context_window_override_tokens, context_window_source, context_window_resolved_at, context_window_catalog_version
+  max_output_tokens = $9,
+  max_output_override_tokens = $10,
+  max_output_source = $11,
+  max_output_resolved_at = $12,
+  max_output_catalog_version = $13,
+  max_output_source_url = $14,
+  api_key_cipher = $15, capability_text = $16,
+  capability_tools = $17, capability_vision = $18,
+  capability_media_image_generation = COALESCE($19, capability_media_image_generation),
+  capability_media_video_generation = COALESCE($20, capability_media_video_generation),
+  capability_media_speech_generation = COALESCE($21, capability_media_speech_generation),
+  checked_at = $22, updated_at = clock_timestamp()
+WHERE id = $23 AND updated_at = $24
+RETURNING id, owner_id, name, base_url, model_name, api_key_cipher, capability_text, capability_tools, capability_vision, checked_at, created_at, updated_at, capability_media_image_generation, capability_media_video_generation, capability_media_speech_generation, context_window_tokens, context_window_override_tokens, context_window_source, context_window_resolved_at, context_window_catalog_version, max_output_tokens, max_output_override_tokens, max_output_source, max_output_resolved_at, max_output_catalog_version, max_output_source_url
 `
 
 type UpdateModelConnectionParams struct {
@@ -196,6 +236,12 @@ type UpdateModelConnectionParams struct {
 	ContextWindowSource             string             `json:"context_window_source"`
 	ContextWindowResolvedAt         pgtype.Timestamptz `json:"context_window_resolved_at"`
 	ContextWindowCatalogVersion     pgtype.Text        `json:"context_window_catalog_version"`
+	MaxOutputTokens                 pgtype.Int4        `json:"max_output_tokens"`
+	MaxOutputOverrideTokens         pgtype.Int4        `json:"max_output_override_tokens"`
+	MaxOutputSource                 string             `json:"max_output_source"`
+	MaxOutputResolvedAt             pgtype.Timestamptz `json:"max_output_resolved_at"`
+	MaxOutputCatalogVersion         pgtype.Text        `json:"max_output_catalog_version"`
+	MaxOutputSourceUrl              pgtype.Text        `json:"max_output_source_url"`
 	ApiKeyCipher                    []byte             `json:"api_key_cipher"`
 	CapabilityText                  bool               `json:"capability_text"`
 	CapabilityTools                 bool               `json:"capability_tools"`
@@ -218,6 +264,12 @@ func (q *Queries) UpdateModelConnection(ctx context.Context, arg UpdateModelConn
 		arg.ContextWindowSource,
 		arg.ContextWindowResolvedAt,
 		arg.ContextWindowCatalogVersion,
+		arg.MaxOutputTokens,
+		arg.MaxOutputOverrideTokens,
+		arg.MaxOutputSource,
+		arg.MaxOutputResolvedAt,
+		arg.MaxOutputCatalogVersion,
+		arg.MaxOutputSourceUrl,
 		arg.ApiKeyCipher,
 		arg.CapabilityText,
 		arg.CapabilityTools,
@@ -251,6 +303,12 @@ func (q *Queries) UpdateModelConnection(ctx context.Context, arg UpdateModelConn
 		&i.ContextWindowSource,
 		&i.ContextWindowResolvedAt,
 		&i.ContextWindowCatalogVersion,
+		&i.MaxOutputTokens,
+		&i.MaxOutputOverrideTokens,
+		&i.MaxOutputSource,
+		&i.MaxOutputResolvedAt,
+		&i.MaxOutputCatalogVersion,
+		&i.MaxOutputSourceUrl,
 	)
 	return i, err
 }

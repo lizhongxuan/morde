@@ -1,0 +1,85 @@
+package app
+
+import (
+	"fmt"
+	"strings"
+	"unicode/utf8"
+)
+
+// Named reasons for an invalid conversation summary model output. The
+// gateway used to collapse all six conditions into one generic message,
+// which made every summary failure undiagnosable ("0 versions" with no
+// failing condition named). Each reason names the first failed condition.
+const (
+	ConversationSummaryFailureStopReason  = "summary_stop_reason"
+	ConversationSummaryFailureToolCalls   = "summary_tool_calls"
+	ConversationSummaryFailureBlankText   = "summary_blank_text"
+	ConversationSummaryFailureInvalidUTF8 = "summary_invalid_utf8"
+	ConversationSummaryFailureNULByte     = "summary_nul_byte"
+	ConversationSummaryFailureTooLarge    = "summary_text_too_large"
+)
+
+// ConversationSummaryValidationFailure names the first failed condition of
+// an invalid conversation summary without retaining summary text.
+type ConversationSummaryValidationFailure struct {
+	Reason     string
+	StopReason string
+	ToolCalls  int
+	TextBytes  int
+}
+
+// Error renders only bounded diagnostic metadata, never conversation content.
+func (f *ConversationSummaryValidationFailure) Error() string {
+	if f.StopReason == "" {
+		return fmt.Sprintf("%s (text_bytes=%d)", f.Reason, f.TextBytes)
+	}
+	return fmt.Sprintf("%s (stop_reason=%s, tool_calls=%d, text_bytes=%d)",
+		f.Reason, safeConversationSummaryStopReason(f.StopReason), f.ToolCalls, f.TextBytes)
+}
+
+func safeConversationSummaryStopReason(value string) string {
+	switch value {
+	case "stop", "length", "tool_calls", "content_filter", "invalid_response":
+		return value
+	default:
+		return "other"
+	}
+}
+
+// ValidateConversationSummaryModelResponse checks a model response offered
+// as a conversation summary. It returns nil when the response is a usable
+// summary, otherwise the first failed condition in the order the gateway
+// used to check them.
+func ValidateConversationSummaryModelResponse(response ModelResponse) *ConversationSummaryValidationFailure {
+	if response.StopReason != "stop" {
+		return &ConversationSummaryValidationFailure{Reason: ConversationSummaryFailureStopReason,
+			StopReason: response.StopReason, ToolCalls: len(response.ToolCalls),
+			TextBytes: len(response.Text)}
+	}
+	if len(response.ToolCalls) != 0 {
+		return &ConversationSummaryValidationFailure{Reason: ConversationSummaryFailureToolCalls,
+			StopReason: response.StopReason, ToolCalls: len(response.ToolCalls),
+			TextBytes: len(response.Text)}
+	}
+	return validateConversationSummaryText(response.Text)
+}
+
+// validateConversationSummaryText checks only the text-validity conditions
+// shared by the gateway response check and the Seal functions.
+func validateConversationSummaryText(text string) *ConversationSummaryValidationFailure {
+	switch {
+	case strings.TrimSpace(text) == "":
+		return &ConversationSummaryValidationFailure{Reason: ConversationSummaryFailureBlankText,
+			TextBytes: len(text)}
+	case !utf8.ValidString(text):
+		return &ConversationSummaryValidationFailure{Reason: ConversationSummaryFailureInvalidUTF8,
+			TextBytes: len(text)}
+	case strings.ContainsRune(text, '\x00'):
+		return &ConversationSummaryValidationFailure{Reason: ConversationSummaryFailureNULByte,
+			TextBytes: len(text)}
+	case len(text) > MaxConversationSummaryBytes || utf8.RuneCountInString(text) > MaxConversationSummaryCharacters:
+		return &ConversationSummaryValidationFailure{Reason: ConversationSummaryFailureTooLarge,
+			TextBytes: len(text)}
+	}
+	return nil
+}

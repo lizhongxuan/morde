@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import {
-  ENGINE_VERSION, TASK_VALIDATION_REVIEW_IDENTITY_FIELDS, validLateChildTools, validMessageDelivery, validStart,
+  ENGINE_VERSION, TASK_VALIDATION_REVIEW_IDENTITY_FIELDS, validDelegateSelection, validLateChildTools, validMessageDelivery, validStart,
 } from './engine.mjs'
 import { decodeToolImages, MAX_FRAME_BYTES } from './ipc.mjs'
 
@@ -20,6 +20,7 @@ const MAX_LATE_COORDINATOR_RESPONSES = 4096
 const MAX_DELEGATE_OBJECTIVE_BYTES = 32 * 1024
 const MAX_TOOL_OUTPUT_BYTES = 1024 * 1024
 const TOOL_NAME = /^[A-Za-z][A-Za-z0-9_.-]{0,127}$/
+const TASK_TURN_MESSAGE_ID = /^m[a-z0-9]{7}$/
 const SHUTDOWN_TIMEOUT_MS = 5_000
 const RUNTIME_CWD = fileURLToPath(new URL('..', import.meta.url))
 const MORDE_WORKSPACE_DIR = '/workspace'
@@ -38,8 +39,9 @@ const RUNTIME_START_KEYS = ['type', 'version', ...RUNTIME_FIELDS]
 const RUNTIME_SHUTDOWN_KEYS = ['type', 'version', ...RUNTIME_FIELDS]
 const TASK_PROCESS_ADMIT_KEYS = ['type', 'server_instance_id', 'runtime_id', 'runtime_generation', 'runtime_sequence', ...TASK_FENCE_FIELDS]
 const ACCOUNT_START_KEYS = [
-  'type', 'version', ...TASK_FENCE_FIELDS, 'server_instance_id', 'runtime_id', 'runtime_generation',
-  'runtime_sequence', 'task_revision', 'model', 'tools', 'prompt', 'initial_message', 'initial_context', 'revision_messages', 'resume', 'checkpoint_through_seq', 'checkpoint_sha256', 'max_tokens', 'context_window_tokens', 'background_jobs', 'step_retry',
+  'type', 'version', 'traceparent', ...TASK_FENCE_FIELDS, 'server_instance_id', 'runtime_id', 'runtime_generation',
+  'runtime_sequence', 'task_revision', 'conversation_id', 'model', 'tools', 'prompt', 'initial_message', 'initial_context', 'revision_messages', 'resume', 'checkpoint_through_seq', 'checkpoint_sha256', 'max_tokens', 'context_window_tokens', 'background_jobs', 'step_retry', 'model_budget_admission',
+  'model_recovery',
 ]
 const COORDINATOR_START_KEYS = [
   'type', 'version', ...COORDINATOR_FENCE_FIELDS, 'server_instance_id', 'runtime_id', 'runtime_generation',
@@ -182,8 +184,7 @@ function pendingTaskResponse(frame, task) {
     pending.from = frame.from_seq
   } else if (frame.type === 'child_create') {
     const args = frame.arguments
-    if (!args || typeof args !== 'object' || Array.isArray(args) ||
-        !['objective,title,tool_names', 'objective,run_in_background,title,tool_names'].includes(Object.keys(args).sort().join(',')) ||
+    if (!validDelegateSelection(args) ||
         typeof args.title !== 'string' || !args.title.trim() || Buffer.byteLength(args.title) > 256 ||
         typeof args.objective !== 'string' || !args.objective.trim() || Buffer.byteLength(args.objective) > MAX_DELEGATE_OBJECTIVE_BYTES ||
         (Object.hasOwn(args, 'run_in_background') && typeof args.run_in_background !== 'boolean') ||
@@ -1673,10 +1674,13 @@ export class AccountRuntime {
             !validTaskAgentObservation(frame, task)) throw new Error('invalid task agent activity observation')
         if (frame.type === 'tool_call') {
           if (!ID.test(frame.id) || !ID.test(frame.call_id) || typeof frame.name !== 'string' ||
-              !TOOL_NAME.test(frame.name) || task.pendingToolCalls.has(frame.id) || this.lateToolResults.has(frame.id)) {
+              !TOOL_NAME.test(frame.name) ||
+              Object.hasOwn(frame, 'current_task_turn_message_id') && !TASK_TURN_MESSAGE_ID.test(frame.current_task_turn_message_id ?? '') ||
+              task.pendingToolCalls.has(frame.id) || this.lateToolResults.has(frame.id)) {
             throw new Error('invalid task tool call identity')
           }
-          task.pendingToolCalls.set(frame.id, { callID: frame.call_id, sessionID: frame.session_id, name: frame.name })
+          task.pendingToolCalls.set(frame.id, { callID: frame.call_id, sessionID: frame.session_id, name: frame.name,
+            currentTaskTurnMessageID: frame.current_task_turn_message_id ?? '' })
         }
         const pendingResponse = pendingTaskResponse(frame, task)
         if (pendingResponse) {

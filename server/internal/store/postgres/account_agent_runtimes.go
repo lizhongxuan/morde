@@ -334,8 +334,11 @@ func (s *Store) ListAccountAgentRuntimeStopCandidates(ctx context.Context, limit
 lease_expires_at,supervisor_nonce_sha256
 FROM account_agent_runtimes
 WHERE service_instance_id=$1::uuid AND conversation_id IS NOT NULL AND supervisor_nonce_sha256 IS NOT NULL AND lease_expires_at IS NOT NULL
- AND (state IN ('stopping','failed') OR (state IN ('starting','running') AND lease_expires_at<=clock_timestamp()))
-ORDER BY CASE WHEN state='stopping' THEN 0 ELSE 1 END,updated_at,owner_id LIMIT $2`, serviceInstanceID, limit)
+ AND (state='stopping' OR
+      (state='failed' AND (failure_reason IS DISTINCT FROM $2 OR lease_expires_at<=clock_timestamp())) OR
+      (state IN ('starting','running') AND lease_expires_at<=clock_timestamp()))
+ORDER BY CASE WHEN state='stopping' THEN 0 ELSE 1 END,updated_at,owner_id LIMIT $3`,
+			serviceInstanceID, string(execution.RuntimeFailureStartup), limit)
 		if err != nil {
 			return fmt.Errorf("list account Agent Runtime stop candidates: %w", err)
 		}

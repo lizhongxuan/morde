@@ -536,6 +536,22 @@ type ConversationResultSource struct {
 	AuthorizationVersion int64              `json:"authorization_version"`
 }
 
+type ConversationRouteFileDeliveryClarification struct {
+	MessageID            string             `json:"message_id"`
+	TaskID               string             `json:"task_id"`
+	OwnerID              string             `json:"owner_id"`
+	InitiatorID          string             `json:"initiator_id"`
+	ConversationID       string             `json:"conversation_id"`
+	ExpectedRevision     int64              `json:"expected_revision"`
+	ClarificationID      string             `json:"clarification_id"`
+	ClarificationVersion int64              `json:"clarification_version"`
+	Status               string             `json:"status"`
+	FileDeliveryIntent   pgtype.Text        `json:"file_delivery_intent"`
+	Answer               string             `json:"answer"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+	RespondedAt          pgtype.Timestamptz `json:"responded_at"`
+}
+
 type ConversationRouteInternalToolCall struct {
 	TaskID           string             `json:"task_id"`
 	OwnerID          string             `json:"owner_id"`
@@ -960,24 +976,27 @@ type ModelAccountBudget struct {
 }
 
 type ModelCallLedger struct {
-	OwnerID                   string             `json:"owner_id"`
-	Source                    string             `json:"source"`
-	CallID                    string             `json:"call_id"`
-	RequestDigest             []byte             `json:"request_digest"`
-	ModelID                   string             `json:"model_id"`
-	ProviderModel             string             `json:"provider_model"`
-	TaskID                    pgtype.Text        `json:"task_id"`
-	ReservedTokens            int64              `json:"reserved_tokens"`
-	State                     string             `json:"state"`
-	InputTokens               pgtype.Int8        `json:"input_tokens"`
-	OutputTokens              pgtype.Int8        `json:"output_tokens"`
-	CreatedAt                 pgtype.Timestamptz `json:"created_at"`
-	SettledAt                 pgtype.Timestamptz `json:"settled_at"`
-	PersonalModel             bool               `json:"personal_model"`
-	ReviewTaskRevision        pgtype.Int8        `json:"review_task_revision"`
-	ReviewResultEventSequence pgtype.Int8        `json:"review_result_event_sequence"`
-	ReviewResultSha256        []byte             `json:"review_result_sha256"`
-	ReviewClaimGeneration     pgtype.Int8        `json:"review_claim_generation"`
+	OwnerID                         string             `json:"owner_id"`
+	Source                          string             `json:"source"`
+	CallID                          string             `json:"call_id"`
+	RequestDigest                   []byte             `json:"request_digest"`
+	ModelID                         string             `json:"model_id"`
+	ProviderModel                   string             `json:"provider_model"`
+	TaskID                          pgtype.Text        `json:"task_id"`
+	ReservedTokens                  int64              `json:"reserved_tokens"`
+	State                           string             `json:"state"`
+	InputTokens                     pgtype.Int8        `json:"input_tokens"`
+	OutputTokens                    pgtype.Int8        `json:"output_tokens"`
+	CreatedAt                       pgtype.Timestamptz `json:"created_at"`
+	SettledAt                       pgtype.Timestamptz `json:"settled_at"`
+	PersonalModel                   bool               `json:"personal_model"`
+	ReviewTaskRevision              pgtype.Int8        `json:"review_task_revision"`
+	ReviewResultEventSequence       pgtype.Int8        `json:"review_result_event_sequence"`
+	ReviewResultSha256              []byte             `json:"review_result_sha256"`
+	ReviewClaimGeneration           pgtype.Int8        `json:"review_claim_generation"`
+	TerminalDeliveryID              pgtype.Int8        `json:"terminal_delivery_id"`
+	TerminalDeliveryClaimGeneration pgtype.Int8        `json:"terminal_delivery_claim_generation"`
+	TerminalDeliveryDispatchStarted bool               `json:"terminal_delivery_dispatch_started"`
 }
 
 type ModelConnection struct {
@@ -1001,6 +1020,12 @@ type ModelConnection struct {
 	ContextWindowSource             string             `json:"context_window_source"`
 	ContextWindowResolvedAt         pgtype.Timestamptz `json:"context_window_resolved_at"`
 	ContextWindowCatalogVersion     pgtype.Text        `json:"context_window_catalog_version"`
+	MaxOutputTokens                 pgtype.Int4        `json:"max_output_tokens"`
+	MaxOutputOverrideTokens         pgtype.Int4        `json:"max_output_override_tokens"`
+	MaxOutputSource                 string             `json:"max_output_source"`
+	MaxOutputResolvedAt             pgtype.Timestamptz `json:"max_output_resolved_at"`
+	MaxOutputCatalogVersion         pgtype.Text        `json:"max_output_catalog_version"`
+	MaxOutputSourceUrl              pgtype.Text        `json:"max_output_source_url"`
 }
 
 type ModelTextStreamingCapability struct {
@@ -1072,6 +1097,60 @@ type NotificationSourceEvent struct {
 	ProjectID     pgtype.Text        `json:"project_id"`
 	CreatedAt     pgtype.Timestamptz `json:"created_at"`
 	ProcessedAt   pgtype.Timestamptz `json:"processed_at"`
+}
+
+type ObservabilityLog struct {
+	ID         int64              `json:"id"`
+	TraceID    string             `json:"trace_id"`
+	SpanID     string             `json:"span_id"`
+	RequestID  string             `json:"request_id"`
+	TaskID     string             `json:"task_id"`
+	Service    string             `json:"service"`
+	Severity   string             `json:"severity"`
+	Message    string             `json:"message"`
+	Attributes []byte             `json:"attributes"`
+	OccurredAt pgtype.Timestamptz `json:"occurred_at"`
+}
+
+type ObservabilitySpan struct {
+	TraceID           string             `json:"trace_id"`
+	SpanID            string             `json:"span_id"`
+	ParentSpanID      string             `json:"parent_span_id"`
+	Name              string             `json:"name"`
+	SpanKind          string             `json:"span_kind"`
+	StartTime         pgtype.Timestamptz `json:"start_time"`
+	EndTime           pgtype.Timestamptz `json:"end_time"`
+	Status            string             `json:"status"`
+	ScopeName         string             `json:"scope_name"`
+	ScopeVersion      string             `json:"scope_version"`
+	Attributes        []byte             `json:"attributes"`
+	Resource          []byte             `json:"resource"`
+	Links             []byte             `json:"links"`
+	Events            []byte             `json:"events"`
+	DroppedAttributes int32              `json:"dropped_attributes"`
+	DroppedLinks      int32              `json:"dropped_links"`
+	DroppedEvents     int32              `json:"dropped_events"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+}
+
+type ObservabilityTaskAttemptLink struct {
+	TaskID        string             `json:"task_id"`
+	Attempt       int64              `json:"attempt"`
+	OriginTraceID string             `json:"origin_trace_id"`
+	OriginSpanID  string             `json:"origin_span_id"`
+	TaskTraceID   string             `json:"task_trace_id"`
+	TaskSpanID    string             `json:"task_span_id"`
+	RequestID     string             `json:"request_id"`
+	MessageID     string             `json:"message_id"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+}
+
+type ObservabilityTraceLink struct {
+	TraceID   string             `json:"trace_id"`
+	SpanID    string             `json:"span_id"`
+	RequestID string             `json:"request_id"`
+	MessageID string             `json:"message_id"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
 }
 
 type OrphanHostVolumeCleanup struct {
@@ -1605,27 +1684,33 @@ type Schedule struct {
 	AuthClientInstallationID pgtype.Text        `json:"auth_client_installation_id"`
 	Title                    string             `json:"title"`
 	ExecutionPolicy          string             `json:"execution_policy"`
+	FileDeliveryIntent       string             `json:"file_delivery_intent"`
+	PersonalRuleBinding      []byte             `json:"personal_rule_binding"`
 }
 
 type ScheduleRun struct {
-	ID                     string             `json:"id"`
-	ScheduleID             string             `json:"schedule_id"`
-	OwnerID                string             `json:"owner_id"`
-	ScheduleVersion        int64              `json:"schedule_version"`
-	OccurrenceKey          string             `json:"occurrence_key"`
-	ScheduledAt            pgtype.Timestamptz `json:"scheduled_at"`
-	CoalescedCount         int64              `json:"coalesced_count"`
-	Status                 string             `json:"status"`
-	SkipReason             pgtype.Text        `json:"skip_reason"`
-	TaskID                 pgtype.Text        `json:"task_id"`
-	NotificationEvents     []string           `json:"notification_events"`
-	CreatedAt              pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt              pgtype.Timestamptz `json:"updated_at"`
-	FinishedAt             pgtype.Timestamptz `json:"finished_at"`
-	ObservationSpec        []byte             `json:"observation_spec"`
-	ObservationConfigHash  string             `json:"observation_config_hash"`
-	ObservationOutcome     string             `json:"observation_outcome"`
-	ObservationFingerprint string             `json:"observation_fingerprint"`
+	ID                           string             `json:"id"`
+	ScheduleID                   string             `json:"schedule_id"`
+	OwnerID                      string             `json:"owner_id"`
+	ScheduleVersion              int64              `json:"schedule_version"`
+	OccurrenceKey                string             `json:"occurrence_key"`
+	ScheduledAt                  pgtype.Timestamptz `json:"scheduled_at"`
+	CoalescedCount               int64              `json:"coalesced_count"`
+	Status                       string             `json:"status"`
+	SkipReason                   pgtype.Text        `json:"skip_reason"`
+	TaskID                       pgtype.Text        `json:"task_id"`
+	NotificationEvents           []string           `json:"notification_events"`
+	CreatedAt                    pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                    pgtype.Timestamptz `json:"updated_at"`
+	FinishedAt                   pgtype.Timestamptz `json:"finished_at"`
+	ObservationSpec              []byte             `json:"observation_spec"`
+	ObservationConfigHash        string             `json:"observation_config_hash"`
+	ObservationOutcome           string             `json:"observation_outcome"`
+	ObservationFingerprint       string             `json:"observation_fingerprint"`
+	PersonalRuleBinding          []byte             `json:"personal_rule_binding"`
+	PersonalRuleValidationStatus string             `json:"personal_rule_validation_status"`
+	PersonalRuleValidatedAt      pgtype.Timestamptz `json:"personal_rule_validated_at"`
+	PersonalRuleRevokedAt        pgtype.Timestamptz `json:"personal_rule_revoked_at"`
 }
 
 type ServiceIdentity struct {
@@ -1785,20 +1870,38 @@ type TaskAgentInstance struct {
 }
 
 type TaskAgentMessageDelivery struct {
-	MessageID                   string             `json:"message_id"`
-	TaskID                      string             `json:"task_id"`
-	OwnerID                     string             `json:"owner_id"`
-	InitiatorID                 string             `json:"initiator_id"`
-	AgentInstanceID             string             `json:"agent_instance_id"`
-	AgentGeneration             int64              `json:"agent_generation"`
-	AuthorizationVersion        int64              `json:"authorization_version"`
-	SessionID                   string             `json:"session_id"`
-	Mode                        string             `json:"mode"`
-	EnqueuedThroughSeq          pgtype.Int8        `json:"enqueued_through_seq"`
-	ClaimedThroughSeq           pgtype.Int8        `json:"claimed_through_seq"`
-	CreatedAt                   pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt                   pgtype.Timestamptz `json:"updated_at"`
-	ClaimedCheckpointThroughSeq pgtype.Int8        `json:"claimed_checkpoint_through_seq"`
+	MessageID                    string             `json:"message_id"`
+	TaskID                       string             `json:"task_id"`
+	OwnerID                      string             `json:"owner_id"`
+	InitiatorID                  string             `json:"initiator_id"`
+	AgentInstanceID              string             `json:"agent_instance_id"`
+	AgentGeneration              int64              `json:"agent_generation"`
+	AuthorizationVersion         int64              `json:"authorization_version"`
+	SessionID                    string             `json:"session_id"`
+	Mode                         string             `json:"mode"`
+	EnqueuedThroughSeq           pgtype.Int8        `json:"enqueued_through_seq"`
+	ClaimedThroughSeq            pgtype.Int8        `json:"claimed_through_seq"`
+	CreatedAt                    pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                    pgtype.Timestamptz `json:"updated_at"`
+	ClaimedCheckpointThroughSeq  pgtype.Int8        `json:"claimed_checkpoint_through_seq"`
+	EnqueuedCheckpointThroughSeq pgtype.Int8        `json:"enqueued_checkpoint_through_seq"`
+	ConversationID               pgtype.Text        `json:"conversation_id"`
+	MessageSequence              pgtype.Int8        `json:"message_sequence"`
+	TaskRevision                 pgtype.Int8        `json:"task_revision"`
+	ReceiptAgentGeneration       pgtype.Int8        `json:"receipt_agent_generation"`
+	SourceContentBytes           pgtype.Int8        `json:"source_content_bytes"`
+	// SHA-256 of the immutable original UTF-8 user message, never of the DSH representation.
+	SourceSha256          []byte      `json:"source_sha256"`
+	ManifestVersion       pgtype.Int4 `json:"manifest_version"`
+	ManifestSha256        []byte      `json:"manifest_sha256"`
+	RepresentationKind    pgtype.Text `json:"representation_kind"`
+	RepresentationVersion pgtype.Int4 `json:"representation_version"`
+	// SHA-256 of the canonical inline or source-reference envelope accepted by the root DSH checkpoint.
+	RepresentationSha256   []byte      `json:"representation_sha256"`
+	AttachmentIdsSha256    []byte      `json:"attachment_ids_sha256"`
+	AppliedAgentGeneration pgtype.Int8 `json:"applied_agent_generation"`
+	// Root checkpoint tail sequence that atomically accepted the exact receipt representation; this does not prove full source reading.
+	AppliedCheckpointThroughSeq pgtype.Int8 `json:"applied_checkpoint_through_seq"`
 }
 
 type TaskAgentRequestReconciliation struct {
@@ -1914,29 +2017,32 @@ type TaskAssistantMessageSnapshot struct {
 }
 
 type TaskBatchItem struct {
-	ID        string             `json:"id"`
-	TaskID    string             `json:"task_id"`
-	ItemKey   string             `json:"item_key"`
-	Input     string             `json:"input"`
-	Status    string             `json:"status"`
-	Result    string             `json:"result"`
-	Error     string             `json:"error"`
-	CreatedAt pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
-	Attempt   int32              `json:"attempt"`
+	ID                 string             `json:"id"`
+	TaskID             string             `json:"task_id"`
+	ItemKey            string             `json:"item_key"`
+	Input              string             `json:"input"`
+	Status             string             `json:"status"`
+	Result             string             `json:"result"`
+	Error              string             `json:"error"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
+	Attempt            int32              `json:"attempt"`
+	FileDeliveryIntent string             `json:"file_delivery_intent"`
 }
 
 type TaskClarificationRequest struct {
-	ID          string             `json:"id"`
-	TaskID      string             `json:"task_id"`
-	Version     int64              `json:"version"`
-	ModelStepID string             `json:"model_step_id"`
-	CallID      string             `json:"call_id"`
-	Question    string             `json:"question"`
-	Status      string             `json:"status"`
-	Answer      string             `json:"answer"`
-	CreatedAt   pgtype.Timestamptz `json:"created_at"`
-	RespondedAt pgtype.Timestamptz `json:"responded_at"`
+	ID           string             `json:"id"`
+	TaskID       string             `json:"task_id"`
+	Version      int64              `json:"version"`
+	ModelStepID  string             `json:"model_step_id"`
+	CallID       string             `json:"call_id"`
+	Question     string             `json:"question"`
+	Status       string             `json:"status"`
+	Answer       string             `json:"answer"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	RespondedAt  pgtype.Timestamptz `json:"responded_at"`
+	BatchItemID  pgtype.Text        `json:"batch_item_id"`
+	BatchAttempt pgtype.Int4        `json:"batch_attempt"`
 }
 
 type TaskDependency struct {
@@ -2026,6 +2132,12 @@ type TaskHubOperation struct {
 	SyncSessionID            pgtype.Text        `json:"sync_session_id"`
 	SyncRevision             pgtype.Int8        `json:"sync_revision"`
 	TaskRevision             int64              `json:"task_revision"`
+	AgentSessionID           string             `json:"agent_session_id"`
+	CallID                   string             `json:"call_id"`
+	ToolCallDigest           []byte             `json:"tool_call_digest"`
+	PlanTaskRevision         int64              `json:"plan_task_revision"`
+	PlanRevision             int64              `json:"plan_revision"`
+	PlanStepID               string             `json:"plan_step_id"`
 }
 
 type TaskMcpConnectorGrant struct {
@@ -2155,6 +2267,36 @@ type TaskModelCallResponse struct {
 	ProviderReportedModel pgtype.Text        `json:"provider_reported_model"`
 }
 
+type TaskModelRecoverySchedule struct {
+	TaskID               string             `json:"task_id"`
+	OwnerID              string             `json:"owner_id"`
+	InitiatorID          string             `json:"initiator_id"`
+	TaskRevision         int64              `json:"task_revision"`
+	AuthorizationVersion int64              `json:"authorization_version"`
+	AgentInstanceID      string             `json:"agent_instance_id"`
+	AgentGeneration      int64              `json:"agent_generation"`
+	AgentSessionID       string             `json:"agent_session_id"`
+	FailedLeaseOwner     string             `json:"failed_lease_owner"`
+	FailedLeaseVersion   int64              `json:"failed_lease_version"`
+	EngineVersion        string             `json:"engine_version"`
+	ProfileVersion       string             `json:"profile_version"`
+	FailedCallID         string             `json:"failed_call_id"`
+	FailedModelID        string             `json:"failed_model_id"`
+	FailedRequestDigest  []byte             `json:"failed_request_digest"`
+	FailedThroughSeq     int64              `json:"failed_through_seq"`
+	CheckpointThroughSeq int64              `json:"checkpoint_through_seq"`
+	CheckpointDigest     []byte             `json:"checkpoint_digest"`
+	ToolsetDigest        []byte             `json:"toolset_digest"`
+	RecoveryDSHCallID    string             `json:"recovery_dsh_call_id"`
+	RecoveryCallID       string             `json:"recovery_call_id"`
+	State                string             `json:"state"`
+	Automatic            bool               `json:"automatic"`
+	EventSequence        int64              `json:"event_sequence"`
+	AttemptStartedAt     pgtype.Timestamptz `json:"attempt_started_at"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
+}
+
 type TaskOperation struct {
 	ID                          string             `json:"id"`
 	TaskID                      string             `json:"task_id"`
@@ -2183,6 +2325,16 @@ type TaskOperation struct {
 	ApprovalRequestHash         []byte             `json:"approval_request_hash"`
 }
 
+type TaskPcDeliveryObservation struct {
+	TaskID               string             `json:"task_id"`
+	OwnerID              string             `json:"owner_id"`
+	ConversationID       string             `json:"conversation_id"`
+	ClientInstallationID string             `json:"client_installation_id"`
+	MessageID            string             `json:"message_id"`
+	TaskRevision         int64              `json:"task_revision"`
+	ObservedAt           pgtype.Timestamptz `json:"observed_at"`
+}
+
 type TaskPendingRequest struct {
 	ID                      string             `json:"id"`
 	TaskID                  string             `json:"task_id"`
@@ -2206,6 +2358,60 @@ type TaskPendingRequest struct {
 	ExpiresAt               pgtype.Timestamptz `json:"expires_at"`
 	TaskRevision            pgtype.Int8        `json:"task_revision"`
 	RespondedByUserID       pgtype.Text        `json:"responded_by_user_id"`
+	EvidencePointer         pgtype.Text        `json:"evidence_pointer"`
+	ThisCostMicros          pgtype.Int8        `json:"this_cost_micros"`
+	TotalCostMicros         pgtype.Int8        `json:"total_cost_micros"`
+	TriggerRule             pgtype.Text        `json:"trigger_rule"`
+	RejectionConsequence    pgtype.Text        `json:"rejection_consequence"`
+}
+
+type TaskPlanStepExecutionBinding struct {
+	OwnerID              string             `json:"owner_id"`
+	TaskID               string             `json:"task_id"`
+	TaskRevision         int64              `json:"task_revision"`
+	PlanRevision         int64              `json:"plan_revision"`
+	PlanStepID           string             `json:"plan_step_id"`
+	ExecutionKind        string             `json:"execution_kind"`
+	ExecutionID          string             `json:"execution_id"`
+	AgentSessionID       string             `json:"agent_session_id"`
+	CallID               string             `json:"call_id"`
+	ToolName             string             `json:"tool_name"`
+	ConnectorID          string             `json:"connector_id"`
+	ChildStepID          string             `json:"child_step_id"`
+	ParentStepID         string             `json:"parent_step_id"`
+	RequestDigest        []byte             `json:"request_digest"`
+	AuthorizationVersion int64              `json:"authorization_version"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+	ResultDigest         []byte             `json:"result_digest"`
+	TaskStepID           string             `json:"task_step_id"`
+}
+
+type TaskRequirementManifestAttestation struct {
+	TaskID                   string             `json:"task_id"`
+	OwnerID                  string             `json:"owner_id"`
+	TaskRevision             int64              `json:"task_revision"`
+	PlanRevision             int64              `json:"plan_revision"`
+	PlanEventSequence        int64              `json:"plan_event_sequence"`
+	ManifestDigest           []byte             `json:"manifest_digest"`
+	AttestedByUserID         string             `json:"attested_by_user_id"`
+	AttestedByPrincipalKind  string             `json:"attested_by_principal_kind"`
+	TaskAuthorizationVersion int64              `json:"task_authorization_version"`
+	IdempotencyKey           string             `json:"idempotency_key"`
+	AttestedAt               pgtype.Timestamptz `json:"attested_at"`
+}
+
+type TaskRequirementManifestConfirmation struct {
+	TaskID                   string             `json:"task_id"`
+	OwnerID                  string             `json:"owner_id"`
+	TaskRevision             int64              `json:"task_revision"`
+	PlanRevision             int64              `json:"plan_revision"`
+	PlanEventSequence        int64              `json:"plan_event_sequence"`
+	ManifestDigest           []byte             `json:"manifest_digest"`
+	ConfirmedByUserID        string             `json:"confirmed_by_user_id"`
+	ConfirmedByPrincipalKind string             `json:"confirmed_by_principal_kind"`
+	TaskAuthorizationVersion int64              `json:"task_authorization_version"`
+	IdempotencyKey           string             `json:"idempotency_key"`
+	ConfirmedAt              pgtype.Timestamptz `json:"confirmed_at"`
 }
 
 type TaskRevisionIntent struct {
@@ -2228,11 +2434,12 @@ type TaskRevisionIntent struct {
 }
 
 type TaskRevisionStart struct {
-	TaskID        string             `json:"task_id"`
-	Revision      int64              `json:"revision"`
-	StepID        string             `json:"step_id"`
-	EventSequence int64              `json:"event_sequence"`
-	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	TaskID                   string             `json:"task_id"`
+	Revision                 int64              `json:"revision"`
+	StepID                   string             `json:"step_id"`
+	EventSequence            int64              `json:"event_sequence"`
+	CreatedAt                pgtype.Timestamptz `json:"created_at"`
+	AcknowledgementMessageID pgtype.Text        `json:"acknowledgement_message_id"`
 }
 
 type TaskSandboxCallReceipt struct {
@@ -2369,6 +2576,33 @@ type TaskStopRequest struct {
 	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
 	CompletedAt    pgtype.Timestamptz `json:"completed_at"`
+}
+
+type TaskTerminalDeliveryOutbox struct {
+	ID                        int64              `json:"id"`
+	TaskID                    string             `json:"task_id"`
+	OwnerID                   string             `json:"owner_id"`
+	ConversationID            string             `json:"conversation_id"`
+	InitiatorID               string             `json:"initiator_id"`
+	TaskRevision              int64              `json:"task_revision"`
+	AuthorizationVersion      int64              `json:"authorization_version"`
+	SourceKind                string             `json:"source_kind"`
+	SourceEventSequence       int64              `json:"source_event_sequence"`
+	SourceEventType           string             `json:"source_event_type"`
+	SourceSha256              []byte             `json:"source_sha256"`
+	ResultSha256              []byte             `json:"result_sha256"`
+	ValidationClaimGeneration pgtype.Int8        `json:"validation_claim_generation"`
+	VerdictSha256             []byte             `json:"verdict_sha256"`
+	State                     string             `json:"state"`
+	ClaimGeneration           int64              `json:"claim_generation"`
+	LeaseOwner                pgtype.Text        `json:"lease_owner"`
+	LeaseExpiresAt            pgtype.Timestamptz `json:"lease_expires_at"`
+	ModelCallID               pgtype.Text        `json:"model_call_id"`
+	ResponseCiphertext        []byte             `json:"response_ciphertext"`
+	ResponseSha256            []byte             `json:"response_sha256"`
+	PublishedMessageID        pgtype.Text        `json:"published_message_id"`
+	CreatedAt                 pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                 pgtype.Timestamptz `json:"updated_at"`
 }
 
 type TaskValidationReview struct {

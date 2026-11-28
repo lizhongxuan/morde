@@ -1,15 +1,129 @@
 package runtimeactions
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	mordesync "morde-sync"
 )
+
+func TestTaskWorkspaceSnapshotSHA256IsStableAndTracksExecutionMutation(t *testing.T) {
+	rootPath := t.TempDir()
+	nested := filepath.Join(rootPath, "src")
+	if err := os.Mkdir(nested, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(rootPath, "empty"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	filePath := filepath.Join(nested, "main.go")
+	if err := os.WriteFile(filePath, []byte("package main\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(filePath, filepath.Join(nested, "main-copy.go")); err != nil {
+		t.Skipf("hardlinks are unavailable: %v", err)
+	}
+	if err := os.Symlink("main.go", filepath.Join(nested, "main-link.go")); err != nil {
+		t.Skipf("symlinks are unavailable: %v", err)
+	}
+	modified := time.Unix(1_700_000_000, 123_456_789)
+	if err := os.Chtimes(filePath, modified, modified); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(rootPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+
+	scans := 0
+	scan := func(ctx context.Context, root *os.Root) (mordesync.Manifest, error) {
+		scans++
+		return mordesync.ScanOpenedRoot(ctx, root, nil)
+	}
+	before, err := taskWorkspaceSnapshotSHA256WithScanner(context.Background(), root, scan)
+	if err != nil {
+		t.Fatalf("snapshot digest before execution: %v", err)
+	}
+	if scans != 1 {
+		t.Fatalf("before boundary performed %d opened-root scans; want 1", scans)
+	}
+	again, err := taskWorkspaceSnapshotSHA256WithScanner(context.Background(), root, scan)
+	if err != nil || before == "" || again != before || scans != 2 {
+		t.Fatalf("unchanged snapshot digests = %q, %q, %v", before, again, err)
+	}
+	if err := os.WriteFile(filePath, []byte("package main\nfunc main() {}\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	after, err := taskWorkspaceSnapshotSHA256WithScanner(context.Background(), root, scan)
+	if err != nil || scans != 3 {
+		t.Fatalf("snapshot digest after execution: %v", err)
+	}
+	if after == before {
+		t.Fatal("execution content mutation did not change the shared Workspace snapshot digest")
+	}
+	if err := os.Chmod(filePath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	metadataAfter, err := taskWorkspaceSnapshotSHA256WithScanner(context.Background(), root, scan)
+	if err != nil || metadataAfter == after || scans != 4 {
+		t.Fatalf("mode mutation digest = %q, %v; want a changed digest", metadataAfter, err)
+	}
+}
+
+func TestShellTaskWorkspaceResultV2OmitsLegacyDigestAndStillDecodesV1(t *testing.T) {
+	v2 := shellTaskWorkspaceResult{
+		TaskID: "q1234567", WorkspaceID: "w1234567", WorkspaceViewID: "v" + strings.Repeat("a", 64),
+		WorkspaceSnapshotSHA256Before: strings.Repeat("b", 64), WorkspaceSnapshotSHA256After: strings.Repeat("c", 64),
+	}
+	encoded, err := json.Marshal(v2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(encoded, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["workspace_snapshot_sha256_before"] != strings.Repeat("b", 64) || got["workspace_snapshot_sha256_after"] != strings.Repeat("c", 64) {
+		t.Fatalf("v2 output lacks common snapshot digests: %s", encoded)
+	}
+	for _, field := range []string{"workspace_manifest_sha256_before", "workspace_manifest_sha256_after"} {
+		if _, ok := got[field]; ok {
+			t.Errorf("v2 output unexpectedly includes legacy field %q: %s", field, encoded)
+		}
+	}
+
+	legacyJSON := []byte(`{"workspace_manifest_sha256_before":"` + strings.Repeat("d", 64) + `","workspace_manifest_sha256_after":"` + strings.Repeat("e", 64) + `"}`)
+	var legacy shellTaskWorkspaceResult
+	if err := json.Unmarshal(legacyJSON, &legacy); err != nil {
+		t.Fatalf("decode v1 shell result: %v", err)
+	}
+	if legacy.WorkspaceManifestSHA256Before != strings.Repeat("d", 64) || legacy.WorkspaceManifestSHA256After != strings.Repeat("e", 64) {
+		t.Fatalf("v1 fields were not decoded: %+v", legacy)
+	}
+}
+
+func TestShellRunnerCoverageReceiptSerializesOperationIdentity(t *testing.T) {
+	encoded, err := json.Marshal(shellRunnerCoverageReceipt{OperationID: "op-12345678", RunnerVersion: "go version go1.25.3 linux/amd64"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(encoded, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["operation_id"] != "op-12345678" || got["runner_version"] != "go version go1.25.3 linux/amd64" {
+		t.Fatalf("receipt identity fields = %#v", got)
+	}
+}
 
 func TestParseShellArguments(t *testing.T) {
 	tests := []struct {
@@ -44,6 +158,34 @@ func TestParseShellArguments(t *testing.T) {
 				if timeout != test.wantTimeout {
 					t.Fatalf("timeout=%s, want %s", timeout, test.wantTimeout)
 				}
+			}
+		})
+	}
+}
+
+func TestParseShellGoTestSpecFailsClosedOnCommandVariants(t *testing.T) {
+	tests := []struct {
+		command string
+		want    shellGoTestSpec
+		valid   bool
+	}{
+		{command: "go test ./...", want: shellGoTestSpec{ScopeMode: "full_suite", PackageSelector: "./..."}, valid: true},
+		{command: "go test -run=^TestExample$ ./internal/app", want: shellGoTestSpec{
+			ScopeMode: "targeted", PackageSelector: "./internal/app", TestSelector: "^TestExample$",
+		}, valid: true},
+		{command: "go test ./... -count=1"},
+		{command: "go test -run TestExample ./internal/app"},
+		{command: "go test -run=^TestExample$ ./internal/app && echo done"},
+		{command: "go test -run=^TestExample$ ./internal/../app"},
+		{command: "go test -run=^TestExample$ ./internal/app ./other"},
+		{command: "go test ./... "},
+		{command: "bash -c 'go test ./...'"},
+	}
+	for _, test := range tests {
+		t.Run(test.command, func(t *testing.T) {
+			got, valid := parseShellGoTestSpec(test.command)
+			if valid != test.valid || valid && got != test.want {
+				t.Fatalf("parseShellGoTestSpec(%q) = (%+v, %v), want (%+v, %v)", test.command, got, valid, test.want, test.valid)
 			}
 		})
 	}

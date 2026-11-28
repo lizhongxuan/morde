@@ -10,8 +10,8 @@ import (
 	"morde/server/internal/app"
 )
 
-// shortcut: ResponsesClient has a fixed 45-second hard timeout; revisit this age if that timeout becomes configurable.
 const staleModelCallAge = 2 * time.Minute
+const staleTaskModelCallAge = app.TaskModelCallTimeout + 2*time.Minute
 const staleModelCallBatchSize = 100
 
 type staleModelCall struct {
@@ -29,8 +29,9 @@ func (s *Store) MarkStaleModelCallsUnknown(ctx context.Context) (int, error) {
 	marked := 0
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
 		rows, err := tx.Query(ctx, `SELECT DISTINCT owner_id FROM model_call_ledger
- WHERE state='dispatched' AND source NOT IN ('route','compaction') AND created_at < clock_timestamp() - ($1 * interval '1 second')
-ORDER BY owner_id LIMIT $2`, staleModelCallAge.Seconds(), staleModelCallBatchSize)
+ WHERE state='dispatched' AND source NOT IN ('route','compaction') AND created_at < clock_timestamp() -
+  (CASE WHEN source='task' THEN $1::double precision ELSE $2::double precision END * interval '1 second')
+ORDER BY owner_id LIMIT $3`, staleTaskModelCallAge.Seconds(), staleModelCallAge.Seconds(), staleModelCallBatchSize)
 		if err != nil {
 			return fmt.Errorf("list stale model call owners: %w", err)
 		}
@@ -59,7 +60,9 @@ ORDER BY owner_id LIMIT $2`, staleModelCallAge.Seconds(), staleModelCallBatchSiz
 			}
 			var hasPlatform bool
 			if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM model_call_ledger WHERE owner_id=$1 AND state='dispatched' AND source NOT IN ('route','compaction')
-AND NOT personal_model AND created_at < clock_timestamp() - ($2 * interval '1 second'))`, ownerID, staleModelCallAge.Seconds()).Scan(&hasPlatform); err != nil {
+AND NOT personal_model AND created_at < clock_timestamp() -
+ (CASE WHEN source='task' THEN $2::double precision ELSE $3::double precision END * interval '1 second'))`,
+				ownerID, staleTaskModelCallAge.Seconds(), staleModelCallAge.Seconds()).Scan(&hasPlatform); err != nil {
 				return fmt.Errorf("inspect stale model calls: %w", err)
 			}
 			if hasPlatform {
@@ -71,13 +74,14 @@ AND NOT personal_model AND created_at < clock_timestamp() - ($2 * interval '1 se
 		projectRows, err := tx.Query(ctx, `WITH stale_calls AS (
  SELECT owner_id,source,call_id,task_id FROM model_call_ledger
  WHERE owner_id=ANY($1::text[]) AND state='dispatched' AND source NOT IN ('route','compaction')
-   AND created_at < clock_timestamp() - ($2 * interval '1 second')
- ORDER BY owner_id,created_at,source,call_id LIMIT $3
+   AND created_at < clock_timestamp() -
+    (CASE WHEN source='task' THEN $2::double precision ELSE $3::double precision END * interval '1 second')
+ ORDER BY owner_id,created_at,source,call_id LIMIT $4
 )
 SELECT DISTINCT p.project_id
 FROM stale_calls l JOIN project_budget_ledger p
   ON p.actor_id=l.owner_id AND p.source=l.source AND p.call_id=l.call_id AND p.task_id IS NOT DISTINCT FROM l.task_id
-ORDER BY p.project_id`, owners, staleModelCallAge.Seconds(), staleModelCallBatchSize)
+ORDER BY p.project_id`, owners, staleTaskModelCallAge.Seconds(), staleModelCallAge.Seconds(), staleModelCallBatchSize)
 		if err != nil {
 			return fmt.Errorf("list stale project model call budgets: %w", err)
 		}
@@ -104,9 +108,10 @@ ORDER BY p.project_id`, owners, staleModelCallAge.Seconds(), staleModelCallBatch
 
 		rows, err = tx.Query(ctx, `SELECT owner_id,source,call_id,COALESCE(task_id,''),personal_model FROM model_call_ledger
 WHERE owner_id=ANY($1::text[]) AND state='dispatched' AND source NOT IN ('route','compaction')
-  AND created_at < clock_timestamp() - ($2 * interval '1 second')
-ORDER BY owner_id,created_at,source,call_id LIMIT $3 FOR UPDATE SKIP LOCKED`,
-			owners, staleModelCallAge.Seconds(), staleModelCallBatchSize)
+  AND created_at < clock_timestamp() -
+   (CASE WHEN source='task' THEN $2::double precision ELSE $3::double precision END * interval '1 second')
+ORDER BY owner_id,created_at,source,call_id LIMIT $4 FOR UPDATE SKIP LOCKED`,
+			owners, staleTaskModelCallAge.Seconds(), staleModelCallAge.Seconds(), staleModelCallBatchSize)
 		if err != nil {
 			return fmt.Errorf("lock stale model calls: %w", err)
 		}

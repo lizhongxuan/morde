@@ -320,8 +320,11 @@ WHERE s.task_id=$1 AND s.owner_id=$2 AND s.session_id=$3`, call.Task.TaskID, cal
 			return app.ModelResponse{Text: "Coordinator verified nested-alpha-result and nested-beta-result.", StopReason: "stop", Usage: usage}, nil
 		case 4:
 			handoff, err := nestedModelHandoff(call.RawRequest)
-			if err != nil || !strings.Contains(handoff, "nested-alpha-result") || !strings.Contains(handoff, "nested-beta-result") || strings.Count(handoff, `"status":"succeeded"`) != 2 {
-				return app.ModelResponse{}, fmt.Errorf("coordinator review did not include both actual successes: %q err=%v", handoff, err)
+			if err != nil {
+				return app.ModelResponse{}, fmt.Errorf("read coordinator review handoff: %w", err)
+			}
+			if !strings.Contains(handoff, "nested-alpha-result") || !strings.Contains(handoff, "nested-beta-result") || strings.Count(handoff, `"status":"succeeded"`) != 2 {
+				return app.ModelResponse{}, fmt.Errorf("coordinator review did not include both actual successes: %q", handoff)
 			}
 			return app.ModelResponse{Text: "Coordinator verified nested-alpha-result and nested-beta-result.", StopReason: "stop", Usage: usage}, nil
 		}

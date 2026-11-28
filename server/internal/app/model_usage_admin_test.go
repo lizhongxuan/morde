@@ -61,6 +61,13 @@ func TestModelUsageAdminRequiresUnboundAdminSessionAndValidEvidence(t *testing.T
 	if _, err := service.Reconcile(ctx, principal, reviewCommand); err != nil || store.command.Source != ModelCallReview || store.writes != 2 {
 		t.Fatalf("review reconcile = %#v, %v", store.command, err)
 	}
+	terminalDeliveryCommand := command
+	terminalDeliveryCommand.Source = ModelCallTerminalDelivery
+	terminalDeliveryCommand.CallID = "terminal_delivery_001"
+	if _, err := service.Reconcile(ctx, principal, terminalDeliveryCommand); err != nil ||
+		store.command.Source != ModelCallTerminalDelivery || store.command.CallID != terminalDeliveryCommand.CallID || store.writes != 3 {
+		t.Fatalf("terminal delivery reconcile = %#v, %v", store.command, err)
+	}
 	for _, denied := range []identity.Principal{
 		{UserID: principal.UserID, TokenID: principal.TokenID, Kind: identity.KindClient, Role: identity.RoleAdmin},
 		{UserID: principal.UserID, TokenID: principal.TokenID, Kind: identity.KindSession, Role: identity.RoleUser},
@@ -82,7 +89,7 @@ func TestModelUsageAdminRequiresUnboundAdminSessionAndValidEvidence(t *testing.T
 			t.Fatalf("invalid command %#v: %v", invalid, err)
 		}
 	}
-	if store.writes != 2 {
+	if store.writes != 3 {
 		t.Fatalf("invalid commands reached store %d times", store.writes)
 	}
 }

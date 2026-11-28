@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -17,18 +18,86 @@ const (
 )
 
 type taskStepShellOutput struct {
-	ExitCode        int    `json:"exit_code"`
-	TimedOut        bool   `json:"timed_out"`
-	Stdout          string `json:"stdout"`
-	Stderr          string `json:"stderr"`
-	StdoutTruncated bool   `json:"stdout_truncated"`
-	StderrTruncated bool   `json:"stderr_truncated"`
+	ExitCode                      int                                  `json:"exit_code"`
+	TimedOut                      bool                                 `json:"timed_out"`
+	Stdout                        string                               `json:"stdout"`
+	Stderr                        string                               `json:"stderr"`
+	StdoutTruncated               bool                                 `json:"stdout_truncated"`
+	StderrTruncated               bool                                 `json:"stderr_truncated"`
+	TaskID                        string                               `json:"task_id,omitempty"`
+	WorkspaceID                   string                               `json:"workspace_id,omitempty"`
+	BindingVersion                int64                                `json:"binding_version,omitempty"`
+	WorkspaceViewID               string                               `json:"workspace_view_id,omitempty"`
+	WorkspaceCheckpointRevision   *int64                               `json:"workspace_checkpoint_revision,omitempty"`
+	WorkspaceManifestSHA256Before string                               `json:"workspace_manifest_sha256_before,omitempty"`
+	WorkspaceManifestSHA256After  string                               `json:"workspace_manifest_sha256_after,omitempty"`
+	WorkspaceSnapshotSHA256Before string                               `json:"workspace_snapshot_sha256_before,omitempty"`
+	WorkspaceSnapshotSHA256After  string                               `json:"workspace_snapshot_sha256_after,omitempty"`
+	VerificationCheck             *TaskValidationCheckExecutionReceipt `json:"verification_check,omitempty"`
+	CoverageReceipt               *TaskValidationRunnerCoverageReceipt `json:"coverage_receipt,omitempty"`
+}
+
+// TaskValidationCheckExecutionReceipt is written by the server-side tool
+// broker into the durable operation result after it matches a typed plan
+// check to the exact shell command and validates the Runtime Workspace facts.
+// It contains identifiers and digests only, never command output or file data.
+type TaskValidationCheckExecutionReceipt struct {
+	Version        int    `json:"version"`
+	TaskRevision   int64  `json:"task_revision"`
+	PlanRevision   int64  `json:"plan_revision"`
+	CheckID        string `json:"check_id"`
+	Kind           string `json:"kind"`
+	Basis          string `json:"basis"`
+	CommandSHA256  string `json:"command_sha256"`
+	CheckSHA256    string `json:"check_sha256"`
+	CoverageSHA256 string `json:"coverage_sha256"`
+	RequestSHA256  string `json:"request_sha256"`
+}
+
+// TaskValidationRunnerCoverageReceipt carries the structured inventory and
+// test events produced by the fixed Go test runner. Store replay must validate
+// this receipt against the typed plan check and the enclosing operation facts;
+// the Runtime's parser_complete flag alone is never sufficient.
+type TaskValidationRunnerCoverageReceipt struct {
+	Version                          int    `json:"version"`
+	OperationID                      string `json:"operation_id"`
+	Runner                           string `json:"runner"`
+	RunnerVersion                    string `json:"runner_version"`
+	ScopeMode                        string `json:"scope_mode"`
+	ScopeContract                    string `json:"scope_contract"`
+	PackageSelector                  string `json:"package_selector"`
+	TestSelector                     string `json:"test_selector"`
+	ExactCommandSHA256               string `json:"exact_command_sha256"`
+	TaskID                           string `json:"task_id"`
+	WorkspaceID                      string `json:"workspace_id"`
+	WorkspaceDirectory               string `json:"workspace_directory"`
+	BindingVersion                   int64  `json:"binding_version"`
+	WorkspaceViewID                  string `json:"workspace_view_id"`
+	WorkspaceCheckpointRevision      *int64 `json:"workspace_checkpoint_revision"`
+	WorkspaceCWD                     string `json:"workspace_cwd"`
+	WorkspaceSnapshotSHA256Before    string `json:"workspace_snapshot_sha256_before"`
+	WorkspaceSnapshotSHA256After     string `json:"workspace_snapshot_sha256_after"`
+	DiscoveredSourceInventorySHA256  string `json:"discovered_source_inventory_sha256"`
+	DiscoveredSourceInventoryCount   int    `json:"discovered_source_inventory_count"`
+	DiscoveredPackageInventorySHA256 string `json:"discovered_package_inventory_sha256"`
+	DiscoveredPackageInventoryCount  int    `json:"discovered_package_inventory_count"`
+	ExecutedPackageInventorySHA256   string `json:"executed_package_inventory_sha256"`
+	ExecutedPackageInventoryCount    int    `json:"executed_package_inventory_count"`
+	DiscoveredTestInventorySHA256    string `json:"discovered_test_inventory_sha256"`
+	DiscoveredTestInventoryCount     int    `json:"discovered_test_inventory_count"`
+	ExecutedTestInventorySHA256      string `json:"executed_test_inventory_sha256"`
+	ExecutedTestInventoryCount       int    `json:"executed_test_inventory_count"`
+	PassedTestCount                  int    `json:"passed_test_count"`
+	FailedTestCount                  int    `json:"failed_test_count"`
+	SkippedTestCount                 int    `json:"skipped_test_count"`
+	ParserComplete                   bool   `json:"parser_complete"`
 }
 
 var taskStepSecretAssignment = regexp.MustCompile("(?i)((?:--)?(?:password|passwd|passphrase|pwd|secret|token|api[_-]?key|authorization|credential|client[_-]?secret|private[_-]?key|access[_-]?key|refresh[_-]?token)[\"']?\\s*(?:=|:|\\s)\\s*)(?:\"[^\"]*\"|'[^']*'|[^\\s,;}&]+)")
-var taskStepSecretURL = regexp.MustCompile("(?i)(https?://)[^\\s/@]+:[^\\s/@]+@")
+var taskStepSecretURL = regexp.MustCompile(`(?i)(https?://)[^\s/@]+:[^\s/@]+@`)
 var taskStepPrivateKey = regexp.MustCompile("(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----")
-var taskStepSensitiveCommand = regexp.MustCompile("(?i)(?:\\b(?:printenv|env)\\b|\\b(?:aws\\s+(?:configure|sts|iam|secretsmanager|sso)|gcloud\\s+auth|az\\s+account\\s+get-access-token|security\\s+find-generic-password|ssh-add\\s+-L)\\b|(?:^|[\\s/])(?:\\.env|\\.ssh|\\.gnupg|\\.aws|\\.azure|\\.kube|\\.docker|\\.netrc|\\.git-credentials|\\.config/(?:gh|gcloud))(?:[./\\s]|$)|(?:^|[\\s/])[^\\s]+\\.(?:pem|p12|pfx|keystore|key)(?:[\\s]|$)|\\$\\{?[a-z_][a-z0-9_]*(?:password|passwd|secret|token|key|credential))")
+var taskStepWorkspaceQuerySecretAssignment = regexp.MustCompile(`(?i)(?:^|[\s,;?&._-])(?:--(?:password|passwd|passphrase|pwd|secret|token|api[_-]?key|authorization|credential|client[_-]?secret|private[_-]?key|access[_-]?key|refresh[_-]?token)\s+|(?:password|passwd|passphrase|pwd|secret|token|api[_-]?key|authorization|credential|client[_-]?secret|private[_-]?key|access[_-]?key|refresh[_-]?token)["']?\s*(?:=|:)\s*)(?:"[^"]*"|'[^']*'|[^\s,;}&]+)`)
+var taskStepSensitiveCommand = regexp.MustCompile(`(?i)(?:\b(?:printenv|env)\b|\b(?:aws\s+(?:configure|sts|iam|secretsmanager|sso)|gcloud\s+auth|az\s+account\s+get-access-token|security\s+find-generic-password|ssh-add\s+-L)\b|(?:^|[\s/])(?:\.env|\.ssh|\.gnupg|\.aws|\.azure|\.kube|\.docker|\.netrc|\.git-credentials|\.config/(?:gh|gcloud))(?:[./\s]|$)|(?:^|[\s/])[^\s]+\.(?:pem|p12|pfx|keystore|key)(?:[\s]|$)|\$\{?[a-z_][a-z0-9_]*(?:password|passwd|secret|token|key|credential))`)
 
 // Timing covers only a call actually dispatched to the Host, never recovery.
 func withTaskToolExecutionStart(ctx context.Context) context.Context {
@@ -166,19 +235,36 @@ func taskToolExecutionDetails(activity cloudDSHToolActivity) (*TaskStepExecution
 		result.DurationMS == nil && result.ExitCode == nil && result.Stdout == nil && result.Stderr == nil {
 		return nil, truncated
 	}
-	if taskStepExecutionRequiresWorkspace(&result) && taskToolExecutionWorkspaceID(activity) == "" {
+	if taskStepExecutionRequiresWorkspace(activity.call.Name, &result) && taskToolExecutionWorkspaceID(activity) == "" {
 		return nil, truncated
 	}
 	return &result, truncated
 }
 
-func taskStepExecutionRequiresWorkspace(value *TaskStepExecution) bool {
-	return value != nil && (value.Parameters != nil || value.Command != nil || value.WorkingDirectory != nil ||
+func taskStepExecutionRequiresWorkspace(toolName string, value *TaskStepExecution) bool {
+	if value == nil {
+		return false
+	}
+	// Only the sanitized, metadata-only browser parameter projection is
+	// independent of Workspace visibility. Any output or execution evidence
+	// remains behind the same Workspace authorization gate as shell/file data.
+	browserParameters := value.Parameters != nil && taskStepBrowserParametersAreWorkspaceIndependent(toolName)
+	return (value.Parameters != nil && !browserParameters) || value.Command != nil || value.WorkingDirectory != nil ||
 		value.ExitCode != nil || value.TimedOut != nil || value.Stdout != nil || value.Stderr != nil ||
 		value.StdoutTotalBytes != nil || value.StderrTotalBytes != nil || value.StdoutOmittedBytes != nil ||
 		value.StderrOmittedBytes != nil || value.StdoutTruncated != nil || value.StderrTruncated != nil ||
 		value.StdoutRuntimeTruncated != nil || value.StderrRuntimeTruncated != nil ||
-		value.StdoutDetailTruncated != nil || value.StderrDetailTruncated != nil)
+		value.StdoutDetailTruncated != nil || value.StderrDetailTruncated != nil
+}
+
+func taskStepBrowserParametersAreWorkspaceIndependent(toolName string) bool {
+	switch toolName {
+	case runtimeToolBrowserOpenTab, runtimeToolBrowserNavigate, runtimeToolBrowserClick, runtimeToolBrowserType,
+		runtimeToolBrowserPressKey:
+		return true
+	default:
+		return false
+	}
 }
 
 func taskToolExecutionWorkspaceID(activity cloudDSHToolActivity) string {
@@ -210,6 +296,8 @@ func taskToolExecutionParameters(name, raw string) string {
 	switch name {
 	case runtimeToolFileRead, runtimeToolFileWrite, runtimeToolFileList, runtimeToolFileFind,
 		cloudDSHWorkspaceReadToolName, cloudDSHWorkspaceWriteToolName, cloudDSHWorkspaceListToolName, cloudDSHWorkspaceSearchToolName:
+	case runtimeToolBrowserOpenTab, runtimeToolBrowserNavigate, runtimeToolBrowserClick, runtimeToolBrowserType,
+		runtimeToolBrowserPressKey:
 	default:
 		return ""
 	}
@@ -218,14 +306,48 @@ func taskToolExecutionParameters(name, raw string) string {
 		return ""
 	}
 	selected := make(map[string]any)
-	if path := decodeSafeString(fields["path"], 2048); path != "" && !cloudDSHWorkspacePathIsSensitive(path) {
-		cleaned, _, _ := taskStepDisclosureText(path)
-		selected["path"] = cleaned
-	}
-	for _, key := range []string{"start_line", "end_line"} {
-		var number int64
-		if len(fields[key]) > 0 && json.Unmarshal(fields[key], &number) == nil && number > 0 {
-			selected[key] = number
+	switch name {
+	case runtimeToolFileRead, runtimeToolFileWrite, runtimeToolFileList, runtimeToolFileFind,
+		cloudDSHWorkspaceReadToolName, cloudDSHWorkspaceWriteToolName, cloudDSHWorkspaceListToolName, cloudDSHWorkspaceSearchToolName:
+		if path := decodeSafeString(fields["path"], 2048); path != "" && !cloudDSHWorkspacePathIsSensitive(path) {
+			cleaned, _, _ := taskStepDisclosureText(path)
+			selected["path"] = cleaned
+		}
+		if name == cloudDSHWorkspaceSearchToolName {
+			if query, ok := taskStepWorkspaceSearchQuery(fields["query"]); ok {
+				selected["query"] = query
+			}
+		}
+		for _, key := range []string{"start_line", "end_line"} {
+			var number int64
+			if len(fields[key]) > 0 && json.Unmarshal(fields[key], &number) == nil && number > 0 {
+				selected[key] = number
+			}
+		}
+	case runtimeToolBrowserOpenTab, runtimeToolBrowserNavigate:
+		if rawURL := decodeSafeString(fields["url"], 2048); rawURL != "" {
+			if origin := taskToolBrowserOrigin(rawURL); origin != "" {
+				selected["site"] = origin
+			}
+		}
+	case runtimeToolBrowserClick, runtimeToolBrowserType:
+		if role := decodeSafeString(fields["role"], 32); validTaskStepBrowserRole(role) {
+			selected["role"] = role
+		}
+		if elementName := decodeSafeString(fields["name"], 512); elementName != "" {
+			cleaned, redacted, truncated := taskStepDisclosureText(elementName)
+			if !redacted && !truncated && cleaned != "" {
+				selected["element"] = cleaned
+			}
+		}
+		if name == runtimeToolBrowserType {
+			if text := decodeSafeString(fields["text"], 4096); text != "" {
+				selected["text_omitted"] = true
+			}
+		}
+	case runtimeToolBrowserPressKey:
+		if key := decodeSafeString(fields["key"], 16); validTaskStepBrowserKey(key) {
+			selected["key"] = key
 		}
 	}
 	if len(selected) == 0 {
@@ -236,6 +358,59 @@ func taskToolExecutionParameters(name, raw string) string {
 		return ""
 	}
 	return string(encoded)
+}
+
+func taskStepWorkspaceSearchQuery(raw json.RawMessage) (string, bool) {
+	query := decodeSafeString(raw, 640)
+	if query == "" || utf8.RuneCountInString(query) > 160 || cloudDSHHistoryCredentialPattern.MatchString(query) ||
+		taskStepSecretURL.MatchString(query) || taskStepPrivateKey.MatchString(query) ||
+		taskStepWorkspaceQuerySecretAssignment.MatchString(query) {
+		return "", false
+	}
+	query = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, query)
+	query = strings.TrimSpace(query)
+	return query, query != ""
+}
+
+// taskToolBrowserOrigin records only the scheme and host. Browser URLs may
+// contain signed query strings, session identifiers, or sensitive path data;
+// the detailed work item needs to show the site without persisting those parts.
+func taskToolBrowserOrigin(raw string) string {
+	if raw == "" || len(raw) > 2048 || !utf8.ValidString(raw) || strings.ContainsRune(raw, '\x00') {
+		return ""
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.User != nil || parsed.Opaque != "" || parsed.Hostname() == "" {
+		return ""
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return ""
+	}
+	return scheme + "://" + strings.ToLower(parsed.Host)
+}
+
+func validTaskStepBrowserRole(value string) bool {
+	switch value {
+	case "button", "link", "textbox", "searchbox", "checkbox", "radio", "option", "menuitem", "tab", "combobox", "switch":
+		return true
+	default:
+		return false
+	}
+}
+
+func validTaskStepBrowserKey(value string) bool {
+	switch value {
+	case "Enter", "Tab", "Escape", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight":
+		return true
+	default:
+		return false
+	}
 }
 
 func taskStepOutputDisclosure(raw string, hostTruncated bool) (*string, *int, *int, *bool) {
@@ -368,6 +543,14 @@ func taskStepSanitizedText(raw string) (string, bool) {
 	clean = taskStepSecretURL.ReplaceAllString(clean, "$1[已隐藏]@")
 	clean = taskStepSecretAssignment.ReplaceAllString(clean, "$1[已隐藏]")
 	return clean, clean != raw
+}
+
+// SanitizeAdminAgentDiagnosticText applies the same credential and private-key
+// redaction used for existing Task execution disclosures before admin views
+// render event data.
+func SanitizeAdminAgentDiagnosticText(raw string) string {
+	clean, _ := taskStepSanitizedText(raw)
+	return clean
 }
 
 func truncateTaskStepDisclosure(value string, maxBytes int) (string, bool) {

@@ -12,12 +12,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf16"
 	"unicode/utf8"
 
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 	"go.uber.org/zap"
 
 	"morde/server/internal/app"
@@ -27,6 +32,8 @@ import (
 
 const cloudDSHMaxFrame = 4 << 20
 const cloudDSHMaxText = app.MaxDSHModelResponseTextBytes
+const cloudDSHMaxModelResponseContentBytes = 2 << 20
+const cloudDSHMaxModelResponseBlockBytes = 256 << 10
 
 // This is the persisted Morde checkpoint/protocol compatibility identifier, not the upstream DSH package release.
 // Changing it requires migrating existing durable Task agent instances and checkpoints.
@@ -46,6 +53,19 @@ var ErrCloudDSHCompletionPending = errors.New("dsh completion requires output ve
 // ErrCloudDSHWaitingForUser means the broker durably paused the task before
 // returning a tool result, so the dsh process must stop without failing it.
 var ErrCloudDSHWaitingForUser = errors.New("dsh task is waiting for user input")
+var errCloudDSHModelBudgetCapacityWaiting = errors.New("dsh task is waiting for model capacity")
+
+func cloudDSHModelBudgetPlanDenialError(planErr, denialWriteErr error) error {
+	if errors.Is(planErr, app.ErrTaskModelBudgetCapacityWaiting) {
+		// The wait row and Task state are already durable. A broken runtime pipe
+		// must not turn this safe wait into a generic recovery failure.
+		return errCloudDSHModelBudgetCapacityWaiting
+	}
+	if denialWriteErr != nil {
+		return denialWriteErr
+	}
+	return errors.New("dsh model budget plan was denied")
+}
 
 var errCloudDSHTerminalToolAttempt = errors.New("dsh tool attempt was durably terminated")
 
@@ -102,11 +122,15 @@ func cloudDSHToolExecutionFailureFor(frame cloudDSHFrame, reasonCode string, cau
 }
 
 type cloudDSHModelResultError struct {
-	stage      string
-	category   string
-	reasonCode string
-	toolName   string
-	toolCallID string
+	stage              string
+	category           string
+	reasonCode         string
+	toolName           string
+	toolCallID         string
+	noDispatch         *app.TaskModelNoDispatchEvidence
+	recoveryFailure    *app.TaskModelRecoveryFailureEvidence
+	recoveryFailureErr app.TaskModelRecoveryFailure
+	recoveryCheckpoint *cloudDSHReadOnlyRecoveryCheckpoint
 }
 
 func (e cloudDSHModelResultError) Error() string { return errCloudDSHModelResultUnavailable.Error() }
@@ -122,6 +146,17 @@ func (e cloudDSHModelResultError) ModelFailureDiagnostic() app.AgentModelFailure
 		ToolName: e.toolName, ToolCallID: e.toolCallID}
 }
 
+func (e cloudDSHModelResultError) TaskModelNoDispatchEvidence() (app.TaskModelNoDispatchEvidence, bool) {
+	if e.noDispatch == nil {
+		return app.TaskModelNoDispatchEvidence{}, false
+	}
+	return *e.noDispatch, true
+}
+
+func (e cloudDSHModelResultError) taskModelRecoveryProof() (app.TaskModelRecoveryFailure, *cloudDSHReadOnlyRecoveryCheckpoint) {
+	return e.recoveryFailureErr, e.recoveryCheckpoint
+}
+
 func cloudDSHModelErrorCategory(err error) string {
 	if err == nil {
 		return "invalid_response"
@@ -132,6 +167,7 @@ func cloudDSHModelErrorCategory(err error) string {
 	}
 	var domainErr *domain.Error
 	if errors.As(err, &domainErr) {
+		providerStatusWithoutCode := false
 		if domainErr.Details["reason"] == "task_model_budget_exhausted" {
 			return "task_budget_exhausted"
 		}
@@ -160,7 +196,7 @@ func cloudDSHModelErrorCategory(err error) string {
 				case "server_error":
 					return "provider_server_error"
 				default:
-					return "provider_request_rejected"
+					providerStatusWithoutCode = true
 				}
 			}
 		}
@@ -168,9 +204,15 @@ func cloudDSHModelErrorCategory(err error) string {
 			switch app.ModelClientErrorKind(reason) {
 			case app.ModelErrorAuthentication, app.ModelErrorAccess, app.ModelErrorRateLimited, app.ModelErrorQuota,
 				app.ModelErrorInvalidRequest, app.ModelErrorUnavailable, app.ModelErrorTimeout, app.ModelErrorTransport,
-				app.ModelErrorInvalidResponse:
+				app.ModelErrorInvalidResponse, app.ModelErrorContentFiltered:
 				return reason
 			}
+		}
+		// Providers need not return a structured error code. Preserve the
+		// gateway's allowlisted failure kind before falling back to a generic
+		// rejected request, otherwise authentication is retried as a 5xx.
+		if providerStatusWithoutCode {
+			return "provider_request_rejected"
 		}
 		switch domainErr.Code {
 		case domain.CodeResultTooLarge:
@@ -202,6 +244,55 @@ func cloudDSHModelErrorCategory(err error) string {
 
 func cloudDSHModelResultErrorFor(err error) error {
 	return cloudDSHModelResultError{category: cloudDSHModelErrorCategory(err)}
+}
+
+type cloudDSHModelRecoveryFailureSource interface {
+	TaskModelRecoveryFailureEvidence() app.TaskModelRecoveryFailureEvidence
+}
+
+func cloudDSHModelResultErrorForCall(err error, call app.ModelCall, checkpoints ...cloudDSHReadOnlyRecoveryCheckpoint) error {
+	var preclassified cloudDSHModelResultError
+	if errors.As(err, &preclassified) && preclassified.stage != "" {
+		return preclassified
+	}
+	failure := cloudDSHModelResultError{category: cloudDSHModelErrorCategory(err)}
+	var source cloudDSHModelRecoveryFailureSource
+	if !errors.As(err, &source) || call.Source != app.ModelCallTask || call.Task == nil ||
+		call.Task.RecoveryCallID != "" || call.Task.RecoveryDSHCallID != "" {
+		return failure
+	}
+	evidence := source.TaskModelRecoveryFailureEvidence()
+	wantCallID, callIDErr := app.DSHModelCallID(call.Task.TaskID, call.Task.AgentSessionID, call.Task.ThroughSequence)
+	if callIDErr != nil || evidence.TaskFence != *call.Task || evidence.CallID != call.CallID || evidence.CallID != wantCallID ||
+		!evidence.UsageKnown || evidence.InputTokens != 0 || evidence.OutputTokens != 0 || evidence.ModelID != call.ModelID ||
+		len(evidence.RequestDigest) != 32 {
+		return failure
+	}
+	switch evidence.Kind {
+	case app.TaskModelRecoveryFailureNoDispatch:
+		if evidence.ProviderErrorKind != "" {
+			return failure
+		}
+		noDispatch := app.TaskModelNoDispatchEvidence{TaskFence: evidence.TaskFence, CallID: evidence.CallID,
+			ModelID: evidence.ModelID, RequestDigest: append([]byte(nil), evidence.RequestDigest...), UsageKnown: evidence.UsageKnown,
+			InputTokens: evidence.InputTokens, OutputTokens: evidence.OutputTokens}
+		failure.noDispatch = &noDispatch
+	case app.TaskModelRecoveryFailureProviderReject:
+		if evidence.ProviderErrorKind != app.ModelErrorRateLimited && evidence.ProviderErrorKind != app.ModelErrorUnavailable {
+			return failure
+		}
+	default:
+		return failure
+	}
+	recoveryEvidence := evidence
+	recoveryEvidence.RequestDigest = append([]byte(nil), evidence.RequestDigest...)
+	failure.recoveryFailure = &recoveryEvidence
+	failure.recoveryFailureErr = source
+	if len(checkpoints) == 1 {
+		checkpoint := checkpoints[0]
+		failure.recoveryCheckpoint = &checkpoint
+	}
+	return failure
 }
 
 func cloudDSHChildModelFailureCode(err error) (string, bool) {
@@ -291,6 +382,94 @@ type CloudDSHModels interface {
 	Complete(context.Context, app.ModelCall) (app.ModelResponse, error)
 }
 
+// CloudDSHModelBudgetPlanRequest is the validated provider-bound input and
+// DSH-local context used by the opt-in P0 budget-plan probe. Request excludes
+// max_tokens; Config and ToolHistory are available to planning but excluded
+// from RequestDigest, which covers only provider/model/messages/tools.
+type CloudDSHModelBudgetPlanRequest struct {
+	Fence             app.AgentInstanceFence
+	TaskRevision      int64
+	SessionID         string
+	ModelID           string
+	ThroughSeq        int64
+	Turn              int64
+	Step              int64
+	CallID            string
+	DSHCallID         string
+	RecoveryCallID    string
+	RecoveryDSHCallID string
+	RequestDigest     string
+	Request           json.RawMessage
+	Config            json.RawMessage
+	ToolHistory       json.RawMessage
+}
+
+// CloudDSHModelBudgetPlan is an opaque, one-call plan returned to the DSH
+// runtime. It does not represent an account or Task budget reservation.
+type CloudDSHModelBudgetPlan struct {
+	PlanID    string
+	MaxTokens int
+}
+
+// CloudDSHModelBudgetPlanner enables the P0 opt-in worker/runtime probe when
+// supplied. Production budget admission and ledger settlement are separate
+// contracts and are not implemented by this interface.
+type CloudDSHModelBudgetPlanner interface {
+	SupportsTaskModelBudgetAdmission(context.Context, task.Task) (bool, error)
+	PrepareModelBudget(context.Context, CloudDSHModelBudgetPlanRequest) (CloudDSHModelBudgetPlan, error)
+}
+
+type CloudDSHModelBudgetPreparationService interface {
+	SupportsTaskModelBudgetAdmission(context.Context, task.Task) (bool, error)
+	PrepareTaskModelBudget(context.Context, app.TaskModelBudgetPrepareRequest) (app.TaskModelBudgetPlan, error)
+}
+
+type cloudDSHModelBudgetPlannerAdapter struct {
+	service CloudDSHModelBudgetPreparationService
+}
+
+func NewCloudDSHModelBudgetPlanner(service CloudDSHModelBudgetPreparationService) (CloudDSHModelBudgetPlanner, error) {
+	if service == nil {
+		return nil, errors.New("adaptive model budget preparation service is required")
+	}
+	return &cloudDSHModelBudgetPlannerAdapter{service: service}, nil
+}
+
+func (adapter *cloudDSHModelBudgetPlannerAdapter) PrepareModelBudget(ctx context.Context, request CloudDSHModelBudgetPlanRequest) (CloudDSHModelBudgetPlan, error) {
+	if adapter == nil || adapter.service == nil {
+		return CloudDSHModelBudgetPlan{}, errors.New("adaptive model budget preparation service is unavailable")
+	}
+	plan, err := adapter.service.PrepareTaskModelBudget(ctx, app.TaskModelBudgetPrepareRequest{
+		Fence: func() app.ModelTaskFence {
+			fence := cloudDSHModelFence(request.Fence, request.SessionID, request.ThroughSeq, request.TaskRevision)
+			fence.RecoveryCallID, fence.RecoveryDSHCallID = request.RecoveryCallID, request.RecoveryDSHCallID
+			return fence
+		}(), DSHCallID: request.DSHCallID, ModelID: request.ModelID, ThroughSequence: request.ThroughSeq,
+		Turn: request.Turn, Step: request.Step, BudgetCallID: request.CallID,
+		RequestDigest: request.RequestDigest, ProviderRequest: append(json.RawMessage(nil), request.Request...),
+	})
+	if err != nil {
+		return CloudDSHModelBudgetPlan{}, err
+	}
+	return CloudDSHModelBudgetPlan{PlanID: plan.PlanID, MaxTokens: plan.MaxTokens}, nil
+}
+
+func (adapter *cloudDSHModelBudgetPlannerAdapter) SupportsTaskModelBudgetAdmission(ctx context.Context, value task.Task) (bool, error) {
+	if adapter == nil || adapter.service == nil {
+		return false, errors.New("adaptive model budget preparation service is unavailable")
+	}
+	return adapter.service.SupportsTaskModelBudgetAdmission(ctx, value)
+}
+
+func configureCloudDSHModelBudgetAdmission(start map[string]any, planner CloudDSHModelBudgetPlanner,
+	enabledForTask bool, legacyMaxTokens int64) {
+	if planner == nil || !enabledForTask {
+		start["max_tokens"] = legacyMaxTokens
+		return
+	}
+	start["model_budget_admission"] = true
+}
+
 type CloudDSHTaskContextWindowResolver interface {
 	ResolveTaskContextWindow(context.Context, task.Task) (*int, error)
 }
@@ -331,6 +510,10 @@ type CloudDSHRecoveryTools interface {
 	PauseRecovery(context.Context, task.Task) error
 }
 
+type cloudDSHDetailedRecoveryTools interface {
+	PauseRecoveryDiagnostic(context.Context, task.Task, app.AgentRecoveryDiagnostic) error
+}
+
 type cloudDSHModelRecoveryTools interface {
 	PauseModelRecovery(context.Context, task.Task, string) error
 }
@@ -339,11 +522,37 @@ type cloudDSHDetailedModelRecoveryTools interface {
 	PauseModelRecoveryDiagnostic(context.Context, task.Task, app.AgentModelFailureDiagnostic) error
 }
 
+type cloudDSHTaskModelRecoveryScheduler interface {
+	ScheduleTaskModelRecovery(context.Context, task.Task, app.TaskModelRecoveryFailure, int64, []byte, []byte) (bool, error)
+}
+
+type cloudDSHTaskModelRecoveryAttemptStarter interface {
+	BeginTaskModelRecoveryAttempt(context.Context, task.ModelRecoveryIntent, app.AgentInstanceFence) error
+}
+
 type cloudDSHModelFailureDiagnosticSource interface {
 	ModelFailureDiagnostic() app.AgentModelFailureDiagnostic
 }
 
 func pauseCloudDSHModelRecovery(ctx context.Context, tools CloudDSHRecoveryTools, value task.Task, cause error) error {
+	var proofSource interface {
+		taskModelRecoveryProof() (app.TaskModelRecoveryFailure, *cloudDSHReadOnlyRecoveryCheckpoint)
+	}
+	if errors.As(cause, &proofSource) {
+		failure, checkpoint := proofSource.taskModelRecoveryProof()
+		if failure != nil && checkpoint != nil {
+			if scheduler, ok := tools.(cloudDSHTaskModelRecoveryScheduler); ok {
+				checkpointTask := value
+				checkpointTask.CheckpointThroughSequence = checkpoint.ThroughSequence
+				checkpointTask.CheckpointDigest = append([]byte(nil), checkpoint.Digest...)
+				scheduled, err := scheduler.ScheduleTaskModelRecovery(ctx, checkpointTask, failure, checkpoint.ThroughSequence,
+					checkpoint.Digest, checkpoint.ToolsetDigest)
+				if scheduled || err != nil {
+					return err
+				}
+			}
+		}
+	}
 	var source cloudDSHModelFailureDiagnosticSource
 	if errors.As(cause, &source) {
 		if detailed, ok := tools.(cloudDSHDetailedModelRecoveryTools); ok {
@@ -359,30 +568,50 @@ func pauseCloudDSHModelRecovery(ctx context.Context, tools CloudDSHRecoveryTools
 	return tools.PauseRecovery(ctx, value)
 }
 
+func pauseCloudDSHRecovery(ctx context.Context, tools CloudDSHRecoveryTools, value task.Task) error {
+	if detailed, ok := tools.(cloudDSHDetailedRecoveryTools); ok {
+		return detailed.PauseRecoveryDiagnostic(ctx, value, app.AgentRecoveryDiagnostic{
+			Stage: app.AgentRecoveryStageCloudDSHRun, ReasonCode: app.AgentRecoveryReasonUnclassifiedRuntime,
+		})
+	}
+	return tools.PauseRecovery(ctx, value)
+}
+
 type CloudDSHCompleter interface {
 	Complete(context.Context, task.Task, app.CloudDSHTaskCompletion) error
 }
 
 type CloudDSHExecutorOptions struct {
-	SupervisorID     string
-	Logger           *zap.Logger
-	SummarySealer    *app.Sealer
-	AccountRuntimes  *CloudDSHAccountRuntimeManager
-	Instances        CloudDSHInstances
-	Checkpoints      CloudDSHCheckpoints
-	Models           CloudDSHModels
-	ToolCapabilities CloudDSHModelToolCapability
-	ProjectContexts  CloudDSHProjectContexts
-	StreamCapability CloudDSHTextStreamingCapability
-	TextStreams      CloudDSHTextStreamStore
-	AgentActivity    app.TaskAgentActivityRecorder
-	RevisionStops    CloudDSHRevisionStopWitness
-	Tools            CloudDSHTools
-	Children         CloudDSHChildSessions
-	Completion       CloudDSHCompleter
+	SupervisorID         string
+	Logger               *zap.Logger
+	TracerProvider       trace.TracerProvider
+	ObservabilityContext app.TaskObservabilityContextReader
+	AttemptTraceLinker   app.TaskAttemptTraceLinker
+	SummarySealer        *app.Sealer
+	AccountRuntimes      *CloudDSHAccountRuntimeManager
+	Instances            CloudDSHInstances
+	Checkpoints          CloudDSHCheckpoints
+	Models               CloudDSHModels
+	ModelBudgetPlanner   CloudDSHModelBudgetPlanner
+	ToolCapabilities     CloudDSHModelToolCapability
+	ProjectContexts      CloudDSHProjectContexts
+	StreamCapability     CloudDSHTextStreamingCapability
+	TextStreams          CloudDSHTextStreamStore
+	AgentActivity        app.TaskAgentActivityRecorder
+	RevisionStops        CloudDSHRevisionStopWitness
+	Tools                CloudDSHTools
+	Children             CloudDSHChildSessions
+	Completion           CloudDSHCompleter
+	// MaxSubagentDepth bounds delegation hops from the root session (0
+	// keeps the app.DefaultMaxSubagentDepth of 2). It is the single
+	// configurable for the E12 subagent depth limit.
+	MaxSubagentDepth int
 }
 
-type CloudDSHExecutor struct{ options CloudDSHExecutorOptions }
+type CloudDSHExecutor struct {
+	options CloudDSHExecutorOptions
+	tracer  trace.Tracer
+}
 
 func NewCloudDSHExecutor(options CloudDSHExecutorOptions) (*CloudDSHExecutor, error) {
 	if !cloudDSHID.MatchString(options.SupervisorID) || options.AccountRuntimes == nil ||
@@ -398,7 +627,20 @@ func NewCloudDSHExecutor(options CloudDSHExecutorOptions) (*CloudDSHExecutor, er
 	if options.Logger == nil {
 		options.Logger = zap.NewNop()
 	}
-	return &CloudDSHExecutor{options: options}, nil
+	provider := options.TracerProvider
+	if provider == nil {
+		provider = noop.NewTracerProvider()
+	}
+	return &CloudDSHExecutor{options: options, tracer: provider.Tracer("morde/server/internal/worker")}, nil
+}
+
+// maxSubagentDepth is the configured E12 delegation limit (0 keeps the
+// app.DefaultMaxSubagentDepth of two delegation hops).
+func (e *CloudDSHExecutor) maxSubagentDepth() int {
+	if e != nil && e.options.MaxSubagentDepth > 0 {
+		return e.options.MaxSubagentDepth
+	}
+	return app.DefaultMaxSubagentDepth
 }
 
 func openCloudDSHTaskSummary(value task.Task, contextValue *task.ConversationContext, sealer *app.Sealer) error {
@@ -603,6 +845,14 @@ func (e *CloudDSHExecutor) ExecuteTask(ctx context.Context, value task.Task) (re
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	ctx, attemptSpan := e.startTaskAttemptTrace(ctx, value)
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			cloudDSHEndSpan(attemptSpan, "failed", errors.New("task attempt panicked"))
+			panic(recovered)
+		}
+		cloudDSHEndSpan(attemptSpan, cloudDSHAttemptSpanStatus(retErr), retErr)
+	}()
 	projectRecovery := recoveringAgent && value.ProjectID != "" && value.CheckpointThroughSequence >= 0
 	if projectRecovery {
 		if e.options.ProjectContexts == nil {
@@ -719,6 +969,8 @@ func (e *CloudDSHExecutor) ExecuteTask(ctx context.Context, value task.Task) (re
 			}
 		}
 		if errors.Is(retErr, errCloudDSHModelResultUnavailable) && ctx.Err() == nil {
+			// shortcut: Task model calls lack a durable, ledger-bound retry
+			// schedule; pause until a safe new attempt can be admitted.
 			if recoveryTools, ok := e.options.Tools.(CloudDSHRecoveryTools); ok {
 				pauseCtx, cancelPause := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 				retErr = errors.Join(retErr, pauseCloudDSHModelRecovery(pauseCtx, recoveryTools, value, retErr))
@@ -785,10 +1037,11 @@ func (e *CloudDSHExecutor) ExecuteTask(ctx context.Context, value task.Task) (re
 	// A disconnected child is reclaimed from its durable checkpoint; the operation ledger decides whether a tool can be replayed.
 	if err != nil && !errors.Is(err, errCloudDSHConnectionInterrupted) && !errors.Is(err, errCloudDSHBackgroundOutputPending) &&
 		!errors.Is(err, ErrCloudDSHCompletionPending) && !errors.Is(err, errCloudDSHModelResultUnavailable) &&
-		!errors.Is(err, errCloudDSHPersonalMemoryChanged) && !errors.Is(err, errCloudDSHTerminalToolAttempt) && recoveringAgent && ctx.Err() == nil {
+		!errors.Is(err, errCloudDSHPersonalMemoryChanged) && !errors.Is(err, errCloudDSHTerminalToolAttempt) &&
+		!errors.Is(err, errCloudDSHModelBudgetCapacityWaiting) && recoveringAgent && ctx.Err() == nil {
 		if recoveryTools, ok := e.options.Tools.(CloudDSHRecoveryTools); ok {
 			pauseCtx, cancelPause := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-			err = errors.Join(err, recoveryTools.PauseRecovery(pauseCtx, value))
+			err = errors.Join(err, pauseCloudDSHRecovery(pauseCtx, recoveryTools, value))
 			cancelPause()
 		}
 	}
@@ -800,7 +1053,7 @@ func (e *CloudDSHExecutor) ExecuteTask(ctx context.Context, value task.Task) (re
 			return cause
 		}
 	}
-	if errors.Is(err, ErrCloudDSHWaitingForUser) {
+	if errors.Is(err, ErrCloudDSHWaitingForUser) || errors.Is(err, errCloudDSHModelBudgetCapacityWaiting) {
 		return nil
 	}
 	if errors.Is(err, errCloudDSHTerminalToolAttempt) {
@@ -908,30 +1161,38 @@ type cloudDSHIdentity struct {
 type cloudDSHFrame struct {
 	Type string `json:"type"`
 	cloudDSHIdentity
-	Version             int             `json:"version,omitempty"`
-	Engine              string          `json:"engine,omitempty"`
-	EngineVer           string          `json:"engine_version,omitempty"`
-	ID                  string          `json:"id,omitempty"`
-	From                *int64          `json:"from_seq,omitempty"`
-	Through             *int64          `json:"through_seq,omitempty"`
-	ObservationSequence *int64          `json:"observation_sequence,omitempty"`
-	TaskRevision        *int64          `json:"task_revision,omitempty"`
-	Payload             string          `json:"payload,omitempty"`
-	SHA256              string          `json:"sha256,omitempty"`
-	Request             json.RawMessage `json:"request,omitempty"`
-	CallID              string          `json:"call_id,omitempty"`
-	RequestKind         string          `json:"request_kind,omitempty"`
-	RequestDigest       string          `json:"request_digest,omitempty"`
-	Name                string          `json:"name,omitempty"`
-	Arguments           json.RawMessage `json:"arguments,omitempty"`
-	State               string          `json:"state,omitempty"`
-	Status              string          `json:"status,omitempty"`
-	Phase               string          `json:"phase,omitempty"`
-	ActivityID          string          `json:"activity_id,omitempty"`
-	Code                string          `json:"code,omitempty"`
-	Reason              string          `json:"reason,omitempty"`
-	Summary             string          `json:"summary,omitempty"`
-	JobID               string          `json:"job_id,omitempty"`
+	Version                  int             `json:"version,omitempty"`
+	Engine                   string          `json:"engine,omitempty"`
+	EngineVer                string          `json:"engine_version,omitempty"`
+	ID                       string          `json:"id,omitempty"`
+	From                     *int64          `json:"from_seq,omitempty"`
+	Through                  *int64          `json:"through_seq,omitempty"`
+	ObservationSequence      *int64          `json:"observation_sequence,omitempty"`
+	TaskRevision             *int64          `json:"task_revision,omitempty"`
+	Payload                  string          `json:"payload,omitempty"`
+	SHA256                   string          `json:"sha256,omitempty"`
+	Request                  json.RawMessage `json:"request,omitempty"`
+	Config                   json.RawMessage `json:"config,omitempty"`
+	ToolHistory              json.RawMessage `json:"tool_history,omitempty"`
+	CallID                   string          `json:"call_id,omitempty"`
+	DSHCallID                string          `json:"dsh_call_id,omitempty"`
+	BudgetCallID             string          `json:"budget_call_id,omitempty"`
+	Turn                     *int64          `json:"turn,omitempty"`
+	Step                     *int64          `json:"step,omitempty"`
+	BudgetPlanID             string          `json:"budget_plan_id,omitempty"`
+	CurrentTaskTurnMessageID string          `json:"current_task_turn_message_id,omitempty"`
+	RequestKind              string          `json:"request_kind,omitempty"`
+	RequestDigest            string          `json:"request_digest,omitempty"`
+	Name                     string          `json:"name,omitempty"`
+	Arguments                json.RawMessage `json:"arguments,omitempty"`
+	State                    string          `json:"state,omitempty"`
+	Status                   string          `json:"status,omitempty"`
+	Phase                    string          `json:"phase,omitempty"`
+	ActivityID               string          `json:"activity_id,omitempty"`
+	Code                     string          `json:"code,omitempty"`
+	Reason                   string          `json:"reason,omitempty"`
+	Summary                  string          `json:"summary,omitempty"`
+	JobID                    string          `json:"job_id,omitempty"`
 }
 
 type cloudDSHRead struct {
@@ -984,7 +1245,9 @@ func readCloudDSHFrames(ctx context.Context, source io.Reader, out chan<- cloudD
 // the required keys for a frame type. The task runtime reports a failure
 // reason on "failed" frames; older runtimes omit it.
 var cloudDSHFrameOptionalFields = map[string][]string{
-	"failed": {"reason"},
+	"failed":    {"reason"},
+	"tool_call": {"current_task_turn_message_id"},
+	"model":     {"budget_plan_id", "budget_call_id", "request_digest"},
 }
 
 func decodeCloudDSHFrame(raw []byte) (cloudDSHFrame, error) {
@@ -1010,6 +1273,7 @@ func decodeCloudDSHFrame(raw []byte) (cloudDSHFrame, error) {
 		"checkpoint":            {"type", "id", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "from_seq", "through_seq", "payload", "sha256"},
 		"checkpoint_read":       {"type", "id", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "from_seq"},
 		"model":                 {"type", "id", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "through_seq", "request", "sha256"},
+		"model_budget_prepare":  {"type", "id", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "through_seq", "call_id", "dsh_call_id", "turn", "step", "request_digest", "request", "config", "tool_history"},
 		"tool_call":             {"type", "id", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "through_seq", "call_id", "name", "arguments"},
 		"child_create":          {"type", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "through_seq", "call_id", "arguments"},
 		"child_settle":          {"type", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "through_seq", "call_id", "status", "sha256", "summary"},
@@ -1055,6 +1319,24 @@ func decodeCloudDSHFrame(raw []byte) (cloudDSHFrame, error) {
 	for _, name := range required {
 		if _, ok := keys[name]; !ok {
 			return cloudDSHFrame{}, errors.New("missing dsh frame field")
+		}
+	}
+	if frame.Type == "tool_call" {
+		if _, exists := keys["current_task_turn_message_id"]; exists &&
+			(!validCloudDSHJSONStringField(keys, "current_task_turn_message_id") || !domain.ValidMessageID(frame.CurrentTaskTurnMessageID)) {
+			return cloudDSHFrame{}, errors.New("invalid dsh current Task turn message identity")
+		}
+	}
+	if frame.Type == "model" {
+		_, hasPlan := keys["budget_plan_id"]
+		_, hasCall := keys["budget_call_id"]
+		_, hasDigest := keys["request_digest"]
+		if hasPlan || hasCall || hasDigest {
+			if _, ok := cloudDSHDigestBytes(frame.RequestDigest); !hasPlan || !hasCall || !hasDigest ||
+				!cloudDSHID.MatchString(frame.BudgetPlanID) || !cloudDSHID.MatchString(frame.BudgetCallID) ||
+				!validCloudDSHJSONStringField(keys, "request_digest") || !ok {
+				return cloudDSHFrame{}, errors.New("invalid dsh model budget identity")
+			}
 		}
 	}
 	if !validCloudDSHObservationFrame(frame, keys) {
@@ -1192,6 +1474,180 @@ func cloudDSHDigest(data []byte, encoded string) bool {
 func cloudDSHDigestBytes(encoded string) ([]byte, bool) {
 	want, err := hex.DecodeString(encoded)
 	return want, err == nil && len(encoded) == 64 && len(want) == sha256.Size && encoded == strings.ToLower(encoded)
+}
+
+func cloudDSHModelBudgetRequestDigest(raw []byte) (string, bool) {
+	if len(raw) == 0 || len(raw) > cloudDSHMaxFrame || !utf8.Valid(raw) || !uniqueCloudDSHJSON(raw) {
+		return "", false
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil || fields == nil {
+		return "", false
+	}
+	subset := make(map[string]json.RawMessage, 4)
+	for _, key := range []string{"provider", "model", "messages", "tools"} {
+		value, ok := fields[key]
+		if !ok {
+			return "", false
+		}
+		subset[key] = value
+	}
+	encoded, err := json.Marshal(subset)
+	if err != nil {
+		return "", false
+	}
+	canonical, ok := cloudDSHCanonicalJSONStringify(encoded)
+	if !ok {
+		return "", false
+	}
+	digest := sha256.Sum256(canonical)
+	return hex.EncodeToString(digest[:]), true
+}
+
+func cloudDSHCanonicalJSONStringify(raw []byte) ([]byte, bool) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var value any
+	if decoder.Decode(&value) != nil || decoder.Decode(new(any)) != io.EOF {
+		return nil, false
+	}
+	var output bytes.Buffer
+	if !appendCloudDSHCanonicalJSON(&output, value) {
+		return nil, false
+	}
+	return output.Bytes(), true
+}
+
+func appendCloudDSHCanonicalJSON(output *bytes.Buffer, value any) bool {
+	switch typed := value.(type) {
+	case nil:
+		output.WriteString("null")
+	case bool:
+		output.WriteString(strconv.FormatBool(typed))
+	case string:
+		appendCloudDSHJSONString(output, typed)
+	case json.Number:
+		encoded, ok := cloudDSHCanonicalJSNumber(typed)
+		if !ok {
+			return false
+		}
+		output.WriteString(encoded)
+	case []any:
+		output.WriteByte('[')
+		for index, item := range typed {
+			if index > 0 {
+				output.WriteByte(',')
+			}
+			if !appendCloudDSHCanonicalJSON(output, item) {
+				return false
+			}
+		}
+		output.WriteByte(']')
+	case map[string]any:
+		keys := make([]string, 0, len(typed))
+		for key := range typed {
+			keys = append(keys, key)
+		}
+		sort.Slice(keys, func(left, right int) bool {
+			return cloudDSHJSONStringifyKeyLess(keys[left], keys[right])
+		})
+		output.WriteByte('{')
+		for index, key := range keys {
+			if index > 0 {
+				output.WriteByte(',')
+			}
+			appendCloudDSHJSONString(output, key)
+			output.WriteByte(':')
+			if !appendCloudDSHCanonicalJSON(output, typed[key]) {
+				return false
+			}
+		}
+		output.WriteByte('}')
+	default:
+		return false
+	}
+	return true
+}
+
+func cloudDSHJSONStringifyKeyLess(left, right string) bool {
+	leftUnits, rightUnits := utf16.Encode([]rune(left)), utf16.Encode([]rune(right))
+	for index := 0; index < len(leftUnits) && index < len(rightUnits); index++ {
+		if leftUnits[index] != rightUnits[index] {
+			return leftUnits[index] < rightUnits[index]
+		}
+	}
+	return len(leftUnits) < len(rightUnits)
+}
+
+func appendCloudDSHJSONString(output *bytes.Buffer, value string) {
+	const hex = "0123456789abcdef"
+	output.WriteByte('"')
+	for _, char := range value {
+		switch char {
+		case '"', '\\':
+			output.WriteByte('\\')
+			output.WriteRune(char)
+		case '\b':
+			output.WriteString("\\b")
+		case '\f':
+			output.WriteString("\\f")
+		case '\n':
+			output.WriteString("\\n")
+		case '\r':
+			output.WriteString("\\r")
+		case '\t':
+			output.WriteString("\\t")
+		default:
+			if char < 0x20 {
+				output.WriteString("\\u00")
+				output.WriteByte(hex[byte(char)>>4])
+				output.WriteByte(hex[byte(char)&0x0f])
+			} else {
+				output.WriteRune(char)
+			}
+		}
+	}
+	output.WriteByte('"')
+}
+
+func cloudDSHCanonicalJSNumber(value json.Number) (string, bool) {
+	number, err := strconv.ParseFloat(value.String(), 64)
+	if err != nil || math.IsInf(number, 0) || math.IsNaN(number) {
+		return "", false
+	}
+	if number == 0 {
+		return "0", true
+	}
+	sign := ""
+	if number < 0 {
+		sign = "-"
+		number = -number
+	}
+	scientific := strconv.FormatFloat(number, 'e', -1, 64)
+	parts := strings.SplitN(scientific, "e", 2)
+	if len(parts) != 2 {
+		return "", false
+	}
+	exponent, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return "", false
+	}
+	digits := strings.ReplaceAll(parts[0], ".", "")
+	if number >= 1e-6 && number < 1e21 {
+		decimal := exponent + 1
+		if decimal >= len(digits) {
+			return sign + digits + strings.Repeat("0", decimal-len(digits)), true
+		}
+		if decimal > 0 {
+			return sign + digits[:decimal] + "." + digits[decimal:], true
+		}
+		return sign + "0." + strings.Repeat("0", -decimal) + digits, true
+	}
+	coefficient := parts[0]
+	if exponent >= 0 {
+		return sign + coefficient + "e+" + strconv.Itoa(exponent), true
+	}
+	return sign + coefficient + "e" + strconv.Itoa(exponent), true
 }
 
 func cloudDSHToolPayload(definitions []app.AgentToolDefinition) []map[string]any {
@@ -1412,7 +1868,7 @@ func validCloudDSHJSONObject(raw []byte) bool {
 }
 
 func cloudDSHModelResponseFailureDiagnostic(response app.ModelResponse, definitions []app.AgentToolDefinition) app.AgentModelFailureDiagnostic {
-	if !app.ValidDSHModelResponse(response) {
+	if !app.ValidDSHModelResponse(response) && !app.ValidTaskModelTextTruncation(response) {
 		reasonCode := "response_shape_invalid"
 		toolName := ""
 		toolCallID := ""
@@ -1509,45 +1965,83 @@ func writeCloudDSHFrame(ctx context.Context, target io.WriteCloser, frame any) e
 }
 
 func writeCloudDSHModel(ctx context.Context, target io.WriteCloser, id string, identity cloudDSHIdentity, response app.ModelResponse) error {
+	if err := ctx.Err(); err != nil {
+		return context.Cause(ctx)
+	}
+	knownTextTruncation := app.ValidTaskModelTextTruncation(response)
 	if response.Usage.InputTokens < 0 || response.Usage.OutputTokens < 0 ||
 		response.Usage.InputTokens > 1<<53-1 || response.Usage.OutputTokens > 1<<53-1 ||
-		(len(response.ToolCalls) == 0 && response.StopReason != "stop") || (len(response.ToolCalls) > 0 && response.StopReason != "tool_calls") {
+		(len(response.ToolCalls) == 0 && response.StopReason != "stop" && !knownTextTruncation) ||
+		(len(response.ToolCalls) > 0 && response.StopReason != "tool_calls") ||
+		knownTextTruncation && (len(response.ToolCalls) != 0 || response.Reasoning != "" || !cloudDSHID.MatchString(id)) {
 		return errors.New("dsh model usage is invalid")
 	}
 	chunks := make([]any, 0, 7+len(response.ToolCalls))
 	blockIndex := 0
-	if response.Reasoning != "" {
-		chunks = append(chunks,
-			map[string]any{"type": "block-start", "index": blockIndex, "blockType": "reasoning"},
-			map[string]any{"type": "reasoning-delta", "index": blockIndex, "text": response.Reasoning},
-			map[string]any{"type": "block-end", "index": blockIndex, "block": map[string]any{"type": "reasoning", "text": response.Reasoning}},
-		)
-		blockIndex++
+	var err error
+	chunks, blockIndex, err = appendCloudDSHModelContent(chunks, blockIndex, "reasoning", response.Reasoning)
+	if err != nil {
+		return err
 	}
-	if response.Text != "" {
-		chunks = append(chunks,
-			map[string]any{"type": "block-start", "index": blockIndex, "blockType": "text"},
-			map[string]any{"type": "text-delta", "index": blockIndex, "text": response.Text},
-			map[string]any{"type": "block-end", "index": blockIndex, "block": map[string]any{"type": "text", "text": response.Text}},
-		)
-		blockIndex++
+	chunks, blockIndex, err = appendCloudDSHModelContent(chunks, blockIndex, "text", response.Text)
+	if err != nil {
+		return err
 	}
 	for index, call := range response.ToolCalls {
 		chunks = append(chunks, map[string]any{"type": "tool-call-delta", "index": blockIndex + index,
 			"id": call.CallID, "name": call.Name, "argumentsDelta": call.Arguments})
 	}
 	finishReason := "stop"
-	if len(response.ToolCalls) > 0 {
+	if knownTextTruncation {
+		finishReason = "max-tokens"
+	} else if len(response.ToolCalls) > 0 {
 		finishReason = "tool-calls"
+	}
+	finishChunk := map[string]any{"type": "finish", "reason": map[string]any{"kind": finishReason}}
+	if knownTextTruncation {
+		finishChunk["replayState"] = map[string]any{"response": map[string]any{
+			"morde_task_text_truncated": true, "morde_task_call_id": id,
+		}}
+	}
+	if len(response.ToolCalls) > 0 {
+		messageID := response.ToolCalls[0].CurrentTaskTurnMessageID
+		if messageID != "" {
+			if !domain.ValidMessageID(messageID) {
+				return errors.New("dsh model response source identity is invalid")
+			}
+			for _, call := range response.ToolCalls[1:] {
+				if call.CurrentTaskTurnMessageID != messageID {
+					return errors.New("dsh model response source identities do not match")
+				}
+			}
+			finishChunk["replayState"] = map[string]any{"response": map[string]any{"morde_task_turn_message_id": messageID}}
+		}
 	}
 	chunks = append(chunks,
 		map[string]any{"type": "usage", "usage": map[string]any{"inputTokens": response.Usage.InputTokens, "outputTokens": response.Usage.OutputTokens}},
-		map[string]any{"type": "finish", "reason": map[string]any{"kind": finishReason}},
+		finishChunk,
 	)
 	frame := func(kind string) map[string]any {
 		return map[string]any{"type": kind, "task_id": identity.TaskID, "owner_id": identity.OwnerID,
 			"agent_id": identity.AgentID, "session_id": identity.SessionID, "generation": identity.Generation,
 			"authorization_version": identity.AuthorizationVersion, "id": id}
+	}
+	// Validate every encoded frame before writing any of them. In particular,
+	// block-end repeats the final block contents, so checking only delta sizes
+	// would allow JSON escaping to produce an oversized IPC line after a visible
+	// prefix had already been delivered.
+	for index, chunk := range chunks {
+		message := frame("model_chunk")
+		message["index"] = index
+		message["chunk"] = chunk
+		if !cloudDSHModelFrameWithinLimit(message) {
+			return errors.New("dsh model response frame exceeds the size limit")
+		}
+	}
+	message := frame("model_end")
+	message["ok"] = true
+	if !cloudDSHModelFrameWithinLimit(message) {
+		return errors.New("dsh model response end frame exceeds the size limit")
 	}
 	for index, chunk := range chunks {
 		message := frame("model_chunk")
@@ -1557,9 +2051,73 @@ func writeCloudDSHModel(ctx context.Context, target io.WriteCloser, id string, i
 			return err
 		}
 	}
-	message := frame("model_end")
+	message = frame("model_end")
 	message["ok"] = true
 	return writeCloudDSHFrame(ctx, target, message)
+}
+
+func appendCloudDSHModelContent(chunks []any, firstBlockIndex int, blockType, content string) ([]any, int, error) {
+	if content == "" {
+		return chunks, firstBlockIndex, nil
+	}
+	if !utf8.ValidString(content) || len(content) > cloudDSHMaxModelResponseContentBytes {
+		return nil, firstBlockIndex, errors.New("dsh model response content is invalid or too large")
+	}
+	blockTexts, err := splitCloudDSHUTF8(content, cloudDSHMaxModelResponseBlockBytes)
+	if err != nil {
+		return nil, firstBlockIndex, err
+	}
+	deltaType := "text-delta"
+	if blockType == "reasoning" {
+		deltaType = "reasoning-delta"
+	}
+	for _, blockText := range blockTexts {
+		blockIndex := firstBlockIndex
+		firstBlockIndex++
+		chunks = append(chunks, map[string]any{"type": "block-start", "index": blockIndex, "blockType": blockType})
+		deltas, err := splitCloudDSHUTF8(blockText, app.MaxAssistantMessageBytes)
+		if err != nil {
+			return nil, firstBlockIndex, err
+		}
+		for _, delta := range deltas {
+			chunks = append(chunks, map[string]any{"type": deltaType, "index": blockIndex, "text": delta})
+		}
+		chunks = append(chunks, map[string]any{"type": "block-end", "index": blockIndex,
+			"block": map[string]any{"type": blockType, "text": blockText}})
+	}
+	return chunks, firstBlockIndex, nil
+}
+
+// splitCloudDSHUTF8 splits valid UTF-8 text at rune boundaries. Each returned
+// string is at most maxBytes, so byte-based protocol and persistence limits
+// remain deterministic for multi-byte text.
+func splitCloudDSHUTF8(content string, maxBytes int) ([]string, error) {
+	if maxBytes < 1 || !utf8.ValidString(content) {
+		return nil, errors.New("dsh model response text is invalid")
+	}
+	parts := make([]string, 0, (len(content)+maxBytes-1)/maxBytes)
+	for len(content) > 0 {
+		end := len(content)
+		if end > maxBytes {
+			end = maxBytes
+			for end > 0 && !utf8.RuneStart(content[end]) {
+				end--
+			}
+		}
+		if end == 0 {
+			return nil, errors.New("dsh model response text cannot be split safely")
+		}
+		parts = append(parts, content[:end])
+		content = content[end:]
+	}
+	return parts, nil
+}
+
+func cloudDSHModelFrameWithinLimit(frame any) bool {
+	var buffer bytes.Buffer
+	encoder := json.NewEncoder(&buffer)
+	encoder.SetEscapeHTML(false)
+	return encoder.Encode(frame) == nil && buffer.Len() <= cloudDSHMaxFrame
 }
 
 func writeCloudDSHModelFailure(ctx context.Context, target io.WriteCloser, id string, identity cloudDSHIdentity) error {

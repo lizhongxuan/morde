@@ -186,12 +186,21 @@ WHERE service_instance_id=$1::uuid AND message_id=$2 AND owner_id=$3 AND actor_i
 				claim.ServiceInstanceID, claim.Message.ID, claim.Message.OwnerID, claim.Message.ActorID,
 				claim.Message.ConversationID, claim.LeaseOwner, claim.LeaseVersion, claim.RouteAttempt, int64(delay/time.Second))
 		} else {
-			result, err = tx.Exec(ctx, `UPDATE conversation_message_routes SET state='failed',failure_reason='model_unavailable',
+			// The durable ladder ends in one of two terminal states. Three
+			// rejected calls means the retry budget is spent, which gets
+			// the ladder-exhausted marker; an over-horizon provider wait
+			// keeps the existing model_unavailable reason (M09-05). The
+			// failure_reason column is free text, so no migration.
+			failureReason := "model_unavailable"
+			if rejectedCalls >= 3 {
+				failureReason = app.RouteRetryLadderExhaustedReason
+			}
+			result, err = tx.Exec(ctx, `UPDATE conversation_message_routes SET state='failed',failure_reason=$9,
 lease_owner='',lease_expires_at=NULL,updated_at=clock_timestamp()
 WHERE service_instance_id=$1::uuid AND message_id=$2 AND owner_id=$3 AND actor_id=$4 AND conversation_id=$5
  AND state='processing' AND lease_owner=$6 AND lease_version=$7 AND route_attempt=$8 AND lease_expires_at>clock_timestamp()`,
 				claim.ServiceInstanceID, claim.Message.ID, claim.Message.OwnerID, claim.Message.ActorID,
-				claim.Message.ConversationID, claim.LeaseOwner, claim.LeaseVersion, claim.RouteAttempt)
+				claim.Message.ConversationID, claim.LeaseOwner, claim.LeaseVersion, claim.RouteAttempt, failureReason)
 		}
 		if err != nil {
 			return fmt.Errorf("finish rate-limited conversation route: %w", err)

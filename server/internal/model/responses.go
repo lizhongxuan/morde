@@ -13,6 +13,7 @@ import (
 	"image/color"
 	"image/png"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/netip"
@@ -20,37 +21,50 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"morde/server/internal/app"
 )
 
 const (
-	maxRequestBytes  = 8 << 20
-	maxResponseBytes = 8 << 20
-	maxStreamLine    = 1 << 20
-	maxImageBytes    = 2 << 20
-	maxTotalImages   = 4 << 20
-	maxInputs        = 128
-	maxTools         = 64
-	maxTextBytes     = 1 << 20
-	maxSchemaBytes   = 64 << 10
-	maxModelIDBytes  = 256
-	maxAPIKeyBytes   = 4096
-	requestTimeout   = app.ModelCallTimeout
+	maxRequestBytes         = 8 << 20
+	maxResponseBytes        = 8 << 20
+	maxStreamLine           = 1 << 20
+	maxImageBytes           = 2 << 20
+	maxTotalImages          = 4 << 20
+	maxInputs               = 128
+	maxTools                = 64
+	maxTextBytes            = 1 << 20
+	maxSchemaBytes          = 64 << 10
+	maxModelIDBytes         = 256
+	maxAPIKeyBytes          = 4096
+	responseTotalTimeout    = app.TaskModelCallTimeout
+	responseBodyIdleTimeout = 60 * time.Second
+	providerDialTimeout     = 10 * time.Second
+	providerTLSHandshake    = 10 * time.Second
+	providerHeaderTimeout   = 20 * time.Second
 )
 
 var (
-	toolNameRE          = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
-	errResponseTooLarge = errors.New("model provider response exceeds size limit")
-	errResponseRead     = errors.New("could not read model provider response")
+	toolNameRE                  = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+	providerRetryAfterMsRE      = regexp.MustCompile(`^\d+(?:\.\d+)?$`)
+	providerRemainingRE         = regexp.MustCompile(`^-?\d+(?:\.\d+)?$`)
+	providerQuotaResetSegmentRE = regexp.MustCompile(`(\d+(?:\.\d+)?)(ms|s|m|h)`)
+	errResponseTooLarge         = errors.New("model provider response exceeds size limit")
+	errResponseRead             = errors.New("could not read model provider response")
 )
+
+const maxProviderDurableRetryAfter = 24 * time.Hour
 
 // ResponsesClient calls allowed model providers without following redirects
 // or allowing requests to resolve to non-public addresses.
 type ResponsesClient struct {
-	allowedHosts map[string]struct{}
-	httpClient   *http.Client
+	allowedHosts    map[string]struct{}
+	httpClient      *http.Client
+	totalTimeout    time.Duration
+	bodyIdleTimeout time.Duration
 }
 
 // NewResponsesClient creates a production Responses API client restricted to
@@ -65,6 +79,10 @@ func NewResponsesClient(allowedHosts []string, proxyURL string) (*ResponsesClien
 }
 
 func newResponsesClient(allowedHosts []string, transport http.RoundTripper) (*ResponsesClient, error) {
+	return newResponsesClientWithTimeouts(allowedHosts, transport, responseTotalTimeout, responseBodyIdleTimeout)
+}
+
+func newResponsesClientWithTimeouts(allowedHosts []string, transport http.RoundTripper, totalTimeout, bodyIdleTimeout time.Duration) (*ResponsesClient, error) {
 	hosts := make(map[string]struct{}, len(allowedHosts))
 	for _, host := range allowedHosts {
 		name, err := normalizeAllowedHost(host)
@@ -79,11 +97,15 @@ func newResponsesClient(allowedHosts []string, transport http.RoundTripper) (*Re
 	if transport == nil {
 		return nil, errors.New("model provider transport is nil")
 	}
+	if totalTimeout <= 0 || bodyIdleTimeout <= 0 || bodyIdleTimeout > totalTimeout {
+		return nil, errors.New("model provider timeouts are invalid")
+	}
 	return &ResponsesClient{
 		allowedHosts: hosts,
+		totalTimeout: totalTimeout, bodyIdleTimeout: bodyIdleTimeout,
 		httpClient: &http.Client{
 			Transport: transport,
-			Timeout:   requestTimeout,
+			Timeout:   totalTimeout,
 			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
@@ -114,7 +136,9 @@ func (c *ResponsesClient) complete(ctx context.Context, request app.ModelRequest
 		return app.ModelResponse{}, modelClientErrorAt(app.ModelErrorInvalidRequest, "client_validation", "")
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpointURL, bytes.NewReader(body))
+	requestCtx, cancelRequest := context.WithTimeout(ctx, c.totalTimeout)
+	defer cancelRequest()
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, endpointURL, bytes.NewReader(body))
 	if err != nil {
 		return app.ModelResponse{}, modelClientErrorAt(app.ModelErrorInvalidRequest, "client_validation", "")
 	}
@@ -141,7 +165,9 @@ func (c *ResponsesClient) complete(ctx context.Context, request app.ModelRequest
 		return app.ModelResponse{}, modelClientError(app.ModelErrorTransport)
 	}
 	responseReceivedAt := time.Now()
-	defer func() { _ = resp.Body.Close() }()
+	idleBody := newIdleTimeoutResponseBody(resp.Body, c.bodyIdleTimeout, cancelRequest)
+	resp.Body = idleBody
+	defer func() { _ = idleBody.Close() }()
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		responseBody, err := readResponseBody(resp.Body, maxResponseBytes)
@@ -149,27 +175,25 @@ func (c *ResponsesClient) complete(ctx context.Context, request app.ModelRequest
 			if errors.Is(err, errResponseTooLarge) {
 				return app.ModelResponse{}, modelClientError(app.ModelErrorInvalidResponse)
 			}
-			return app.ModelResponse{}, modelClientError(app.ModelErrorTransport)
+			return app.ModelResponse{}, classifyResponseBodyFailure(ctx, requestCtx, idleBody, err)
 		}
 		return app.ModelResponse{}, providerStatusError(resp.StatusCode, responseBody, request.Endpoint.APIKey, zai,
-			resp.Header.Get("Retry-After"), responseReceivedAt)
+			resp.Header, responseReceivedAt)
 	}
 	if request.OnTextDelta != nil {
 		if !strings.HasPrefix(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
 			return app.ModelResponse{}, modelClientError(app.ModelErrorInvalidResponse)
 		}
 		var response app.ModelResponse
+		onTextDelta := idleBody.wrapCallback(request.OnTextDelta)
 		if zai {
-			response, err = readZAIStream(resp.Body, request.OnTextDelta)
+			response, err = readZAIStream(resp.Body, onTextDelta)
 		} else {
-			response, err = readStreamingResponse(resp.Body, request.OnTextDelta)
+			response, err = readStreamingResponse(resp.Body, onTextDelta)
 		}
 		if err != nil {
-			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-				return app.ModelResponse{}, modelClientError(app.ModelErrorTimeout)
-			}
-			if ctx.Err() != nil {
-				return app.ModelResponse{}, ctx.Err()
+			if contextErr := modelRequestContextFailure(ctx, requestCtx, idleBody); contextErr != nil {
+				return app.ModelResponse{}, contextErr
 			}
 			var callbackErr *streamCallbackError
 			if errors.As(err, &callbackErr) {
@@ -180,6 +204,9 @@ func (c *ResponsesClient) complete(ctx context.Context, request app.ModelRequest
 			}
 			return app.ModelResponse{}, classifyStreamReadFailure(err)
 		}
+		if contextErr := modelRequestContextFailure(ctx, requestCtx, idleBody); contextErr != nil {
+			return app.ModelResponse{}, contextErr
+		}
 		return response, nil
 	}
 	responseBody, err := readResponseBody(resp.Body, maxResponseBytes)
@@ -187,7 +214,10 @@ func (c *ResponsesClient) complete(ctx context.Context, request app.ModelRequest
 		if errors.Is(err, errResponseTooLarge) {
 			return app.ModelResponse{}, modelClientError(app.ModelErrorInvalidResponse)
 		}
-		return app.ModelResponse{}, modelClientError(app.ModelErrorTransport)
+		return app.ModelResponse{}, classifyResponseBodyFailure(ctx, requestCtx, idleBody, err)
+	}
+	if contextErr := modelRequestContextFailure(ctx, requestCtx, idleBody); contextErr != nil {
+		return app.ModelResponse{}, contextErr
 	}
 
 	var response app.ModelResponse
@@ -202,6 +232,9 @@ func (c *ResponsesClient) complete(ctx context.Context, request app.ModelRequest
 	}
 	if err != nil {
 		return app.ModelResponse{}, modelClientError(app.ModelErrorInvalidResponse)
+	}
+	if contextErr := modelRequestContextFailure(ctx, requestCtx, idleBody); contextErr != nil {
+		return app.ModelResponse{}, contextErr
 	}
 	return response, nil
 }
@@ -288,7 +321,7 @@ func (c *ResponsesClient) endpointURL(endpoint app.ModelEndpoint) (string, error
 }
 
 func encodeRequest(request app.ModelRequest, choice *toolChoice) ([]byte, error) {
-	if request.MaxOutputTokens < 1 || request.MaxOutputTokens > 32768 {
+	if !validVerifiedModelOutputCap(request.Endpoint, request.MaxOutputTokens) {
 		return nil, errors.New("model output token limit is invalid")
 	}
 	if request.Temperature != nil && (*request.Temperature < 0 || *request.Temperature > 2) {
@@ -372,6 +405,17 @@ func encodeRequest(request app.ModelRequest, choice *toolChoice) ([]byte, error)
 		return nil, errors.New("could not encode model request")
 	}
 	return encoded, nil
+}
+
+func validVerifiedModelOutputCap(endpoint app.ModelEndpoint, requested int) bool {
+	maxOutputTokens := 32_768
+	if endpoint.VerifiedMaxOutputTokens != 0 {
+		if endpoint.VerifiedMaxOutputTokens < 1 || endpoint.VerifiedMaxOutputTokens > app.MaxModelOutputTokens {
+			return false
+		}
+		maxOutputTokens = endpoint.VerifiedMaxOutputTokens
+	}
+	return requested >= 1 && requested <= maxOutputTokens
 }
 
 func encodeInput(item app.ModelInput) (any, int, error) {
@@ -500,6 +544,120 @@ type streamReadError struct{ err error }
 func (e *streamReadError) Error() string { return "read model provider stream" }
 func (e *streamReadError) Unwrap() error { return e.err }
 
+// idleTimeoutResponseBody bounds stalls while reading a provider response. It
+// cancels the request context and closes the underlying body so a blocked Read
+// can return. Callback work is excluded from the idle clock: a slow durable
+// consumer is governed by the total request deadline, not misreported as an
+// idle provider.
+type idleTimeoutResponseBody struct {
+	body      io.ReadCloser
+	timeout   time.Duration
+	cancel    context.CancelFunc
+	mu        sync.Mutex
+	timer     *time.Timer
+	paused    bool
+	timedOut  atomic.Bool
+	closeOnce sync.Once
+}
+
+func newIdleTimeoutResponseBody(body io.ReadCloser, timeout time.Duration, cancel context.CancelFunc) *idleTimeoutResponseBody {
+	watch := &idleTimeoutResponseBody{body: body, timeout: timeout, cancel: cancel}
+	watch.timer = time.AfterFunc(timeout, watch.expire)
+	return watch
+}
+
+func (b *idleTimeoutResponseBody) Read(p []byte) (int, error) {
+	n, err := b.body.Read(p)
+	if n > 0 {
+		b.mu.Lock()
+		if !b.paused && !b.timedOut.Load() {
+			b.timer.Reset(b.timeout)
+		}
+		b.mu.Unlock()
+	}
+	if err != nil {
+		b.stopTimer()
+	}
+	return n, err
+}
+
+func (b *idleTimeoutResponseBody) Close() error {
+	b.stopTimer()
+	var closeErr error
+	b.closeOnce.Do(func() { closeErr = b.body.Close() })
+	return closeErr
+}
+
+func (b *idleTimeoutResponseBody) expire() {
+	if !b.timedOut.CompareAndSwap(false, true) {
+		return
+	}
+	b.cancel()
+	_ = b.Close()
+}
+
+func (b *idleTimeoutResponseBody) stopTimer() {
+	b.mu.Lock()
+	b.timer.Stop()
+	b.mu.Unlock()
+}
+
+func (b *idleTimeoutResponseBody) pause() {
+	b.mu.Lock()
+	b.paused = true
+	b.timer.Stop()
+	b.mu.Unlock()
+}
+
+func (b *idleTimeoutResponseBody) resume() {
+	b.mu.Lock()
+	if b.paused {
+		b.paused = false
+		if !b.timedOut.Load() {
+			b.timer.Reset(b.timeout)
+		}
+	}
+	b.mu.Unlock()
+}
+
+func (b *idleTimeoutResponseBody) wrapCallback(callback func(string) error) func(string) error {
+	if callback == nil {
+		return nil
+	}
+	return func(text string) error {
+		b.pause()
+		defer b.resume()
+		return callback(text)
+	}
+}
+
+func modelRequestContextFailure(parentCtx, requestCtx context.Context, body *idleTimeoutResponseBody) error {
+	if errors.Is(parentCtx.Err(), context.Canceled) {
+		return parentCtx.Err()
+	}
+	if errors.Is(parentCtx.Err(), context.DeadlineExceeded) || errors.Is(requestCtx.Err(), context.DeadlineExceeded) || body.timedOut.Load() {
+		return modelClientError(app.ModelErrorTimeout)
+	}
+	if errors.Is(requestCtx.Err(), context.Canceled) {
+		return context.Canceled
+	}
+	return nil
+}
+
+func classifyResponseBodyFailure(parentCtx, requestCtx context.Context, body *idleTimeoutResponseBody, err error) error {
+	if contextErr := modelRequestContextFailure(parentCtx, requestCtx, body); contextErr != nil {
+		return contextErr
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return modelClientError(app.ModelErrorTimeout)
+	}
+	var networkErr net.Error
+	if errors.As(err, &networkErr) && networkErr.Timeout() {
+		return modelClientError(app.ModelErrorTimeout)
+	}
+	return modelClientError(app.ModelErrorTransport)
+}
+
 func classifyStreamReadFailure(err error) error {
 	var networkErr net.Error
 	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &networkErr) && networkErr.Timeout()) {
@@ -611,7 +769,7 @@ func readStreamingResponse(body io.Reader, onTextDelta func(string) error) (app.
 	return result, nil
 }
 
-func providerStatusError(status int, body []byte, apiKey string, zai bool, retryAfterHeader string, receivedAt time.Time) error {
+func providerStatusError(status int, body []byte, apiKey string, zai bool, retryAfterHeaders http.Header, receivedAt time.Time) error {
 	var parsed struct {
 		Error struct {
 			Code string `json:"code"`
@@ -646,18 +804,18 @@ func providerStatusError(status int, body []byte, apiKey string, zai bool, retry
 	default:
 		kind = app.ModelErrorInvalidResponse
 	}
-	err := &app.ModelClientError{Kind: kind, Stage: "provider_status", ProviderCode: code}
+	err := &app.ModelClientError{Kind: kind, Stage: "provider_status", ProviderCode: code,
+		ConfirmedNoUsage: status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable}
 	if kind == app.ModelErrorRateLimited {
-		err.RetryAfter, _, err.RetryAfterExceedsDurableHorizon = parseProviderRetryAfter(retryAfterHeader, receivedAt)
+		err.RetryAfter, _, err.RetryAfterExceedsDurableHorizon = parseProviderRetryAfterHeaders(status, retryAfterHeaders, receivedAt)
 	}
 	return err
 }
 
 func parseProviderRetryAfter(value string, now time.Time) (time.Duration, bool, bool) {
-	const maxDurableRetryAfter = 24 * time.Hour
 	value = strings.TrimSpace(value)
 	if seconds, err := strconv.ParseUint(value, 10, 64); err == nil {
-		if seconds > uint64(maxDurableRetryAfter/time.Second) {
+		if seconds > uint64(maxProviderDurableRetryAfter/time.Second) {
 			return 0, true, true
 		}
 		return time.Duration(seconds) * time.Second, true, false
@@ -676,16 +834,203 @@ func parseProviderRetryAfter(value string, now time.Time) (time.Duration, bool, 
 	if delay < 0 {
 		return 0, true, false
 	}
-	if delay > maxDurableRetryAfter {
+	if delay > maxProviderDurableRetryAfter {
 		return 0, true, true
 	}
 	return delay, true, false
 }
 
+// parseProviderRetryAfterHeaders adapts OpenClaw's
+// packages/ai/src/internal/retry-after.ts header timing rules to the Morde
+// model boundary. [待重对] This was compared with the local source snapshot;
+// its pinned upstream commit was not independently verified. Morde keeps its
+// own 24-hour durable wait horizon; an over-horizon floor ends the current
+// route attempt instead of being shortened into an early retry.
+func parseProviderRetryAfterHeaders(status int, headers http.Header, now time.Time) (time.Duration, bool, bool) {
+	var explicit time.Duration
+	explicitFound := false
+	explicitBeyondHorizon := false
+	for _, value := range modelHeaderValues(headers, "retry-after") {
+		delay, found, beyondHorizon := parseProviderRetryAfter(value, now)
+		if beyondHorizon {
+			explicitBeyondHorizon = true
+		}
+		if found && !beyondHorizon && (!explicitFound || delay > explicit) {
+			explicit = delay
+			explicitFound = true
+		}
+	}
+	for _, value := range modelHeaderValues(headers, "retry-after-ms") {
+		delay, found, beyondHorizon := parseProviderRetryAfterMilliseconds(value)
+		if beyondHorizon {
+			explicitBeyondHorizon = true
+		}
+		if found && !beyondHorizon && (!explicitFound || delay > explicit) {
+			explicit = delay
+			explicitFound = true
+		}
+	}
+	if explicitBeyondHorizon {
+		return 0, true, true
+	}
+	if explicitFound {
+		return explicit, true, false
+	}
+	if status != http.StatusTooManyRequests {
+		return 0, false, false
+	}
+
+	var reset time.Duration
+	resetFound := false
+	resetBeyondHorizon := false
+	for _, dimension := range []string{"tokens", "requests", "project-tokens"} {
+		if !modelQuotaBucketExhausted(headers, "x-ratelimit-remaining-"+dimension) {
+			continue
+		}
+		for _, value := range modelHeaderValues(headers, "x-ratelimit-reset-"+dimension) {
+			delay, found, beyondHorizon := parseProviderQuotaReset(value, now)
+			if beyondHorizon {
+				resetBeyondHorizon = true
+			}
+			if found && !beyondHorizon && (!resetFound || delay > reset) {
+				reset = delay
+				resetFound = true
+			}
+		}
+	}
+	for _, dimension := range []string{"requests", "tokens", "input-tokens", "output-tokens"} {
+		if !modelQuotaBucketExhausted(headers, "anthropic-ratelimit-"+dimension+"-remaining") {
+			continue
+		}
+		for _, value := range modelHeaderValues(headers, "anthropic-ratelimit-"+dimension+"-reset") {
+			delay, found, beyondHorizon := parseProviderRFC3339Reset(value, now)
+			if beyondHorizon {
+				resetBeyondHorizon = true
+			}
+			if found && !beyondHorizon && (!resetFound || delay > reset) {
+				reset = delay
+				resetFound = true
+			}
+		}
+	}
+	if resetBeyondHorizon {
+		return 0, true, true
+	}
+	return reset, resetFound, false
+}
+
+func modelHeaderValues(headers http.Header, name string) []string {
+	var values []string
+	for key, entries := range headers {
+		if strings.EqualFold(key, name) {
+			values = append(values, entries...)
+		}
+	}
+	return values
+}
+
+func parseProviderRetryAfterMilliseconds(value string) (time.Duration, bool, bool) {
+	value = strings.TrimSpace(value)
+	if !providerRetryAfterMsRE.MatchString(value) {
+		return 0, false, false
+	}
+	milliseconds, ok := new(big.Rat).SetString(value)
+	if !ok {
+		return 0, false, false
+	}
+	return providerRetryDurationFromMilliseconds(milliseconds)
+}
+
+func modelQuotaBucketExhausted(headers http.Header, remainingHeader string) bool {
+	for _, value := range modelHeaderValues(headers, remainingHeader) {
+		value = strings.TrimSpace(value)
+		if !providerRemainingRE.MatchString(value) {
+			continue
+		}
+		remaining, err := strconv.ParseFloat(value, 64)
+		if err == nil && remaining <= 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func parseProviderQuotaReset(value string, now time.Time) (time.Duration, bool, bool) {
+	value = strings.TrimSpace(value)
+	var milliseconds big.Rat
+	position := 0
+	for _, match := range providerQuotaResetSegmentRE.FindAllStringSubmatchIndex(value, -1) {
+		if match[0] != position {
+			return 0, false, false
+		}
+		amount, ok := new(big.Rat).SetString(value[match[2]:match[3]])
+		if !ok {
+			return 0, false, false
+		}
+		multiplier := int64(1)
+		switch value[match[4]:match[5]] {
+		case "ms":
+		case "s":
+			multiplier = 1000
+		case "m":
+			multiplier = 60_000
+		case "h":
+			multiplier = 3_600_000
+		}
+		milliseconds.Add(&milliseconds, amount.Mul(amount, new(big.Rat).SetInt64(multiplier)))
+		position = match[1]
+	}
+	if position != len(value) || position == 0 {
+		return 0, false, false
+	}
+	delay, found, beyondHorizon := providerRetryDurationFromMilliseconds(&milliseconds)
+	return delay, found, beyondHorizon
+}
+
+func parseProviderRFC3339Reset(value string, now time.Time) (time.Duration, bool, bool) {
+	when, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(value))
+	if err != nil {
+		return 0, false, false
+	}
+	delay := when.Sub(now)
+	if delay < 0 {
+		delay = 0
+	}
+	if delay > maxProviderDurableRetryAfter {
+		return 0, true, true
+	}
+	return roundProviderRetryAfterUpToMillisecond(delay), true, false
+}
+
+func providerRetryDurationFromMilliseconds(milliseconds *big.Rat) (time.Duration, bool, bool) {
+	if milliseconds.Sign() < 0 {
+		return 0, false, false
+	}
+	maxMilliseconds := int64(maxProviderDurableRetryAfter / time.Millisecond)
+	if milliseconds.Cmp(new(big.Rat).SetInt64(maxMilliseconds)) > 0 {
+		return 0, true, true
+	}
+	quotient, remainder := new(big.Int).QuoRem(milliseconds.Num(), milliseconds.Denom(), new(big.Int))
+	if remainder.Sign() > 0 {
+		quotient.Add(quotient, big.NewInt(1))
+	}
+	if !quotient.IsInt64() || quotient.Int64() > maxMilliseconds {
+		return 0, true, true
+	}
+	return time.Duration(quotient.Int64()) * time.Millisecond, true, false
+}
+
+func roundProviderRetryAfterUpToMillisecond(delay time.Duration) time.Duration {
+	if delay <= 0 {
+		return 0
+	}
+	return (delay + time.Millisecond - 1) / time.Millisecond * time.Millisecond
+}
+
 func readResponseBody(body io.Reader, limit int64) ([]byte, error) {
 	data, err := io.ReadAll(io.LimitReader(body, limit+1))
 	if err != nil {
-		return nil, errResponseRead
+		return nil, fmt.Errorf("%w: %w", errResponseRead, err)
 	}
 	if int64(len(data)) > limit {
 		return nil, errResponseTooLarge
@@ -825,7 +1170,7 @@ func newPublicHTTPTransport(allowedHosts []string, proxyAddress string) http.Rou
 			allowed[name] = struct{}{}
 		}
 	}
-	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	dialer := &net.Dialer{Timeout: providerDialTimeout, KeepAlive: 30 * time.Second}
 	transport := &http.Transport{
 		Proxy: nil,
 		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
@@ -864,8 +1209,8 @@ func newPublicHTTPTransport(allowedHosts []string, proxyAddress string) http.Rou
 			}
 			return nil, lastErr
 		},
-		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 20 * time.Second,
+		TLSHandshakeTimeout:   providerTLSHandshake,
+		ResponseHeaderTimeout: providerHeaderTimeout,
 		IdleConnTimeout:       90 * time.Second,
 		MaxIdleConns:          16,
 		MaxIdleConnsPerHost:   2,
@@ -884,7 +1229,7 @@ func dialModelProxy(ctx context.Context, dialer *net.Dialer, proxyAddress, targe
 	}
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	defer stop()
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(providerDialTimeout)
 	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
 		deadline = ctxDeadline
 	}

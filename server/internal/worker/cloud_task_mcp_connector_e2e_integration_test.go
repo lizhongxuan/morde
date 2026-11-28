@@ -862,12 +862,16 @@ func TestCloudTaskMCPConnectorSurvivesNodeRestartWithoutRedispatch(t *testing.T)
 			t.Fatalf("new TaskWorker stopped before recovering the MCP Task: %v", workerErr)
 		case <-recoveryDeadline.C:
 			stopRecovery()
-			<-recoveryDone
+			if workerErr := <-recoveryDone; workerErr != nil && !errors.Is(workerErr, context.Canceled) {
+				t.Errorf("stop recovered TaskWorker after timeout: %v", workerErr)
+			}
 			t.Fatalf("new TaskWorker did not recover the MCP Task: model_calls=%d", model.callCount())
 		case <-recoveryPoll.C:
 		case <-ctx.Done():
 			stopRecovery()
-			<-recoveryDone
+			if workerErr := <-recoveryDone; workerErr != nil && !errors.Is(workerErr, context.Canceled) {
+				t.Errorf("stop recovered TaskWorker after context cancellation: %v", workerErr)
+			}
 			t.Fatalf("wait for new TaskWorker recovery: %v", ctx.Err())
 		}
 	}

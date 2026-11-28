@@ -78,6 +78,16 @@ const workspaceDiffDisplayLabel: Record<WorkspaceRevisionDiff['changes'][number]
   metadata_only: '仅元数据', not_applicable: '无正文',
 };
 
+function projectSyncHostUnavailableMessage(host: Host): string {
+  if (host.state_reason === 'restore_failed') {
+    return '默认云端电脑上次恢复失败，文件同步已暂停。请联系管理员检查失败原因，确认修复后再恢复；不会自动重试或切换到其他电脑。';
+  }
+  if (host.state_reason === 'restore_unknown') {
+    return '默认云端电脑恢复结果待核对，文件同步已暂停。请先核实当前运行状态，确认前不要重试；不会自动切换到其他电脑。';
+  }
+  return `默认云端电脑当前${hostStateLabel[host.state] || host.state}，同步已暂停。请先恢复默认电脑；不会切换到其他电脑。`;
+}
+
 function portalProjectBridge(): PortalProjectBridge | undefined {
   if (typeof window === 'undefined') return undefined;
   return (window as Window & { morde?: PortalProjectBridge }).morde;
@@ -196,7 +206,11 @@ function projectUploadStatus(value: unknown): string {
         : '目标电脑已应用本次项目，但本机状态基线未确认；请重新同步后核对。';
     if (receipt.status === 'conflict') return `云端已确认，目标电脑存在冲突；恢复点已保留。${projectConflictPaths(receipt.impacts)}`;
     if (receipt.status === 'unknown' || result.hostStatus === 'unknown') return '云端已确认，目标电脑应用状态未知；恢复点已保留。';
-    return '云端已确认，等待目标电脑应用。';
+    if (receipt.status === 'applied' || result.hostStatus === 'applied') {
+      return '云端已确认，但目标电脑应用回执证据不足；状态待核验，恢复点已保留。';
+    }
+    if (receipt.status === 'pending_apply' || result.hostStatus === 'pending_apply') return '云端已确认，等待目标电脑应用。';
+    return '云端已确认，目标电脑应用状态待核验；恢复点已保留。';
   }
   const messages: Record<string, string> = { running: '同步仍在进行，恢复点已保留。', conflict: '发现冲突，本次同步未提交。',
     failed: '同步失败，云端未确认完成。', cancelled: '同步已取消，云端未确认完成。', expired: '同步会话已过期，云端未确认完成。' };
@@ -218,6 +232,14 @@ function projectConflictPaths(value: unknown): string {
     return [path];
   });
   return paths.length ? ` 受影响路径：${paths.join('、')}。` : '';
+}
+
+function completedProjectReceiptMessage(status: string | undefined): string {
+  if (status === 'conflict') return '目标电脑应用存在冲突；恢复点已保留。点击“核对电脑应用状态”查看最新回执。';
+  if (status === 'unknown') return '目标电脑应用状态未知；恢复点已保留。点击“核对电脑应用状态”重新核对。';
+  if (status === 'pending_apply') return '云端已确认，等待目标电脑应用。';
+  if (status === 'applied') return '目标电脑已报告应用；本机恢复点仍待核对。';
+  return '云端已确认，目标电脑应用状态待核对。';
 }
 
 function validateProjectName(value: string): { name: string; error: string | null } {
@@ -416,25 +438,39 @@ function WorkspacesContent({ user, projectSyncOnly }: { user: ReturnType<typeof 
     : undefined;
   const projectTargetRouteMismatch = projectPreferences.isSuccess && Boolean(computerID && computerID !== defaultHostID);
   const selectedProjectTarget = projectTargetRouteMismatch ? undefined : configuredDefaultProjectTarget;
-  const selectedProjectTargetUnavailable = !selectedProjectTarget || selectedProjectTarget.hostState !== 'running'
+  const projectTargetStateVerified = projectPreferences.isSuccess && !projectPreferences.isError && !projectPreferences.isFetching
+    && hosts.isSuccess && !hosts.isError && !hosts.isFetching;
+  const projectReceiptCheckUnavailable = projectPreferences.isError || projectPreferences.isFetching || hosts.isError || hosts.isFetching;
+  const selectedProjectTargetUnavailable = !projectTargetStateVerified || !selectedProjectTarget || configuredDefaultHost?.state !== 'running'
+    || selectedProjectTarget.hostState !== 'running'
     || configuredDefaultHost?.workspace_runtime_online !== true || !configuredDefaultWorkspaceReady
     || projectPreferences.isFetching || projectTargets.isFetching || projectTargets.isError || Boolean(selectedProjectTarget.blockedMessage);
   const scopedProjectState = localProjectState;
   const scopedProjectSelection = projectDirectorySelection;
-  const savedProjectSelection = scopedProjectState?.projectMappings.find((item) => item.hostId === selectedProjectTarget?.hostId
-    && item.workspaceId === selectedProjectTarget.workspaceId);
+  const savedProjectSelections = scopedProjectState?.projectMappings.filter((item) => item.hostId === selectedProjectTarget?.hostId
+    && item.workspaceId === selectedProjectTarget.workspaceId) ?? [];
+  const checkpointProjectSelection = scopedProjectState?.syncCheckpoint?.projectSelectionID
+    ? savedProjectSelections.find((item) => item.selectionID === scopedProjectState.syncCheckpoint?.projectSelectionID
+      && item.projectName === scopedProjectState.syncCheckpoint?.projectName)
+    : undefined;
+  const savedProjectSelection = checkpointProjectSelection
+    ?? (savedProjectSelections.length === 1 ? savedProjectSelections[0] : undefined);
   const projectSelectionMatchesTarget = Boolean(selectedProjectTarget && scopedProjectSelection
     && scopedProjectSelection.hostId === selectedProjectTarget.hostId
     && scopedProjectSelection.workspaceId === selectedProjectTarget.workspaceId);
+  const projectSelectionOptions = projectSelectionMatchesTarget && scopedProjectSelection
+    && !savedProjectSelections.some((item) => item.selectionID === scopedProjectSelection.selectionID)
+    ? [scopedProjectSelection, ...savedProjectSelections] : savedProjectSelections;
   useEffect(() => {
     if (!savedProjectSelection || scopedProjectSelection || !user?.id) return;
-    // Restore a saved native directory selection into the editable form once it arrives.
+    // Restore a single saved directory or the directory tied to a pending recovery point.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setProjectDirectorySelection(savedProjectSelection);
     setProjectNameDraft(savedProjectSelection.projectName);
     setConfirmedProjectName('');
   }, [savedProjectSelection, scopedProjectSelection, user?.id]);
   const projectCheckpoint = scopedProjectState?.syncCheckpoint;
+  const projectSelectionChangeBlocked = !scopedProjectState || scopedProjectState.syncState !== 'idle' || Boolean(projectCheckpoint);
   const checkpointMatchesSelection = Boolean(projectCheckpoint && scopedProjectSelection
     && projectCheckpoint.workspaceId === scopedProjectSelection.workspaceId
     && projectCheckpoint.projectSelectionID === scopedProjectSelection.selectionID
@@ -712,6 +748,19 @@ function WorkspacesContent({ user, projectSyncOnly }: { user: ReturnType<typeof 
     setProjectNameError(validation.error ?? '');
     if (!validation.error && scopedProjectSelection) setConfirmedProjectName(validation.name);
   };
+  const restoreSavedProjectSelection = (selectionID: string) => {
+    if (!selectionID || projectSelectionChangeBlocked) return;
+    const selection = projectSelectionOptions.find((item) => item.selectionID === selectionID);
+    if (!selection || !selectedProjectTarget || selectedProjectTargetUnavailable
+      || selection.hostId !== selectedProjectTarget.hostId || selection.workspaceId !== selectedProjectTarget.workspaceId) return;
+    projectSelectionRevision.current += 1;
+    setProjectDirectorySelection(selection);
+    setProjectNameDraft(selection.projectName);
+    setConfirmedProjectName('');
+    setProjectNameError('');
+    setProjectDirectoryNotice(`已恢复本机目录“${selection.directoryName}”。`);
+    setProjectUploadMessage('待处理：确认项目名后，点击同步才会更新云端。');
+  };
   const refreshLocalProjectState = async () => {
     if (!projectBridge?.state || !user?.id) return;
     const ownerID = user.id;
@@ -823,9 +872,9 @@ function WorkspacesContent({ user, projectSyncOnly }: { user: ReturnType<typeof 
       {projectBridgeAvailable && !projectBridge?.state && <p className="muted" role="status">当前桌面客户端不支持读取本机同步状态，请更新客户端。</p>}
       {localProjectError && <p className="muted" role="status">{localProjectError} <button type="button" className="button button-secondary button-small" onClick={() => void refreshLocalProjectState()}>重试</button></p>}
       {receiptSelection && projectCheckpoint?.projectName && <div className="inline-actions">
-        <span role="status">云端已确认，目标电脑应用状态待核对。</span>
-        <button type="button" className="button button-secondary button-small" disabled={projectUploadBusy || scopedProjectState?.syncState === 'running' || !projectBridge?.uploadProject}
-          onClick={() => void startProjectUpload(receiptSelection, projectCheckpoint.projectName!, true)}>核对电脑应用状态</button>
+        <span role="status">{completedProjectReceiptMessage(projectCheckpoint.hostApplicationStatus)}</span>
+        {!projectReceiptCheckUnavailable && <button type="button" className="button button-secondary button-small" disabled={projectUploadBusy || scopedProjectState?.syncState === 'running' || !projectBridge?.uploadProject}
+          onClick={() => void startProjectUpload(receiptSelection, projectCheckpoint.projectName!, true)}>核对电脑应用状态</button>}
       </div>}
       {scopedProjectState?.syncState === 'running' && projectCheckpoint?.projectSelectionID && <button type="button" className="button button-secondary button-small"
         disabled={!projectBridge?.stopProjectSync || projectStopBusy} onClick={() => void stopProjectUpload()}>{projectStopBusy ? '正在停止…' : '停止同步'}</button>}
@@ -837,25 +886,41 @@ function WorkspacesContent({ user, projectSyncOnly }: { user: ReturnType<typeof 
         {defaultHostID && hosts.isPending && <FloatingNotice className="notice-info">正在核对默认云端电脑和文件目录…</FloatingNotice>}
         {defaultHostID && hosts.isError && <div className="error-inline" role="alert">无法核对默认云端电脑及其文件目录，文件同步已暂停。<button type="button" className="button button-secondary button-small" onClick={() => void hosts.refetch()}>重试</button></div>}
         {defaultHostID && hosts.isSuccess && !configuredDefaultHost && <p className="notice notice-warning" role="status">默认云端电脑不可用或已失去访问权限。请先检查默认电脑设置；文件同步不会改用其他电脑。</p>}
-        {configuredDefaultHost && configuredDefaultHost.state !== 'running' && <p className="notice notice-warning" role="status">默认云端电脑当前{hostStateLabel[configuredDefaultHost.state] || configuredDefaultHost.state}，同步已暂停。请先恢复默认电脑。</p>}
+        {configuredDefaultHost && configuredDefaultHost.state !== 'running' && <p className="notice notice-warning" role="status">
+          {projectSyncHostUnavailableMessage(configuredDefaultHost)}{' '}
+          {(configuredDefaultHost.state_reason === 'restore_failed' || configuredDefaultHost.state_reason === 'restore_unknown')
+            && <Link to="/hosts">云端电脑页面</Link>}
+        </p>}
         {configuredDefaultHost?.state === 'running' && configuredDefaultHost.workspace_runtime_online !== true && <p className="notice notice-warning" role="status">默认云端电脑的文件服务未确认在线，文件同步已暂停。</p>}
         {configuredDefaultHost && !configuredDefaultWorkspace && <p className="notice notice-warning" role="status">默认云端电脑的文件目录未就绪或无法唯一确认，文件同步已暂停。</p>}
         {configuredDefaultWorkspace && !configuredDefaultWorkspaceReady && <p className="notice notice-warning" role="status">默认云端电脑的文件状态未确认完成或存在冲突，文件同步已暂停。</p>}
         {projectPreferences.isSuccess && Boolean(defaultHostID) && configuredDefaultHost && configuredDefaultWorkspace && projectTargets.isPending
           && <FloatingNotice className="notice-info">正在核对默认电脑的项目同步权限…</FloatingNotice>}
-        {projectPreferences.isSuccess && Boolean(defaultHostID) && projectTargets.isError && <div className="error-inline" role="alert">无法核对默认电脑的项目同步权限，文件同步已暂停。<button type="button" className="button button-secondary button-small" onClick={() => void projectTargets.refetch()}>重试</button></div>}
+        {projectPreferences.isSuccess && Boolean(defaultHostID) && projectTargets.isError && <div className="error-inline" role="alert">无法核对默认电脑的项目同步权限，文件同步已暂停：{errorDetails(projectTargets.error).message}<button type="button" className="button button-secondary button-small" onClick={() => void projectTargets.refetch()}>重试</button></div>}
         {projectTargets.isSuccess && defaultHostID && configuredDefaultHost && configuredDefaultWorkspace && !configuredDefaultProjectTarget
           && <p className="notice notice-warning" role="status">默认云端电脑当前不可用于项目同步（目录未就绪、授权变化或仍有旧版同步）。文件同步已暂停，不会切换到其他电脑。</p>}
         {configuredDefaultProjectTarget && <article className="schedule-card" role="group" aria-label="同步目标电脑" style={{ padding: '8px 10px' }}>
           <div className="schedule-card-heading">
-            <div><strong>{configuredDefaultProjectTarget.hostName} · 默认电脑</strong><span>{configuredDefaultProjectTarget.hostState === 'running' ? '运行中' : '已停止'} · 已有项目 {configuredDefaultProjectTarget.folders.length} 个</span></div>
+            <div><strong>{configuredDefaultProjectTarget.hostName} · 默认电脑</strong><span>{hostStateLabel[configuredDefaultHost?.state ?? configuredDefaultProjectTarget.hostState] || configuredDefaultProjectTarget.hostState} · 已有项目 {configuredDefaultProjectTarget.folders.length} 个</span></div>
           </div>
           <p className="muted">目标目录：~/workspace/project/&lt;项目名&gt;/</p>
-          {configuredDefaultProjectTarget.blockedMessage && <small className="table-sub">{configuredDefaultProjectTarget.blockedMessage}</small>}
+          {configuredDefaultProjectTarget.blockedMessage
+            && configuredDefaultHost?.state_reason !== 'restore_failed' && configuredDefaultHost?.state_reason !== 'restore_unknown'
+            && <small className="table-sub">{configuredDefaultProjectTarget.blockedMessage}</small>}
         </article>}
         {selectedProjectTarget && !selectedProjectTargetUnavailable && <div className="form-stack" style={{ marginTop: 10 }}>
+            {projectSelectionOptions.length > 0 && <>
+              <label htmlFor="saved-project-selection">已保存的本机项目</label>
+              <select id="saved-project-selection" value={scopedProjectSelection?.selectionID ?? ''}
+                disabled={projectSelectionChangeBlocked} onChange={(event) => restoreSavedProjectSelection(event.target.value)}>
+                {!scopedProjectSelection && <option value="">请选择一个已保存的项目目录</option>}
+                {projectSelectionOptions.map((item) => <option key={item.selectionID} value={item.selectionID}>
+                  {item.projectName} · {item.directoryName}
+                </option>)}
+              </select>
+            </>}
             <div className="inline-actions">
-              <button type="button" className="button button-secondary" disabled={projectDirectoryBusy || projectUploadBusy || scopedProjectState?.syncState === 'running'} onClick={() => void chooseProjectDirectory()}>
+              <button type="button" className="button button-secondary" disabled={projectDirectoryBusy || projectSelectionChangeBlocked} onClick={() => void chooseProjectDirectory()}>
                 {projectDirectoryBusy ? '正在打开目录选择器…' : projectSelectionMatchesTarget ? '重新选择本机目录' : '选择本机目录'}
               </button>
               {projectSelectionMatchesTarget && scopedProjectSelection && <span role="status">已选：{scopedProjectSelection.directoryName}</span>}

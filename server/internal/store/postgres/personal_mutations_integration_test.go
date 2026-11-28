@@ -7,7 +7,9 @@ import (
 	"testing"
 	"time"
 
+	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/personal"
 )
 
@@ -172,6 +174,45 @@ WHERE p.owner_id=$1 AND p.object_type=$2 AND p.object_id=$3`, owner.ID, personal
 	if err := store.pool.QueryRow(ctx, `SELECT used_bytes FROM personal_data_quotas WHERE owner_id=$1`, owner.ID).Scan(&remainingUsed); err != nil || remainingUsed != 0 {
 		t.Fatalf("usage after delete = %d, want 0, err=%v", remainingUsed, err)
 	}
+}
+
+func TestPostgresDeletingBuiltinMemoryInvalidatesPersonalSummaries(t *testing.T) {
+	f := newRouteActionsTestFixture(t)
+	ctx := context.Background()
+	principal := identity.Principal{UserID: f.ownerID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: f.authorization.TokenID}
+	if _, err := f.store.ApplyPersonalMutation(ctx, principal, personalObjectMutationForTest(t, f.ownerID,
+		"delete-memory-setting-enable", personal.ObjectTypeSkillSetting, "builtin_memory", 0, `{"enabled":true}`, false)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.ApplyPersonalMutation(ctx, principal, personalObjectMutationForTest(t, f.ownerID,
+		"delete-memory-setting-memory", personal.ObjectTypeMemory, "global", 0,
+		`{"content":"the user prefers morning meetings","category":"preference"}`, false)); err != nil {
+		t.Fatal(err)
+	}
+	_, claim, taskID := createRouteTaskWithSummary(t, f, "Summary includes the authorized personal memory.",
+		func(_, claim app.ConversationRouteClaim) []app.ConversationSummarySource {
+			identityValue, err := app.ConversationSummaryScopeForClaim(claim)
+			if err != nil {
+				t.Fatal(err)
+			}
+			memorySource := app.ConversationSummarySource{Kind: app.ConversationSummarySourceMemory, ID: "global",
+				ObjectType: personal.ObjectTypeMemory, Version: 1}
+			memorySource.SHA256 = app.ConversationSummaryMemorySourceDigest(identityValue, memorySource)
+			return []app.ConversationSummarySource{memorySource}
+		})
+	if claim.Message.ID == "" || taskID == "" {
+		t.Fatal("summary fixture did not create the expected Task")
+	}
+	if _, err := f.store.ApplyPersonalMutation(ctx, principal, personalObjectMutationForTest(t, f.ownerID,
+		"delete-memory-setting-revoke", personal.ObjectTypeSkillSetting, "builtin_memory", 1, "", true)); err != nil {
+		t.Fatal(err)
+	}
+	var state string
+	if err := f.store.pool.QueryRow(ctx, `SELECT state FROM conversation_summary_versions
+WHERE owner_id=$1 AND conversation_id=$2 AND version=1`, f.ownerID, claim.Message.ConversationID).Scan(&state); err != nil || state != "invalid" {
+		t.Fatalf("personal-memory summary state after consent deletion = %q, err=%v; want invalid", state, err)
+	}
+	assertTaskSummaryRecoveryFailsBeforeClaim(t, f, taskID)
 }
 
 func TestPostgresGoalUsesPersonalQuotaVersionAndOwnerLedger(t *testing.T) {

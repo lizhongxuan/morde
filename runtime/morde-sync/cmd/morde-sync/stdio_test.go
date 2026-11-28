@@ -744,6 +744,7 @@ func TestStdioProjectUploadParamsRequireFixedUnscopedContract(t *testing.T) {
 	params := syncParams{
 		BaseURL: "http://127.0.0.1", BearerToken: testBearerToken, WorkspaceID: testWorkspaceID,
 		FolderID: "morde-0123456789abcdef0123456789abcdef", SourceBindingID: "12345678-1234-4234-8234-123456789abc", Directory: "/tmp/empty-project",
+		SourceDevice: "1", SourceInode: "2",
 		Direction: "upload", Policy: "compare_merge", BaseRevision: &baseRevision,
 	}
 	if err := validateSyncParams(params); err != nil {
@@ -766,6 +767,12 @@ func TestStdioProjectUploadParamsRequireFixedUnscopedContract(t *testing.T) {
 			Directory: params.Directory, Direction: "upload", Policy: "compare_merge", BaseRevision: &baseRevision},
 		{BaseURL: params.BaseURL, BearerToken: params.BearerToken, WorkspaceID: params.WorkspaceID, FolderID: params.FolderID, SourceBindingID: "12345678-1234-4234-8234-123456789ABC",
 			Directory: params.Directory, Direction: "upload", Policy: "compare_merge", BaseRevision: &baseRevision},
+		{BaseURL: params.BaseURL, BearerToken: params.BearerToken, WorkspaceID: params.WorkspaceID, FolderID: params.FolderID, SourceBindingID: params.SourceBindingID,
+			Directory: params.Directory, SourceDevice: "", SourceInode: params.SourceInode, Direction: "upload", Policy: "compare_merge", BaseRevision: &baseRevision},
+		{BaseURL: params.BaseURL, BearerToken: params.BearerToken, WorkspaceID: params.WorkspaceID, FolderID: params.FolderID, SourceBindingID: params.SourceBindingID,
+			Directory: params.Directory, SourceDevice: params.SourceDevice, SourceInode: "0", Direction: "upload", Policy: "compare_merge", BaseRevision: &baseRevision},
+		{BaseURL: params.BaseURL, BearerToken: params.BearerToken, WorkspaceID: params.WorkspaceID, FolderID: params.FolderID, SourceBindingID: params.SourceBindingID,
+			Directory: params.Directory, SourceDevice: "not-a-device", SourceInode: params.SourceInode, Direction: "upload", Policy: "compare_merge", BaseRevision: &baseRevision},
 	}
 	for _, value := range invalid {
 		if err := validateSyncParams(value); err == nil {
@@ -775,12 +782,19 @@ func TestStdioProjectUploadParamsRequireFixedUnscopedContract(t *testing.T) {
 	ordinary := params
 	ordinary.FolderID = ""
 	ordinary.SourceBindingID = ""
+	ordinary.SourceDevice = ""
+	ordinary.SourceInode = ""
 	if err := validateSyncParams(ordinary); err != nil {
 		t.Fatalf("non-project sync rejected: %v", err)
 	}
 	ordinary.SourceBindingID = params.SourceBindingID
 	if err := validateSyncParams(ordinary); err == nil {
 		t.Fatal("non-project sync accepted source_binding_id")
+	}
+	ordinary.SourceBindingID = ""
+	ordinary.SourceDevice = params.SourceDevice
+	if err := validateSyncParams(ordinary); err == nil {
+		t.Fatal("non-project sync accepted project source identity")
 	}
 }
 

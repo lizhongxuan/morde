@@ -14,28 +14,28 @@ import (
 )
 
 type taskModelResponseRow struct {
-	taskOwnerID          string
-	initiatorID          string
-	projectID            string
-	personalModel        bool
-	agentInstanceID      string
-	agentGeneration      int64
-	agentSessionID       string
-	agentRootSessionID   string
-	leaseOwner           string
-	leaseVersion         int64
-	authorizationVersion int64
-	throughSequence      int64
-	engineVersion        string
-	profileVersion       string
-	modelID              string
-	providerEndpoint     string
-	providerModel        string
+	taskOwnerID           string
+	initiatorID           string
+	projectID             string
+	personalModel         bool
+	agentInstanceID       string
+	agentGeneration       int64
+	agentSessionID        string
+	agentRootSessionID    string
+	leaseOwner            string
+	leaseVersion          int64
+	authorizationVersion  int64
+	throughSequence       int64
+	engineVersion         string
+	profileVersion        string
+	modelID               string
+	providerEndpoint      string
+	providerModel         string
 	providerReportedModel string
-	connectionVersion    time.Time
-	requestDigest        []byte
-	ciphertext           []byte
-	digest               []byte
+	connectionVersion     time.Time
+	requestDigest         []byte
+	ciphertext            []byte
+	digest                []byte
 }
 
 func (s *Store) RecoverTaskModelResponse(ctx context.Context, request app.ModelCallReservation) (app.TaskModelResponseRecord, bool, error) {
@@ -51,6 +51,37 @@ func (s *Store) RecoverTaskModelResponse(ctx context.Context, request app.ModelC
 		}
 		if err := checkModelCaller(ctx, tx, request); err != nil {
 			return err
+		}
+		adaptiveBudget := request.BudgetPlanID != "" || request.BudgetCallID != "" || request.BudgetRequestDigest != ""
+		if request.Task.RecoveryCallID != "" {
+			if err := verifyTaskModelRecoveryAttemptForReservation(ctx, tx, request); err != nil {
+				return err
+			}
+			if adaptiveBudget {
+				if err := verifyTaskModelBudgetPreparationInTx(ctx, tx, request, map[string]bool{"prepared": true, "settled": true}, true); err != nil {
+					return err
+				}
+			}
+		} else if adaptiveBudget {
+			if !validModelBudgetPreparationID(request.BudgetPlanID) || !validModelBudgetPreparationID(request.BudgetCallID) ||
+				len(request.BudgetRequestDigest) != 64 {
+				return domain.InvalidArgument("task_model_response", "adaptive Task model response identity is incomplete")
+			}
+			if err := verifyTaskModelBudgetPreparationInTx(ctx, tx, request, map[string]bool{"prepared": true, "settled": true}, true); err != nil {
+				return err
+			}
+			var preparedDSHCallID string
+			var preparedThrough int64
+			if err := tx.QueryRow(ctx, `SELECT dsh_call_id,through_sequence FROM model_budget_preparations
+WHERE owner_id=$1 AND source='task' AND call_id=$2`, request.OwnerID, request.CallID).Scan(&preparedDSHCallID, &preparedThrough); err != nil {
+				return domain.NewError(domain.CodeInvalidState, "adaptive Task model response preparation is unavailable")
+			}
+			canonicalPreparedID, err := app.DSHModelCallID(request.Task.TaskID, request.Task.AgentSessionID, preparedThrough)
+			if err != nil || preparedDSHCallID != canonicalPreparedID || request.CallID != preparedDSHCallID {
+				return domain.NewError(domain.CodeConflict, "adaptive Task model response ledger identity changed")
+			}
+		} else if request.DSHCallID != "" && request.CallID != request.DSHCallID {
+			return domain.NewError(domain.CodeInvalidState, "Task model response frame identity changed")
 		}
 		var state, modelID, providerModel string
 		var taskID *string
@@ -68,6 +99,12 @@ FROM model_call_ledger WHERE owner_id=$1 AND source='task' AND call_id=$2 FOR UP
 		if taskID == nil || *taskID != request.Task.TaskID || modelID != request.ModelID || providerModel != request.ProviderModel ||
 			!bytes.Equal(requestDigest, request.RequestDigest) {
 			return domain.NewError(domain.CodeIdempotencyConflict, "Task model response call identity changed")
+		}
+		// Adaptive budgeting creates the ledger row before ModelGateway's
+		// response-replay check. A still-prepared call has not been dispatched,
+		// so it may continue through the normal fenced dispatch path below.
+		if state == "prepared" {
+			return nil
 		}
 		if state != "settled" || inputTokens == nil || outputTokens == nil {
 			return domain.NewError(domain.CodeInvalidState, "Task model call has no recoverable settled response")

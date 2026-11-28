@@ -3,11 +3,14 @@
 package dshguardian
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -140,6 +143,269 @@ func (p hostProcessInspector) TaskProcessGone(containerID string, runtimeProof p
 		return false, fmt.Errorf("verify task host PID exit: %w", err)
 	}
 	return true, nil
+}
+
+func (p hostProcessInspector) SnapshotTaskProcess(containerID string, runtimeProof processProof, proof taskProcessProof,
+	taskKey string) ([]TaskProcessSnapshotEntry, error) {
+	taskDir, err := p.validateTaskProof(containerID, runtimeProof, proof, taskKey)
+	if err != nil {
+		return nil, err
+	}
+	if err := p.requireTaskCgroup(taskDir); err != nil {
+		return nil, err
+	}
+	for attempt := 0; attempt < 3; attempt++ {
+		first, err := p.readTaskProcessSnapshot(containerID, proof, taskDir)
+		if err != nil {
+			return nil, err
+		}
+		second, err := p.readTaskProcessSnapshot(containerID, proof, taskDir)
+		if err != nil {
+			return nil, err
+		}
+		if sameTaskProcessSnapshotIdentity(first, second) {
+			return second, nil
+		}
+	}
+	return nil, errors.New("Task process tree changed while its bounded snapshot was captured")
+}
+
+type taskProcessSnapshotRecord struct {
+	hostPID       int
+	hostParentPID int
+	containerPID  int
+	cgroupPath    string
+	state         string
+	startTimeTick uint64
+}
+
+func (p hostProcessInspector) readTaskProcessSnapshot(containerID string, proof taskProcessProof,
+	taskDir string) ([]TaskProcessSnapshotEntry, error) {
+	processesByHostPID := make(map[int]taskProcessSnapshotRecord)
+	cgroupPaths := make(map[string]struct{})
+	cgroupCount := 0
+	err := filepath.WalkDir(taskDir, func(dir string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return errors.New("Task cgroup tree contains a symlink")
+		}
+		if !entry.IsDir() {
+			return nil
+		}
+		info, statErr := os.Lstat(dir)
+		if statErr != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return errors.New("Task cgroup tree contains an unsafe directory")
+		}
+		relative, relErr := filepath.Rel(taskDir, dir)
+		if relErr != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			return errors.New("Task cgroup traversal escaped its root")
+		}
+		cgroupPath := proof.CgroupPath
+		if relative != "." {
+			cgroupPath = path.Join(cgroupPath, filepath.ToSlash(relative))
+		}
+		if !cgroupPathWithin(proof.CgroupPath, cgroupPath) || !containerCgroupMatches(cgroupPath, containerID) {
+			return errors.New("Task cgroup descendant escaped the guarded Runtime")
+		}
+		cgroupCount++
+		if cgroupCount > maxTaskProcessSnapshotCgroups {
+			return errors.New("Task cgroup subtree exceeds the snapshot size limit")
+		}
+		cgroupPaths[cgroupPath] = struct{}{}
+		procsPath := filepath.Join(dir, "cgroup.procs")
+		procsInfo, infoErr := os.Lstat(procsPath)
+		if infoErr != nil || !procsInfo.Mode().IsRegular() || procsInfo.Mode()&os.ModeSymlink != 0 {
+			return errors.New("Task cgroup process list is unavailable or unsafe")
+		}
+		pids, readErr := readTaskCgroupPIDsBounded(procsPath, maxTaskProcessSnapshotProcesses-len(processesByHostPID))
+		if readErr != nil {
+			return readErr
+		}
+		for _, hostPID := range pids {
+			if _, duplicate := processesByHostPID[hostPID]; duplicate {
+				return errors.New("Task process appears in multiple cgroup directories")
+			}
+			if len(processesByHostPID) >= maxTaskProcessSnapshotProcesses {
+				return errors.New("Task process tree exceeds the snapshot size limit")
+			}
+			record, recordErr := p.readTaskProcessSnapshotRecord(hostPID, proof.NamespaceInode, proof.CgroupPath)
+			if recordErr != nil {
+				return recordErr
+			}
+			processesByHostPID[hostPID] = record
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("capture Task cgroup process tree: %w", err)
+	}
+	if len(processesByHostPID) == 0 {
+		return nil, errors.New("Task cgroup process tree is empty")
+	}
+	for _, record := range processesByHostPID {
+		if _, ok := cgroupPaths[record.cgroupPath]; !ok {
+			return nil, errors.New("Task process membership changed during cgroup traversal")
+		}
+	}
+	root, ok := processesByHostPID[proof.HostPID]
+	if !ok || root.containerPID != proof.ContainerPID || root.startTimeTick != proof.StartTimeTick {
+		return nil, errors.New("fenced Task root process is missing or has been reused")
+	}
+
+	containerPIDByHostPID := make(map[int]int, len(processesByHostPID))
+	for hostPID, record := range processesByHostPID {
+		if _, duplicate := containerPIDByHostPID[record.containerPID]; duplicate {
+			return nil, errors.New("Task process PID namespace mapping is ambiguous")
+		}
+		containerPIDByHostPID[hostPID] = record.containerPID
+	}
+	entries := make([]TaskProcessSnapshotEntry, 0, len(processesByHostPID))
+	seenContainerPIDs := make(map[int]struct{}, len(processesByHostPID))
+	for _, record := range processesByHostPID {
+		if _, duplicate := seenContainerPIDs[record.containerPID]; duplicate {
+			return nil, errors.New("Task process PID namespace mapping is ambiguous")
+		}
+		seenContainerPIDs[record.containerPID] = struct{}{}
+		entry := TaskProcessSnapshotEntry{PID: record.containerPID, State: record.state, StartTimeTick: record.startTimeTick,
+			ParentOutsideScope: true}
+		if parentPID, inside := containerPIDByHostPID[record.hostParentPID]; inside {
+			if parentPID == record.containerPID {
+				return nil, errors.New("Task process has an invalid self-parent relationship")
+			}
+			entry.ParentPID = parentPID
+			entry.ParentOutsideScope = false
+		}
+		entries = append(entries, entry)
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].PID < entries[j].PID })
+	return entries, nil
+}
+
+func (p hostProcessInspector) readTaskProcessSnapshotRecord(hostPID int, namespaceInode uint64,
+	taskCgroupPath string) (taskProcessSnapshotRecord, error) {
+	procDir := filepath.Join(p.procRoot, strconv.Itoa(hostPID))
+	first, err := os.ReadFile(filepath.Join(procDir, "stat"))
+	if err != nil {
+		return taskProcessSnapshotRecord{}, fmt.Errorf("read Task process identity: %w", err)
+	}
+	_, hostParentPID, startTimeTick, err := parseProcSnapshotStat(first)
+	if err != nil {
+		return taskProcessSnapshotRecord{}, err
+	}
+	cgroupData, err := os.ReadFile(filepath.Join(procDir, "cgroup"))
+	if err != nil {
+		return taskProcessSnapshotRecord{}, fmt.Errorf("read Task process cgroup identity: %w", err)
+	}
+	cgroupPath, err := parseUnifiedCgroup(cgroupData)
+	if err != nil || !cgroupPathWithin(taskCgroupPath, cgroupPath) {
+		return taskProcessSnapshotRecord{}, errors.New("Task process is outside its Guardian cgroup subtree")
+	}
+	actualNamespace, err := p.pidNamespaceInode(hostPID)
+	if err != nil || actualNamespace != namespaceInode {
+		return taskProcessSnapshotRecord{}, errors.New("Task process PID namespace changed or is unavailable")
+	}
+	nspids, err := readProcNSpid(filepath.Join(procDir, "status"))
+	if err != nil || len(nspids) == 0 || nspids[0] != hostPID {
+		return taskProcessSnapshotRecord{}, errors.New("Task process namespace PID mapping is invalid")
+	}
+	second, err := os.ReadFile(filepath.Join(procDir, "stat"))
+	if err != nil {
+		return taskProcessSnapshotRecord{}, fmt.Errorf("recheck Task process identity: %w", err)
+	}
+	secondState, secondParentPID, secondStartTimeTick, err := parseProcSnapshotStat(second)
+	if err != nil || secondStartTimeTick != startTimeTick || secondParentPID != hostParentPID {
+		return taskProcessSnapshotRecord{}, errors.New("Task process PID was reused or reparented during capture")
+	}
+	secondCgroupData, err := os.ReadFile(filepath.Join(procDir, "cgroup"))
+	if err != nil {
+		return taskProcessSnapshotRecord{}, fmt.Errorf("recheck Task process cgroup identity: %w", err)
+	}
+	secondCgroupPath, err := parseUnifiedCgroup(secondCgroupData)
+	if err != nil || secondCgroupPath != cgroupPath || len(nspids) == 0 || nspids[len(nspids)-1] < 1 {
+		return taskProcessSnapshotRecord{}, errors.New("Task process scope or namespace PID changed during capture")
+	}
+	return taskProcessSnapshotRecord{hostPID: hostPID, hostParentPID: hostParentPID, containerPID: nspids[len(nspids)-1],
+		cgroupPath: secondCgroupPath, state: secondState, startTimeTick: startTimeTick}, nil
+}
+
+func readTaskCgroupPIDsBounded(path string, maxPIDs int) ([]int, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	pids := make([]int, 0)
+	for scanner.Scan() {
+		pid, parseErr := strconv.Atoi(strings.TrimSpace(scanner.Text()))
+		if parseErr != nil || pid < 2 {
+			return nil, errors.New("Task cgroup process list contains an invalid PID")
+		}
+		if len(pids) >= maxPIDs {
+			return nil, errors.New("Task cgroup process list exceeds the snapshot size limit")
+		}
+		pids = append(pids, pid)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return pids, nil
+}
+
+func readProcNSpid(statusPath string) ([]int, error) {
+	file, err := os.Open(statusPath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if strings.HasPrefix(string(line), "NSpid:") {
+			return parseNSpid(append([]byte(nil), line...))
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+	return nil, errors.New("proc status does not expose NSpid")
+}
+
+func parseProcSnapshotStat(data []byte) (string, int, uint64, error) {
+	text := string(data)
+	end := strings.LastIndexByte(text, ')')
+	if end < 0 || end+1 >= len(text) {
+		return "", 0, 0, errors.New("proc stat record is malformed")
+	}
+	fields := strings.Fields(text[end+1:])
+	if len(fields) <= 19 || len(fields[0]) != 1 {
+		return "", 0, 0, errors.New("proc stat record lacks process state or identity")
+	}
+	parentPID, err := strconv.Atoi(fields[1])
+	if err != nil || parentPID < 0 {
+		return "", 0, 0, errors.New("proc parent PID is invalid")
+	}
+	startTimeTick, err := strconv.ParseUint(fields[19], 10, 64)
+	if err != nil || startTimeTick == 0 {
+		return "", 0, 0, errors.New("proc start time is invalid")
+	}
+	return fields[0], parentPID, startTimeTick, nil
+}
+
+func sameTaskProcessSnapshotIdentity(first, second []TaskProcessSnapshotEntry) bool {
+	if len(first) != len(second) {
+		return false
+	}
+	for index := range first {
+		left, right := first[index], second[index]
+		if left.PID != right.PID || left.ParentPID != right.ParentPID || left.ParentOutsideScope != right.ParentOutsideScope ||
+			left.StartTimeTick != right.StartTimeTick {
+			return false
+		}
+	}
+	return true
 }
 
 func (p hostProcessInspector) RemoveTaskCgroup(containerID string, runtimeProof processProof, proof taskProcessProof, taskKey string) error {

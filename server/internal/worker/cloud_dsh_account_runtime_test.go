@@ -1235,7 +1235,11 @@ func TestAccountAgentRuntimeTaskStartWaitsForGuardianAdmission(t *testing.T) {
 
 func TestAccountAgentRuntimeTaskPipeTagsSequenceAndDropsLateToolResult(t *testing.T) {
 	reader, writer := io.Pipe()
-	defer reader.Close()
+	defer func() {
+		if err := reader.Close(); err != nil {
+			t.Errorf("close runtime stream reader: %v", err)
+		}
+	}()
 	session := &cloudDSHAccountRuntimeSession{
 		runtime: app.AccountAgentRuntime{Fence: app.AccountAgentRuntimeFence{ServiceInstanceID: "server_123",
 			RuntimeID: "runtime_123", RuntimeGeneration: 4}},

@@ -20,8 +20,9 @@ import (
 )
 
 type Store struct {
-	pool *pgxpool.Pool
-	q    *sqlcgen.Queries
+	pool                                *pgxpool.Pool
+	q                                   *sqlcgen.Queries
+	workflowTraceTaskProcessSnapshotter WorkflowTraceTaskProcessSnapshotReader
 }
 
 func New(pool *pgxpool.Pool) *Store {

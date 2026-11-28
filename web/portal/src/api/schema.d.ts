@@ -305,7 +305,7 @@ export interface paths {
         put?: never;
         /**
          * Log in to the portal
-         * @description Sets the ch_portal session cookie only for approved accounts. Login attempts are rate limited. Correct credentials for pending, rejected, or disabled accounts return the matching account status without a session. The default admin/admin credential is accepted only from a loopback client and receives a restricted password-change session.
+         * @description Sets the ch_portal session cookie only for approved accounts. Login attempts are rate limited. Correct credentials for pending, rejected, or disabled accounts return the matching account status without a session. Initial or reset passwords do not require a loopback connection; an account marked for a password change receives a restricted session until it changes its password, with no access to other APIs or onboarding side effects.
          */
         post: operations["login"];
         delete?: never;
@@ -2968,6 +2968,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/projects/{id}/conversations/{conversation_id}/messages/{message_id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+                message_id: components["schemas"]["MessageId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Cancel processing of an accepted project conversation message
+         * @description Only the original message actor may cancel. Cancellation is idempotent and is bound to this project, conversation, message, service instance, and authenticated actor. The response uses the accepted-message envelope and returns the current source message state.
+         */
+        post: operations["cancelProjectConversationMessage"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/projects/{id}/conversations/{conversation_id}/messages/{message_id}/retry-processing": {
         parameters: {
             query?: never;
@@ -2993,6 +3017,35 @@ export interface paths {
          * @description Only the original actor may retry a failed message without a Task. A repeated message is normalized to its original request and retry identity. Exact retries use the same key; dispatched or unknown model calls are reconciled, never blindly repeated. Existing Tasks use Task operations.
          */
         post: operations["retryProjectConversationMessageProcessing"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/projects/{id}/conversations/{conversation_id}/messages/{message_id}/retry-eligibility": {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+                message_id: components["schemas"]["MessageId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Check whether an accepted message can be retried
+         * @description Returns the current advisory eligibility for retrying this message. The retry-processing POST rechecks authorization and route state transactionally, so eligibility may change before it is called.
+         */
+        get: operations["getProjectConversationMessageRetryEligibility"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -3649,6 +3702,29 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/conversations/{id}/messages/{message_id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["ConversationId"];
+                message_id: components["schemas"]["MessageId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Cancel processing of an accepted conversation message
+         * @description Only the original message actor may cancel. Cancellation is idempotent and is bound to this conversation, message, service instance, and authenticated actor. The response uses the accepted-message envelope and returns the current source message state.
+         */
+        post: operations["cancelConversationMessage"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/conversations/{id}/messages/{message_id}/retry-processing": {
         parameters: {
             query?: never;
@@ -3673,6 +3749,34 @@ export interface paths {
          * @description Only the original actor may retry a failed message without a Task. A repeated message is normalized to its original request and retry identity. Exact retries use the same key; dispatched or unknown model calls are reconciled, never blindly repeated. Existing Tasks use Task operations.
          */
         post: operations["retryConversationMessageProcessing"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/conversations/{id}/messages/{message_id}/retry-eligibility": {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["schemas"]["ConversationId"];
+                message_id: components["schemas"]["MessageId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Check whether an accepted message can be retried
+         * @description Returns the current advisory eligibility for retrying this message. The retry-processing POST rechecks authorization and route state transactionally, so eligibility may change before it is called.
+         */
+        get: operations["getConversationMessageRetryEligibility"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -3855,6 +3959,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/tasks/{id}/requirement-manifest/confirm": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Confirm the exact current Task verification requirement manifest
+         * @description Requires an authenticated Task reader and an Idempotency-Key. The user attests that the reviewed candidate manifest is complete and accurately represents the applicable Task requirements. The server separately rechecks each source identity and digest before using this attestation for H07. Task revision, plan revision, plan event sequence, digest, and current authorization are rechecked transactionally. Stale, cancelled, unauthorized, or changed plans are rejected.
+         */
+        post: operations["confirmTaskRequirementManifest"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/tasks/{id}/artifacts/{artifact_id}/content": {
         parameters: {
             query?: never;
@@ -3915,6 +4041,28 @@ export interface paths {
          * @description Retries the exact persisted tool call only when the prior attempt is confirmed not dispatched, or a connector rate limit is proven by the failed MCP operation ledger and its retry-after window has elapsed. The current Task, authorization, Host, Workspace, resource and checkpoint fences must still match. The request binds the expected Task revision and source attempt; the server reads the tool request digest from the persisted source step. Request parameters cannot replace tool arguments. Repeating the same Idempotency-Key returns the same attempt. Unknown or possibly partial side effects are rejected.
          */
         post: operations["retryTaskStep"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{id}/model-recovery-retries": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Queue one persisted safe model recovery for the current Task revision
+         * @description Available only when the server has persisted a retry_available intent from gateway-confirmed zero-dispatch evidence. The server rechecks the initiator, current authorization version, Task revision, event sequence, checkpoint and one-attempt schedule atomically. External writes and unknown outcomes are never retried by this action.
+         */
+        post: operations["retryTaskModelRecovery"];
         delete?: never;
         options?: never;
         head?: never;
@@ -4141,6 +4289,28 @@ export interface paths {
          * @description Portal session only. The caller must currently be able to read this Task and own its running Host. The raw ticket is returned once, expires within 60 seconds, and is persisted server-side only as a hash. It grants read-only Task status/events and verified artifact metadata; it grants no Host control or Workspace file access.
          */
         post: operations["issueTaskWorkbenchObservationTicket"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{id}/pc-delivery-observations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Record a desktop client-visible Task reply
+         * @description Accepts only the Task initiator's client web session bound to an active desktop installation, with current access to the conversation, and a completed assistant message bound to the exact persisted task.result event for this Task and revision. The server records its own observation time and installation identity; request bodies contain no message content.
+         */
+        post: operations["observeTaskReplyInPC"];
         delete?: never;
         options?: never;
         head?: never;
@@ -4418,7 +4588,7 @@ export interface paths {
         put?: never;
         /**
          * Create and enable a schedule
-         * @description Requires an enabled Owner execution gate and an Idempotency-Key. Omit host_id or set it to null to create a hostless schedule. Browser observation requires a Host. Authorization is derived from the current session or a separate schedule grant; credentials are never included in responses or sync snapshots.
+         * @description Requires an enabled Owner execution gate and an Idempotency-Key. Omit host_id or set it to null to create a hostless schedule. Browser observation requires a Host. `file_delivery_intent` is structured and defaults to `none`; schedules currently cannot require file delivery because they do not bind a Workspace, and `unclear` must be clarified before saving. Authorization is derived from the current session or a separate schedule grant; credentials are never included in responses or sync snapshots.
          */
         post: operations["createSchedule"];
         delete?: never;
@@ -4443,7 +4613,7 @@ export interface paths {
         get: operations["getSchedule"];
         /**
          * Update a schedule definition at the expected version
-         * @description Omit host_id to keep the current Host, or set it to null to remove the Host association. When removing a Host from a schedule with browser observation, also set observation to null. Browser observation requires a Host.
+         * @description Omit host_id to keep the current Host, or set it to null to remove the Host association. When removing a Host from a schedule with browser observation, also set observation to null. Browser observation requires a Host. Omitted `file_delivery_intent` preserves the current structured intent; schedules currently support `none` only.
          */
         put: operations["updateSchedule"];
         post?: never;
@@ -4520,7 +4690,7 @@ export interface paths {
             header?: never;
             path: {
                 type: components["schemas"]["PersonalMutationObjectType"];
-                /** @description Identifier rules depend on type. profile and feed_preferences use default; memory uses global, user, or m_<8 lowercase hex characters; skill_setting uses builtin_<non-empty id>; connector_setting uses catalogue_<non-empty id>. Other enabled types use a path-free opaque identifier. The server also rejects . and ..; schedule uses its dedicated API rather than this mutation route. */
+                /** @description Identifier rules depend on type. profile and feed_preferences use default; memory uses global, user, or m_<8 lowercase hex characters; skill_setting uses builtin_<non-empty id>; connector_setting uses catalogue_<non-empty id>. skill_candidate uses sk_<8 lowercase hexadecimal characters. Other enabled types use a path-free opaque identifier. The server also rejects . and ..; schedule uses its dedicated API rather than this mutation route. */
                 id: components["schemas"]["PersonalObjectId"];
             };
             cookie?: never;
@@ -5217,8 +5387,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Safely recover an uncertain Host restore
-         * @description Rechecks remote sandbox state. Existing sandboxes are adopted; a new create is queued only after an administrator confirms the external issue is fixed and no matching sandbox exists.
+         * Safely recover a failed or uncertain Host restore
+         * @description Rechecks remote sandbox state for the expected runtime generation. A single matching running or pending sandbox is adopted. For a failed Host with reason lost, replacement requires a complete successful sandbox listing with no active candidate and the saved sandbox confirmed not found or terminated; a failed or ambiguous candidate in this state requires manual review. For other recoverable failure reasons, a failed sandbox may be replaced after explicit confirmation. Recovery keeps the same Host and Workspace/Profile volumes and advances the runtime generation when creating a replacement.
          */
         post: operations["recoverAdminHost"];
         delete?: never;
@@ -5301,6 +5471,28 @@ export interface paths {
          * @description Requires an approved administrator's unbound Portal session. On the first transition from pending or rejected to approved, a configured default platform model budget is created in the same transaction as the status change and audit. If no default is configured, approval succeeds without granting a platform model budget. Disabling and restoring an account does not grant or reset a budget.
          */
         patch: operations["updateUser"];
+        trace?: never;
+    };
+    "/api/admin/users/{id}/password": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Reset an account password
+         * @description Requires a super administrator's approved Portal session. The new password takes effect immediately, invalidates the target account's existing sessions and client credentials, and requires the user to change it in the Portal before using a client application.
+         */
+        post: operations["resetAdminUserPassword"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
         trace?: never;
     };
     "/api/admin/users/{id}/personal-data-quota": {
@@ -5570,6 +5762,106 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/admin/observability/overview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read independent Harness observability source health and request spans
+         * @description Administrators only. Each source reports its own coverage state; unavailable DSH checkpoints do not hide span data.
+         */
+        get: operations["getAdminObservabilityOverview"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/observability/traces": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Search distributed traces and linked conversation Tasks
+         * @description Administrators only. Search is bounded and cursors are opaque.
+         */
+        get: operations["listAdminObservabilityTraces"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/observability/traces/{trace_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read the bounded spans for one trace
+         * @description Administrators only. Span attributes use an allowlist and details are not cacheable.
+         */
+        get: operations["getAdminObservabilityTrace"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/observability/traces/{trace_id}/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read a committed DSH checkpoint event page for a trace-linked Task
+         * @description Administrators only. Only digest-verified committed events are returned; checkpoint content is redacted and never modified.
+         */
+        get: operations["listAdminObservabilityTraceEvents"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/observability/traces/{trace_id}/logs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read trace-correlated structured Portal logs
+         * @description Administrators only. Results contain allowlisted fields, are bounded and are never cacheable.
+         */
+        get: operations["listAdminObservabilityTraceLogs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/admin/model-connections": {
         parameters: {
             query?: never;
@@ -5619,6 +5911,26 @@ export interface paths {
          * @description Does not inspect conversation content. Returns unavailable until a separately consented quality sample source is configured.
          */
         get: operations["getAdminQuality"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/users/{id}/tasks/{task_id}/workflow-trace": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read a source-bound workflow trace for a Task
+         * @description Reads Task, route, Agent, model-call, operation, approval, validation, conversation-delivery and Host ledger facts from one database snapshot. It exposes only ledger metadata and hashes, preserves unavailable relationships as gaps, and does not infer Task success or a quality score. PC-side observation remains unavailable until its adapter is provided. Administrators only.
+         */
+        get: operations["getAdminTaskWorkflowTrace"];
         put?: never;
         post?: never;
         delete?: never;
@@ -6020,7 +6332,7 @@ export interface paths {
         put?: never;
         /**
          * Record provider-verified usage for an unknown model call
-         * @description An approved administrator verifies the provider's counts before submitting them. The ledger, associated server Task usage and audit record commit atomically. Only unknown calls can be reconciled. A repeat by the same administrator with identical counts and evidence is idempotent; different submissions conflict. This does not restore an unpersisted model response or restart the call.
+         * @description An approved administrator verifies the provider's counts before submitting them. The ledger, associated server Task usage and audit record commit atomically. For an adaptive Task budget overage, the administrator must confirm authoritative provider usage; the account and project ledgers are settled with those verified actual amounts even when they exceed the original hold, and the overage record is resolved with the administrator, evidence and verified amounts. This does not increase any budget, restore an unpersisted model response, or restart the call. Other unknown calls still cannot be reconciled above their signed reservation. A repeat by the same administrator with identical counts and evidence is idempotent; different submissions conflict.
          */
         post: operations["reconcileUnknownModelUsage"];
         delete?: never;
@@ -6587,9 +6899,9 @@ export interface components {
         TokenId: string;
         ClientInstallationId: string;
         /** @enum {string} */
-        PersonalMutationObjectType: "profile" | "memory" | "rule_candidate" | "soul" | "diary" | "goal" | "feed_post" | "feed_preferences" | "idea_mark" | "library_item" | "skill_setting" | "connector_setting";
+        PersonalMutationObjectType: "profile" | "memory" | "rule_candidate" | "skill_candidate" | "soul" | "diary" | "goal" | "feed_post" | "feed_preferences" | "idea_mark" | "library_item" | "skill_setting" | "connector_setting";
         /** @enum {string} */
-        PersonalObjectType: "profile" | "memory" | "rule_candidate" | "soul" | "diary" | "goal" | "schedule" | "feed_post" | "feed_preferences" | "idea_mark" | "library_item" | "skill_setting" | "connector_setting";
+        PersonalObjectType: "profile" | "memory" | "rule_candidate" | "skill_candidate" | "soul" | "diary" | "goal" | "schedule" | "feed_post" | "feed_preferences" | "idea_mark" | "library_item" | "skill_setting" | "connector_setting";
         /** @description Path-free opaque identifier; exact accepted values depend on object_type. The server rejects . and .. and enforces each type's allowlist. */
         PersonalObjectId: string;
         GoalId: string;
@@ -6618,6 +6930,8 @@ export interface components {
              */
             base_url: string;
             model_name: string;
+            /** @description Optional output-capacity metadata override for personal custom model routes. This records provider-documented capacity and does not change the gateway dispatch limit. System presets are maintained by Morde. */
+            max_output_override_tokens?: number | null;
             /**
              * @deprecated
              * @description Legacy write alias for context_window_override_tokens. New clients should use context_window_override_tokens.
@@ -6640,6 +6954,8 @@ export interface components {
              */
             base_url: string;
             model_name: string;
+            /** @description Optional output-capacity metadata override for personal custom model routes. Omitted preserves it for an unchanged route; route changes clear it unless a new value is supplied; null clears it. This records provider-documented capacity and does not change the gateway dispatch limit. System presets are maintained by Morde. */
+            max_output_override_tokens?: number | null;
             /**
              * @deprecated
              * @description Legacy write alias for context_window_override_tokens. New clients should use context_window_override_tokens.
@@ -6670,6 +6986,27 @@ export interface components {
             /** Format: uri */
             base_url: string;
             model_name: string;
+            /** @description Additive response field. Effective model output-capacity metadata for this exact configured route; null means unknown. It does not imply that the current gateway can dispatch this many tokens. Older servers may omit it. */
+            max_output_tokens?: number | null;
+            /** @description Additive response field. Explicit output-capacity metadata override for personal custom routes only. Older servers may omit it. */
+            max_output_override_tokens?: number | null;
+            /**
+             * @description Additive response field. Older servers may omit it.
+             * @enum {string}
+             */
+            max_output_source?: "unknown" | "override" | "model_catalog";
+            /**
+             * Format: date-time
+             * @description Additive response field. Older servers may omit it.
+             */
+            max_output_resolved_at?: string | null;
+            /** @description Additive response field. Older servers may omit it. */
+            max_output_catalog_version?: string | null;
+            /**
+             * Format: uri
+             * @description Additive response field. Older servers may omit it.
+             */
+            max_output_source_url?: string | null;
             /** @description Effective capacity for the configured route */
             context_window_tokens: number | null;
             /** @description Explicit advanced override for custom routes only. */
@@ -8159,11 +8496,17 @@ export interface components {
             title: string;
             /** @description Execution objective must be non-empty after trimming and is limited to 1–32768 UTF-8 bytes. */
             objective: string;
+            /**
+             * @description Structured output intent. Omission from legacy sync definitions means none; schedules currently only execute with none because they have no Workspace binding.
+             * @enum {string}
+             */
+            file_delivery_intent: "none" | "required" | "unclear";
             timing: components["schemas"]["ScheduleTiming"];
             budget: components["schemas"]["ScheduleBudget"];
             misfire_policy: components["schemas"]["ScheduleMisfirePolicy"];
             notification_events: components["schemas"]["ScheduleNotificationEvent"][];
             observation?: components["schemas"]["ScheduleObservation"];
+            personal_rule?: components["schemas"]["SchedulePersonalRuleBinding"] | null;
         } & unknown;
         GoalCreateRequest: {
             id: components["schemas"]["GoalId"];
@@ -8189,11 +8532,18 @@ export interface components {
             title?: string;
             /** @description Required execution objective, non-empty after trimming and limited to 1–32768 UTF-8 bytes. */
             objective: string;
+            /**
+             * @description Structured output intent; never inferred from objective text. Omission means none. Schedules currently have no Workspace binding, so required is rejected; unclear must be clarified before saving.
+             * @enum {string}
+             */
+            file_delivery_intent?: "none" | "required" | "unclear";
             timing: components["schemas"]["ScheduleTiming"];
             budget: components["schemas"]["ScheduleBudget"];
             misfire_policy?: components["schemas"]["ScheduleMisfirePolicy"];
             notification_events?: components["schemas"]["ScheduleNotificationEvent"][];
             observation?: components["schemas"]["ScheduleObservation"] | null;
+            /** @description Optional explicit opt-in to one active personal rule revision. The server resolves and stores the exact source memory revision. */
+            personal_rule?: components["schemas"]["SchedulePersonalRuleSelection"] | null;
         } & unknown;
         ScheduleUpdateRequest: {
             /** Format: int64 */
@@ -8204,11 +8554,18 @@ export interface components {
             title?: string;
             /** @description Optional execution objective update; when supplied it must be non-empty after trimming and is limited to 1–32768 UTF-8 bytes. */
             objective?: string;
+            /**
+             * @description Structured output intent; never inferred from objective text. Omission preserves the current value. Schedules currently have no Workspace binding, so required is rejected; unclear must be clarified before saving.
+             * @enum {string}
+             */
+            file_delivery_intent?: "none" | "required" | "unclear";
             timing?: components["schemas"]["ScheduleTiming"];
             budget?: components["schemas"]["ScheduleBudget"];
             misfire_policy?: components["schemas"]["ScheduleMisfirePolicy"];
             notification_events?: components["schemas"]["ScheduleNotificationEvent"][];
             observation?: components["schemas"]["ScheduleObservation"] | null;
+            /** @description Omission preserves the current binding; null removes it; an object replaces it with one explicitly selected candidate revision. */
+            personal_rule?: components["schemas"]["SchedulePersonalRuleSelection"] | null;
         };
         ScheduleActionRequest: {
             /** @enum {string} */
@@ -8221,7 +8578,22 @@ export interface components {
         /** @enum {string} */
         ScheduleRunStatus: "queued" | "running" | "waiting_user" | "pausing" | "paused" | "stopping" | "completed" | "failed" | "cancelled" | "skipped" | "missed";
         /** @enum {string} */
-        ScheduleRunSkipReason: "dst_gap" | "overlap" | "authorization_ended";
+        ScheduleRunSkipReason: "dst_gap" | "overlap" | "authorization_ended" | "personal_rule_revoked";
+        /** @enum {string} */
+        SchedulePersonalRuleValidationStatus: "not_bound" | "validated" | "revoked";
+        SchedulePersonalRuleSelection: {
+            candidate_id: string;
+            /** Format: int64 */
+            candidate_revision: number;
+        };
+        SchedulePersonalRuleBinding: {
+            candidate_id: string;
+            /** Format: int64 */
+            candidate_revision: number;
+            source_memory_id: string;
+            /** Format: int64 */
+            source_memory_revision: number;
+        };
         ScheduleRun: {
             id: components["schemas"]["ScheduleRunId"];
             schedule_id: components["schemas"]["ScheduleId"];
@@ -8237,6 +8609,12 @@ export interface components {
             task_id: components["schemas"]["TaskId"] | null;
             notification_events: components["schemas"]["ScheduleNotificationEvent"][];
             observation: components["schemas"]["ScheduleObservation"] | null;
+            personal_rule: components["schemas"]["SchedulePersonalRuleBinding"] | null;
+            personal_rule_validation_status: components["schemas"]["SchedulePersonalRuleValidationStatus"];
+            /** Format: date-time */
+            personal_rule_validated_at: string | null;
+            /** Format: date-time */
+            personal_rule_revoked_at: string | null;
             /** @enum {string} */
             observation_outcome: "unknown" | "baseline" | "changed" | "no_change";
             /** Format: date-time */
@@ -8257,11 +8635,17 @@ export interface components {
             title: string;
             /** @description Stored execution objective, non-empty after trimming and limited to 1–32768 UTF-8 bytes. */
             objective: string;
+            /**
+             * @description Structured output intent selected when the schedule is defined. Currently only none can execute because schedules have no Workspace binding.
+             * @enum {string}
+             */
+            file_delivery_intent: "none" | "required" | "unclear";
             timing: components["schemas"]["ScheduleTiming"];
             budget: components["schemas"]["ScheduleBudget"];
             misfire_policy: components["schemas"]["ScheduleMisfirePolicy"];
             notification_events: components["schemas"]["ScheduleNotificationEvent"][];
             observation: components["schemas"]["ScheduleObservation"] | null;
+            personal_rule: components["schemas"]["SchedulePersonalRuleBinding"] | null;
             /** Format: date-time */
             next_run_at: string | null;
             last_run: components["schemas"]["ScheduleRun"] | null;
@@ -9100,8 +9484,13 @@ export interface components {
             /** @description Task associated through the original request */
             related_task_id?: components["schemas"]["TaskId"];
             client_message_id?: string;
+            /**
+             * @description Requested direct-reply mode for this user message; legacy messages may omit it.
+             * @enum {string}
+             */
+            response_mode?: "short" | "long_form";
             /** @enum {string} */
-            routing_status?: "pending" | "processing" | "routed" | "waiting_user" | "waiting_adjustment" | "failed";
+            routing_status?: "pending" | "processing" | "cancel_requested" | "routed" | "waiting_user" | "waiting_adjustment" | "partial" | "cancelled" | "failed";
             /** @enum {string} */
             routing_failure_reason?: "model_unavailable" | "routing_context_unavailable" | "routing_action_unavailable" | "message_too_long";
             /** @description True only after the Main Agent chose to acknowledge this message and its associated background Task actually started. Clients cannot set this field. */
@@ -9181,6 +9570,11 @@ export interface components {
             model_id?: string;
             /** @description Optional IANA time-zone identifier captured when the user sends the message. */
             time_zone?: string;
+            /**
+             * @description Explicitly choose a direct short response or the bounded long-form conversation reply path. Omission defaults to short.
+             * @enum {string}
+             */
+            response_mode?: "short" | "long_form";
             content: string;
             mcp_connector_ids?: components["schemas"]["MCPConnectorId"][];
             client_attachment_ids?: string[];
@@ -9190,6 +9584,17 @@ export interface components {
             message: components["schemas"]["ConversationMessage"];
             /** @description True when an identical message receipt was returned. */
             replayed: boolean;
+        };
+        ConversationMessageRetryEligibility: {
+            /** @description Whether the saved source message currently passes the server retry gate. */
+            retry_eligible: boolean;
+            /** @enum {string} */
+            retry_reason: "retry_available" | "route_not_failed" | "task_already_created" | "message_too_long" | "reconciliation_required" | "route_processing" | "result_review_not_retryable" | "result_review_outcome_unknown" | "retry_limit_reached";
+            /**
+             * @description A previous personal model call has an unknown outcome. A new attempt is independent and does not prove the previous call settled.
+             * @enum {string}
+             */
+            retry_warning?: "previous_personal_model_call_outcome_unknown";
         };
         CreateConversationMessageVariantRequest: {
             /** @enum {string} */
@@ -9420,6 +9825,13 @@ export interface components {
             end_byte: number;
             evidence_refs: components["schemas"]["TaskValidationEvidenceRef"][];
             performance_comparison?: components["schemas"]["TaskValidationPerformanceComparison"];
+            /**
+             * @description Server-derived locator availability for the exact evidence steps cited by this claim; this is not a correctness verdict.
+             * @enum {string}
+             */
+            source_location_state?: "mapped" | "partial" | "unavailable" | "restricted" | "no_locator" | "truncated";
+            /** @description References into the response's deduplicated source_locations list. */
+            source_location_ids?: string[];
         };
         TaskValidationEvidenceDetail: {
             /** Format: int64 */
@@ -9428,6 +9840,8 @@ export interface components {
             event_sequence: number;
             result_sha256: string;
             claims: components["schemas"]["TaskValidationEvidenceClaim"][];
+            /** @description Server-validated locators used by claim source_location_ids. Workspace paths are returned only when the reader is authorized for the Task Workspace. */
+            source_locations?: components["schemas"]["TaskStepSourceLocation"][];
         };
         TaskSummary: {
             id: components["schemas"]["TaskId"];
@@ -9458,6 +9872,8 @@ export interface components {
             model_id: string;
             objective: string;
             status: components["schemas"]["TaskStatus"];
+            /** @description Safe Task wait/pause reason used for status presentation; clients should not infer a user action from the reason alone. */
+            waiting_reason?: string | null;
             /** @description User priority for queued work; tasks waiting for 15 minutes or longer are promoted into an age-ordered fairness band. */
             queue_priority: components["schemas"]["TaskQueuePriority"];
             current_step: string | null;
@@ -9523,6 +9939,71 @@ export interface components {
             completion_criteria: string[];
             /** @enum {string} */
             status: "pending" | "in_progress" | "completed" | "blocked";
+            /**
+             * @description Omitted on legacy plans means verification applicability is unknown and H07 must remain pending. New fix plan submissions classify every step.
+             * @enum {string}
+             */
+            verification_applicability?: "check" | "not_applicable";
+            /** @description Typed check identity for H07. A declared coverage path is plan scope, not proof of actual test coverage. */
+            verification_check?: {
+                /** @enum {string} */
+                kind: "test" | "build" | "lint" | "typecheck" | "other";
+                /**
+                 * @description Required checks cite an explicit user message or project file; risk_selected checks are chosen for this task.
+                 * @enum {string}
+                 */
+                basis: "required" | "risk_selected";
+                command: string;
+                /** @enum {string} */
+                scope_mode?: "full_suite" | "targeted";
+                coverage_paths: string[];
+                selectors?: string[];
+                requirement_ids?: string[];
+                requirement_source?: {
+                    /** @enum {string} */
+                    kind: "user_message" | "project_file";
+                    message_id?: string;
+                    workspace_path?: string;
+                    /** Format: int64 */
+                    workspace_revision?: number;
+                    /** @description Canonical digest stored in the plan; new plan-tool submissions have the server resolve the source and compute this value. */
+                    content_sha256: string;
+                };
+            };
+        };
+        /** @description Canonical persisted source identity. Submission-only locator/token fields are never stored in a Plan event. */
+        TaskPlanRequirementSource: components["schemas"]["TaskPlanUserMessageRequirementSource"] | components["schemas"]["TaskPlanProjectFileRequirementSource"];
+        TaskPlanUserMessageRequirementSource: {
+            /** @constant */
+            kind: "user_message";
+            message_id: string;
+            content_sha256: string;
+        };
+        TaskPlanProjectFileRequirementSource: {
+            /** @constant */
+            kind: "project_file";
+            workspace_path: string;
+            /** Format: int64 */
+            workspace_revision: number;
+            content_sha256: string;
+        };
+        TaskPlanRequirementObligation: {
+            id: string;
+            statement: string;
+            /** @enum {string} */
+            kind: "test" | "build" | "lint" | "typecheck" | "other";
+            /** @enum {string} */
+            scope_mode: "full_suite" | "targeted";
+            coverage_paths: string[];
+            selectors?: string[];
+            source: components["schemas"]["TaskPlanRequirementSource"];
+        };
+        TaskPlanRequirementManifest: {
+            /** @constant */
+            version: 1;
+            obligations: components["schemas"]["TaskPlanRequirementObligation"][];
+            /** @description Server-computed digest of the canonical candidate manifest. It does not prove completeness. */
+            digest: string;
         };
         TaskPlan: {
             /** Format: int64 */
@@ -9536,14 +10017,50 @@ export interface components {
              */
             cost_estimate_state: "unknown";
             steps: components["schemas"]["TaskPlanStep"][];
+            requirement_manifest?: components["schemas"]["TaskPlanRequirementManifest"];
             /** Format: date-time */
             created_at?: string;
+        };
+        TaskRequirementManifestConfirmationRequest: {
+            /** Format: int64 */
+            expected_task_revision: number;
+            /** Format: int64 */
+            expected_plan_revision: number;
+            /** Format: int64 */
+            expected_plan_event_sequence: number;
+            /**
+             * @description Authenticated user declaration that the reviewed obligation list is complete and faithfully expresses the applicable requirements.
+             * @constant
+             */
+            requirements_complete_attested: true;
+        };
+        TaskRequirementManifestConfirmation: {
+            task_id: components["schemas"]["TaskId"];
+            /** Format: int64 */
+            task_revision: number;
+            /** Format: int64 */
+            plan_revision: number;
+            /** Format: int64 */
+            plan_event_sequence: number;
+            manifest_digest: string;
+            /** @constant */
+            requirements_complete_attested: true;
+            /** Format: date-time */
+            attested_at: string;
+            /** Format: date-time */
+            confirmed_at: string;
         };
         TaskStepRetryRequest: {
             /** Format: int64 */
             expected_task_revision: number;
             /** Format: int64 */
             expected_attempt: number;
+        };
+        TaskModelRecoveryRetryRequest: {
+            /** Format: int64 */
+            expected_revision: number;
+            /** Format: int64 */
+            expected_event_sequence: number;
         };
         TaskStepRetryResult: {
             task_id: components["schemas"]["TaskId"];
@@ -9596,6 +10113,36 @@ export interface components {
             truncated: boolean;
             execution?: components["schemas"]["TaskStepExecution"];
             content_evidence?: components["schemas"]["TaskStepContentEvidence"];
+            /** @description Server-derived source locations from successful tool reads. Workspace paths are returned only to readers authorized for the Task Workspace. These locations are not yet a claim-to-source correctness verdict. */
+            source_locations?: components["schemas"]["TaskStepSourceLocation"][];
+        };
+        TaskStepSourceLocation: {
+            /** @description Stable server-derived identity bound to Task owner, Task, step, revision, tool call, and this source locator. */
+            id: string;
+            /** @enum {string} */
+            kind: "public_web_page" | "workspace_file" | "workspace_search_match";
+            /**
+             * Format: uri
+             * @description Canonical HTTPS request URI with query and fragment removed; present only for public_web_page.
+             */
+            uri?: string;
+            /** @description Bound Task Workspace ID; present only for Workspace locators. */
+            workspace_id?: string;
+            /**
+             * Format: int64
+             * @description Workspace revision requested by the successful read. For live_directory state this is the Task checkpoint revision, not an immutable content version.
+             */
+            revision?: number;
+            /** @description Normalized */
+            path?: string;
+            /** @description One-based line number for a Workspace search match. */
+            line?: number;
+            /** @description Immutable Workspace manifest digest; absent for live-directory reads. */
+            manifest_sha256?: string;
+            /** @enum {string} */
+            state: "requested_uri_only" | "immutable_workspace_revision" | "live_workspace_directory";
+            /** @description Captured web output digest or verified Workspace file-content digest associated with this locator. */
+            content_sha256: string;
         };
         /** @description Bounded, persisted excerpt from a successful built-in web search/read result, returned only after Task access and evidence identity checks. Treat preview text as untrusted web content; it is not a structured citation list. SHA-256 covers the full captured text before preview truncation. */
         TaskStepContentEvidence: {
@@ -9698,6 +10245,25 @@ export interface components {
             expires_at: string | null;
             /** @description Present only while an image */
             media_preview_operation_id?: components["schemas"]["OperationId"];
+            /** @description Evidence anchor for the action, "step:<step-id>" of the step whose command and output justify it. Empty for approvals created before E05. */
+            evidence_pointer?: string;
+            /**
+             * Format: int64
+             * @description Trusted cost of this exact action in micro-units. Null when no trusted per-action cost source exists; never a fabricated 0.
+             */
+            this_cost_micros?: number | null;
+            /**
+             * Format: int64
+             * @description Trusted cumulative cost of the task in micro-units at the moment the card was created. Null when any cost component is unknown.
+             */
+            total_cost_micros?: number | null;
+            /**
+             * @description Action-matrix category that required this approval. Empty for approvals created before E05.
+             * @enum {string}
+             */
+            trigger_rule?: "host_sensitive_tool" | "external_mcp_tool" | "workspace_live_write" | "media_publish";
+            /** @description What happens if the user rejects the action. Empty when the approval text did not state one. */
+            rejection_consequence?: string;
         };
         /** @description A known disclosure includes its evidence-backed summary. Unknown and not_applicable disclosures have a null summary. */
         TaskApprovalTextDisclosure: {
@@ -9732,6 +10298,8 @@ export interface components {
             id: components["schemas"]["ClarificationId"];
             version: number;
             question: string;
+            /** @description Opaque clarification identity used by clients to select any structured answer fields. Clients must not infer clarification type from question text. */
+            call_id: string;
         };
         TaskStopRequest: {
             id: string;
@@ -9852,6 +10420,7 @@ export interface components {
             result_event_sequence?: number;
             /** @constant */
             role: "assistant";
+            /** @description Maximum UTF-8 encoded size is 2 MiB; streaming deltas are each limited to 32 KiB. */
             content: string;
             /** @enum {string} */
             status: "streaming" | "completed" | "interrupted";
@@ -9864,6 +10433,14 @@ export interface components {
             host_id: components["schemas"]["HostId"];
             /** Format: date-time */
             expires_at: string;
+        };
+        TaskPCDeliveryObservationRequest: {
+            message_id: components["schemas"]["MessageId"];
+            /**
+             * Format: int64
+             * @description Exact revision represented by the completed assistant message.
+             */
+            task_revision: number;
         };
         /** @description Read-only Task projection. It contains no objective, Task result, event payload, file path, mutation field, or Host control capability. */
         TaskWorkbenchObservationSnapshot: {
@@ -9896,6 +10473,8 @@ export interface components {
              * @description Event cursor from the same database snapshot as this Task; resume task events after this sequence.
              */
             event_sequence: number;
+            /** @description Server-derived presentation state for this authenticated caller. Action is non-null only for a current operation the caller can perform; event_sequence must match this Task snapshot. */
+            attention?: components["schemas"]["TaskAttention"] | null;
             result: string | null;
             /** @description Optional read-only claim-to-evidence mapping for the current Task revision. Event streams do not expose this detail. */
             validation_detail?: components["schemas"]["TaskValidationEvidenceDetail"];
@@ -9910,6 +10489,13 @@ export interface components {
             steps: components["schemas"]["TaskStep"][];
             /** @description Latest advisory plan for the current Task revision. It never grants authorization; prior revisions remain in the task event history. */
             plan?: components["schemas"]["TaskPlan"] | null;
+            /**
+             * Format: int64
+             * @description Durable Task event sequence for the current plan
+             */
+            plan_event_sequence?: number;
+            /** @description Present only for a current plan manifest with a matching authenticated user completeness attestation. */
+            requirement_manifest_confirmation?: components["schemas"]["TaskRequirementManifestStatus"];
             /** @description Task-scoped model call totals from the authorized account/project usage ledger. Costs retain currency and rate snapshot versions; unknown */
             billing?: components["schemas"]["TaskBilling"];
             agents?: components["schemas"]["TaskAgentExecution"][];
@@ -9922,9 +10508,35 @@ export interface components {
             /** Format: date-time */
             finished_at: string | null;
         };
+        TaskAttention: {
+            /** @enum {string} */
+            kind: "needs_user_action" | "recovering" | "paused_retryable" | "interrupted" | "result_unverified";
+            /**
+             * @description Safe category only; never a provider error
+             * @enum {string}
+             */
+            reason: "approval_required" | "clarification_required" | "recovery_scheduled" | "retry_available" | "execution_failed" | "outcome_unknown" | "unknown";
+            /**
+             * @description Null when no current authorized action exists.
+             * @enum {string|null}
+             */
+            action: "approve" | "clarify" | "retry" | "view_details" | null;
+            /**
+             * Format: int64
+             * @description Must match the event_sequence of the Task snapshot.
+             */
+            event_sequence: number;
+        };
         TaskPage: {
             items: components["schemas"]["TaskSummary"][];
             next_cursor: string | null;
+        };
+        TaskRequirementManifestStatus: {
+            manifest_digest: string;
+            /** @constant */
+            requirements_complete_attested: true;
+            /** Format: date-time */
+            attested_at: string;
         };
         TaskApprovalPage: {
             items: components["schemas"]["TaskApprovalItem"][];
@@ -9969,6 +10581,25 @@ export interface components {
             /** Format: date-time */
             created_at: string;
             media_preview_operation_id?: components["schemas"]["OperationId"];
+            /** @description Evidence anchor for the action, "step:<step-id>" of the step whose command and output justify it. Empty for approvals created before E05. */
+            evidence_pointer?: string;
+            /**
+             * Format: int64
+             * @description Trusted cost of this exact action in micro-units. Null when no trusted per-action cost source exists; never a fabricated 0.
+             */
+            this_cost_micros?: number | null;
+            /**
+             * Format: int64
+             * @description Trusted cumulative cost of the task in micro-units at the moment the card was created. Null when any cost component is unknown.
+             */
+            total_cost_micros?: number | null;
+            /**
+             * @description Action-matrix category that required this approval. Empty for approvals created before E05.
+             * @enum {string}
+             */
+            trigger_rule?: "host_sensitive_tool" | "external_mcp_tool" | "workspace_live_write" | "media_publish";
+            /** @description What happens if the user rejects the action. Empty when the approval text did not state one. */
+            rejection_consequence?: string;
         };
         ConversationActiveTask: components["schemas"]["TaskSummary"] & {
             /** Format: int64 */
@@ -9992,6 +10623,11 @@ export interface components {
             application_id?: string;
             model_id: string;
             objective: string;
+            /**
+             * @description Structured output intent for the Task. Omission means none. `required` requires workspace_id. `unclear` opens a versioned clarification; it is never inferred from objective text.
+             * @enum {string}
+             */
+            file_delivery_intent?: "none" | "required" | "unclear";
             mcp_connector_ids?: components["schemas"]["MCPConnectorId"][];
             budget?: components["schemas"]["TaskBudgetRequest"] | null;
             batch_items?: components["schemas"]["TaskBatchItemInput"][];
@@ -9999,6 +10635,11 @@ export interface components {
         TaskBatchItemInput: {
             key: string;
             input: string;
+            /**
+             * @description Structured output intent for this batch item. Omission means none. `required` requires workspace_id. `unclear` opens a versioned clarification targeted to this item and its current attempt.
+             * @enum {string}
+             */
+            file_delivery_intent?: "none" | "required" | "unclear";
         };
         /** @description retry_batch_item requires batch_item_id only. Pause, resume and cancel require expected_status. expected_current_revision and expected_desired_revision are optional together; when both are present, both task revisions are compared atomically before applying the action. Legacy clients may omit both revision fields. Supplying only one is invalid. set_priority requires queue_priority and expected_event_sequence and is accepted only while the task is queued. Priority changes are idempotent and append a task.priority event. Supplying fields for a different action is invalid. */
         TaskActionRequest: {
@@ -10028,6 +10669,11 @@ export interface components {
             clarification_id: components["schemas"]["ClarificationId"];
             clarification_version: number;
             answer: string;
+            /**
+             * @description Required only when answering a file delivery clarification. This structured choice is authoritative; it is not inferred from answer text. `required` requires the Task to have a Workspace.
+             * @enum {string}
+             */
+            file_delivery_intent?: "none" | "required";
         };
         TaskApprovalResponseRequest: {
             version: number;
@@ -10115,7 +10761,7 @@ export interface components {
         AdminHostRecoveryRequest: {
             /** Format: int64 */
             runtime_generation: number;
-            /** @description Confirm that the external issue is fixed before creating a replacement sandbox. */
+            /** @description Confirm an administrator reviewed the remote state and the external issue is fixed before creating a replacement sandbox; adoption does not create or replace a sandbox. */
             confirm_retry: boolean;
         };
         AdminHostRecoveryResult: {
@@ -10241,6 +10887,127 @@ export interface components {
             summary: components["schemas"]["AdminUsageSummary"];
             by_day: components["schemas"]["AdminUsageDay"][];
             by_model: components["schemas"]["AdminUsageModel"][];
+        };
+        /** @enum {string} */
+        AdminObservabilityStatus: "available" | "partial" | "unavailable" | "disabled";
+        AdminObservabilitySource: {
+            status: components["schemas"]["AdminObservabilityStatus"];
+            reason: string | null;
+            /** Format: date-time */
+            updated_at: string | null;
+        };
+        AdminObservabilityOverview: {
+            sources: {
+                spans: components["schemas"]["AdminObservabilitySource"];
+                logs: components["schemas"]["AdminObservabilitySource"];
+                dsh_events: components["schemas"]["AdminObservabilitySource"];
+            };
+            spans_24h: {
+                /** Format: int64 */
+                request_count: number;
+                /** Format: int64 */
+                error_count: number;
+                p95_duration_ms: number;
+            };
+        };
+        AdminObservabilityTraceSummary: {
+            trace_id: string;
+            request_id: string | null;
+            task_id: string | null;
+            /** Format: date-time */
+            started_at: string;
+            /** Format: date-time */
+            ended_at: string | null;
+            /** @enum {string} */
+            status: "ok" | "error" | "partial";
+            /** Format: int64 */
+            span_count: number;
+            /** Format: int64 */
+            error_count: number;
+        };
+        AdminObservabilityTracePage: {
+            items: components["schemas"]["AdminObservabilityTraceSummary"][];
+            next_cursor: string | null;
+            sources: {
+                spans: components["schemas"]["AdminObservabilitySource"];
+            };
+        };
+        AdminObservabilitySpan: {
+            trace_id: string;
+            span_id: string;
+            parent_span_id: string | null;
+            name: string;
+            /** @enum {string} */
+            kind: "unspecified" | "internal" | "server" | "client" | "producer" | "consumer";
+            /** @enum {string} */
+            status: "unset" | "ok" | "error";
+            /** Format: date-time */
+            start_at: string;
+            /** Format: date-time */
+            end_at: string | null;
+            attributes: {
+                [key: string]: unknown;
+            };
+            links: components["schemas"]["AdminObservabilitySpanLink"][];
+            events: {
+                [key: string]: unknown;
+            }[];
+        };
+        AdminObservabilitySpanLink: {
+            trace_id: string;
+            span_id: string;
+            attributes: {
+                [key: string]: unknown;
+            };
+        };
+        AdminObservabilityTrace: {
+            trace_id: string;
+            spans: components["schemas"]["AdminObservabilitySpan"][];
+            coverage: components["schemas"]["AdminObservabilitySource"];
+        };
+        AdminObservabilityAgentSession: {
+            session_id: string;
+            parent_session_id: string | null;
+            step_id: string | null;
+            /** @enum {string} */
+            role: "root" | "subagent";
+        };
+        AdminObservabilityDSHEvent: {
+            session_id: string;
+            /** Format: int64 */
+            sequence: number;
+            /** Format: date-time */
+            time: string;
+            type: string;
+            data: unknown;
+        };
+        AdminObservabilityTraceEvents: {
+            task_id: string | null;
+            agent_sessions: components["schemas"]["AdminObservabilityAgentSession"][];
+            events: components["schemas"]["AdminObservabilityDSHEvent"][];
+            /** Format: int64 */
+            next_sequence: number | null;
+            coverage: components["schemas"]["AdminObservabilitySource"];
+        };
+        AdminObservabilityLog: {
+            /** Format: date-time */
+            time: string;
+            /** @enum {string} */
+            severity: "debug" | "info" | "warn" | "error" | "dpanic" | "panic" | "fatal";
+            service: string;
+            message: string;
+            trace_id: string;
+            span_id: string | null;
+            request_id: string | null;
+            task_id: string | null;
+            attributes: {
+                [key: string]: unknown;
+            };
+        };
+        AdminObservabilityLogPage: {
+            items: components["schemas"]["AdminObservabilityLog"][];
+            next_cursor: string | null;
+            coverage: components["schemas"]["AdminObservabilitySource"];
         };
         /** @enum {string} */
         EvaluationScore: "0" | "1" | "N/A";
@@ -10411,6 +11178,56 @@ export interface components {
             pending_reason?: string;
             review_count: number;
             arbitration_count: number;
+        };
+        WorkflowTrace: {
+            /** @constant */
+            version: 1;
+            trace_id: string;
+            run_id?: string;
+            /** @enum {string} */
+            data_class: "synthetic" | "live-scripted" | "live-observed";
+            /** Format: date-time */
+            captured_at: string;
+            /** @enum {string} */
+            coverage: "declared_complete" | "partial" | "unknown";
+            coverage_source_ids: string[];
+            sources: components["schemas"]["WorkflowSource"][];
+            nodes: components["schemas"]["WorkflowNode"][];
+            edges: components["schemas"]["WorkflowEdge"][];
+            gaps: components["schemas"]["WorkflowGap"][];
+        };
+        WorkflowSource: {
+            id: string;
+            /** @enum {string} */
+            kind: "task_ledger" | "agent_ledger" | "model_call_ledger" | "operation_ledger" | "approval_ledger" | "validation_ledger" | "conversation_output" | "pc_observation" | "authorization_snapshot" | "runtime_snapshot" | "host_snapshot" | "route_result" | "local_test" | "code_inspection" | "evaluation_run";
+            locator: string;
+            sha256?: string;
+        };
+        WorkflowNode: {
+            id: string;
+            /** @enum {string} */
+            kind: "route" | "task" | "agent" | "model_call" | "operation" | "approval" | "validation" | "delivery" | "host" | "runtime" | "authorization";
+            /** @enum {string} */
+            state: "started" | "running" | "settled" | "completed" | "failed" | "waiting" | "waiting_user" | "pending" | "approved" | "rejected" | "expired" | "cancelled" | "unknown" | "unavailable";
+            source_ids: string[];
+        };
+        WorkflowEdge: {
+            id: string;
+            from: string;
+            to: string;
+            /** @enum {string} */
+            kind: "created" | "handoff" | "invoked" | "returned" | "approved" | "rejected" | "verified" | "delivered" | "resumed" | "routed" | "targets" | "authorized" | "approval_requested";
+            source_ids: string[];
+        };
+        WorkflowGap: {
+            id: string;
+            /** @enum {string} */
+            stage: "route" | "task" | "agent" | "model_call" | "operation" | "approval" | "verification" | "delivery" | "host" | "runtime" | "authorization" | "provenance";
+            scope: string;
+            /** @enum {string} */
+            state: "absent" | "not_run" | "unavailable" | "unknown";
+            count?: number;
+            source_ids: string[];
         };
         AdminQuality: {
             /** @enum {integer} */
@@ -10807,6 +11624,10 @@ export interface components {
             role?: components["schemas"]["UserRole"];
             quota?: components["schemas"]["Quota"];
             default_host_resources?: components["schemas"]["HostResourcesTarget"];
+        };
+        AdminResetUserPasswordRequest: {
+            expected_status: components["schemas"]["AccountStatus"];
+            new_password: string;
         };
     };
     responses: {
@@ -15887,6 +16708,41 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    cancelProjectConversationMessage: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+                message_id: components["schemas"]["MessageId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Cancellation was accepted or had already been applied. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AcceptedProjectConversationMessageResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
     retryProjectConversationMessageProcessing: {
         parameters: {
             query?: never;
@@ -15918,6 +16774,40 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getProjectConversationMessageRetryEligibility: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+                message_id: components["schemas"]["MessageId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current advisory retry eligibility */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConversationMessageRetryEligibility"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
             default: components["responses"]["Error"];
         };
     };
@@ -17213,6 +18103,40 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    cancelConversationMessage: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["schemas"]["ConversationId"];
+                message_id: components["schemas"]["MessageId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Cancellation was accepted or had already been applied. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AcceptedConversationMessageResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
     retryConversationMessageProcessing: {
         parameters: {
             query?: never;
@@ -17243,6 +18167,39 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getConversationMessageRetryEligibility: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["schemas"]["ConversationId"];
+                message_id: components["schemas"]["MessageId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current advisory retry eligibility */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConversationMessageRetryEligibility"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
             default: components["responses"]["Error"];
         };
     };
@@ -17547,6 +18504,43 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    confirmTaskRequirementManifest: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+                /** @description Strong quoted lowercase SHA-256 ETag of the candidate manifest, for example "<64 lowercase hex characters>". The server recomputes this digest from the current Plan event. */
+                "If-Match": string;
+            };
+            path: {
+                id: components["schemas"]["TaskId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TaskRequirementManifestConfirmationRequest"];
+            };
+        };
+        responses: {
+            /** @description Persisted user completeness attestation for the exact current manifest. */
+            200: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskRequirementManifestConfirmation"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
     getTaskArtifactContent: {
         parameters: {
             query?: never;
@@ -17630,6 +18624,42 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["TaskStepRetryResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    retryTaskModelRecovery: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["schemas"]["TaskId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TaskModelRecoveryRetryRequest"];
+            };
+        };
+        responses: {
+            /** @description The exact Task recovery was queued or returned for an idempotent replay. */
+            202: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Task"];
                 };
             };
             400: components["responses"]["BadRequest"];
@@ -17960,6 +18990,34 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    observeTaskReplyInPC: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TaskPCDeliveryObservationRequest"];
+            };
+        };
+        responses: {
+            /** @description The PC-visible observation was recorded idempotently. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
             default: components["responses"]["Error"];
         };
@@ -18665,7 +19723,7 @@ export interface operations {
             header?: never;
             path: {
                 type: components["schemas"]["PersonalMutationObjectType"];
-                /** @description Identifier rules depend on type. profile and feed_preferences use default; memory uses global, user, or m_<8 lowercase hex characters; skill_setting uses builtin_<non-empty id>; connector_setting uses catalogue_<non-empty id>. Other enabled types use a path-free opaque identifier. The server also rejects . and ..; schedule uses its dedicated API rather than this mutation route. */
+                /** @description Identifier rules depend on type. profile and feed_preferences use default; memory uses global, user, or m_<8 lowercase hex characters; skill_setting uses builtin_<non-empty id>; connector_setting uses catalogue_<non-empty id>. skill_candidate uses sk_<8 lowercase hexadecimal characters. Other enabled types use a path-free opaque identifier. The server also rejects . and ..; schedule uses its dedicated API rather than this mutation route. */
                 id: components["schemas"]["PersonalObjectId"];
             };
             cookie?: never;
@@ -18699,7 +19757,7 @@ export interface operations {
             };
             path: {
                 type: components["schemas"]["PersonalMutationObjectType"];
-                /** @description Identifier rules depend on type. profile and feed_preferences use default; memory uses global, user, or m_<8 lowercase hex characters; skill_setting uses builtin_<non-empty id>; connector_setting uses catalogue_<non-empty id>. Other enabled types use a path-free opaque identifier. The server also rejects . and ..; schedule uses its dedicated API rather than this mutation route. */
+                /** @description Identifier rules depend on type. profile and feed_preferences use default; memory uses global, user, or m_<8 lowercase hex characters; skill_setting uses builtin_<non-empty id>; connector_setting uses catalogue_<non-empty id>. skill_candidate uses sk_<8 lowercase hexadecimal characters. Other enabled types use a path-free opaque identifier. The server also rejects . and ..; schedule uses its dedicated API rather than this mutation route. */
                 id: components["schemas"]["PersonalObjectId"];
             };
             cookie?: never;
@@ -18739,7 +19797,7 @@ export interface operations {
             };
             path: {
                 type: components["schemas"]["PersonalMutationObjectType"];
-                /** @description Identifier rules depend on type. profile and feed_preferences use default; memory uses global, user, or m_<8 lowercase hex characters; skill_setting uses builtin_<non-empty id>; connector_setting uses catalogue_<non-empty id>. Other enabled types use a path-free opaque identifier. The server also rejects . and ..; schedule uses its dedicated API rather than this mutation route. */
+                /** @description Identifier rules depend on type. profile and feed_preferences use default; memory uses global, user, or m_<8 lowercase hex characters; skill_setting uses builtin_<non-empty id>; connector_setting uses catalogue_<non-empty id>. skill_candidate uses sk_<8 lowercase hexadecimal characters. Other enabled types use a path-free opaque identifier. The server also rejects . and ..; schedule uses its dedicated API rather than this mutation route. */
                 id: components["schemas"]["PersonalObjectId"];
             };
             cookie?: never;
@@ -20108,6 +21166,36 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    resetAdminUserPassword: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AdminResetUserPasswordRequest"];
+            };
+        };
+        responses: {
+            /** @description Password reset and account credentials revoked */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
     getAdminPersonalDataQuota: {
         parameters: {
             query?: never;
@@ -20494,6 +21582,153 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    getAdminObservabilityOverview: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Source health and 24-hour request aggregates */
+            200: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminObservabilityOverview"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listAdminObservabilityTraces: {
+        parameters: {
+            query?: {
+                trace_id?: string;
+                request_id?: string;
+                task_id?: string;
+                q?: string;
+                limit?: number;
+                cursor?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Trace summaries and span coverage */
+            200: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminObservabilityTracePage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getAdminObservabilityTrace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                trace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Span tree and coverage state */
+            200: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminObservabilityTrace"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listAdminObservabilityTraceEvents: {
+        parameters: {
+            query?: {
+                agent_session_id?: string;
+                from_sequence?: number;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                trace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Session tree, committed event page, and explicit coverage state */
+            200: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminObservabilityTraceEvents"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listAdminObservabilityTraceLogs: {
+        parameters: {
+            query?: {
+                request_id?: string;
+                task_id?: string;
+                limit?: number;
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                trace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Correlated log page and explicit capture coverage */
+            200: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminObservabilityLogPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
     listAdminModelConnections: {
         parameters: {
             query?: never;
@@ -20566,6 +21801,34 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getAdminTaskWorkflowTrace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+                task_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Source-bound execution graph with explicit coverage gaps */
+            200: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkflowTrace"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
             default: components["responses"]["Error"];
         };
     };
@@ -21124,7 +22387,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Unknown calls; no prompt, response, or credential is returned. */
+            /** @description Unknown calls; no prompt, response, or credential is returned. An adaptive_budget_overage object is included when provider-reported usage exceeded a signed adaptive Task hold and the administrator must confirm the usage with provider evidence. */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -21134,7 +22397,7 @@ export interface operations {
                         items: {
                             owner_id: components["schemas"]["UserId"];
                             /** @enum {string} */
-                            source: "client" | "chat" | "task" | "route" | "probe" | "compaction";
+                            source: "client" | "chat" | "task" | "probe" | "route" | "compaction" | "review" | "terminal_delivery";
                             call_id: string;
                             model_id: string;
                             provider_model: string;
@@ -21145,6 +22408,32 @@ export interface operations {
                             created_at: string;
                             /** Format: date-time */
                             unknown_at: string;
+                            adaptive_budget_overage?: {
+                                /** @enum {string} */
+                                status: "open";
+                                /** @enum {string} */
+                                reason_code: "input_bound_exceeded" | "output_cap_exceeded" | "input_and_output_exceeded";
+                                /** Format: int64 */
+                                reserved_input_tokens: number;
+                                /** Format: int64 */
+                                reserved_output_tokens: number;
+                                /** Format: int64 */
+                                reported_input_tokens: number;
+                                /** Format: int64 */
+                                reported_output_tokens: number;
+                                /** Format: int64 */
+                                input_overage_tokens: number;
+                                /** Format: int64 */
+                                output_overage_tokens: number;
+                                project_id?: string;
+                                currency?: string;
+                                /** Format: int64 */
+                                reserved_micros?: number;
+                                /** Format: int64 */
+                                reported_micros?: number;
+                                /** Format: int64 */
+                                money_overage_micros?: number;
+                            };
                         }[];
                     };
                 };
@@ -21167,7 +22456,7 @@ export interface operations {
                 "application/json": {
                     owner_id: components["schemas"]["UserId"];
                     /** @enum {string} */
-                    source: "client" | "chat" | "task" | "route" | "probe" | "compaction";
+                    source: "client" | "chat" | "task" | "probe" | "route" | "compaction" | "review" | "terminal_delivery";
                     call_id: string;
                     /** Format: int64 */
                     input_tokens: number;

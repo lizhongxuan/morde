@@ -84,13 +84,15 @@ RETURNING status,lease_version`, value.OwnerID, value.TaskID, value.Key, value.L
 		_, err = tx.Exec(ctx, `INSERT INTO task_hub_operations (
 task_id, owner_id, operation_key, tool_name, target_installation_id, action,
 task_authorization_version, target_grant_version, task_revision, lease_version, request_hash,
-workspace_id, workspace_path, workspace_size_bytes, workspace_sha256, source_checkpoint_revision, sync_stage, status
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'prepared')
+workspace_id, workspace_path, workspace_size_bytes, workspace_sha256, source_checkpoint_revision, sync_stage, status,
+agent_session_id, call_id, tool_call_digest, plan_task_revision, plan_revision, plan_step_id
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,'prepared',$18,$19,$20,$21,$22,$23)
 ON CONFLICT (owner_id, task_id, operation_key) DO NOTHING`,
 			value.TaskID, value.OwnerID, value.Key, value.ToolName, value.TargetInstallationID, value.Action,
 			value.TaskAuthorizationVersion, value.TargetGrantVersion, value.TaskRevision, value.LeaseVersion, value.RequestHash,
 			nullableString(value.WorkspaceID), nullableString(value.WorkspacePath), nullableInt64(value.Action == hub.ActionFilePut, value.WorkspaceSizeBytes),
-			nullableString(value.WorkspaceSHA256), nullableInt64(value.Action == hub.ActionFilePut, value.SourceCheckpointRevision), value.SyncStage)
+			nullableString(value.WorkspaceSHA256), nullableInt64(value.Action == hub.ActionFilePut, value.SourceCheckpointRevision), value.SyncStage,
+			value.AgentSessionID, value.CallID, value.ToolCallDigest, value.PlanTaskRevision, value.PlanRevision, value.PlanStepID)
 		if err != nil {
 			return fmt.Errorf("prepare Hub Task operation: %w", err)
 		}
@@ -144,6 +146,11 @@ func (s *Store) MarkTaskHubOperationDispatched(ctx context.Context, value app.Ta
 			}
 			inputPending = true
 			return nil
+		}
+		if stored.Action == hub.ActionCommand {
+			if err := admitCloudDSHTaskPlanStepHubOperationDispatchInTx(ctx, tx, taskDomain(row), stored); err != nil {
+				return err
+			}
 		}
 		command, err := tx.Exec(ctx, `UPDATE task_hub_operations SET status='dispatched', updated_at=clock_timestamp()
 WHERE owner_id=$1 AND task_id=$2 AND operation_key=$3 AND lease_version=$4 AND status='prepared'`,
@@ -771,7 +778,8 @@ func (s *Store) GetTaskHubOperation(ctx context.Context, ownerID, taskID, key st
 	result, err := scanTaskHubOperation(s.pool.QueryRow(ctx, `SELECT task_id, owner_id, operation_key, tool_name, target_installation_id, action,
 task_authorization_version, target_grant_version, task_revision, lease_version, request_hash, result_hash, status,
 workspace_id, workspace_path, workspace_size_bytes, workspace_sha256, source_checkpoint_revision,
-local_receipt_hash, sync_stage, sync_session_id, sync_revision
+local_receipt_hash, sync_stage, sync_session_id, sync_revision,
+agent_session_id, call_id, tool_call_digest, plan_task_revision, plan_revision, plan_step_id
 FROM task_hub_operations WHERE owner_id=$1 AND task_id=$2 AND operation_key=$3`, ownerID, taskID, key))
 	if err != nil {
 		return app.TaskHubOperation{}, storeError("get Hub Task operation", "Hub Task operation", err)
@@ -861,7 +869,8 @@ func getTaskHubOperationForUpdate(ctx context.Context, tx pgx.Tx, ownerID, taskI
 	return scanTaskHubOperation(tx.QueryRow(ctx, `SELECT task_id, owner_id, operation_key, tool_name, target_installation_id, action,
 task_authorization_version, target_grant_version, task_revision, lease_version, request_hash, result_hash, status,
 workspace_id, workspace_path, workspace_size_bytes, workspace_sha256, source_checkpoint_revision,
-local_receipt_hash, sync_stage, sync_session_id, sync_revision
+local_receipt_hash, sync_stage, sync_session_id, sync_revision,
+agent_session_id, call_id, tool_call_digest, plan_task_revision, plan_revision, plan_step_id
 FROM task_hub_operations WHERE owner_id=$1 AND task_id=$2 AND operation_key=$3 FOR UPDATE`, ownerID, taskID, key))
 }
 
@@ -873,7 +882,8 @@ func scanTaskHubOperation(row pgx.Row) (app.TaskHubOperation, error) {
 		&result.TaskID, &result.OwnerID, &result.Key, &result.ToolName, &result.TargetInstallationID, &result.Action,
 		&result.TaskAuthorizationVersion, &result.TargetGrantVersion, &result.TaskRevision, &result.LeaseVersion, &result.RequestHash,
 		&result.ResultHash, &result.Status, &workspaceID, &workspacePath, &workspaceSizeBytes, &workspaceSHA256,
-		&sourceCheckpointRevision, &result.LocalReceiptHash, &result.SyncStage, &syncSessionID, &syncRevision)
+		&sourceCheckpointRevision, &result.LocalReceiptHash, &result.SyncStage, &syncSessionID, &syncRevision,
+		&result.AgentSessionID, &result.CallID, &result.ToolCallDigest, &result.PlanTaskRevision, &result.PlanRevision, &result.PlanStepID)
 	if err != nil {
 		return app.TaskHubOperation{}, err
 	}
@@ -901,6 +911,7 @@ func scanTaskHubOperation(row pgx.Row) (app.TaskHubOperation, error) {
 	result.RequestHash = append([]byte(nil), result.RequestHash...)
 	result.ResultHash = append([]byte(nil), result.ResultHash...)
 	result.LocalReceiptHash = append([]byte(nil), result.LocalReceiptHash...)
+	result.ToolCallDigest = append([]byte(nil), result.ToolCallDigest...)
 	return result, nil
 }
 
@@ -918,15 +929,28 @@ func validTaskHubOperationState(value app.TaskHubOperation) bool {
 		return false
 	}
 	if value.Action != hub.ActionFilePut {
-		return (value.Action == hub.ActionFileFetch && value.TaskRevision >= 0 || value.Action != hub.ActionFileFetch && value.TaskRevision == 0) &&
+		return validTaskHubPlanBinding(value) &&
+			(value.Action == hub.ActionFileFetch && value.TaskRevision >= 0 || value.Action != hub.ActionFileFetch && value.TaskRevision == 0) &&
 			value.WorkspaceID == "" && value.WorkspacePath == "" && value.WorkspaceSizeBytes == 0 && value.WorkspaceSHA256 == "" &&
 			value.SourceCheckpointRevision == 0 && len(value.LocalReceiptHash) == 0 && value.SyncStage == "" && value.SyncSessionID == "" &&
 			value.SyncRevision == 0 && (len(value.ResultHash) == 0 || len(value.ResultHash) == 32)
 	}
-	return domain.ValidWorkspaceID(value.WorkspaceID) && workspace.ValidateRelativePath(value.WorkspacePath) == nil &&
+	return validTaskHubPlanBinding(value) && domain.ValidWorkspaceID(value.WorkspaceID) && workspace.ValidateRelativePath(value.WorkspacePath) == nil &&
 		len(value.WorkspacePath) <= hub.MaxHubPathBytes && value.WorkspaceSizeBytes >= 0 && value.WorkspaceSizeBytes <= hub.MaxWorkspaceWriteBytes &&
 		validPostgresSHA256(value.WorkspaceSHA256) && value.SourceCheckpointRevision >= 0 &&
 		validTaskHubWriteState(value)
+}
+
+func validTaskHubPlanBinding(value app.TaskHubOperation) bool {
+	if value.PlanRevision == 0 {
+		return value.PlanTaskRevision == 0 && value.PlanStepID == "" && value.AgentSessionID == "" && value.CallID == "" &&
+			len(value.ToolCallDigest) == 0
+	}
+	return value.Action == hub.ActionCommand && value.PlanTaskRevision >= 0 && value.PlanStepID != "" && len(value.PlanStepID) <= 40 &&
+		validTaskPlanStepID(value.PlanStepID) && value.AgentSessionID != "" && len(value.AgentSessionID) <= 128 &&
+		utf8.ValidString(value.AgentSessionID) && !strings.ContainsRune(value.AgentSessionID, '\x00') &&
+		value.CallID != "" && len(value.CallID) <= 256 && utf8.ValidString(value.CallID) && !strings.ContainsRune(value.CallID, '\x00') &&
+		len(value.ToolCallDigest) == 32
 }
 
 func validTaskHubAction(action string) bool {
@@ -953,7 +977,10 @@ func sameTaskHubOperationRequest(stored, requested app.TaskHubOperation) bool {
 		stored.TargetGrantVersion == requested.TargetGrantVersion && stored.TaskRevision == requested.TaskRevision && bytes.Equal(stored.RequestHash, requested.RequestHash) &&
 		stored.WorkspaceID == requested.WorkspaceID && stored.WorkspacePath == requested.WorkspacePath &&
 		stored.WorkspaceSizeBytes == requested.WorkspaceSizeBytes && stored.WorkspaceSHA256 == requested.WorkspaceSHA256 &&
-		stored.SourceCheckpointRevision == requested.SourceCheckpointRevision
+		stored.SourceCheckpointRevision == requested.SourceCheckpointRevision && stored.AgentSessionID == requested.AgentSessionID &&
+		stored.CallID == requested.CallID && bytes.Equal(stored.ToolCallDigest, requested.ToolCallDigest) &&
+		stored.PlanTaskRevision == requested.PlanTaskRevision && stored.PlanRevision == requested.PlanRevision &&
+		stored.PlanStepID == requested.PlanStepID
 }
 
 func validTaskHubWriteState(value app.TaskHubOperation) bool {

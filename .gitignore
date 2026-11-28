@@ -1,4 +1,6 @@
 .local/
+# P0 smoke gate run record (E10): evidence of the last local run, not source.
+deploy/single/smoke-record.json
 web/portal/public/downloads/
 .idea
 /runtime/morde-runtime/.tmp-t21-shell/
@@ -8,3 +10,4 @@ docs/实施/.local-baseline
 clients/desktop/harness/desktop/dist-ui-review/mac-arm64/morde-pc.app/Contents/Frameworks/Electron Framework.framework/Versions/A/Resources
 clients/desktop/harness/desktop/dist-ui-review/mac-arm64/morde-pc.app
 project
+deploy/single/smoke-record.json

@@ -179,7 +179,7 @@ VALUES ($1,$2,1,'approval','Approve','operation','Allow operation?','It changes 
 				t.Fatal(err)
 			}
 			changed := make(map[string]string)
-			var last int64 = before
+			var last = before
 			for _, event := range events {
 				if event.Sequence != last+1 {
 					t.Fatalf("task event sequence jumped from %d to %d", last, event.Sequence)

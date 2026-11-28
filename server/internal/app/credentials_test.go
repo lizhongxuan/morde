@@ -154,6 +154,27 @@ func TestCredentialLoginEnsuresOneStoppedHostBeforeIssuingSession(t *testing.T) 
 	}
 }
 
+func TestInitialAdminCanLogInRemotelyButMustChangePasswordBeforeOnboarding(t *testing.T) {
+	service, users, hosts, _, _, _ := newCredentialFixture(t)
+	initialAdmin := users.values["u1234567"]
+	initialAdmin.Name = "admin"
+	initialAdmin.Role = identity.RoleSuperAdmin
+	initialAdmin.MustChangePassword = true
+	users.values[initialAdmin.ID] = initialAdmin
+
+	result, err := service.Login(context.Background(), "admin", "correct horse", "198.51.100.27")
+	if err != nil {
+		t.Fatalf("remote initial-admin login = %v", err)
+	}
+	if !result.User.MustChangePassword || len(hosts.values) != 0 {
+		t.Fatalf("initial-admin login must be restricted without onboarding side effects: user=%#v hosts=%#v", result.User, hosts.values)
+	}
+	principal, err := service.VerifySession(context.Background(), result.Credential)
+	if err != nil || principal.Role != identity.RoleSuperAdmin || !principal.MustChangePassword {
+		t.Fatalf("remote initial-admin session = %#v, %v", principal, err)
+	}
+}
+
 func (s *credentialHosts) GetHost(_ context.Context, id string) (host.Host, error) {
 	for _, value := range s.values {
 		if value.ID == id {
@@ -459,7 +480,10 @@ func TestCredentialServiceLoginVerifyLogoutAndRateLimit(t *testing.T) {
 }
 
 func TestCredentialServiceVerifiesRevocableDynamicWorkspaceDevice(t *testing.T) {
-	service, _, _, _, tokens, _ := newCredentialFixture(t)
+	service, users, _, _, tokens, _ := newCredentialFixture(t)
+	user := users.values["u1234567"]
+	user.MustChangePassword = true
+	users.values[user.ID] = user
 	raw, secretHash, err := identity.NewCredential(identity.KindDevice, "tdevice1")
 	if err != nil {
 		t.Fatal(err)
@@ -478,7 +502,7 @@ func TestCredentialServiceVerifiesRevocableDynamicWorkspaceDevice(t *testing.T) 
 	tokens.clientActive = true
 	principal, err := service.VerifyDevice(context.Background(), raw)
 	if err != nil || principal.Kind != identity.KindDevice || principal.Role != identity.RoleUser ||
-		!principal.AllowsWorkspace("w1234567") || !principal.AllowsWorkspace("w7654321") || principal.HasScope(identity.ScopeComputerOperate) {
+		!principal.MustChangePassword || !principal.AllowsWorkspace("w1234567") || !principal.AllowsWorkspace("w7654321") || principal.HasScope(identity.ScopeComputerOperate) {
 		t.Fatalf("VerifyDevice() principal=%#v err=%v", principal, err)
 	}
 	if _, err := service.VerifyAPIKey(context.Background(), raw); !errors.Is(err, identity.ErrInvalidCredential) {
@@ -503,6 +527,36 @@ func TestCredentialServiceVerifiesRevocableDynamicWorkspaceDevice(t *testing.T) 
 	}
 	if _, err := service.VerifyDevice(context.Background(), raw); !errors.Is(err, identity.ErrInvalidCredential) {
 		t.Fatalf("VerifyDevice(revoked) error = %v", err)
+	}
+}
+
+func TestCredentialVerificationCarriesPasswordChangeRequirementToClient(t *testing.T) {
+	service, users, _, _, tokens, _ := newCredentialFixture(t)
+	user := users.values["u1234567"]
+	user.MustChangePassword = true
+	users.values[user.ID] = user
+	tokens.clientActive = true
+
+	raw, secretHash, err := identity.NewCredential(identity.KindClient, "tclntpw1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokens.values["tclntpw1"] = identity.Token{
+		ID: "tclntpw1", OwnerID: user.ID, Kind: identity.KindClient, ClientInstallationID: "i1234567",
+		SecretHash: secretHash, ExpiresAt: time.Now().Add(time.Hour),
+	}
+	principal, err := service.VerifyClient(context.Background(), raw)
+	if err != nil || principal.Kind != identity.KindClient || !principal.MustChangePassword {
+		t.Fatalf("VerifyClient() principal=%#v err=%v", principal, err)
+	}
+	webToken, webCredential, err := newClientWebToken(user.ID, "i1234567", time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokens.values[webToken.ID] = webToken
+	webPrincipal, err := service.VerifySession(context.Background(), webCredential)
+	if err != nil || webPrincipal.Kind != identity.KindSession || !webPrincipal.MustChangePassword || webPrincipal.ClientInstallationID != "i1234567" {
+		t.Fatalf("restricted client Web session principal=%#v err=%v", webPrincipal, err)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/project"
 	"morde/server/internal/domain/task"
+	"morde/server/internal/domain/workspace"
 )
 
 // AcceptConversationMessageCommand describes user input before any Task exists.
@@ -27,6 +28,7 @@ type AcceptConversationMessageCommand struct {
 	ChangeTaskTarget        bool
 	ApplicationID           string
 	TimeZone                string
+	ResponseMode            string
 	MCPConnectorIDs         []string
 	ClientAttachmentIDs     []string
 	Budget                  task.Budget
@@ -35,24 +37,29 @@ type AcceptConversationMessageCommand struct {
 
 // ConversationRoutingInput contains only the immutable options needed after receipt.
 type ConversationRoutingInput struct {
-	ProjectID               string      `json:"project_id,omitempty"`
-	VariantGroupID          string      `json:"variant_group_id,omitempty"`
-	VariantVersion          int64       `json:"variant_version,omitempty"`
-	VariantAction           string      `json:"variant_action,omitempty"`
-	VariantOperationID      string      `json:"variant_operation_id,omitempty"`
-	VariantSourceMessageID  string      `json:"variant_source_message_id,omitempty"`
-	ResultReviewID          string      `json:"result_review_id,omitempty"`
-	PreviousClientMessageID string      `json:"previous_client_message_id,omitempty"`
-	ReferenceTaskID         string      `json:"reference_task_id,omitempty"`
-	ModelID                 string      `json:"model_id,omitempty"`
-	HostID                  string      `json:"host_id,omitempty"`
-	WorkspaceID             string      `json:"workspace_id,omitempty"`
-	ChangeTaskTarget        bool        `json:"change_task_target,omitempty"`
-	ApplicationID           string      `json:"application_id,omitempty"`
-	TimeZone                string      `json:"time_zone,omitempty"`
-	MCPConnectorIDs         []string    `json:"mcp_connector_ids,omitempty"`
-	ClientAttachmentIDs     []string    `json:"client_attachment_ids,omitempty"`
-	Budget                  task.Budget `json:"budget"`
+	ProjectID                       string      `json:"project_id,omitempty"`
+	VariantGroupID                  string      `json:"variant_group_id,omitempty"`
+	VariantVersion                  int64       `json:"variant_version,omitempty"`
+	VariantAction                   string      `json:"variant_action,omitempty"`
+	VariantOperationID              string      `json:"variant_operation_id,omitempty"`
+	VariantSourceMessageID          string      `json:"variant_source_message_id,omitempty"`
+	ResultReviewID                  string      `json:"result_review_id,omitempty"`
+	PreviousClientMessageID         string      `json:"previous_client_message_id,omitempty"`
+	ReferenceTaskID                 string      `json:"reference_task_id,omitempty"`
+	ModelID                         string      `json:"model_id,omitempty"`
+	HostID                          string      `json:"host_id,omitempty"`
+	WorkspaceID                     string      `json:"workspace_id,omitempty"`
+	WorkspaceOwnerID                string      `json:"workspace_owner_id,omitempty"`
+	WorkspaceProjectResourceVersion *int64      `json:"workspace_project_resource_version,omitempty"`
+	WorkspaceInputRevision          *int64      `json:"workspace_input_revision,omitempty"`
+	WorkspaceContextDigest          []byte      `json:"workspace_context_digest,omitempty"`
+	ChangeTaskTarget                bool        `json:"change_task_target,omitempty"`
+	ApplicationID                   string      `json:"application_id,omitempty"`
+	TimeZone                        string      `json:"time_zone,omitempty"`
+	ResponseMode                    string      `json:"response_mode,omitempty"`
+	MCPConnectorIDs                 []string    `json:"mcp_connector_ids,omitempty"`
+	ClientAttachmentIDs             []string    `json:"client_attachment_ids,omitempty"`
+	Budget                          task.Budget `json:"budget"`
 }
 
 type ConversationMessageReceipt struct {
@@ -66,6 +73,10 @@ type ConversationMessageReceipt struct {
 
 type ConversationMessageReceiptStore interface {
 	AcceptConversationMessage(context.Context, ConversationMessageReceipt) (conversation.Message, bool, error)
+}
+
+type ConversationRouteCancellationStore interface {
+	CancelConversationRoute(context.Context, string, string, string, string, string) (conversation.Message, bool, error)
 }
 
 // prepareConversationMessage verifies identity and immutable routing options without checking tool availability.
@@ -113,6 +124,18 @@ func (s *TaskService) prepareConversationMessage(ctx context.Context, principal 
 	if len(command.ClientAttachmentIDs) > conversation.MaxHistoryImportAttachments {
 		return ConversationMessageReceipt{}, domain.InvalidArgument("client_attachment_ids", "message attachment count exceeds the limit")
 	}
+	responseMode := strings.TrimSpace(command.ResponseMode)
+	if responseMode == "" {
+		responseMode = ConversationResponseShort
+	}
+	if responseMode != ConversationResponseShort && responseMode != ConversationResponseLongForm {
+		return ConversationMessageReceipt{}, domain.InvalidArgument("response_mode", "response mode is invalid")
+	}
+	if responseMode == ConversationResponseLongForm && (command.ReferenceTaskID != "" || command.HostID != "" ||
+		command.WorkspaceID != "" || command.ChangeTaskTarget || command.ApplicationID != "" || len(command.ClientAttachmentIDs) != 0 ||
+		len(command.MCPConnectorIDs) != 0) {
+		return ConversationMessageReceipt{}, domain.InvalidArgument("response_mode", "long-form replies cannot include Task, host, tool, or attachment options")
+	}
 	seen := make(map[string]struct{}, len(command.ClientAttachmentIDs))
 	for _, id := range command.ClientAttachmentIDs {
 		if !idempotencyKeyPattern.MatchString(id) {
@@ -147,7 +170,9 @@ func (s *TaskService) prepareConversationMessage(ctx context.Context, principal 
 	} else if _, err := s.store.GetConversation(ctx, conversationID, principal.UserID); err != nil {
 		return ConversationMessageReceipt{}, err
 	}
-	// Host and Workspace authorization is intentionally deferred until a tool uses them.
+	// Host authorization remains deferred. A selected personal Workspace is
+	// best-effort captured below, but the selection grants no access unless the
+	// routed Task later passes the owner-scoped snapshot gate.
 	authorization, err := s.authorizeTask(ctx, principal, "", identity.ScopeTaskSubmit)
 	if err != nil {
 		return ConversationMessageReceipt{}, err
@@ -158,7 +183,22 @@ func (s *TaskService) prepareConversationMessage(ctx context.Context, principal 
 		WorkspaceID: command.WorkspaceID, ChangeTaskTarget: command.ChangeTaskTarget,
 		ApplicationID: command.ApplicationID, MCPConnectorIDs: connectors,
 		TimeZone:            command.TimeZone,
+		ResponseMode:        responseMode,
 		ClientAttachmentIDs: append([]string(nil), command.ClientAttachmentIDs...), Budget: budget,
+	}
+	// A selected personal Workspace is captured at the current committed
+	// revision when the receipt is accepted. The selection remains only a hint
+	// until routing requires a file deliverable; missing or inaccessible
+	// snapshots are left unset so a non-file request can still be accepted.
+	if command.WorkspaceID != "" && command.ProjectID == "" && ownerID == principal.UserID {
+		if reader, ok := s.store.(taskWorkspaceSnapshotReader); ok {
+			value, readErr := reader.GetWorkspace(ctx, command.WorkspaceID)
+			if readErr == nil && value.OwnerID == principal.UserID && value.State == workspace.StateReady && value.DeletedAt == nil {
+				revision := value.Revision
+				input.WorkspaceInputRevision, input.WorkspaceContextDigest, _ = s.workspaceInputSnapshot(ctx,
+					principal.UserID, command.HostID, command.WorkspaceID, &revision)
+			}
+		}
 	}
 	return ConversationMessageReceipt{
 		Message: conversation.Message{ConversationID: conversationID, OwnerID: ownerID, ActorID: principal.UserID,
@@ -169,6 +209,13 @@ func (s *TaskService) prepareConversationMessage(ctx context.Context, principal 
 
 // ConversationReceiptHash binds the complete text and immutable routing options to one receipt.
 func ConversationReceiptHash(conversationID, content string, input ConversationRoutingInput) ([]byte, error) {
+	// These fields are captured from mutable server state at first acceptance.
+	// Exclude them from request identity so retrying the same client message
+	// after a Workspace revision advances still replays its original receipt.
+	input.WorkspaceOwnerID = ""
+	input.WorkspaceProjectResourceVersion = nil
+	input.WorkspaceInputRevision = nil
+	input.WorkspaceContextDigest = nil
 	return hashIdempotencyRequest(struct {
 		ConversationID string                   `json:"conversation_id"`
 		Content        string                   `json:"content"`
@@ -210,4 +257,32 @@ func (s *TaskService) AcceptProjectMessage(ctx context.Context, principal identi
 	}
 	command.ProjectID = projectID
 	return s.AcceptConversationMessage(ctx, principal, conversationID, command)
+}
+
+// CancelConversationMessage requests cancellation of an explicitly selected
+// long-form reply. The second return value reports whether this call changed
+// the persisted route state; repeating cancellation is safe.
+func (s *TaskService) CancelConversationMessage(ctx context.Context, principal identity.Principal, projectID, conversationID,
+	messageID, serviceInstanceID string) (conversation.Message, bool, error) {
+	if err := validateConversationPrincipal(principal, identity.ScopeTaskSubmit); err != nil {
+		return conversation.Message{}, false, err
+	}
+	if !domain.ValidConversationID(conversationID) || !domain.ValidMessageID(messageID) || !domain.ValidServiceInstanceID(serviceInstanceID) {
+		return conversation.Message{}, false, domain.InvalidArgument("conversation_message", "conversation message identity is invalid")
+	}
+	if projectID != "" {
+		if !project.ValidID(projectID) || s.projectAccess == nil {
+			return conversation.Message{}, false, domain.NewError(domain.CodeNotFound, "conversation not found")
+		}
+		if _, err := s.projectAccess.RequireAccess(ctx, principal, projectID, project.RoleMember); err != nil {
+			return conversation.Message{}, false, err
+		}
+	} else if _, err := s.store.GetConversation(ctx, conversationID, principal.UserID); err != nil {
+		return conversation.Message{}, false, err
+	}
+	store, ok := s.store.(ConversationRouteCancellationStore)
+	if !ok {
+		return conversation.Message{}, false, domain.NewError(domain.CodeUnsupported, "conversation route cancellation is unavailable")
+	}
+	return store.CancelConversationRoute(ctx, principal.UserID, projectID, conversationID, messageID, serviceInstanceID)
 }

@@ -15,6 +15,7 @@ import (
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/task"
+	"morde/server/internal/store/postgres/sqlcgen"
 )
 
 const maxAgentChildSessionsPerTask = 16
@@ -23,7 +24,10 @@ func (s *Store) CreateAgentChildSession(ctx context.Context, request app.AgentCh
 	fence := request.Fence
 	if err := fence.Validate(); err != nil || request.ParentSessionID == "" ||
 		request.SessionID == "" || request.SessionID == request.ParentSessionID || request.StepID == "" ||
-		request.SpawnKey == "" || len(request.RequestHash) != 32 || request.Title == "" || !validStoredAgentToolNames(request.AllowedTools) {
+		request.SpawnKey == "" || len(request.RequestHash) != 32 || request.Title == "" ||
+		(request.PlanStepID == "") != (request.PlanRevision == 0) ||
+		(request.PlanStepID != "" && (request.PlanRevision < 1 || !validTaskPlanStepID(request.PlanStepID))) ||
+		!validStoredAgentToolNames(request.AllowedTools) {
 		return app.AgentChildSession{}, false, domain.InvalidArgument("child_session", "child session fields are invalid")
 	}
 	toolNames := append([]string{}, request.AllowedTools...)
@@ -37,6 +41,15 @@ func (s *Store) CreateAgentChildSession(ctx context.Context, request app.AgentCh
 	var supersedingMessages []app.AgentConversationMessage
 	err = s.WithTx(ctx, func(tx pgx.Tx) error {
 		if err := lockCurrentAgentChildSessionTask(ctx, tx, fence); err != nil {
+			return err
+		}
+		taskRow, err := sqlcgen.New(tx).GetTask(ctx, sqlcgen.GetTaskParams{ID: fence.TaskID, OwnerID: fence.OwnerID})
+		if err != nil {
+			return storeError("load child session Task plan fence", "task", err)
+		}
+		currentTask := taskDomain(taskRow)
+		planFence, err := taskPlanChildBindingFenceInTx(ctx, tx, currentTask, request)
+		if err != nil {
 			return err
 		}
 		var parentOfParent, parentStepID string
@@ -122,10 +135,33 @@ WHERE s.task_id=$1 AND s.owner_id=$2 AND s.parent_session_id=$3 AND s.spawn_key=
 				return domain.NewError(domain.CodeIdempotencyConflict, "child spawn key changed its root checkpoint baseline")
 			}
 			result.Step.ID, result.Step.TaskID = existingStepID, fence.TaskID
+			if planFence != nil {
+				binding := taskPlanStepExecutionBinding{kind: planStepExecutionChild, executionID: result.SessionID,
+					agentSessionID: request.ParentSessionID, callID: request.SpawnKey, childStepID: existingStepID,
+					authorizationVersion: currentTask.Authorization.Version}
+				if err := verifyTaskPlanStepExecutionSource(ctx, tx, *planFence, &binding); err != nil {
+					return err
+				}
+				if err := requireExistingTaskPlanStepOperationBindingInTx(ctx, tx, *planFence, request.PlanStepID, binding); err != nil {
+					return err
+				}
+			}
 			replayed = true
 			return nil
 		} else if !errors.Is(err, pgx.ErrNoRows) {
 			return fmt.Errorf("read existing child Agent Session: %w", err)
+		}
+		// Check dependencies only after looking up the spawn identity. Reusing a
+		// spawn key with changed plan metadata must fail as an idempotency conflict
+		// even when the newly selected step is not currently ready.
+		if planFence != nil {
+			ready, reason, err := taskPlanStepDependenciesReadyInTx(ctx, tx, *planFence, request.PlanStepID)
+			if err != nil {
+				return err
+			}
+			if !ready {
+				return taskPlanStepBindingConflict(reason)
+			}
 		}
 		if parentCancelRequested {
 			return domain.NewError(domain.CodeInvalidState, "parent Agent Session cancellation is pending")
@@ -170,7 +206,6 @@ WHERE s.task_id=$1 AND s.owner_id=$2 AND s.parent_session_id=$3 AND s.spawn_key=
 		if childCount >= maxAgentChildSessionsPerTask {
 			return domain.NewError(domain.CodeQuotaExceeded, "Task child Agent limit exceeded")
 		}
-
 		var lastSequence int64
 		if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(sequence),0) FROM task_steps WHERE task_id=$1`, fence.TaskID).Scan(&lastSequence); err != nil {
 			return fmt.Errorf("read last TaskStep sequence: %w", err)
@@ -187,6 +222,17 @@ VALUES ($1,$2,$3,'subagent','running',$4,$5) RETURNING created_at`, request.Step
 VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,(SELECT current_revision FROM tasks WHERE id=$1),$10,true)`, fence.TaskID, fence.OwnerID, request.SessionID, request.ParentSessionID,
 			request.StepID, request.SpawnKey, request.RequestHash, string(allowedTools), request.Background, request.RootCheckpointThroughSequence); err != nil {
 			return fmt.Errorf("create child Agent Session: %w", err)
+		}
+		if planFence != nil {
+			binding := taskPlanStepExecutionBinding{kind: planStepExecutionChild, executionID: request.SessionID,
+				agentSessionID: request.ParentSessionID, callID: request.SpawnKey, childStepID: request.StepID,
+				authorizationVersion: currentTask.Authorization.Version}
+			if err := verifyTaskPlanStepExecutionSource(ctx, tx, *planFence, &binding); err != nil {
+				return err
+			}
+			if err := persistTaskPlanStepExecutionBindingInTx(ctx, tx, *planFence, request.PlanStepID, binding); err != nil {
+				return err
+			}
 		}
 		sequenceNumber, err := incrementTaskEventSequence(ctx, tx, fence.TaskID)
 		if err != nil {
@@ -212,6 +258,32 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,(SELECT current_revision FROM tasks WH
 		return app.AgentChildSession{}, false, app.NewTaskInputPendingError(supersedingMessages)
 	}
 	return result, replayed, err
+}
+
+func taskPlanChildBindingFenceInTx(ctx context.Context, tx pgx.Tx, current task.Task,
+	request app.AgentChildSessionCreate) (*taskPlanStepBindingFence, error) {
+	if request.PlanStepID == "" {
+		if current.CurrentRevision == nil {
+			return nil, nil
+		}
+		plan, err := latestTaskPlan(ctx, tx, current.ID, *current.CurrentRevision)
+		if err != nil {
+			return nil, err
+		}
+		if plan != nil {
+			return nil, taskPlanStepBindingConflict(planStepReadinessStepMissing)
+		}
+		return nil, nil
+	}
+	fence, blocked, err := taskPlanStepBindingFenceInTx(ctx, tx, current, request.PlanRevision, request.PlanStepID,
+		current.Authorization.Version, true)
+	if err != nil {
+		return nil, err
+	}
+	if blocked != "" {
+		return nil, taskPlanStepBindingConflict(blocked)
+	}
+	return &fence, nil
 }
 
 func (s *Store) GetAgentChildSession(ctx context.Context, fence app.AgentInstanceFence, actorSessionID, sessionID string) (app.AgentChildSession, error) {

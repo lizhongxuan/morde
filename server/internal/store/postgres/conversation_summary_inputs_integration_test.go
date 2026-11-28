@@ -113,6 +113,51 @@ VALUES ($1::uuid,$2,$3)`, f.instanceID, f.ownerID, suppressed.Message.ID); err !
 	}
 }
 
+func TestConversationSummaryInputIncludesUnresolvedPredecessorWithoutMarkingItComplete(t *testing.T) {
+	f := newRouteActionsTestFixture(t)
+	ctx := context.Background()
+	const predecessorClientID = "summary-pending-predecessor"
+	predecessor := f.receive(t, predecessorClientID, "整理这份材料并说明风险。", app.ConversationRoutingInput{})
+	snapshot, err := f.store.LoadConversationRouteSnapshot(ctx, predecessor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot.Context.ModelID = "p1234567"
+	if err := f.store.ApplyConversationRoute(ctx, predecessor, snapshot, app.ConversationRouteDecision{
+		Action: app.ConversationRouteClarify, Question: "请确认你需要的风险分析范围。",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	current := f.receive(t, "summary-pending-current", "先继续处理其他部分。", app.ConversationRoutingInput{
+		PreviousClientMessageID: predecessorClientID,
+	})
+	page, err := f.store.LoadConversationSummaryInputPage(ctx, app.ConversationSummaryInputPageRequest{
+		Claim: current, ContextWindowTokens: 4096,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !page.PendingPredecessor {
+		t.Fatal("summary input did not retain the unresolved predecessor state")
+	}
+	userRequest, assistantClarification := false, false
+	for _, source := range page.Sources {
+		userRequest = userRequest || source.Source.ID == predecessor.Message.ID && source.Role == string(conversation.RoleUser) &&
+			source.Content == predecessor.Message.Content
+		assistantClarification = assistantClarification || source.Role == string(conversation.RoleAssistant) &&
+			source.Content == "请确认你需要的风险分析范围。"
+	}
+	if !userRequest || !assistantClarification {
+		t.Fatalf("summary input lost the unresolved request or its clarification: pending=%t sources=%+v",
+			page.PendingPredecessor, page.Sources)
+	}
+	proofs, err := app.ConversationSummaryPromptProofs(page.Sources)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commitRouteTestSummary(t, f, current, page.Head.Version, "材料请求仍待用户确认。", proofs, page.PendingPredecessor)
+}
+
 func TestProjectConversationSummaryInputSharesOnlyProvenMemberHistory(t *testing.T) {
 	f := newProjectAttachmentFixture(t)
 	ctx := context.Background()

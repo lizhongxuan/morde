@@ -438,6 +438,32 @@ func scanTaskWorkspace(ctx context.Context, directory string) (mordesync.Manifes
 	return manifest, digest, err
 }
 
+func scanTaskWorkspaceRoot(ctx context.Context, root *os.Root) (mordesync.Manifest, string, error) {
+	if ctx == nil || root == nil {
+		return mordesync.Manifest{}, "", errors.New("context and opened Task Workspace root are required")
+	}
+	scanContext, cancel := context.WithCancel(ctx)
+	defer cancel()
+	tooLarge := false
+	manifest, err := mordesync.ScanOpenedRoot(scanContext, root, func(progress mordesync.ScanProgress) {
+		if progress.FilesFound > maxTaskViewFiles || progress.BytesFound > maxTaskViewBytes {
+			tooLarge = true
+			cancel()
+		}
+	})
+	if err != nil {
+		if tooLarge {
+			return mordesync.Manifest{}, "", ErrTaskWorkspaceView
+		}
+		return mordesync.Manifest{}, "", err
+	}
+	if manifest.FileCount > maxTaskViewFiles || int64(max(len(manifest.EmptyDirectories), len(manifest.Directories))) > maxTaskViewFiles-manifest.FileCount || manifest.TotalBytes > maxTaskViewBytes {
+		return mordesync.Manifest{}, "", ErrTaskWorkspaceView
+	}
+	digest, err := taskManifestSHA256(manifest)
+	return manifest, digest, err
+}
+
 func taskManifestSHA256(manifest mordesync.Manifest) (string, error) {
 	if err := mordesync.ValidateManifest(manifest); err != nil || manifest.FileCount != int64(len(manifest.Files)) || manifest.TotalBytes > maxTaskViewBytes ||
 		manifest.FileCount > maxTaskViewFiles || int64(max(len(manifest.EmptyDirectories), len(manifest.Directories))) > maxTaskViewFiles-manifest.FileCount {

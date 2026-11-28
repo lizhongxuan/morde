@@ -17,7 +17,7 @@ const user: components['schemas']['AdminUser'] = {
 type UnknownModelCall = Awaited<ReturnType<typeof portalApi.adminUnknownModelUsage>>['items'][number];
 
 const call: UnknownModelCall = {
-  owner_id: user.id, source: 'task', call_id: 'model-call-123', model_id: 'm1234567', provider_model: 'provider-model',
+  owner_id: user.id, source: 'terminal_delivery', call_id: 'terminal_delivery_12', model_id: 'm1234567', provider_model: 'provider-model',
   task_id: 't1234567', reserved_tokens: 1000, created_at: '2026-10-27T00:00:00Z', unknown_at: '2026-10-27T00:01:00Z',
 };
 
@@ -53,6 +53,7 @@ describe('admin model usage reconciliation', () => {
     expect(list).not.toHaveBeenCalled();
     await input.click(screen.getByRole('button', { name: '查看待核对记录' }));
     expect(await screen.findByText('provider-model')).toBeInTheDocument();
+    expect(screen.getByText(/任务终态说明/)).toBeInTheDocument();
     expect(list).toHaveBeenCalledWith(user.id);
 
     await input.type(screen.getByLabelText('核实的输入 tokens'), '620');
@@ -61,11 +62,62 @@ describe('admin model usage reconciliation', () => {
     await input.click(screen.getByRole('button', { name: '保存核对结果' }));
 
     expect(reconcile).toHaveBeenCalledWith({
-      owner_id: user.id, source: 'task', call_id: call.call_id, input_tokens: 620, output_tokens: 180,
+      owner_id: user.id, source: 'terminal_delivery', call_id: call.call_id, input_tokens: 620, output_tokens: 180,
       evidence: '供应商账单记录 #abc-123',
     });
     expect(await screen.findByText('模型用量已核对并记账。')).toBeInTheDocument();
     expect(screen.getByText(/不会恢复丢失的模型响应/)).toBeInTheDocument();
+  });
+
+  it('shows signed and reported adaptive budget overage and pre-fills editable counts', async () => {
+    const input = userEvent.setup();
+    mockUserDetails();
+    vi.spyOn(portalApi, 'adminHosts').mockResolvedValue({ items: [] });
+    vi.spyOn(portalApi, 'adminWorkspaces').mockResolvedValue({ items: [], next_cursor: null });
+    vi.spyOn(portalApi, 'adminModelAccountBudget').mockResolvedValue({ owner_id: user.id, configured: true, token_limit: 5000, max_concurrent: 2, used_tokens: 0, in_flight: 0, has_unknown: true });
+    const overageCall: UnknownModelCall = {
+      ...call,
+      source: 'task',
+      call_id: 'task_budget_overage_12',
+      adaptive_budget_overage: {
+        status: 'open',
+        reason_code: 'output_cap_exceeded',
+        reserved_input_tokens: 620,
+        reserved_output_tokens: 180,
+        reported_input_tokens: 640,
+        reported_output_tokens: 220,
+        input_overage_tokens: 20,
+        output_overage_tokens: 40,
+        project_id: 'p1234567',
+        currency: 'USD',
+        reserved_micros: 300,
+        reported_micros: 306,
+        money_overage_micros: 6,
+      },
+    };
+    vi.spyOn(portalApi, 'adminUnknownModelUsage').mockResolvedValue({ items: [overageCall] });
+    const reconcile = vi.spyOn(portalApi, 'reconcileModelUsage').mockResolvedValue({ replayed: false });
+    renderPage();
+
+    expect(await screen.findByRole('heading', { name: 'alice' })).toBeInTheDocument();
+    await input.click(screen.getByRole('button', { name: '查看待核对记录' }));
+    expect(await screen.findByText('自适应预算超额待核对')).toBeInTheDocument();
+    expect(screen.getByText(/签约预留：输入 620、输出 180 tokens/)).toBeInTheDocument();
+    expect(screen.getByText(/模型返回用量（尚未核对到账单）：输入 640、输出 220 tokens/)).toBeInTheDocument();
+    expect(screen.getByText(/预留 300、模型返回 306、差额 6 USD/)).toBeInTheDocument();
+    expect(screen.getByLabelText('核实的输入 tokens')).toHaveValue(640);
+    expect(screen.getByLabelText('核实的输出 tokens')).toHaveValue(220);
+
+    await input.type(screen.getByLabelText('供应商记录与核对依据'), '供应商账单记录 #overage-12');
+    await input.click(screen.getByRole('button', { name: '核对并结算超额' }));
+
+    expect(reconcile).toHaveBeenCalledWith({
+      owner_id: user.id, source: 'task', call_id: overageCall.call_id, input_tokens: 640, output_tokens: 220,
+      evidence: '供应商账单记录 #overage-12',
+    });
+    expect(await screen.findByText('模型用量已核对并记账。')).toBeInTheDocument();
+    expect(screen.getByText(/超过预算的实际用量仍会计入已用额度/)).toBeInTheDocument();
+    expect(screen.getAllByText(/不会恢复丢失的模型响应/)).toHaveLength(2);
   });
 
   it('lets an administrator update the token and concurrency limits', async () => {

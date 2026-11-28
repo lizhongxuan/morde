@@ -727,7 +727,7 @@ func TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView(t 
 		for _, step := range current.Steps {
 			if step.Kind == "verification" {
 				verificationOperation, verificationOperationErr = store.GetOperation(diagnosticCtx, owner.ID, acceptedTaskID,
-					fmt.Sprintf("agent:verify:%s:%s:%d", step.ID, workspaceValue.ID, binding.BindingVersion))
+					fmt.Sprintf("agent:verify:v2:%s:%s:%d", step.ID, workspaceValue.ID, binding.BindingVersion))
 			}
 		}
 		t.Fatalf("Cloud Task did not complete after publishing its private view: wait_error=%v status=%s waiting_reason=%s pending_request=%#v checkpoint_revision=%v checkpoint_sequence=%d agent_session=%s agent_generation=%d steps=%#v model_calls=%d binding_state=%s binding_version=%d desired_revision=%d applied_revision=%d sync_state=%s approval_operation=%#v approval_operation_error=%v write_operation=%#v write_operation_error=%v verify_operation=%#v verify_operation_error=%v host_state=%s control=%s generation=%d instance=%q control_version=%d host_error=%v current_fence=%+v fence_error=%v task_error=%v binding_error=%v",

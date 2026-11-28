@@ -163,7 +163,10 @@ capability_tools=false,capability_vision=false WHERE id=$1`, created.ID); err !=
 	if err != nil {
 		t.Fatal(err)
 	}
-	modelRequest, err := json.Marshal(map[string]any{"provider": "morde", "model": executionModelID, "messages": []any{map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": "verify"}}}}, "tools": []any{}, "max_tokens": 128})
+	modelRequest, marshalErr := json.Marshal(map[string]any{"provider": "morde", "model": executionModelID, "messages": []any{map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": "verify"}}}}, "tools": []any{}, "max_tokens": 128})
+	if marshalErr != nil {
+		t.Fatalf("marshal synthetic task model request: %v", marshalErr)
+	}
 	executionResponse, err := gateway.Complete(ctx, app.ModelCall{Source: app.ModelCallTask, Task: &fence, ModelID: executionModelID,
 		CallID: callID, RawRequest: modelRequest})
 	if err != nil || executionResponse.Text != "Verified synthetic task result." {

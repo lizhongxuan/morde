@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { cleanup, render, screen, within } from '@testing-library/react';
+import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MemoryRouter } from 'react-router';
@@ -12,6 +12,7 @@ type ModelConnection = Awaited<ReturnType<typeof portalApi.adminModelConnections
 const model: ModelConnection = {
   id: 'p1234567', name: '平台主模型', base_url: 'https://models.example.test/v1', model_name: 'gpt-test',
   context_window_tokens: null, context_window_override_tokens: null, context_window_source: 'unknown', context_window_resolved_at: null, context_window_catalog_version: null,
+  max_output_tokens: null, max_output_override_tokens: null, max_output_source: 'unknown', max_output_resolved_at: null, max_output_catalog_version: null, max_output_source_url: null,
   shared: true, has_api_key: true, capabilities: { text: true, tools: false, vision: false, text_stream: false },
   checked_at: '2026-10-22T08:00:00Z', created_at: '2026-10-20T08:00:00Z', updated_at: '2026-10-22T08:00:00Z',
 };
@@ -30,14 +31,14 @@ describe('admin platform model connections', () => {
     vi.spyOn(portalApi, 'checkModelConnection').mockResolvedValue(model.capabilities);
     const user = userEvent.setup();
     renderPage();
-    await user.click(await screen.findByRole('button', { name: '添加平台模型' }));
+    await user.click(await screen.findByRole('button', { name: /添加平台模型/ }));
     await user.selectOptions(screen.getByLabelText('选择服务和模型'), 'glm-5.1');
     expect(screen.getByLabelText('模型名')).toHaveValue('glm-5.1');
     expect(screen.getByLabelText('模型名')).toHaveAttribute('readonly');
     expect(screen.getByLabelText('服务地址')).toHaveValue('https://api.z.ai/api/paas/v4');
     expect(screen.getByLabelText('服务地址')).toHaveAttribute('readonly');
     expect(screen.queryByLabelText('上下文窗口高级覆盖（tokens，可选）')).not.toBeInTheDocument();
-    expect(screen.getByText('上下文窗口由 Morde 模型目录自动识别，不能手工修改。')).toBeInTheDocument();
+    expect(screen.getByText('系统预设按服务端返回目录信息显示上下文窗口和单次生成上限；不能手工修改。')).toBeInTheDocument();
     expect(screen.getByLabelText('API 密钥')).toHaveValue('');
     await user.type(screen.getByLabelText('API 密钥'), 'provider-key');
     await user.click(screen.getByRole('button', { name: '添加并检查连接' }));
@@ -187,5 +188,46 @@ describe('admin platform model connections', () => {
     expect(remove).toHaveBeenCalledWith(model.id);
     expect(await screen.findByRole('heading', { name: '尚未配置平台模型' })).toBeInTheDocument();
     expect(await screen.findByRole('status')).toHaveTextContent('平台模型连接已删除');
+  });
+
+  it('shows output capability provenance and leaves unverified shared custom routes unknown', async () => {
+    const user = userEvent.setup();
+    const catalogModel: ModelConnection = { ...model, name: '目录容量模型', model_name: 'name-does-not-set-the-limit',
+      max_output_tokens: 8192, max_output_source: 'model_catalog', max_output_catalog_version: 'catalog-2026-11', max_output_source_url: 'https://catalog.example.test/models/entry' };
+    const unknownModel: ModelConnection = { ...model, id: 'p7654321', name: '未知模型', model_name: 'deepseek-name-does-not-set-a-limit' };
+    let rows: ModelConnection[] = [catalogModel, unknownModel];
+    vi.spyOn(portalApi, 'adminModelConnections').mockImplementation(async () => ({ items: [...rows], configuration_status: 'configured' }));
+    renderPage();
+
+    const catalogRow = await screen.findByRole('row', { name: /目录容量模型/ });
+    expect(within(catalogRow).getByText('8,192 tokens')).toBeInTheDocument();
+    expect(within(catalogRow).getByText(/来源：Morde 模型目录 · 目录版本 catalog-2026-11/)).toBeInTheDocument();
+    expect(within(catalogRow).getByRole('link', { name: '查看来源' })).toHaveAttribute('href', catalogModel.max_output_source_url);
+    const unknownRow = screen.getByRole('row', { name: /未知模型/ });
+    const unknownOutputCell = unknownRow.querySelectorAll('td')[3]!;
+    expect(unknownOutputCell).toHaveTextContent('暂未识别');
+    expect(unknownOutputCell.querySelector('.table-sub')).toHaveTextContent('来源：暂未识别');
+    expect(within(unknownOutputCell).queryByRole('link', { name: '查看来源' })).not.toBeInTheDocument();
+
+    await user.click(await screen.findByRole('button', { name: /添加平台模型/ }));
+    await user.selectOptions(screen.getByLabelText('选择服务和模型'), 'custom');
+    await user.type(screen.getByLabelText('显示名称'), '自定义输出模型');
+    await user.type(screen.getByLabelText('模型名'), 'vendor-model');
+    await user.type(screen.getByLabelText('服务地址'), 'https://api.example.test/v1');
+    await user.type(screen.getByLabelText('API 密钥'), 'admin-test-secret');
+    const create = vi.spyOn(portalApi, 'createModelConnection').mockImplementation(async (body) => {
+      const created: ModelConnection = { ...model, id: 'p9988776', name: body.name, model_name: body.model_name, base_url: body.base_url,
+        max_output_tokens: null, max_output_override_tokens: null, max_output_source: 'unknown' };
+      rows = [...rows, created];
+      return created;
+    });
+    await user.click(screen.getByRole('button', { name: '添加连接' }));
+    await waitFor(() => expect(create).toHaveBeenCalledWith(expect.objectContaining({ shared: true, model_name: 'vendor-model' })));
+    expect(create.mock.calls[0]?.[0]).not.toHaveProperty('max_output_override_tokens');
+
+    const customRow = await screen.findByRole('row', { name: /自定义输出模型/ });
+    expect(customRow.querySelectorAll('td')[3]).toHaveTextContent('暂未识别');
+    await user.click(within(customRow).getByRole('button', { name: '编辑' }));
+    expect(screen.queryByLabelText('单次生成上限高级覆盖（tokens，可选）')).not.toBeInTheDocument();
   });
 });

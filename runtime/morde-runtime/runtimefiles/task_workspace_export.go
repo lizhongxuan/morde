@@ -9,7 +9,6 @@ import (
 	"errors"
 	"io"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 
@@ -66,6 +65,7 @@ type TaskWorkspaceManifestPage struct {
 	InputManifestSHA256         string                           `json:"input_manifest_sha256"`
 	ViewID                      string                           `json:"view_id"`
 	ManifestSHA256              string                           `json:"manifest_sha256"`
+	WorkspaceSnapshotSHA256     string                           `json:"workspace_snapshot_sha256"`
 	Files                       []TaskWorkspaceManifestFile      `json:"files"`
 	EmptyDirectories            []string                         `json:"empty_directories"`
 	Directories                 []TaskWorkspaceManifestDirectory `json:"directories"`
@@ -73,11 +73,12 @@ type TaskWorkspaceManifestPage struct {
 }
 
 type taskWorkspaceManifestSnapshot struct {
-	Metadata         persistedTaskView       `json:"metadata"`
-	ManifestSHA256   string                  `json:"manifest_sha256"`
-	Files            []taskManifestFile      `json:"files"`
-	EmptyDirectories []string                `json:"empty_directories"`
-	Directories      []taskManifestDirectory `json:"directories"`
+	Metadata                persistedTaskView       `json:"metadata"`
+	ManifestSHA256          string                  `json:"manifest_sha256"`
+	WorkspaceSnapshotSHA256 string                  `json:"workspace_snapshot_sha256,omitempty"`
+	Files                   []taskManifestFile      `json:"files"`
+	EmptyDirectories        []string                `json:"empty_directories"`
+	Directories             []taskManifestDirectory `json:"directories"`
 }
 
 type taskWorkspaceBlockLocation struct {
@@ -124,7 +125,8 @@ func (w *Workspace) ExportTaskWorkspaceManifestPage(ctx context.Context, request
 		TaskID: page.TaskID, WorkspaceID: page.WorkspaceID, BindingVersion: page.BindingVersion,
 		InputRevision: page.InputRevision, WorkspaceCheckpointRevision: page.WorkspaceCheckpointRevision,
 		InputManifestSHA256: page.InputManifestSHA256, ViewID: page.ViewID, ManifestSHA256: page.ManifestSHA256,
-		Files: files, EmptyDirectories: append([]string{}, page.EmptyDirectories...), Directories: directories, NextCursor: page.NextCursor,
+		WorkspaceSnapshotSHA256: page.WorkspaceSnapshotSHA256,
+		Files:                   files, EmptyDirectories: append([]string{}, page.EmptyDirectories...), Directories: directories, NextCursor: page.NextCursor,
 	}, nil
 }
 
@@ -241,7 +243,11 @@ func (w *Workspace) createTaskWorkspaceManifestSnapshot(ctx context.Context, tas
 	if err != nil {
 		return taskWorkspaceManifestSnapshot{}, ErrTaskWorkspaceView
 	}
-	manifest, digest, err := scanTaskWorkspace(ctx, filepath.Join(w.taskRootPath, taskID, viewID, taskWorkspaceContentDirectory))
+	manifest, digest, err := scanTaskWorkspaceRoot(ctx, viewRoot)
+	if err != nil {
+		return taskWorkspaceManifestSnapshot{}, ErrTaskWorkspaceView
+	}
+	workspaceSnapshotSHA256, err := mordesync.TaskWorkspaceSnapshotSHA256(manifest)
 	if err != nil {
 		return taskWorkspaceManifestSnapshot{}, ErrTaskWorkspaceView
 	}
@@ -259,7 +265,7 @@ func (w *Workspace) createTaskWorkspaceManifestSnapshot(ctx context.Context, tas
 		return taskWorkspaceManifestSnapshot{}, ErrTaskWorkspaceView
 	}
 	snapshot := taskWorkspaceManifestSnapshot{
-		Metadata: metadata, ManifestSHA256: digest, Files: taskManifestFiles(manifest),
+		Metadata: metadata, ManifestSHA256: digest, WorkspaceSnapshotSHA256: workspaceSnapshotSHA256, Files: taskManifestFiles(manifest),
 		EmptyDirectories: append([]string{}, manifest.EmptyDirectories...), Directories: taskManifestDirectories(manifest),
 	}
 	if err := validateTaskWorkspaceManifestSnapshot(&snapshot); err != nil {
@@ -452,6 +458,14 @@ func validateTaskWorkspaceManifestSnapshot(snapshot *taskWorkspaceManifestSnapsh
 	if err != nil || digest != snapshot.ManifestSHA256 {
 		return ErrTaskWorkspaceView
 	}
+	workspaceSnapshotSHA256, err := mordesync.TaskWorkspaceSnapshotSHA256(manifest)
+	if err != nil || snapshot.WorkspaceSnapshotSHA256 != "" && workspaceSnapshotSHA256 != snapshot.WorkspaceSnapshotSHA256 {
+		return ErrTaskWorkspaceView
+	}
+	// Older persisted snapshots do not have the common digest field. Recompute
+	// it from their saved manifest without changing the legacy digest used by
+	// pagination and block reads.
+	snapshot.WorkspaceSnapshotSHA256 = workspaceSnapshotSHA256
 	return nil
 }
 
@@ -529,7 +543,8 @@ func taskWorkspaceManifestPageRange(snapshot taskWorkspaceManifestSnapshot, entr
 		BindingVersion: snapshot.Metadata.BindingVersion, InputRevision: snapshot.Metadata.InputRevision,
 		WorkspaceCheckpointRevision: snapshot.Metadata.WorkspaceCheckpointRevision,
 		InputManifestSHA256:         snapshot.Metadata.ManifestSHA256, ViewID: snapshot.Metadata.ViewID,
-		ManifestSHA256: snapshot.ManifestSHA256, Files: files, EmptyDirectories: emptyDirectories, Directories: directories,
+		ManifestSHA256: snapshot.ManifestSHA256, WorkspaceSnapshotSHA256: snapshot.WorkspaceSnapshotSHA256,
+		Files: files, EmptyDirectories: emptyDirectories, Directories: directories,
 	}
 	if hasMore && len(entries) > 0 {
 		page.NextCursor = entries[len(entries)-1].Path

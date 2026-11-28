@@ -131,6 +131,13 @@ export const projectApi = {
     if (clientMessageID && (!serviceInstanceID || !actorID)) throw new Error('服务或账号身份尚未确认。');
     return allPages(async (query: ProjectConversationMessagesPageQuery) => unwrapApiResponse(await api.GET('/api/projects/{id}/conversations/{conversation_id}/messages', { params: { path: { id, conversation_id: conversationID }, query: { ...query, ...(clientMessageID ? { client_message_id: clientMessageID } : {}) }, ...(serviceInstanceID || actorID ? { header: { ...(serviceInstanceID ? { 'X-Morde-Service-Instance-ID': serviceInstanceID } : {}), ...(actorID ? { 'X-Morde-Actor-ID': actorID } : {}) } } : {}) } })));
   },
+  projectConversationMessageRetryEligibility: async (id: string, conversationID: string, messageID: string, serviceInstanceID: string, actorID: string) => {
+    if (!serviceInstanceID || !actorID) throw new Error('服务或账号身份尚未确认。');
+    return unwrapApiResponse(await api.GET('/api/projects/{id}/conversations/{conversation_id}/messages/{message_id}/retry-eligibility', {
+      params: { path: { id, conversation_id: conversationID, message_id: messageID },
+        header: { 'X-Morde-Service-Instance-ID': serviceInstanceID, 'X-Morde-Actor-ID': actorID } },
+    }));
+  },
   createProjectConversation: async (id: string, body: components['schemas']['CreateProjectConversationRequest'], idempotencyKey?: RequestKey) => unwrapApiResponse(await api.POST('/api/projects/{id}/conversations', {
     params: { path: { id }, header: { 'Idempotency-Key': requestKey(idempotencyKey) } }, body,
   })),
@@ -152,5 +159,17 @@ export const projectApi = {
     });
     if (result.error !== undefined) unwrapApiResponse(result);
     if (result.response.status !== 202) throw new Error('服务端未确认消息重试。');
+  },
+  cancelProjectConversationMessage: async (id: string, conversationID: string, messageID: string, serviceInstanceID: string, actorID: string) => {
+    if (!serviceInstanceID || !actorID) throw new Error('服务或账号身份尚未确认。');
+    const result = await api.POST('/api/projects/{id}/conversations/{conversation_id}/messages/{message_id}/cancel', {
+      params: { path: { id, conversation_id: conversationID, message_id: messageID },
+        header: { 'X-Morde-Service-Instance-ID': serviceInstanceID, 'X-Morde-Actor-ID': actorID } },
+    });
+    const response = unwrapApiResponse(result);
+    if (result.response.status !== 202 || response.message.id !== messageID || response.message.conversation_id !== conversationID) {
+      throw new Error('取消消息响应与当前项目会话不匹配。');
+    }
+    return response;
   },
 };

@@ -4,11 +4,13 @@ package runtimeactions
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -41,6 +43,316 @@ func TestCgroupPopulated(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTaskWorkspaceManifestSHA256IsStableAndTracksMutation(t *testing.T) {
+	rootPath := t.TempDir()
+	if err := os.Mkdir(filepath.Join(rootPath, "src"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rootPath, "src", "main.go"), []byte("package main\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(rootPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+
+	first, err := taskWorkspaceManifestSHA256(context.Background(), root)
+	if err != nil {
+		t.Fatalf("first manifest digest: %v", err)
+	}
+	second, err := taskWorkspaceManifestSHA256(context.Background(), root)
+	if err != nil {
+		t.Fatalf("second manifest digest: %v", err)
+	}
+	if first == "" || first != second {
+		t.Fatalf("stable Workspace digests differ: %q != %q", first, second)
+	}
+	if err := os.WriteFile(filepath.Join(rootPath, "src", "main.go"), []byte("package main\nfunc main() {}\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := taskWorkspaceManifestSHA256(context.Background(), root)
+	if err != nil {
+		t.Fatalf("changed manifest digest: %v", err)
+	}
+	if changed == first {
+		t.Fatal("Workspace content mutation did not change the manifest digest")
+	}
+}
+
+func TestTaskWorkspaceManifestSHA256FailsClosedOnSpecialFile(t *testing.T) {
+	rootPath := t.TempDir()
+	if err := syscall.Mkfifo(filepath.Join(rootPath, "pipe"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(rootPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	if digest, err := taskWorkspaceManifestSHA256(context.Background(), root); err == nil || digest != "" {
+		t.Fatalf("special file produced a manifest proof: digest=%q err=%v", digest, err)
+	}
+}
+
+func TestTaskWorkspaceManifestSHA256FailsClosedOnScanError(t *testing.T) {
+	root, err := os.OpenRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := root.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if digest, err := taskWorkspaceManifestSHA256(context.Background(), root); err == nil || digest != "" {
+		t.Fatalf("closed root produced a manifest proof: digest=%q err=%v", digest, err)
+	}
+}
+
+func TestShellTaskWorkspaceResultPreservesOutputAndSnapshotIdentity(t *testing.T) {
+	revision := int64(0)
+	result := shellTaskWorkspaceResult{
+		ExitCode: 7, Stdout: "stdout", Stderr: "stderr", StdoutTruncated: true, StderrTruncated: false, TimedOut: true,
+		TaskID: "q1234567", WorkspaceID: "w1234567", BindingVersion: 3, WorkspaceViewID: "v" + strings.Repeat("a", 64),
+		WorkspaceCheckpointRevision:   &revision,
+		WorkspaceManifestSHA256Before: strings.Repeat("b", 64), WorkspaceManifestSHA256After: strings.Repeat("c", 64),
+		WorkspaceSnapshotSHA256Before: strings.Repeat("d", 64), WorkspaceSnapshotSHA256After: strings.Repeat("e", 64),
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(encoded, &got); err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]any{
+		"exit_code": float64(7), "stdout": "stdout", "stderr": "stderr", "stdout_truncated": true,
+		"stderr_truncated": false, "timed_out": true, "task_id": "q1234567", "workspace_id": "w1234567",
+		"binding_version": float64(3), "workspace_view_id": "v" + strings.Repeat("a", 64),
+		"workspace_checkpoint_revision": float64(0), "workspace_manifest_sha256_before": strings.Repeat("b", 64),
+		"workspace_manifest_sha256_after":  strings.Repeat("c", 64),
+		"workspace_snapshot_sha256_before": strings.Repeat("d", 64),
+		"workspace_snapshot_sha256_after":  strings.Repeat("e", 64),
+	} {
+		if got[key] != want {
+			t.Errorf("result field %q = %#v, want %#v", key, got[key], want)
+		}
+	}
+	legacyEncoded, err := json.Marshal(shellResult{ExitCode: 0, Stdout: "legacy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var legacy map[string]any
+	if err := json.Unmarshal(legacyEncoded, &legacy); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{
+		"task_id", "workspace_id", "binding_version", "workspace_view_id", "workspace_checkpoint_revision",
+		"workspace_manifest_sha256_before", "workspace_manifest_sha256_after",
+		"workspace_snapshot_sha256_before", "workspace_snapshot_sha256_after",
+	} {
+		if _, ok := legacy[key]; ok {
+			t.Errorf("non-Task shell result unexpectedly includes %q", key)
+		}
+	}
+}
+
+func TestGoTestASTInventoryMatchesOneStructuredExecutionWithoutListingSideEffects(t *testing.T) {
+	workspacePath := t.TempDir()
+	packagePath := "example.test/pkg/one"
+	noTestPackagePath := "example.test/pkg/empty"
+	if err := os.MkdirAll(filepath.Join(workspacePath, "pkg", "one"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(workspacePath, "pkg", "empty"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, contents := range map[string]string{
+		"pkg/one/one_test.go":      "package one\nimport \"testing\"\nfunc TestAlpha(t *testing.T) {}\n",
+		"pkg/one/external_test.go": "package one_test\nimport check \"testing\"\nfunc TestExternal(t *check.T) {}\n",
+	} {
+		if err := os.WriteFile(filepath.Join(workspacePath, name), []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	root, err := os.OpenRoot(workspacePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	listed := strings.Join([]string{
+		`{"ImportPath":"` + packagePath + `","Dir":"` + filepath.Join("/workspace", "pkg/one") + `","Name":"one","TestGoFiles":["one_test.go"],"XTestGoFiles":["external_test.go"]}`,
+		`{"ImportPath":"` + noTestPackagePath + `","Dir":"` + filepath.Join("/workspace", "pkg/empty") + `","Name":"empty"}`,
+	}, "\n")
+	source, _, _, ok := parseGoSourceInventory(listed, "/workspace", "/workspace")
+	if !ok || len(source.all) != 2 || len(source.testBearing) != 1 {
+		t.Fatalf("source inventory=(%+v,%v)", source, ok)
+	}
+	discovered, sourceDigest, sourceCount, ok := scanGoTestSourceFiles(root, source)
+	if !ok || sourceDigest == "" || sourceCount != 2 || len(flattenGoTestInventory(discovered)) != 2 {
+		t.Fatalf("AST inventory=(%v,%q,%d,%v)", discovered, sourceDigest, sourceCount, ok)
+	}
+
+	runEvents := []goTestEvent{
+		{Action: "start", Package: packagePath},
+		{Action: "run", Package: packagePath, Test: "TestAlpha"},
+		{Action: "run", Package: packagePath, Test: "TestAlpha/sub"},
+		{Action: "pass", Package: packagePath, Test: "TestAlpha/sub"},
+		{Action: "pass", Package: packagePath, Test: "TestAlpha"},
+		{Action: "run", Package: packagePath, Test: "TestExternal"},
+		{Action: "pass", Package: packagePath, Test: "TestExternal"},
+		{Action: "output", Package: packagePath, Output: "PASS\n"},
+		{Action: "output", Package: packagePath, Output: "ok  \t" + packagePath + "\t0.001s\n"},
+		{Action: "pass", Package: packagePath},
+		{Action: "start", Package: noTestPackagePath},
+		{Action: "output", Package: noTestPackagePath, Output: "? " + noTestPackagePath + " [no test files]\n"},
+		{Action: "skip", Package: noTestPackagePath},
+	}
+	executed, executedPackages, stats, ok := parseGoTestRun(encodeGoTestEvents(t, runEvents), discovered, source)
+	if !ok || stats.passed != 3 || stats.failed != 0 || stats.skipped != 0 || len(executedPackages) != 1 || !executedPackages[packagePath] {
+		t.Fatalf("execution inventory=(%v,%v,%+v,%v)", executed, executedPackages, stats, ok)
+	}
+	if !sameStringSet(flattenGoTestInventory(discovered), flattenGoTestInventory(executed)) {
+		t.Fatalf("discovered roots %v do not match executed roots %v", discovered, executed)
+	}
+}
+
+func TestGoTestASTInventoryFailsClosedForUnsupportedDefinitions(t *testing.T) {
+	for _, sourceText := range []string{
+		"package pkg\nimport \"testing\"\nfunc TestAlpha() {}\n",
+		"package pkg\nfunc ExampleAlpha() {}\n",
+		"package pkg\nimport \"testing\"\nfunc TestMain(m *testing.M) {}\n",
+	} {
+		t.Run(strings.ReplaceAll(sourceText, "\n", "_"), func(t *testing.T) {
+			workspace := t.TempDir()
+			if err := os.WriteFile(filepath.Join(workspace, "pkg_test.go"), []byte(sourceText), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			root, err := os.OpenRoot(workspace)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer root.Close()
+			inventory := goSourceInventory{
+				all: map[string]goPackageInventory{"example.test/pkg": {
+					importPath: "example.test/pkg", relativeDir: ".", testGoFiles: []string{"pkg_test.go"},
+				}},
+				testBearing: map[string]bool{"example.test/pkg": true},
+			}
+			if tests, _, _, ok := scanGoTestSourceFiles(root, inventory); ok {
+				t.Fatalf("unsupported source unexpectedly produced inventory: %v", tests)
+			}
+		})
+	}
+}
+
+func TestGoTestRunParserFailsClosedOnIncompleteOrSkippedEvents(t *testing.T) {
+	packagePath := "example.test/pkg"
+	source := goSourceInventory{
+		all: map[string]goPackageInventory{packagePath: {
+			importPath: packagePath, relativeDir: ".", testGoFiles: []string{"pkg_test.go"},
+		}},
+		testBearing: map[string]bool{packagePath: true},
+	}
+	discovered := map[string]map[string]bool{packagePath: {"TestAlpha": true}}
+	for _, test := range []struct {
+		name   string
+		output string
+	}{
+		{name: "missing terminal", output: encodeGoTestEvents(t, []goTestEvent{
+			{Action: "start", Package: packagePath}, {Action: "run", Package: packagePath, Test: "TestAlpha"}, {Action: "pass", Package: packagePath},
+		})},
+		{name: "unknown event", output: encodeGoTestEvents(t, []goTestEvent{
+			{Action: "start", Package: packagePath}, {Action: "bogus", Package: packagePath},
+		})},
+		{name: "malformed trailing json", output: encodeGoTestEvents(t, []goTestEvent{
+			{Action: "start", Package: packagePath}, {Action: "run", Package: packagePath, Test: "TestAlpha"},
+			{Action: "pass", Package: packagePath, Test: "TestAlpha"}, {Action: "pass", Package: packagePath},
+		}) + `{"Action":`},
+		{name: "test before package start", output: encodeGoTestEvents(t, []goTestEvent{
+			{Action: "run", Package: packagePath, Test: "TestAlpha"},
+		})},
+		{name: "event after package terminal", output: encodeGoTestEvents(t, []goTestEvent{
+			{Action: "start", Package: packagePath}, {Action: "run", Package: packagePath, Test: "TestAlpha"},
+			{Action: "pass", Package: packagePath, Test: "TestAlpha"}, {Action: "pass", Package: packagePath},
+			{Action: "output", Package: packagePath, Output: "PASS\n"},
+		})},
+		{name: "duplicate package start", output: encodeGoTestEvents(t, []goTestEvent{
+			{Action: "start", Package: packagePath}, {Action: "start", Package: packagePath},
+		})},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, _, _, valid := parseGoTestRun(test.output, discovered, source); valid {
+				t.Fatal("incomplete runner events produced a valid inventory")
+			}
+		})
+	}
+
+	skipEvents := []goTestEvent{
+		{Action: "start", Package: packagePath},
+		{Action: "run", Package: packagePath, Test: "TestAlpha"},
+		{Action: "skip", Package: packagePath, Test: "TestAlpha"},
+		{Action: "pass", Package: packagePath},
+	}
+	_, _, stats, valid := parseGoTestRun(encodeGoTestEvents(t, skipEvents), discovered, source)
+	if !valid || stats.skipped != 1 {
+		t.Fatalf("skip event parse=(%+v,%v), want one recorded skip", stats, valid)
+	}
+}
+
+func TestTrustedGoVersionRequiresAndReturnsCompleteOutput(t *testing.T) {
+	version, ok := parseTrustedGoVersion("go version go1.25.3 linux/amd64\n", "", 0, false, false, true)
+	if !ok || version != "go version go1.25.3 linux/amd64" {
+		t.Fatalf("version=(%q,%v), want complete go version output", version, ok)
+	}
+	for _, stdout := range []string{
+		"go1.25.3 linux/amd64\n",
+		"go version go1.25.3 linux/amd64",
+		"go version go1.25.3 linux/amd64\nextra\n",
+	} {
+		if version, ok := parseTrustedGoVersion(stdout, "", 0, false, false, true); ok {
+			t.Fatalf("incomplete version output %q accepted as %q", stdout, version)
+		}
+	}
+}
+
+func TestTrustedGoStageKeepsVisibleAndParserCaptureLimitsSeparate(t *testing.T) {
+	stage := newShellGoStageResult(4, 8)
+	if _, err := stage.stdoutWriter().Write([]byte("123456")); err != nil {
+		t.Fatal(err)
+	}
+	if got := stage.stdout.String(); got != "123456" || stage.stdout.truncated {
+		t.Fatalf("parser capture=(%q,truncated=%v), want complete 6-byte capture", got, stage.stdout.truncated)
+	}
+	if got := stage.visibleStdout.String(); got != "1234" || !stage.visibleStdout.truncated {
+		t.Fatalf("visible output=(%q,truncated=%v), want bounded 4-byte prefix", got, stage.visibleStdout.truncated)
+	}
+	stage.clean = true
+	if !successfulTrustedGoStage(stage) {
+		t.Fatal("user-visible truncation incorrectly invalidated complete internal parser capture")
+	}
+
+	truncatedCapture := newShellGoStageResult(4, 5)
+	_, _ = truncatedCapture.stdoutWriter().Write([]byte("123456"))
+	truncatedCapture.clean = true
+	if successfulTrustedGoStage(truncatedCapture) {
+		t.Fatal("internal parser capture truncation was treated as complete")
+	}
+}
+
+func encodeGoTestEvents(t *testing.T, events []goTestEvent) string {
+	t.Helper()
+	lines := make([]string, 0, len(events))
+	for _, event := range events {
+		encoded, err := json.Marshal(event)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines = append(lines, string(encoded))
+	}
+	return strings.Join(lines, "\n") + "\n"
 }
 
 func TestCreateOperationGroupFailsClosedOnOrdinaryFilesystem(t *testing.T) {

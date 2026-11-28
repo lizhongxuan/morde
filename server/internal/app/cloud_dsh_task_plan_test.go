@@ -13,6 +13,9 @@ func TestCloudDSHTaskPlanDefinitionAndEventFence(t *testing.T) {
 	}
 	plan := task.Plan{TaskRevision: 2, Revision: 1, Goal: "Prepare report", CostEstimateState: "unknown", Steps: []task.PlanStep{
 		{ID: "sources", Title: "Collect sources", Description: "", DependsOn: []string{}, Outputs: []string{"source notes"}, CompletionCriteria: []string{"sources are cited"}, Status: task.PlanStepPending},
+		{ID: "verify", Title: "Run focused tests", Status: task.PlanStepPending,
+			VerificationCheck: &task.PlanVerificationCheck{Kind: task.PlanVerificationCheckTest, Basis: task.PlanVerificationCheckRiskSelected,
+				Command: "go test ./server/internal/app -run TestReport", CoveragePaths: []string{"server/internal/app"}}},
 	}}
 	commit := CloudDSHTaskPlanCommit{TaskID: "q1234567", OwnerID: "u1234567", AgentSessionID: "session-plan",
 		AuthorizationVersion: 3, CallID: "call-plan", Plan: plan}

@@ -197,6 +197,35 @@ func TestCloudDSHGoalAndScheduleToolDefinitionsArePersonalAndValid(t *testing.T)
 			t.Errorf("missing schedule tool %q", name)
 		}
 	}
+	for _, name := range []string{cloudDSHScheduleCreateToolName, cloudDSHScheduleUpdateToolName} {
+		var definition AgentToolDefinition
+		for _, candidate := range definitions {
+			if candidate.Name == name {
+				definition = candidate
+				break
+			}
+		}
+		var schema struct {
+			Properties map[string]json.RawMessage `json:"properties"`
+			Required   []string                   `json:"required"`
+		}
+		if err := json.Unmarshal(definition.Parameters, &schema); err != nil {
+			t.Fatalf("decode %s schema: %v", name, err)
+		}
+		var intent struct {
+			Type string   `json:"type"`
+			Enum []string `json:"enum"`
+		}
+		if err := json.Unmarshal(schema.Properties["file_delivery_intent"], &intent); err != nil ||
+			intent.Type != "string" || strings.Join(intent.Enum, ",") != "none,required,unclear" {
+			t.Fatalf("%s file_delivery_intent schema = %+v; err=%v", name, intent, err)
+		}
+		for _, required := range schema.Required {
+			if required == "file_delivery_intent" {
+				t.Fatalf("%s requires optional file_delivery_intent", name)
+			}
+		}
+	}
 }
 
 func TestCloudDSHGoalContextAcceptsSubmitScopeButRejectsUnknownScope(t *testing.T) {
@@ -366,6 +395,12 @@ func TestCloudDSHScheduleToolsUseScheduleServiceIdempotencyAndActionFlow(t *test
 	if !ok || !schedule.ValidID(scheduleID) {
 		t.Fatalf("schedule create result = %s", first.Output)
 	}
+	if got := store.values[scheduleID].FileDeliveryIntent; got != task.FileDeliveryNone {
+		t.Fatalf("omitted create file_delivery_intent = %q, want none", got)
+	}
+	if got := created["file_delivery_intent"]; got != string(task.FileDeliveryNone) {
+		t.Fatalf("schedule summary file_delivery_intent = %v, want none", got)
+	}
 	list := ModelToolCall{CallID: "call_schedule_list_1", Name: cloudDSHScheduleListToolName,
 		Arguments: `{"status":"all","limit":10,"cursor":""}`}
 	if _, err := broker.execute(context.Background(), claimed, list, false, nil); err != nil || store.listOwner != claimed.OwnerID {
@@ -375,6 +410,9 @@ func TestCloudDSHScheduleToolsUseScheduleServiceIdempotencyAndActionFlow(t *test
 		Arguments: fmt.Sprintf(`{"schedule_id":%q,"expected_version":1,"title":"更新后的复盘","objective":null,"timing":null}`, scheduleID)}
 	if _, err := broker.execute(context.Background(), claimed, update, false, nil); err != nil || store.updateCalls != 1 {
 		t.Fatalf("schedule update err=%v update calls=%d", err, store.updateCalls)
+	}
+	if got := store.updatedValue.FileDeliveryIntent; got != task.FileDeliveryNone {
+		t.Fatalf("omitted update file_delivery_intent changed to %q, want inherited none", got)
 	}
 	action := ModelToolCall{CallID: "call_schedule_action_1", Name: cloudDSHScheduleActionToolName,
 		Arguments: fmt.Sprintf(`{"schedule_id":%q,"expected_version":2,"action":"disable","current_run_action":""}`, scheduleID)}
@@ -461,5 +499,49 @@ func TestCloudDSHScheduleCreateRejectsInvalidTimingBeforeStoreMutation(t *testin
 	}
 	if store.createCalls != 0 {
 		t.Fatal("invalid schedule timing reached schedule store")
+	}
+}
+
+func TestCloudDSHScheduleToolsPassExplicitFileDeliveryIntentWithoutTextClassification(t *testing.T) {
+	broker, _, claimed, _, store := cloudDSHGoalScheduleTaskFixture(t)
+	runAt := time.Now().UTC().Add(24 * time.Hour).Truncate(time.Second).Format(time.RFC3339)
+	create := ModelToolCall{CallID: "call_schedule_intent_create", Name: cloudDSHScheduleCreateToolName,
+		Arguments: fmt.Sprintf(`{"title":"文件请求明确为 none","objective":"Generate a report file and save it to Workspace","file_delivery_intent":"none","timing":{"kind":"once","run_at":%q,"starts_on":"","local_time":"","time_zone":"UTC","weekdays":[],"interval_hours":0,"anchor_at":""}}`, runAt)}
+	created, err := broker.execute(context.Background(), claimed, create, false, nil)
+	if err != nil {
+		t.Fatalf("explicit none was reclassified from objective text: %v", err)
+	}
+	var result struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(created.Output), &result); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.values[result.ID].FileDeliveryIntent; got != task.FileDeliveryNone {
+		t.Fatalf("explicit create file_delivery_intent = %q, want none", got)
+	}
+
+	invalid := ModelToolCall{CallID: "call_schedule_intent_invalid", Name: cloudDSHScheduleCreateToolName,
+		Arguments: fmt.Sprintf(`{"title":"bad intent","objective":"explain","file_delivery_intent":"maybe","timing":{"kind":"once","run_at":%q,"starts_on":"","local_time":"","time_zone":"UTC","weekdays":[],"interval_hours":0,"anchor_at":""}}`, runAt)}
+	if _, err := broker.execute(context.Background(), claimed, invalid, false, nil); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("invalid create intent error = %v, want invalid argument", err)
+	}
+	if store.createCalls != 1 {
+		t.Fatalf("invalid create intent reached schedule store; create calls=%d", store.createCalls)
+	}
+
+	unsupported := ModelToolCall{CallID: "call_schedule_intent_required", Name: cloudDSHScheduleCreateToolName,
+		Arguments: fmt.Sprintf(`{"title":"hostless required","objective":"prepare the task result","file_delivery_intent":"required","timing":{"kind":"once","run_at":%q,"starts_on":"","local_time":"","time_zone":"UTC","weekdays":[],"interval_hours":0,"anchor_at":""}}`, runAt)}
+	if _, err := broker.execute(context.Background(), claimed, unsupported, false, nil); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("hostless required intent error = %v, want service invalid argument", err)
+	}
+	if store.createCalls != 1 {
+		t.Fatalf("hostless required intent reached schedule store; create calls=%d", store.createCalls)
+	}
+
+	intentOnlyUpdate := ModelToolCall{CallID: "call_schedule_intent_update", Name: cloudDSHScheduleUpdateToolName,
+		Arguments: fmt.Sprintf(`{"schedule_id":%q,"expected_version":1,"title":null,"objective":null,"file_delivery_intent":"none","timing":null}`, result.ID)}
+	if _, err := broker.execute(context.Background(), claimed, intentOnlyUpdate, false, nil); err != nil || store.updateCalls != 1 {
+		t.Fatalf("file_delivery_intent-only update err=%v update calls=%d", err, store.updateCalls)
 	}
 }

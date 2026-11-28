@@ -19,6 +19,7 @@ type ModelCall = Awaited<ReturnType<typeof portalApi.adminUserModelCalls>>['item
 
 const modelUsageSourceLabel: Record<UnknownModelCall['source'], string> = {
   client: '客户端', chat: '对话', task: '云端任务', route: '消息分流', probe: '连接检查', compaction: '摘要压缩',
+  review: '任务验证', terminal_delivery: '任务终态说明',
 };
 
 function UserResourceEditor({ user }: { user: AdminUser }) {
@@ -50,8 +51,9 @@ function UserResourceEditor({ user }: { user: AdminUser }) {
 function UnknownModelCallEditor({ item, ownerID }: { item: UnknownModelCall; ownerID: string }) {
   const client = useQueryClient();
   const { notify } = useToast();
-  const [inputTokens, setInputTokens] = useState('');
-  const [outputTokens, setOutputTokens] = useState('');
+  const overage = item.adaptive_budget_overage;
+  const [inputTokens, setInputTokens] = useState(String(overage?.reported_input_tokens ?? ''));
+  const [outputTokens, setOutputTokens] = useState(String(overage?.reported_output_tokens ?? ''));
   const [evidence, setEvidence] = useState('');
   const queryKey = ['admin', 'model-usage', ownerID];
   const reconcile = useMutation({
@@ -73,6 +75,15 @@ function UnknownModelCallEditor({ item, ownerID }: { item: UnknownModelCall; own
   return <article className="form-card form-stack">
     <div><strong>{item.provider_model}</strong><p className="muted">{modelUsageSourceLabel[item.source]} · {formatDate(item.unknown_at)} · 预留 {item.reserved_tokens.toLocaleString()} tokens</p></div>
     <p className="muted mono">调用 {item.call_id}{item.task_id ? ` · 任务 ${item.task_id}` : ''}</p>
+    {overage && <div className="notice notice-warning" role="status">
+      <strong>自适应预算超额待核对</strong>
+      <p>签约预留：输入 {overage.reserved_input_tokens.toLocaleString()}、输出 {overage.reserved_output_tokens.toLocaleString()} tokens。</p>
+      <p>模型返回用量（尚未核对到账单）：输入 {overage.reported_input_tokens.toLocaleString()}、输出 {overage.reported_output_tokens.toLocaleString()} tokens；超出预留 {overage.input_overage_tokens.toLocaleString()} / {overage.output_overage_tokens.toLocaleString()} tokens。</p>
+      {(overage.currency || overage.reserved_micros != null || overage.reported_micros != null || overage.money_overage_micros != null) && <p>
+        项目费用（微单位）：预留 {overage.reserved_micros?.toLocaleString() ?? '—'}、模型返回 {overage.reported_micros?.toLocaleString() ?? '—'}、差额 {overage.money_overage_micros?.toLocaleString() ?? '—'} {overage.currency ?? ''}
+      </p>}
+      <p>请对照供应商记录核实输入和输出数量后再提交。提交后会按你确认的实际用量结算，即使超过预留；不会恢复丢失的模型响应。</p>
+    </div>}
     <form className="form-stack" onSubmit={submit}>
       <label htmlFor={`model-usage-input-${item.call_id}`}>核实的输入 tokens</label>
       <input id={`model-usage-input-${item.call_id}`} type="number" min="0" max={Number.MAX_SAFE_INTEGER} step="1" required value={inputTokens} onChange={(event) => setInputTokens(event.target.value)} />
@@ -80,7 +91,7 @@ function UnknownModelCallEditor({ item, ownerID }: { item: UnknownModelCall; own
       <input id={`model-usage-output-${item.call_id}`} type="number" min="0" max={Number.MAX_SAFE_INTEGER} step="1" required value={outputTokens} onChange={(event) => setOutputTokens(event.target.value)} />
       <label htmlFor={`model-usage-evidence-${item.call_id}`}>供应商记录与核对依据</label>
       <input id={`model-usage-evidence-${item.call_id}`} maxLength={512} minLength={8} required value={evidence} onChange={(event) => setEvidence(event.target.value)} placeholder="填写可关联的供应商记录，不要粘贴密钥或请求内容" />
-      <div className="form-actions"><button className="button button-primary" disabled={reconcile.isPending} type="submit">{reconcile.isPending ? '正在核对…' : '保存核对结果'}</button></div>
+      <div className="form-actions"><button className="button button-primary" disabled={reconcile.isPending} type="submit">{reconcile.isPending ? '正在核对…' : overage ? '核对并结算超额' : '保存核对结果'}</button></div>
     </form>
   </article>;
 }
@@ -204,7 +215,7 @@ function ModelUsageReconciliation({ ownerID }: { ownerID: string }) {
   });
   const networkError = useNetworkReadNotice([{ failed: query.isError, error: query.error, retry: query.refetch }], '网络异常，待核对模型用量暂时无法读取。');
   return <section className="admin-detail-section">
-    <div className="dashboard-section-heading"><div><h2>未知模型用量核对</h2><p>仅处理已确认结束、但供应商没有返回用量的调用。</p></div>
+    <div className="dashboard-section-heading"><div><h2>未知模型用量核对</h2><p>处理已结束但用量未知、或模型用量超过签约预算的调用。</p></div>
       {!opened && <button className="button button-secondary" type="button" onClick={() => setOpened(true)}>查看待核对记录</button>}
       {opened && <button className="button button-secondary" type="button" onClick={() => void query.refetch()}>刷新</button>}
     </div>
@@ -213,7 +224,7 @@ function ModelUsageReconciliation({ ownerID }: { ownerID: string }) {
     {opened && query.data && (query.data.items.length === 0
       ? <div className="empty-card compact"><p>没有待核对的模型用量。</p></div>
       : <div className="form-stack">{query.data.items.map((item) => <UnknownModelCallEditor key={`${item.owner_id}:${item.source}:${item.call_id}`} item={item} ownerID={ownerID} />)}</div>)}
-    {opened && <p className="notice notice-info">请先在供应商记录中核实准确的输入和输出数量。保存后只更新用量账本，不会恢复丢失的模型响应或重新执行调用。</p>}
+    {opened && <p className="notice notice-info">请先在供应商记录中核实准确的输入和输出数量。结算会按核实值更新用量账本；超过预算的实际用量仍会计入已用额度，不会恢复丢失的模型响应或重新执行调用。</p>}
   </section>;
 }
 

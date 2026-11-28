@@ -89,7 +89,7 @@ func TestCloudDSHInitialMessageOneByteOver128KiBIsRejectedBeforeModelOrToolCall(
 	checkpoints.pending = []app.AgentConversationMessage{{ID: messageID, Content: content, Initial: true}}
 
 	err := executor.ExecuteTask(context.Background(), value)
-	if err == nil || !strings.Contains(err.Error(), "initial conversation message does not match the Task") {
+	if err == nil || !strings.Contains(err.Error(), "initial conversation source reference is invalid") {
 		t.Fatalf("128 KiB+1 Unicode initial Task error = %v, want Worker rejection for invalid initial message size", err)
 	}
 	if len(models.calls) != 0 {
@@ -100,6 +100,36 @@ func TestCloudDSHInitialMessageOneByteOver128KiBIsRejectedBeforeModelOrToolCall(
 	}
 }
 
+func TestCloudDSHInitialMessageUsesUTF8ByteLengthsAtEightKiBBoundary(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		id    string
+		bytes int
+	}{
+		{name: "8191-bytes", id: "m8191001", bytes: 8191},
+		{name: "8192-bytes", id: "m8192001", bytes: 8192},
+		{name: "8193-bytes", id: "m8193001", bytes: 8193},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			content := cloudDSHInitialMessageAtByteLength(test.bytes)
+			if len(content) != test.bytes || !utf8.ValidString(content) || len([]rune(content)) >= len(content) {
+				t.Fatalf("initial message bytes=%d runes=%d, want valid UTF-8 with fewer runes than bytes at %d bytes",
+					len(content), len([]rune(content)), test.bytes)
+			}
+
+			executor, _, _, checkpoints, models, value := cloudDSHFixture(t)
+			value.Objective = content
+			checkpoints.pending = []app.AgentConversationMessage{{ID: test.id, Content: content, Initial: true}}
+			if err := executor.ExecuteTask(context.Background(), value); !errors.Is(err, ErrCloudDSHCompletionPending) {
+				t.Fatalf("%d-byte initial Task result = %v, want a completed model turn pending Task completion", test.bytes, err)
+			}
+			if len(models.calls) != 1 || !strings.Contains(string(models.calls[0].RawRequest), content) {
+				t.Fatalf("%d-byte UTF-8 initial message did not reach the model request intact", test.bytes)
+			}
+		})
+	}
+}
+
 func cloudDSHInitialMessageAtByteLimit(limit int) string {
 	prefix := "HEAD-锚点\n"
 	middle := "\nMIDDLE-锚点🙂\n"
@@ -107,4 +137,10 @@ func cloudDSHInitialMessageAtByteLimit(limit int) string {
 	fillerBytes := limit - len(prefix) - len(middle) - len(suffix)
 	left := fillerBytes / 2
 	return prefix + strings.Repeat("a", left) + middle + strings.Repeat("b", fillerBytes-left) + suffix
+}
+
+func cloudDSHInitialMessageAtByteLength(size int) string {
+	prefix := "头🙂"
+	suffix := "🙂尾"
+	return prefix + strings.Repeat("x", size-len(prefix)-len(suffix)) + suffix
 }

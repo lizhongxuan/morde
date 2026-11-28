@@ -1,4 +1,4 @@
-import { localGatewayOrigin, type HostEmbedTarget } from "./morde-core";
+import { localGatewayOrigin, tracedFetch, type HostEmbedTarget } from "./morde-core";
 
 export type ExchangedHostEmbedSession = {
   url: string;
@@ -17,7 +17,7 @@ export async function exchangeHostEmbedTicket(exchangeURLInput: string, expected
   }
   let response: Response;
   try {
-    response = await fetcher(exchangeURL, {
+    response = await tracedFetch(fetcher, exchangeURL, {
       method: "POST", redirect: "manual", signal: AbortSignal.timeout(15_000),
       headers: { origin: portalOriginInput, accept: "text/html", "content-type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({ ticket, embed_nonce: nonce }),
@@ -25,7 +25,11 @@ export async function exchangeHostEmbedTicket(exchangeURLInput: string, expected
   } catch {
     throw new Error("无法连接指定云端电脑，请重试。");
   }
-  if (response.status !== 303) throw new Error(`Host embed exchange failed (HTTP ${response.status})`);
+  if (response.status !== 303) {
+    const traceID = response.headers.get("x-trace-id");
+    const reference = traceID && /^[0-9a-f]{32}$/.test(traceID) ? `; trace ID ${traceID}` : "";
+    throw new Error(`Host embed exchange failed (HTTP ${response.status})${reference}`);
+  }
   const location = response.headers.get("location");
   if (!location) throw new Error("Host embed exchange omitted its Workbench location");
   const targetURL = new URL(location, exchangeURL);

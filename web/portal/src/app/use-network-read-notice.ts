@@ -13,6 +13,7 @@ export function useNetworkReadNotice(failures: readonly NetworkReadFailure[], me
   const failuresRef = useRef(failures);
   const hasNetworkFailure = failures.some((failure) => failure.failed && isTransientNetworkError(failure.error));
   const noticeID = useRef<number | null>(null);
+  const previouslyHadNetworkFailure = useRef(false);
   const retry = useCallback(() => {
     for (const failure of failuresRef.current) {
       if (failure.failed && isTransientNetworkError(failure.error)) void failure.retry();
@@ -23,14 +24,21 @@ export function useNetworkReadNotice(failures: readonly NetworkReadFailure[], me
 
   useEffect(() => {
     if (!hasNetworkFailure) {
+      if (previouslyHadNetworkFailure.current) window.dispatchEvent(new CustomEvent('morde:api-network-recovered', { detail: { source: 'read' } }));
+      previouslyHadNetworkFailure.current = false;
       if (noticeID.current !== null) dismiss(noticeID.current);
       noticeID.current = null;
     } else if (noticeID.current === null) {
+      previouslyHadNetworkFailure.current = true;
+      window.dispatchEvent(new CustomEvent('morde:api-network-error', { detail: { source: 'read' } }));
       noticeID.current = notify(message, 'error', { label: '重试', onClick: retry });
+    } else {
+      previouslyHadNetworkFailure.current = true;
     }
   }, [dismiss, hasNetworkFailure, message, notify, retry]);
 
   useEffect(() => () => {
+    if (previouslyHadNetworkFailure.current) window.dispatchEvent(new CustomEvent('morde:api-network-recovered', { detail: { source: 'read' } }));
     if (noticeID.current !== null) dismiss(noticeID.current);
   }, [dismiss]);
 

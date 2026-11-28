@@ -385,6 +385,7 @@ func validStoredSchedule(t *testing.T, status schedule.Status) schedule.Schedule
 	return schedule.Schedule{
 		ID: "j1234567", OwnerID: "u1234567", Version: 4, Status: status, ExecutionEpoch: 1,
 		HostID: "h1234567", ModelID: "model-a", Title: "Weekly goal", Objective: "check the weekly goal", Timing: timing,
+		FileDeliveryIntent: task.FileDeliveryNone,
 		Budget:             task.Budget{ActiveSeconds: 300, ToolCalls: 12, ModelTokens: 9000},
 		Authorization:      task.Authorization{Kind: string(identity.KindSession), TokenID: "t1234567"},
 		MisfirePolicy:      schedule.MisfireSkip,
@@ -405,6 +406,7 @@ func storedDailyScheduleForProcessing(t *testing.T, policy schedule.MisfirePolic
 	return schedule.Schedule{
 		ID: "j1234567", OwnerID: "u1234567", Version: 2, Status: schedule.StatusEnabled, ExecutionEpoch: 3,
 		HostID: "h1234567", ModelID: "model-a", Title: "Weekly goal", Objective: "check the weekly goal", Timing: timing,
+		FileDeliveryIntent: task.FileDeliveryNone,
 		Budget:             task.Budget{ActiveSeconds: 300, ToolCalls: 12, ModelTokens: 9000},
 		Authorization:      task.Authorization{Kind: string(identity.KindSession), TokenID: "t1234567"},
 		MisfirePolicy:      policy,
@@ -622,6 +624,7 @@ func TestScheduleCreateAppliesDefaultsAndUsesIdempotencyRecord(t *testing.T) {
 	}
 	if !schedule.ValidID(created.ID) || created.OwnerID != principal.UserID || created.Status != schedule.StatusEnabled ||
 		created.Version != 1 || created.MisfirePolicy != schedule.MisfireSkip ||
+		created.FileDeliveryIntent != task.FileDeliveryNone ||
 		!reflect.DeepEqual(created.NotificationEvents, []schedule.NotificationEvent{schedule.NotifyCompleted, schedule.NotifyFailed, schedule.NotifyWaitingUser}) ||
 		created.NextOccurrenceKey == "" || created.NextCheckAt == nil || created.ExecutionEpoch < 1 {
 		t.Fatalf("created Schedule missing normalized state/defaults: %#v", created)
@@ -647,6 +650,36 @@ func TestScheduleCreateAppliesDefaultsAndUsesIdempotencyRecord(t *testing.T) {
 	changed.Objective = "different request"
 	if _, err := service.Create(context.Background(), principal, changed, "schedule-create-001"); domain.CodeOf(err) != domain.CodeIdempotencyConflict {
 		t.Fatalf("Create() reused key with changed request error = %v", err)
+	}
+}
+
+func TestScheduleCreateRequiresExplicitPersonalRuleSelectionAndHashesIt(t *testing.T) {
+	store := newScheduleServiceStoreFake()
+	service := newTestScheduleService(t, store, &scheduleServiceAuthorizerFake{}, &scheduleServiceModelCatalogFake{configured: true})
+	principal := scheduleServicePrincipal()
+
+	plain := validScheduleCommand()
+	createdPlain, err := service.Create(context.Background(), principal, plain, "schedule-rule-opt-in-plain")
+	if err != nil || createdPlain.PersonalRule != nil || store.values[createdPlain.ID].PersonalRule != nil {
+		t.Fatalf("schedule without explicit rule selection = %#v, %v; want no binding", createdPlain.PersonalRule, err)
+	}
+
+	selected := validScheduleCommand()
+	selected.PersonalRule = &schedule.PersonalRuleSelection{CandidateID: "r_00000001", CandidateRevision: 3}
+	created, err := service.Create(context.Background(), principal, selected, "schedule-rule-opt-in-selected")
+	if err != nil || created.PersonalRule == nil || created.PersonalRule.CandidateID != selected.PersonalRule.CandidateID ||
+		created.PersonalRule.CandidateRevision != selected.PersonalRule.CandidateRevision ||
+		created.PersonalRule.SourceMemoryID != "" || created.PersonalRule.SourceMemoryRevision != 0 {
+		t.Fatalf("explicit schedule rule selection = %#v, %v; want only caller-selected candidate identity", created.PersonalRule, err)
+	}
+	if stored := store.values[created.ID].PersonalRule; stored == nil || *stored != *created.PersonalRule {
+		t.Fatalf("schedule store input personal rule = %#v, want %#v", stored, created.PersonalRule)
+	}
+
+	changed := selected
+	changed.PersonalRule = &schedule.PersonalRuleSelection{CandidateID: "r_00000001", CandidateRevision: 4}
+	if _, err := service.Create(context.Background(), principal, changed, "schedule-rule-opt-in-selected"); domain.CodeOf(err) != domain.CodeIdempotencyConflict {
+		t.Fatalf("reusing schedule idempotency key with changed rule revision error = %v, want idempotency_conflict", err)
 	}
 }
 
@@ -749,7 +782,7 @@ func TestScheduleCreateAcceptsHostlessModelOnlyAndRejectsHostCapabilities(t *tes
 		{
 			name: "workspace file request",
 			mutate: func(value *CreateScheduleCommand) {
-				value.Objective = "Create a PDF report"
+				value.FileDeliveryIntent = task.FileDeliveryRequired
 			},
 		},
 	} {
@@ -771,6 +804,35 @@ func TestScheduleCreateAcceptsHostlessModelOnlyAndRejectsHostCapabilities(t *tes
 	}
 }
 
+func TestScheduleFileDeliveryIntentDoesNotUseObjectiveText(t *testing.T) {
+	store := newScheduleServiceStoreFake()
+	service := newTestScheduleService(t, store, &scheduleServiceAuthorizerFake{}, &scheduleServiceModelCatalogFake{configured: true})
+	command := validScheduleCommand()
+	command.Objective = "Create a PDF report in the Workspace"
+
+	created, err := service.Create(context.Background(), scheduleServicePrincipal(), command, "schedule-intent-no-text-classify")
+	if err != nil || created.FileDeliveryIntent != task.FileDeliveryNone || store.createCalls != 1 {
+		t.Fatalf("objective text changed structured intent: schedule=%#v calls=%d err=%v", created, store.createCalls, err)
+	}
+}
+
+func TestScheduleCreateRejectsUnresolvedOrUnsupportedFileDeliveryIntent(t *testing.T) {
+	for _, intent := range []task.FileDeliveryIntent{task.FileDeliveryRequired, task.FileDeliveryUnclear} {
+		t.Run(string(intent), func(t *testing.T) {
+			store := newScheduleServiceStoreFake()
+			service := newTestScheduleService(t, store, &scheduleServiceAuthorizerFake{}, &scheduleServiceModelCatalogFake{configured: true})
+			command := validScheduleCommand()
+			command.FileDeliveryIntent = intent
+			if _, err := service.Create(context.Background(), scheduleServicePrincipal(), command, "schedule-intent-unsupported"); domain.CodeOf(err) != domain.CodeInvalidArgument {
+				t.Fatalf("Create() intent %q error = %v, want invalid_argument", intent, err)
+			}
+			if store.createCalls != 0 {
+				t.Fatalf("unsupported intent reached store %d times", store.createCalls)
+			}
+		})
+	}
+}
+
 func TestScheduleUpdateCanUnbindOnlyWithoutHostCapabilities(t *testing.T) {
 	store := newScheduleServiceStoreFake()
 	original := validStoredSchedule(t, schedule.StatusEnabled)
@@ -778,8 +840,8 @@ func TestScheduleUpdateCanUnbindOnlyWithoutHostCapabilities(t *testing.T) {
 	authorizer := &scheduleServiceAuthorizerFake{}
 	service := newTestScheduleService(t, store, authorizer, &scheduleServiceModelCatalogFake{configured: true})
 	noHost := ""
-	fileObjective := "Create a PDF report"
-	command := UpdateScheduleCommand{ExpectedVersion: original.Version, HostID: &noHost, Objective: &fileObjective}
+	fileIntent := task.FileDeliveryRequired
+	command := UpdateScheduleCommand{ExpectedVersion: original.Version, HostID: &noHost, FileDeliveryIntent: &fileIntent}
 	if _, err := service.Update(context.Background(), scheduleServicePrincipal(), original.ID, command, "schedule-hostless-update-001"); domain.CodeOf(err) != domain.CodeInvalidArgument {
 		t.Fatalf("Update() unbound workspace request error = %v, want invalid_argument", err)
 	}
@@ -789,6 +851,7 @@ func TestScheduleUpdateCanUnbindOnlyWithoutHostCapabilities(t *testing.T) {
 
 	objective := "Check the goal and answer in chat"
 	command.Objective = &objective
+	command.FileDeliveryIntent = nil
 	updated, err := service.Update(context.Background(), scheduleServicePrincipal(), original.ID, command, "schedule-hostless-update-002")
 	if err != nil || updated.HostID != "" || updated.Objective != objective || authorizer.actionCalls != 0 {
 		t.Fatalf("Update() hostless model schedule = %#v, %v; host authorization=%d", updated, err, authorizer.actionCalls)
@@ -945,12 +1008,12 @@ func TestScheduleUpdateUsesExpectedVersionAndRevalidatesHostAndModel(t *testing.
 	authorizer := &scheduleServiceAuthorizerFake{}
 	models := &scheduleServiceModelCatalogFake{configured: true}
 	service := newTestScheduleService(t, store, authorizer, models)
-	newObjective := "review the updated goal"
+	newObjective := "Create a PDF report in the Workspace"
 	command := UpdateScheduleCommand{
 		ExpectedVersion: original.Version, Objective: &newObjective,
 	}
 	updated, err := service.Update(context.Background(), scheduleServicePrincipal(), original.ID, command, "schedule-update-001")
-	if err != nil || updated.Objective != newObjective || updated.Version != original.Version+1 {
+	if err != nil || updated.Objective != newObjective || updated.Version != original.Version+1 || updated.FileDeliveryIntent != task.FileDeliveryNone {
 		t.Fatalf("Update() = %#v, %v", updated, err)
 	}
 	if store.getOwner != original.OwnerID || store.updateOwner != original.OwnerID || store.updateExpected != original.Version ||

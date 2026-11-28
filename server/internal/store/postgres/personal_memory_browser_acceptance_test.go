@@ -527,7 +527,10 @@ func waitForPersonalMemoryPCElectronPID(process *personalMemoryPCProcess, timeou
 		select {
 		case exitErr := <-process.done:
 			process.done <- exitErr
-			return 0, fmt.Errorf("make pc exited before launching Electron: %v", exitErr)
+			if exitErr != nil {
+				return 0, fmt.Errorf("make pc exited before launching Electron: %w", exitErr)
+			}
+			return 0, errors.New("make pc exited successfully before launching Electron")
 		case <-ticker.C:
 		case <-deadline.C:
 			return 0, fmt.Errorf("make pc did not launch Electron within %s", timeout)
@@ -583,13 +586,19 @@ func stopPersonalMemoryPCForAcceptance(t *testing.T, process *personalMemoryPCPr
 	processGroup := -process.command.Process.Pid
 	_ = syscall.Kill(processGroup, syscall.SIGINT)
 	select {
-	case <-process.done:
+	case exitErr := <-process.done:
+		if exitErr != nil {
+			t.Logf("isolated morde-pc process exited while stopping: %v", exitErr)
+		}
 		_ = syscall.Kill(processGroup, syscall.SIGKILL)
 		return
 	case <-time.After(5 * time.Second):
 		_ = syscall.Kill(processGroup, syscall.SIGKILL)
 		select {
-		case <-process.done:
+		case exitErr := <-process.done:
+			if exitErr != nil {
+				t.Logf("isolated morde-pc process exited after forced stop: %v", exitErr)
+			}
 		case <-time.After(5 * time.Second):
 			t.Errorf("isolated morde-pc PID %d did not stop after the acceptance", process.command.Process.Pid)
 		}
