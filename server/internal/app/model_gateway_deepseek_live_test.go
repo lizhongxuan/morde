@@ -108,6 +108,21 @@ func TestDeepSeekFlashDialogueThroughMordeModelGateway(t *testing.T) {
 		}
 	})
 
+	t.Run("long output above legacy cap", func(t *testing.T) {
+		response := complete(t, app.ModelRequest{
+			Input:           []app.ModelInput{{Type: "message", Role: "user", Text: "请用中文写一篇不少于 3500 个汉字的技术科普文章，主题是分布式系统中的幂等、账本状态与崩溃恢复。分成至少 8 个小节，完整解释请求身份、幂等键、预留、派发、结算和未知结果。只写正文，不要联网、调用工具或添加链接。全文必须超过 3500 个汉字，不要用摘要代替。"}},
+			MaxOutputTokens: 4_096, DisableThinking: true,
+		})
+		if response.Usage.OutputTokens <= 2_048 {
+			t.Fatalf("long-form provider output = %d tokens; want more than 2048 (stop=%q chars=%d)",
+				response.Usage.OutputTokens, response.StopReason, len(response.Text))
+		}
+		if len(strings.TrimSpace(response.Text)) < 3_500 {
+			t.Fatalf("long-form response has only %d characters despite %d output tokens", len(response.Text), response.Usage.OutputTokens)
+		}
+		t.Logf("provider output_tokens=%d response_chars=%d stop_reason=%q", response.Usage.OutputTokens, len(response.Text), response.StopReason)
+	})
+
 	t.Run("format instruction", func(t *testing.T) {
 		response := complete(t, app.ModelRequest{
 			Input:           []app.ModelInput{{Type: "message", Role: "user", Text: "用中文给出恰好三条降低会议时长的建议，每条单独一行并以数字开头。"}},

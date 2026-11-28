@@ -104,6 +104,7 @@ func TestCloudDSHCheckpointHistoryAcceptsVerifiedCompactionReplacement(t *testin
 		{Sequence: 4, Type: "compaction/start", Data: map[string]any{"compactionId": compactionID, "turn": 1}},
 		{Sequence: 5, Type: "compaction/summary", Data: map[string]any{
 			"compactionId": compactionID, "summary": []any{map[string]any{"type": "text", "text": "verified summary"}},
+			"rawOutput": []any{map[string]any{"type": "text", "text": "verified summary"}}, "llmStreamCall": true,
 			"shadowedRange": map[string]any{"start": 2, "end": 3}, "shadowedSeqs": []int64{2, 3}, "shadowedTokenCount": 100,
 			"provider": "morde", "model": "test-model", "maxTokens": 256,
 		}},
@@ -119,6 +120,60 @@ func TestCloudDSHCheckpointHistoryAcceptsVerifiedCompactionReplacement(t *testin
 	}
 	if _, active := history.surfaceNodes[6]; !active || !history.compactions[compactionID].ended {
 		t.Fatal("verified replacement or compaction end was not recorded")
+	}
+}
+
+func TestCloudDSHCheckpointHistoryAcceptsRepeatedCompactionWithNonMonotonicSurfaceRange(t *testing.T) {
+	compactionEvent := func(sequence int64, compactionID string, start, end int64, shadowed []int64) cloudDSHCheckpointEvent {
+		return cloudDSHCheckpointEvent{Sequence: sequence, Type: "compaction/summary", Data: map[string]any{
+			"compactionId": compactionID, "summary": []any{map[string]any{"type": "text", "text": "verified summary " + compactionID}},
+			"rawOutput": []any{map[string]any{"type": "text", "text": "verified summary " + compactionID}}, "llmStreamCall": true,
+			"shadowedRange": map[string]any{"start": start, "end": end}, "shadowedSeqs": shadowed, "shadowedTokenCount": 100,
+			"provider": "morde", "model": "test-model", "maxTokens": 256,
+		}}
+	}
+	replacement := func(sequence, start, end int64, compactionID, summary string, sources []int64) cloudDSHCheckpointEvent {
+		return cloudDSHCheckpointEvent{Sequence: sequence, Type: "user/message", SurfaceOp: map[string]any{
+			"op": "replace", "startSeq": start, "endSeq": end}, SourceEventSeqs: sources, Data: map[string]any{
+			"role": "user", "source": map[string]any{"kind": "compact-checkpoint", "compactionId": compactionID},
+			"content": []any{
+				map[string]any{"type": "text", "text": cloudDSHCompactionPreamble + "\n\n<compacted-summary>"},
+				map[string]any{"type": "text", "text": summary},
+				map[string]any{"type": "text", "text": "</compacted-summary>"},
+			},
+		}}
+	}
+	firstSummary := "verified summary compact_1"
+	secondSummary := "verified summary compact_2"
+	events := []cloudDSHCheckpointEvent{
+		{Sequence: 0, Type: "system/message", SurfaceOp: "append", Data: map[string]any{"message": map[string]any{"role": "system"}}},
+		checkpointTurnStart(1, "turn/start", map[string]any{"turn": 1}),
+		{Sequence: 2, Type: "user/message", SurfaceOp: "append", Data: map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": "older request"}}}},
+		checkpointAssistantText(3, "older answer"),
+		{Sequence: 4, Type: "user/message", SurfaceOp: "append", Data: map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": "recent request"}}}},
+		{Sequence: 5, Type: "compaction/start", Data: map[string]any{"compactionId": "compact_1", "turn": 1}},
+		compactionEvent(6, "compact_1", 2, 3, []int64{2, 3}),
+		replacement(7, 2, 3, "compact_1", firstSummary, []int64{5, 6, 2, 3}),
+		{Sequence: 8, Type: "compaction/end", Data: map[string]any{"compactionId": "compact_1", "turn": 1}},
+		{Sequence: 9, Type: "user/message", SurfaceOp: "append", Data: map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": "follow-up request"}}}},
+		checkpointAssistantText(10, "follow-up answer"),
+		{Sequence: 11, Type: "compaction/start", Data: map[string]any{"compactionId": "compact_2", "turn": 1}},
+		compactionEvent(12, "compact_2", 7, 4, []int64{7, 4}),
+		replacement(13, 7, 4, "compact_2", secondSummary, []int64{11, 12, 7, 4}),
+		{Sequence: 14, Type: "compaction/end", Data: map[string]any{"compactionId": "compact_2", "turn": 1}},
+	}
+	history := newCloudDSHCheckpointHistory("session_1")
+	if err := history.append(cloudDSHCheckpointPayload("session_1", 0, events...), 0, 14); err != nil {
+		t.Fatalf("repeated compaction with a reversed numeric endpoint pair was rejected: %v", err)
+	}
+	if got := history.surfaceOrder; len(got) != 4 || got[0] != 0 || got[1] != 13 || got[2] != 9 || got[3] != 10 {
+		t.Fatalf("active DSH surface after repeated compaction = %v; want [0 13 9 10]", got)
+	}
+	if _, active := history.surfaceNodes[7]; active {
+		t.Fatal("first compacted replacement remained active after the second compaction")
+	}
+	if proof := history.compactions["compact_2"]; proof == nil || !proof.ended || proof.start != 7 || proof.end != 4 {
+		t.Fatalf("second compaction proof = %+v; want verified range 7..4", proof)
 	}
 }
 
@@ -692,6 +747,62 @@ func TestCloudDSHCheckpointHistoryRejectsRecoveredScreenshotWithoutImageBytes(t 
 	history.finishRestore()
 	if err := history.noteToolResult(callID, "desktop_screenshot", []byte(`{}`), app.AgentToolSucceeded, output, nil); err == nil {
 		t.Fatal("recovered screenshot without its authenticated image bytes was accepted")
+	}
+}
+
+func TestCloudDSHCheckpointHistoryPersistsWebResearchGuardDenialWithoutReplaying(t *testing.T) {
+	const callID = "search_guard_1"
+	const toolName = cloudDSHWebResearchSearchToolName
+	const arguments = `{"query":"today news"}`
+	event := cloudDSHCheckpointEvent{Sequence: 4, Type: "tool/result", SurfaceOp: "append", SourceEventSeqs: []int64{3}, Data: map[string]any{
+		"turn": 1, "step": 1, "message": map[string]any{"toolCallId": callID, "isError": true,
+			"source": map[string]any{"kind": "tool", "callId": callID}, "content": []any{
+				map[string]any{"type": "text", "text": "Error: web_research guard: duplicate search"}}},
+		"error": map[string]any{"name": cloudDSHWebResearchGuardErrorName, "code": cloudDSHWebResearchGuardErrorCode},
+	}}
+	history := newCloudDSHCheckpointHistory("session_1")
+	if err := history.append(cloudDSHCheckpointPayload("session_1", 0,
+		checkpointTurnStart(0, "turn/start", map[string]any{"turn": 1}),
+		checkpointTurnStart(1, "step/start", map[string]any{"turn": 1, "step": 1}),
+		checkpointAssistantTextAndTool(2, "search", callID, toolName, arguments),
+		checkpointNamedToolCall(3, callID, toolName, arguments), event), 0, 4); err != nil {
+		t.Fatalf("web research guard denial was not persisted: %v", err)
+	}
+	call := history.calls[callID]
+	if call == nil || !call.resultSeen || !call.resultGuardDenied || call.resultUnknown || !call.reconciled || !history.allCallsReconciled() {
+		t.Fatalf("guard denial was not treated as a settled no-dispatch result: %+v", call)
+	}
+	if err := history.validateRecoveryToolCall(callID, toolName, []byte(arguments)); err == nil {
+		t.Fatal("settled guard denial must not be eligible for Worker replay")
+	}
+
+	for name, mutate := range map[string]func(cloudDSHCheckpointEvent) cloudDSHCheckpointEvent{
+		"wrong marker": func(value cloudDSHCheckpointEvent) cloudDSHCheckpointEvent {
+			value.Data.(map[string]any)["error"] = map[string]any{"name": "WebResearchGuardError", "code": "OTHER"}
+			return value
+		},
+		"extra marker field": func(value cloudDSHCheckpointEvent) cloudDSHCheckpointEvent {
+			value.Data.(map[string]any)["error"] = map[string]any{"name": cloudDSHWebResearchGuardErrorName,
+				"code": cloudDSHWebResearchGuardErrorCode, "query": "private"}
+			return value
+		},
+		"missing safe prefix": func(value cloudDSHCheckpointEvent) cloudDSHCheckpointEvent {
+			message := value.Data.(map[string]any)["message"].(map[string]any)
+			message["content"] = []any{map[string]any{"type": "text", "text": "private detail"}}
+			return value
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			mutated := mutate(event)
+			bad := newCloudDSHCheckpointHistory("session_1")
+			if err := bad.append(cloudDSHCheckpointPayload("session_1", 0,
+				checkpointTurnStart(0, "turn/start", map[string]any{"turn": 1}),
+				checkpointTurnStart(1, "step/start", map[string]any{"turn": 1, "step": 1}),
+				checkpointAssistantTextAndTool(2, "search", callID, toolName, arguments),
+				checkpointNamedToolCall(3, callID, toolName, arguments), mutated), 0, 4); err == nil {
+				t.Fatal("invalid guard-denial checkpoint was accepted")
+			}
+		})
 	}
 }
 

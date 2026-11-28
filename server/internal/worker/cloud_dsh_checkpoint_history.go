@@ -21,6 +21,8 @@ const (
 	cloudDSHUnknownToolResultText         = "The tool outcome is unknown. The operation may already have happened. Do not repeat it; verify external state or ask the user before trying again."
 	cloudDSHUnknownToolResultErrorName    = "ToolOutcomeUnknownError"
 	cloudDSHUnknownToolResultErrorCode    = "TOOL_OUTCOME_UNKNOWN"
+	cloudDSHWebResearchGuardErrorName     = "WebResearchGuardError"
+	cloudDSHWebResearchGuardErrorCode     = "WEB_RESEARCH_GUARD"
 )
 
 type cloudDSHCheckpointHistory struct {
@@ -31,6 +33,7 @@ type cloudDSHCheckpointHistory struct {
 	fileWrites         map[string]struct{}
 	systemNodes        map[int64]struct{}
 	surfaceNodes       map[int64]struct{}
+	surfaceOrder       []int64
 	compactions        map[string]*cloudDSHCompactionProof
 	pendingPrune       *cloudDSHToolResultPruneProof
 	result             string
@@ -109,6 +112,7 @@ type cloudDSHToolCall struct {
 	surfaceResultData json.RawMessage
 	resultSeen        bool
 	resultUnknown     bool
+	resultGuardDenied bool
 	reconciled        bool
 	outputRecorded    bool
 }
@@ -151,6 +155,7 @@ func (h *cloudDSHCheckpointHistory) clone() *cloudDSHCheckpointHistory {
 	for sequence := range h.surfaceNodes {
 		clone.surfaceNodes[sequence] = struct{}{}
 	}
+	clone.surfaceOrder = append([]int64(nil), h.surfaceOrder...)
 	clone.compactions = make(map[string]*cloudDSHCompactionProof, len(h.compactions))
 	for id, proof := range h.compactions {
 		proofCopy := *proof
@@ -222,7 +227,7 @@ func (h *cloudDSHCheckpointHistory) append(payload []byte, from, through int64) 
 		case "system/message":
 			if surfaceOp == "append" && cloudDSHSystemMessage(event.Data) {
 				h.systemNodes[event.Sequence] = struct{}{}
-				h.surfaceNodes[event.Sequence] = struct{}{}
+				h.appendSurfaceNode(event.Sequence)
 			} else if surfaceOp == "append" {
 				return errors.New("dsh system checkpoint is invalid")
 			}
@@ -231,7 +236,7 @@ func (h *cloudDSHCheckpointHistory) append(payload []byte, from, through int64) 
 				if !cloudDSHUserMessage(event.Data) {
 					return errors.New("dsh user checkpoint is invalid")
 				}
-				h.surfaceNodes[event.Sequence] = struct{}{}
+				h.appendSurfaceNode(event.Sequence)
 			} else if !replacement && surfaceOp != "" {
 				return errors.New("dsh user checkpoint surface operation is invalid")
 			}
@@ -239,7 +244,7 @@ func (h *cloudDSHCheckpointHistory) append(payload []byte, from, through int64) 
 			if err := h.appendAssistantMessage(event.Sequence, event.Data); err != nil {
 				return err
 			}
-			h.surfaceNodes[event.Sequence] = struct{}{}
+			h.appendSurfaceNode(event.Sequence)
 		case "tool/call":
 			if err := h.appendToolCall(event.Sequence, event.Data); err != nil {
 				return err
@@ -256,7 +261,7 @@ func (h *cloudDSHCheckpointHistory) append(payload []byte, from, through int64) 
 				if err := h.appendToolResult(event.Sequence, event.Data, surfaceOp, event.SourceEventSeqs); err != nil {
 					return err
 				}
-				h.surfaceNodes[event.Sequence] = struct{}{}
+				h.appendSurfaceNode(event.Sequence)
 			}
 		case "compaction/prune":
 			if surfaceOp != "" || replacement || len(event.SourceEventSeqs) != 0 {
@@ -344,6 +349,63 @@ func cloudDSHSystemMessage(data json.RawMessage) bool {
 	return json.Unmarshal(data, &value) == nil && value.Message.Role == "system"
 }
 
+func (h *cloudDSHCheckpointHistory) appendSurfaceNode(sequence int64) {
+	h.surfaceNodes[sequence] = struct{}{}
+	h.surfaceOrder = append(h.surfaceOrder, sequence)
+}
+
+func (h *cloudDSHCheckpointHistory) surfaceRangeMatches(start, end int64, sequences []int64) bool {
+	if len(sequences) == 0 || sequences[0] != start || sequences[len(sequences)-1] != end {
+		return false
+	}
+	startIndex := -1
+	for index, sequence := range h.surfaceOrder {
+		if sequence == start {
+			startIndex = index
+			break
+		}
+	}
+	if startIndex < 0 || startIndex+len(sequences) > len(h.surfaceOrder) {
+		return false
+	}
+	for offset, sequence := range sequences {
+		if h.surfaceOrder[startIndex+offset] != sequence {
+			return false
+		}
+		if _, active := h.surfaceNodes[sequence]; !active {
+			return false
+		}
+	}
+	return true
+}
+
+func (h *cloudDSHCheckpointHistory) replaceSurfaceRange(sequences []int64, replacement int64) error {
+	if len(sequences) == 0 || !h.surfaceRangeMatches(sequences[0], sequences[len(sequences)-1], sequences) {
+		return errors.New("dsh surface replacement range is unavailable")
+	}
+	startIndex := -1
+	for index, sequence := range h.surfaceOrder {
+		if sequence == sequences[0] {
+			startIndex = index
+			break
+		}
+	}
+	if startIndex < 0 {
+		return errors.New("dsh surface replacement start is unavailable")
+	}
+	for _, sequence := range sequences {
+		delete(h.surfaceNodes, sequence)
+		delete(h.systemNodes, sequence)
+	}
+	updated := make([]int64, 0, len(h.surfaceOrder)-len(sequences)+1)
+	updated = append(updated, h.surfaceOrder[:startIndex]...)
+	updated = append(updated, replacement)
+	updated = append(updated, h.surfaceOrder[startIndex+len(sequences):]...)
+	h.surfaceOrder = updated
+	h.surfaceNodes[replacement] = struct{}{}
+	return nil
+}
+
 func cloudDSHUserMessage(data json.RawMessage) bool {
 	var value struct {
 		Role string `json:"role"`
@@ -381,10 +443,10 @@ func (h *cloudDSHCheckpointHistory) replaceSystemNode(sequence int64, data, raw 
 	if _, exists := h.systemNodes[start]; !exists {
 		return errors.New("dsh system replacement target is unavailable")
 	}
-	delete(h.systemNodes, start)
-	delete(h.surfaceNodes, start)
+	if err := h.replaceSurfaceRange([]int64{start}, sequence); err != nil {
+		return err
+	}
 	h.systemNodes[sequence] = struct{}{}
-	h.surfaceNodes[sequence] = struct{}{}
 	return nil
 }
 
@@ -413,7 +475,7 @@ func (h *cloudDSHCheckpointHistory) beginCompaction(sequence int64, data json.Ra
 
 func (h *cloudDSHCheckpointHistory) summarizeCompaction(sequence int64, data json.RawMessage) error {
 	fields, err := cloudDSHCompactionFields(data, "compactionId", "sourceCommandId", "summary", "shadowedRange", "shadowedSeqs",
-		"shadowedTokenCount", "provider", "model", "maxTokens", "usage")
+		"shadowedTokenCount", "provider", "model", "maxTokens", "usage", "rawOutput", "llmStreamCall")
 	if err != nil {
 		return err
 	}
@@ -439,10 +501,14 @@ func (h *cloudDSHCheckpointHistory) summarizeCompaction(sequence int64, data jso
 	rangeFields, rangeErr := cloudDSHCompactionFields(fields["shadowedRange"], "start", "end")
 	if proof == nil || proof.ended || proof.summarySeq != 0 || proof.turn != h.activeTurn || sequence <= proof.startSeq ||
 		rangeErr != nil || len(rangeFields) != 2 ||
-		value.ShadowedRange.Start < 0 || value.ShadowedRange.Start > value.ShadowedRange.End || value.ShadowedRange.End >= proof.startSeq ||
+		value.ShadowedRange.Start < 0 || value.ShadowedRange.Start > 1<<53-1 || value.ShadowedRange.End < 0 ||
 		value.ShadowedRange.End > 1<<53-1 || len(value.ShadowedSeqs) == 0 || value.ShadowedTokenCount < 1 ||
 		value.Provider != "morde" || value.Model == "" || len(value.Model) > 256 || len(value.Summary) == 0 {
 		return errors.New("dsh compaction summary identity is invalid")
+	}
+	if value.ShadowedRange.End >= proof.startSeq ||
+		!h.surfaceRangeMatches(value.ShadowedRange.Start, value.ShadowedRange.End, value.ShadowedSeqs) {
+		return errors.New("dsh compaction source range is invalid")
 	}
 	if raw := fields["sourceCommandId"]; raw != nil {
 		var sourceCommandID string
@@ -462,28 +528,35 @@ func (h *cloudDSHCheckpointHistory) summarizeCompaction(sequence int64, data jso
 	if summaryBytes == 0 || summaryBytes > 256<<10 {
 		return errors.New("dsh compaction summary exceeds its limit")
 	}
+	if rawOutput, present := fields["rawOutput"]; present {
+		var blocks []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}
+		if json.Unmarshal(rawOutput, &blocks) != nil || len(blocks) == 0 {
+			return errors.New("dsh compaction raw output is invalid")
+		}
+		rawOutputBytes := 0
+		for _, block := range blocks {
+			if block.Type != "text" || !utf8.ValidString(block.Text) {
+				return errors.New("dsh compaction raw output must contain text only")
+			}
+			rawOutputBytes += len(block.Text)
+		}
+		if rawOutputBytes == 0 || rawOutputBytes > 256<<10 {
+			return errors.New("dsh compaction raw output exceeds its limit")
+		}
+	}
+	if rawCall, present := fields["llmStreamCall"]; present {
+		var llmStreamCall bool
+		if json.Unmarshal(rawCall, &llmStreamCall) != nil || !llmStreamCall || fields["rawOutput"] == nil {
+			return errors.New("dsh compaction model-call marker is invalid")
+		}
+	}
 	if maxTokens := fields["maxTokens"]; maxTokens != nil {
 		var value int64
 		if json.Unmarshal(maxTokens, &value) != nil || value < 1 || value > 32768 {
 			return errors.New("dsh compaction output limit is invalid")
-		}
-	}
-	shadowed := make(map[int64]struct{}, len(value.ShadowedSeqs))
-	for index, sequence := range value.ShadowedSeqs {
-		if sequence < value.ShadowedRange.Start || sequence > value.ShadowedRange.End || sequence > 1<<53-1 ||
-			index > 0 && sequence <= value.ShadowedSeqs[index-1] {
-			return errors.New("dsh compaction source range is invalid")
-		}
-		if _, active := h.surfaceNodes[sequence]; !active {
-			return errors.New("dsh compaction source node is unavailable")
-		}
-		shadowed[sequence] = struct{}{}
-	}
-	for sequence := range h.surfaceNodes {
-		if sequence >= value.ShadowedRange.Start && sequence <= value.ShadowedRange.End {
-			if _, included := shadowed[sequence]; !included {
-				return errors.New("dsh compaction source range is incomplete")
-			}
 		}
 	}
 	proof.summarySeq, proof.start, proof.end = sequence, value.ShadowedRange.Start, value.ShadowedRange.End
@@ -506,8 +579,8 @@ func (h *cloudDSHCheckpointHistory) replaceCompactedUserNode(sequence int64, dat
 	var start, end int64
 	if decoder.Decode(&operation) != nil || operation.Op != "replace" || len(operation.Start) == 0 || len(operation.End) == 0 ||
 		string(operation.Start) == "null" || string(operation.End) == "null" || string(operation.Start) == "-0" || string(operation.End) == "-0" ||
-		json.Unmarshal(operation.Start, &start) != nil || json.Unmarshal(operation.End, &end) != nil || start < 0 || start > end ||
-		start > 1<<53-1 || end > 1<<53-1 || end >= sequence || !cloudDSHUserMessage(data) {
+		json.Unmarshal(operation.Start, &start) != nil || json.Unmarshal(operation.End, &end) != nil || start < 0 || end < 0 ||
+		start > 1<<53-1 || end > 1<<53-1 || start >= sequence || end >= sequence || !cloudDSHUserMessage(data) {
 		return errors.New("dsh compacted user replacement is invalid")
 	}
 	var message struct {
@@ -564,19 +637,20 @@ func (h *cloudDSHCheckpointHistory) replaceCompactedUserNode(sequence int64, dat
 	} else if proof.sourceCommandID != "" {
 		return errors.New("dsh compacted user command identity is missing")
 	}
+	shadowed := make(map[int64]struct{}, len(proof.shadowedSeqs))
+	for _, shadowedSequence := range proof.shadowedSeqs {
+		shadowed[shadowedSequence] = struct{}{}
+	}
 	for _, call := range h.calls {
-		assistantInRange := call.assistantSeq >= start && call.assistantSeq <= end
-		callInRange := call.callSeq >= start && call.callSeq <= end
-		resultInRange := call.surfaceResultSeq >= start && call.surfaceResultSeq <= end
-		if assistantInRange != callInRange || callInRange != resultInRange || callInRange && (!call.callSeen || !call.resultSeen) {
+		_, assistantInRange := shadowed[call.assistantSeq]
+		_, resultInRange := shadowed[call.surfaceResultSeq]
+		if assistantInRange != resultInRange || assistantInRange && (!call.callSeen || !call.resultSeen) {
 			return errors.New("dsh compaction range splits a tool call")
 		}
 	}
-	for _, shadowedSequence := range proof.shadowedSeqs {
-		delete(h.surfaceNodes, shadowedSequence)
-		delete(h.systemNodes, shadowedSequence)
+	if err := h.replaceSurfaceRange(proof.shadowedSeqs, sequence); err != nil {
+		return err
 	}
-	h.surfaceNodes[sequence] = struct{}{}
 	proof.replacementSeq = sequence
 	return nil
 }
@@ -626,7 +700,7 @@ func cloudDSHCompactionFields(data json.RawMessage, allowed ...string) (map[stri
 			}
 		}
 		if !valid {
-			return nil, errors.New("dsh compaction event has an unexpected field")
+			return nil, errors.New("dsh compaction event has an unexpected field: " + key)
 		}
 	}
 	return fields, nil
@@ -852,7 +926,15 @@ func (h *cloudDSHCheckpointHistory) appendToolResult(sequence int64, data json.R
 	}
 	unknownOutcome := event.Message.IsError && cloudDSHToolResultErrorMatches(event.Error,
 		cloudDSHUnknownToolResultErrorName, cloudDSHUnknownToolResultErrorCode)
-	if event.Message.IsError != unknownOutcome || !unknownOutcome && len(event.Error) != 0 && string(event.Error) != "null" {
+	guardDeniedOutcome := event.Message.IsError && cloudDSHToolResultErrorMatches(event.Error,
+		cloudDSHWebResearchGuardErrorName, cloudDSHWebResearchGuardErrorCode)
+	if guardDeniedOutcome {
+		guardedCall := h.calls[event.Message.ToolCallID]
+		guardDeniedOutcome = guardedCall != nil &&
+			(guardedCall.name == cloudDSHWebResearchSearchToolName || guardedCall.name == cloudDSHWebResearchReadToolName)
+	}
+	if event.Message.IsError != (unknownOutcome || guardDeniedOutcome) ||
+		!unknownOutcome && !guardDeniedOutcome && len(event.Error) != 0 && string(event.Error) != "null" {
 		return errors.New("dsh tool result checkpoint has an unsupported error")
 	}
 	call := h.calls[event.Message.ToolCallID]
@@ -867,6 +949,10 @@ func (h *cloudDSHCheckpointHistory) appendToolResult(sequence int64, data json.R
 	if unknownOutcome && (call.status != "" || len(imageRefs) != 0 || output != cloudDSHUnknownToolResultText) {
 		return errors.New("dsh unknown tool result is invalid")
 	}
+	if guardDeniedOutcome && (call.status != "" || len(imageRefs) != 0 ||
+		!strings.HasPrefix(output, "Error: web_research guard: ")) {
+		return errors.New("dsh web research guard denial is invalid")
+	}
 	if call.status != "" && !sameCloudDSHImageRefs(call.runtimeImages, imageRefs) {
 		return errors.New("dsh tool result image differs from the reconciled Host result")
 	}
@@ -875,6 +961,10 @@ func (h *cloudDSHCheckpointHistory) appendToolResult(sequence int64, data json.R
 	}
 	call.resultText, call.resultImages, call.resultSeen, call.resultSeq = output, imageRefs, true, sequence
 	call.resultUnknown = unknownOutcome
+	call.resultGuardDenied = guardDeniedOutcome
+	if guardDeniedOutcome {
+		call.reconciled = true
+	}
 	call.surfaceResultSeq = sequence
 	call.surfaceResultData = append(json.RawMessage(nil), data...)
 	if call.status != "" {
@@ -942,8 +1032,9 @@ func (h *cloudDSHCheckpointHistory) replacePrunedToolResult(sequence int64, data
 	if _, active := h.surfaceNodes[proof.resultSeq]; !active {
 		return errors.New("dsh tool-result prune source is no longer active")
 	}
-	delete(h.surfaceNodes, proof.resultSeq)
-	h.surfaceNodes[sequence] = struct{}{}
+	if err := h.replaceSurfaceRange([]int64{proof.resultSeq}, sequence); err != nil {
+		return err
+	}
 	call.surfaceResultSeq = sequence
 	call.surfaceResultData = append(json.RawMessage(nil), data...)
 	h.pendingPrune = nil

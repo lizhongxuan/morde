@@ -16,8 +16,8 @@ import (
 
 func TestTaskModelOutputBudgetStageUsesSummaryForCompaction(t *testing.T) {
 	rootFence := ModelTaskFence{AgentSessionID: "root-session", AgentRootSessionID: "root-session"}
-	if got := taskModelOutputBudgetStage(rootFence, false, ""); got != modelOutputBudgetStageShortAnswer {
-		t.Fatalf("ordinary no-tool Task stage = %q, want short_answer", got)
+	if got := taskModelOutputBudgetStage(rootFence, false, ""); got != modelOutputBudgetStageRootTextOnly {
+		t.Fatalf("ordinary root no-tool Task stage = %q, want root_text_only", got)
 	}
 	if got := taskModelOutputBudgetStage(rootFence, true, ""); got != modelOutputBudgetStageToolStep {
 		t.Fatalf("ordinary tool Task stage = %q, want tool_step", got)

@@ -44,6 +44,24 @@ export function hermesCompactionBudget(contextWindow, outputTokens = 0) {
   return { thresholdTokens, tailTokens }
 }
 
+// Adaptive Task admission reserves UTF-8 input bytes as token upper bounds,
+// while DSH's fixed-density meter prices roughly four characters per token.
+// Trigger at one eighth of the model window so the measured text occupies at
+// most half of the byte-based context hold. Retain no more than Hermes' 2.5%
+// context-window term; a larger tail can leave too little space for the
+// byte-based reservation even after older turns have been summarized.
+export function taskBudgetHermesCompactionBudget(contextWindow, outputTokens = 0) {
+  const hermes = hermesCompactionBudget(contextWindow, outputTokens)
+  const rangeOutputTokens = Math.min(contextWindow - 1,
+    Math.max(outputTokens, Math.floor(contextWindow * 0.75)))
+  const range = hermesCompactionBudget(contextWindow, rangeOutputTokens)
+  return {
+    thresholdTokens: Math.max(1, Math.min(hermes.thresholdTokens, Math.floor(contextWindow * 0.125))),
+    tailTokens: Math.max(1, Math.min(range.tailTokens, Math.floor(contextWindow * 0.025))),
+    rangeOutputTokens,
+  }
+}
+
 export function hermesCompactionMadeProgress(beforeTokens, afterTokens, shadowedSeqs, previouslyCoveredSeqs) {
   return afterTokens < beforeTokens ||
     (Array.isArray(shadowedSeqs) && shadowedSeqs.some(seq => !previouslyCoveredSeqs.has(seq)))
@@ -53,10 +71,15 @@ export function hermesCompactionMadeProgress(beforeTokens, afterTokens, shadowed
 // real user messages (including non-text input), isSummary identifies prior checkpoints,
 // and balancedBefore is DSH's tool-pair balance at that cut. A pinned Task retains its
 // opening brief. The latest user input is never removed: DSH has no verbatim turn replay.
-export function planHermesCompaction(rows, { contextWindow, outputTokens = 0, repeated = false, pinTask = false }) {
-  const { tailTokens } = hermesCompactionBudget(contextWindow, outputTokens)
+export function planHermesCompaction(rows, { contextWindow, outputTokens = 0, repeated = false, pinTask = false,
+  tailTokens }) {
+  const defaultBudget = hermesCompactionBudget(contextWindow, outputTokens)
+  const selectedTailTokens = tailTokens ?? defaultBudget.tailTokens
   if (!Array.isArray(rows) || rows.some(row => !row || !Number.isFinite(row.tokens) || row.tokens < 0 ||
-      typeof row.balancedBefore !== 'boolean')) throw new Error('invalid compaction surface measurement')
+      typeof row.balancedBefore !== 'boolean') || !Number.isSafeInteger(selectedTailTokens) ||
+      selectedTailTokens < 1 || selectedTailTokens >= contextWindow) {
+    throw new Error('invalid compaction surface measurement')
+  }
   const n = rows.length
   if (!n) return null
 
@@ -75,7 +98,8 @@ export function planHermesCompaction(rows, { contextWindow, outputTokens = 0, re
 
   const available = Math.max(0, n - start - 1)
   const minTail = available > 1 ? Math.min(20, Math.max(3, available - 2), available) : 0
-  const ceiling = Math.max(tailTokens, Math.min(Math.floor(tailTokens * 1.5), Math.floor(contextWindow * 0.2)))
+  const ceiling = Math.max(selectedTailTokens,
+    Math.min(Math.floor(selectedTailTokens * 1.5), Math.floor(contextWindow * 0.2)))
   const walkFloor = ceiling >= minTail * 10 ? 0 : minTail
   let newestSummary = -1
   for (let i = n - 1; i >= start; i--) if (rows[i].isSummary) { newestSummary = i; break }
@@ -92,7 +116,7 @@ export function planHermesCompaction(rows, { contextWindow, outputTokens = 0, re
     return [cut, total]
   }
   let [cut, accumulated] = walk(ceiling, walkFloor, false)
-  if (cut <= start && accumulated > 0 && accumulated <= ceiling) [cut] = walk(tailTokens, minTail, true)
+  if (cut <= start && accumulated > 0 && accumulated <= ceiling) [cut] = walk(selectedTailTokens, minTail, true)
   cut = Math.min(cut, n - Math.max(walkFloor, 1))
   if (cut <= start) cut = Math.max(n - minTail, start + 1)
 
@@ -140,7 +164,8 @@ export function planHermesCompaction(rows, { contextWindow, outputTokens = 0, re
   return { start, end: cut }
 }
 
-export function selectHermesCompactionRange(session, measurement, { contextWindow, outputTokens = 0, pinTask = false }) {
+export function selectHermesCompactionRange(session, measurement, { contextWindow, outputTokens = 0, pinTask = false,
+  tailTokens }) {
   const rows = measurement.nodes.map(node => {
     const event = session.eventAt(node.seq)
     const message = event && session.deriveEventMessage(event)
@@ -156,7 +181,7 @@ export function selectHermesCompactionRange(session, measurement, { contextWindo
     }
   })
   const range = planHermesCompaction(rows, {
-    contextWindow, outputTokens, repeated: rows.some(row => row.isSummary), pinTask,
+    contextWindow, outputTokens, repeated: rows.some(row => row.isSummary), pinTask, tailTokens,
   })
   return range === null ? null : {
     start: measurement.nodes[range.start].seq,

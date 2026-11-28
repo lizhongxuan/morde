@@ -168,7 +168,12 @@ run_case() {
     while IFS= read -r mapped_name; do
       names+=("$mapped_name")
     done < <(awk -F'\t' -v c="$case_id" -v p="$pkg" '$1 == c && $2 == p {print $3}' "$CASES_FILE")
-    local regex="^($(IFS='|'; echo "${names[*]}"))$"
+    local joined=""
+    for mapped_name in "${names[@]}"; do
+      [[ -z "$joined" ]] || joined+="|"
+      joined+="$mapped_name"
+    done
+    local regex="^(${joined})$"
     local out="$TMPDIR_SMOKE/$case_id.$(echo "$pkg" | tr '/' '_').log"
     local go_rc=0
     (cd "$SERVER_DIR" && go test -count=1 -timeout "${TIMEOUT}s" -v "./$pkg/" -run "$regex" >"$out" 2>&1) || go_rc=$?

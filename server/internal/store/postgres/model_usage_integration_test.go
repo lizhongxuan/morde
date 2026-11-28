@@ -917,6 +917,104 @@ VALUES ('q1234567',$1,'agent-1',2,$2,'session-1',0,0,$3,decode('01','hex'),'engi
 	}
 }
 
+func TestPostgresTaskModelCheckpointAdvancedReasonRequiresCurrentAuthorizationAndDurableHead(t *testing.T) {
+	store, principal, reservation := modelUsageFixture(t)
+	ctx := context.Background()
+	if _, err := store.pool.Exec(ctx, `UPDATE owner_execution_controls SET state='enabled' WHERE owner_id=$1`, principal.UserID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO conversations(id,owner_id,title) VALUES ('c1234567',$1,'checkpoint advance')`, principal.UserID); err != nil {
+		t.Fatal(err)
+	}
+	oldDigest := sha256.Sum256([]byte("checkpoint before input"))
+	advancedDigest := sha256.Sum256([]byte("checkpoint after input"))
+	if _, err := store.pool.Exec(ctx, `INSERT INTO tasks(id,owner_id,conversation_id,model_id,objective,status,auth_kind,auth_token_id,
+ auth_client_installation_id,budget_active_seconds,budget_tool_calls,budget_model_tokens,usage_model_tokens,
+ lease_owner,lease_version,lease_expires_at,execution_location,auth_version,auth_expires_at,agent_instance_id,
+ agent_generation,agent_session_id,agent_engine_version,agent_profile_version,checkpoint_through_seq,checkpoint_digest)
+ VALUES ('q1234567',$1,'c1234567','p1234567','checkpoint advance','running','client',$2,$3,600,10,125,0,
+ 'worker-1',3,clock_timestamp()+interval '1 hour','server',7,clock_timestamp()+interval '1 hour',
+ 'agent-1',2,'session-1','engine','profile',1,$4)`, principal.UserID, principal.TokenID, principal.ClientInstallationID, advancedDigest[:]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO task_agent_sessions(task_id,owner_id,session_id,checkpoint_through_seq,checkpoint_digest)
+VALUES ('q1234567',$1,'session-1',1,$2)`, principal.UserID, advancedDigest[:]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO task_agent_instances
+(task_id,owner_id,agent_instance_id,agent_generation,agent_session_id,engine_version,profile_version,supervisor_id,
+ stop_nonce_digest,lease_owner,lease_version,auth_version,initial_lease_ms,lease_expires_at,state)
+VALUES ('q1234567',$1,'agent-1',2,'session-1','engine','profile','supervisor-1',$2,'worker-1',3,7,30000,
+ clock_timestamp()+interval '30 seconds','active')`, principal.UserID, make([]byte, 32)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO task_agent_checkpoints(task_id,owner_id,agent_instance_id,agent_generation,agent_session_id,agent_root_session_id,
+ from_seq,through_seq,digest,ciphertext,engine_version,profile_version,auth_version,lease_version)
+ VALUES ('q1234567',$1,'agent-1',2,'session-1','session-1',0,0,$2,decode('01','hex'),'engine','profile',7,3),
+        ('q1234567',$1,'agent-1',2,'session-1','session-1',1,1,$3,decode('01','hex'),'engine','profile',7,3)`,
+		principal.UserID, oldDigest[:], advancedDigest[:]); err != nil {
+		t.Fatal(err)
+	}
+	fence := app.ModelTaskFence{TaskID: "q1234567", OwnerID: principal.UserID, InitiatorID: principal.UserID, LeaseOwner: "worker-1", LeaseVersion: 3,
+		AgentInstanceID: "agent-1", AgentGeneration: 2, AgentSessionID: "session-1", AuthorizationVersion: 7, ThroughSequence: 0,
+		EngineVersion: "engine", ProfileVersion: "profile"}
+	reservation.Source, reservation.Task, reservation.Principal = app.ModelCallTask, &fence, identity.Principal{}
+	callID, err := app.DSHModelCallID(fence.TaskID, fence.AgentSessionID, fence.ThroughSequence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservation.CallID = callID
+	assertNoReservation := func() {
+		t.Helper()
+		var calls int
+		if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM model_call_ledger WHERE owner_id=$1 AND source='task' AND call_id=$2`,
+			principal.UserID, reservation.CallID).Scan(&calls); err != nil || calls != 0 {
+			t.Fatalf("stale model call created %d ledger reservations, err=%v", calls, err)
+		}
+	}
+	if err := store.ReserveModelCall(ctx, reservation); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("stale root checkpoint = %v, want a fenced rejection", err)
+	} else {
+		var domainErr *domain.Error
+		if !errors.As(err, &domainErr) || domainErr.Details["reason"] != "task_checkpoint_advanced" {
+			t.Fatalf("stale root checkpoint reason = %#v, want task_checkpoint_advanced", domainErr)
+		}
+	}
+	assertNoReservation()
+
+	if _, err := store.pool.Exec(ctx, `DELETE FROM task_agent_checkpoints WHERE task_id='q1234567' AND owner_id=$1 AND through_seq=1`, principal.UserID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReserveModelCall(ctx, reservation); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("advanced checkpoint without a durable head = %v, want a generic fenced rejection", err)
+	} else {
+		var domainErr *domain.Error
+		if errors.As(err, &domainErr) && domainErr.Details["reason"] == "task_checkpoint_advanced" {
+			t.Fatalf("missing current durable checkpoint was classified as advanced: %#v", domainErr)
+		}
+	}
+	assertNoReservation()
+
+	if _, err := store.pool.Exec(ctx, `INSERT INTO task_agent_checkpoints(task_id,owner_id,agent_instance_id,agent_generation,agent_session_id,agent_root_session_id,
+ from_seq,through_seq,digest,ciphertext,engine_version,profile_version,auth_version,lease_version)
+ VALUES ('q1234567',$1,'agent-1',2,'session-1','session-1',1,1,$2,decode('01','hex'),'engine','profile',7,3)`,
+		principal.UserID, advancedDigest[:]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE client_installations SET revoked_at=clock_timestamp() WHERE id=$1`, principal.ClientInstallationID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReserveModelCall(ctx, reservation); domain.CodeOf(err) != domain.CodeUnauthenticated {
+		t.Fatalf("advanced checkpoint with revoked installation = %v, want unauthenticated", err)
+	} else {
+		var domainErr *domain.Error
+		if errors.As(err, &domainErr) && domainErr.Details["reason"] == "task_checkpoint_advanced" {
+			t.Fatalf("revoked installation was classified as checkpoint advancement: %#v", domainErr)
+		}
+	}
+	assertNoReservation()
+}
+
 func TestPostgresSubmittedTaskRunsMeteredModelAfterRealCheckpoint(t *testing.T) {
 	store, principal, _ := modelUsageFixture(t)
 	ctx := context.Background()

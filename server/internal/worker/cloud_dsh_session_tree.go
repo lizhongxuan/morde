@@ -2717,11 +2717,43 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 					pending.modelCall.Task.RecoveryCallID != "" && pending.state.hasRecoverySteer() {
 					steerPending = true
 				}
-				if steerPending {
+				recoveryModelCall := value.ModelRecovery != nil && pending.modelCall.Task != nil &&
+					pending.modelCall.Task.RecoveryCallID == value.ModelRecovery.RecoveryCallID &&
+					pending.modelCall.Task.RecoveryDSHCallID == value.ModelRecovery.RecoveryDSHCallID &&
+					pending.modelCall.CallID == value.ModelRecovery.RecoveryDSHCallID
+				staleCheckpointRejection := cloudDSHModelRootCheckpointAdvanced(result.err)
+				if staleCheckpointRejection {
+					callThrough := int64(-1)
+					if pending.modelCall.Task != nil {
+						callThrough = pending.modelCall.Task.ThroughSequence
+					}
+					e.options.Logger.Info("discarding stale DSH model call after Task checkpoint advanced",
+						zap.String("task_id", value.ID), zap.String("session_id", pending.identity.SessionID),
+						zap.Int64("model_call_through_sequence", callThrough), zap.Int64("current_session_through_sequence", pending.state.through),
+						zap.Bool("recovery_call", recoveryModelCall))
+				}
+				staleRootCheckpoint := pending.identity.SessionID == rootIdentity.SessionID && !recoveryModelCall &&
+					staleCheckpointRejection
+				staleInputDuringCall := !steerPending && pending.modelCall.Task != nil &&
+					pending.modelCall.Task.ThroughSequence < pending.state.through && !recoveryModelCall
+				if steerPending || staleRootCheckpoint {
 					if err := deliverPendingMessagesOnce(ctx); err != nil {
 						return errors.New("pending conversation messages are unavailable")
 					}
+				}
+				if staleRootCheckpoint {
+					// The checkpoint fence rejects this root call before provider
+					// dispatch, so its usage is known to be zero. Mark that fact on
+					// the synthetic response so it passes the DSH response contract.
 					result.err = nil
+					result.response = app.ModelResponse{Text: "A new task input arrived during this model call. Re-evaluate the current task before taking action.",
+						StopReason: "stop", Usage: app.ModelUsage{Known: true}}
+				} else if (steerPending || staleInputDuringCall) && result.err == nil {
+					// A newly delivered task input can advance the durable checkpoint
+					// while a model call is running. Discard a successful stale result
+					// and return a bounded re-evaluation signal so DSH continues from
+					// the committed input. Failed calls remain failures unless the
+					// exact pre-dispatch checkpoint rejection above proves zero usage.
 					result.response = app.ModelResponse{Text: "A new task input arrived during this model call. Re-evaluate the current task before taking action.",
 						StopReason: "stop", Usage: result.response.Usage, ProviderReportedModel: result.response.ProviderReportedModel}
 				}
@@ -2761,14 +2793,7 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 					pending.modelCall.CallID == intent.RecoveryDSHCallID {
 					recoveryCallSucceeded = true
 				}
-				recoveryModelCall := value.ModelRecovery != nil && pending.modelCall.Task != nil &&
-					pending.modelCall.Task.RecoveryCallID == value.ModelRecovery.RecoveryCallID &&
-					pending.modelCall.Task.RecoveryDSHCallID == value.ModelRecovery.RecoveryDSHCallID &&
-					pending.modelCall.CallID == value.ModelRecovery.RecoveryDSHCallID
-				if !steerPending && pending.modelCall.Task != nil && pending.modelCall.Task.ThroughSequence < pending.state.through && !recoveryModelCall {
-					result.response = app.ModelResponse{Text: "A new task input arrived during this model call. Re-evaluate the current task before taking action.",
-						StopReason: "stop", Usage: result.response.Usage, ProviderReportedModel: result.response.ProviderReportedModel}
-				} else if !steerPending && pending.stream.hasVisibleText() {
+				if !steerPending && !staleInputDuringCall && pending.stream.hasVisibleText() {
 					pending.state.lastStream = pending.stream
 				}
 				if protectsMemory && memoryValidator.ValidatePersonalMemoryProof(ctx, value, memoryProof, pending.memoryVersions) != nil {
@@ -2800,6 +2825,11 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				"agent_id": rootIdentity.AgentID, "session_id": rootIdentity.SessionID, "generation": rootIdentity.Generation,
 				"authorization_version": rootIdentity.AuthorizationVersion, "task_revision": cloudDSHTaskRevision(value), "model": value.ModelID,
 				"tools": cloudDSHToolPayload(rootDefinitions)}
+			if cloudDSHWebResearchProfileActive(value) {
+				// This value comes from the persisted, server-owned Task context;
+				// never infer a profile from the tool definitions sent to DSH.
+				start["agent_tool_profile"] = string(task.AgentToolProfileWebResearch)
+			}
 			configureCloudDSHModelBudgetAdmission(start, e.options.ModelBudgetPlanner, modelBudgetAdmission, maxTokens)
 			if traceparent := cloudDSHTraceparent(trace.ContextWithSpan(ctx, rootState.traceSpan)); traceparent != "" {
 				start["version"] = 2
@@ -3340,11 +3370,17 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				if ok {
 					response["budget_plan_id"] = result.PlanID
 					response["max_tokens"] = result.MaxTokens
+				} else if reason := cloudDSHModelBudgetPlanDenialReason(planErr); reason != "" {
+					response["denial_reason"] = reason
 				}
 				return writeCloudDSHFrame(ctx, input, response)
 			}
 			if planErr != nil || !cloudDSHID.MatchString(result.PlanID) || result.MaxTokens <= 0 || result.MaxTokens > cloudDSHModelBudgetProtocolMaxTokens {
-				return cloudDSHModelBudgetPlanDenialError(planErr, writeBudgetResponse(false))
+				denialErr := cloudDSHModelBudgetPlanDenialError(planErr, writeBudgetResponse(false))
+				if denialErr != nil {
+					return denialErr
+				}
+				continue
 			}
 			binding := cloudDSHModelBudgetPlanBinding{Identity: state.identity, ThroughSeq: *frame.Through,
 				CallID: frame.CallID, DSHCallID: frame.DSHCallID, LedgerCallID: ledgerCallID,
@@ -3755,6 +3791,15 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 					return errors.New("dsh tool call admission returned an unsupported result")
 				}
 			}
+			webResearchPolicyDenial := ""
+			if cloudDSHWebResearchProfileActive(value) {
+				webResearchPolicyDenial = cloudDSHWebResearchToolDenial(state.history, frame.CallID, frame.Name, arguments, recoveryCall)
+				if webResearchPolicyDenial != "" {
+					// Return a normal failed tool result to DSH so it can synthesize
+					// from evidence already collected. The Broker is not invoked.
+					result = app.AgentToolResult{Status: app.AgentToolFailed, Output: webResearchPolicyDenial}
+				}
+			}
 			cancelRequested, err := e.cloudDSHJobCancelRequested(ctx, fence, state)
 			if err != nil {
 				return errors.New("dsh background job authorization changed")
@@ -3783,7 +3828,7 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 					return errCloudDSHPersonalMemoryChanged
 				}
 			}
-			if !recoveredPersonalResult {
+			if !recoveredPersonalResult && webResearchPolicyDenial == "" {
 				if frame.Name == cloudDSHResultEvidenceToolName {
 					result = app.AgentToolResult{Status: app.AgentToolSucceeded, Output: "Evidence map received as an untrusted claim. It is retained only if references resolve and the final answer exactly matches the text in the assistant message that submitted it."}
 				} else if cloudDSHJobTool(frame.Name) {
@@ -3923,15 +3968,23 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				return cloudDSHToolExecutionFailureFor(frame, "result_output_invalid", nil)
 			}
 			if result.Status == app.AgentToolFailed && !result.TerminalForAttempt {
-				e.options.Logger.Warn("DSH tool returned a definitive failure",
-					zap.String("task_id", state.identity.TaskID),
-					zap.String("failure_stage", "tool_execution"),
-					zap.String("failure_reason", "tool_returned_failed"),
-					zap.String("tool_name", cloudDSHSafeDiagnosticToolName(frame.Name)),
-					zap.String("tool_call_id", safeCloudDSHDiagnosticCallID(frame.CallID)),
-					zap.String("tool_status", string(result.Status)),
-					zap.String("tool_dispatch_status", "result_received"),
-				)
+				if webResearchPolicyDenial != "" {
+					e.options.Logger.Info("DSH web research call was stopped by its bounded policy",
+						zap.String("task_id", state.identity.TaskID),
+						zap.String("failure_stage", "web_research_policy"),
+						zap.String("failure_reason", "attempt_or_duplicate_limit"),
+					)
+				} else {
+					e.options.Logger.Warn("DSH tool returned a definitive failure",
+						zap.String("task_id", state.identity.TaskID),
+						zap.String("failure_stage", "tool_execution"),
+						zap.String("failure_reason", "tool_returned_failed"),
+						zap.String("tool_name", cloudDSHSafeDiagnosticToolName(frame.Name)),
+						zap.String("tool_call_id", safeCloudDSHDiagnosticCallID(frame.CallID)),
+						zap.String("tool_status", string(result.Status)),
+						zap.String("tool_dispatch_status", "result_received"),
+					)
+				}
 			}
 			if result.TerminalForAttempt {
 				retryAfterSeconds, retryAfterKnown := app.MCPConnectorTerminalRetryAfterSeconds(result.Output)

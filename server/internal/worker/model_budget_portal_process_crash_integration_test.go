@@ -7,11 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -35,12 +38,192 @@ const (
 	budgetCrashHelperModelIDEnv   = budgetCrashHelperPrefix + "MODEL_ID"
 	budgetCrashHelperSignalEnv    = budgetCrashHelperPrefix + "SIGNAL"
 	budgetCrashHelperCallEnv      = budgetCrashHelperPrefix + "CALL"
+	budgetCrashPortalBinaryEnv    = "MORDE_MODEL_BUDGET_CRASH_PORTAL_BINARY"
 	budgetCrashWorkerID           = "model-budget-crash-worker"
 	budgetCrashSupervisorID       = "model-budget-crash-supervisor"
 	budgetCrashProviderModel      = "synthetic-budget-process-crash-v1"
 	budgetCrashProviderAPIKey     = "synthetic-budget-process-crash-key"
 	budgetCrashSignedOutputTokens = 3072
 )
+
+// TestPortalProcessCrashMarksDispatchedModelCallUnknownAndDoesNotReplay boots
+// the real Portal binary against an isolated PostgreSQL database. Its local
+// model proxy accepts CONNECT but withholds the tunnel response, giving the
+// test a deterministic point after the ledger dispatch commit and before any
+// provider HTTP request. After SIGKILL and Portal restart, the real reconciler
+// marks the stale dispatch unknown and an API replay with the same key must not
+// contact the proxy or provider again.
+func TestPortalProcessCrashMarksDispatchedModelCallUnknownAndDoesNotReplay(t *testing.T) {
+	if runtime.GOOS != "linux" && strings.TrimSpace(os.Getenv(budgetCrashPortalBinaryEnv)) == "" {
+		t.Skip("the real Portal startup checks Linux /proc mount metadata; run this integration test on Linux")
+	}
+	dsn := strings.TrimSpace(os.Getenv("CH_TEST_DATABASE_URL"))
+	if dsn == "" {
+		t.Skip("CH_TEST_DATABASE_URL is unset; local Portal process-crash test was not run")
+	}
+	config, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatal("parse CH_TEST_DATABASE_URL for Portal process-crash validation")
+	}
+	if !budgetCrashLocalPostgresHost(config.ConnConfig.Host) {
+		t.Skip("CH_TEST_DATABASE_URL must point to local PostgreSQL; refusing a non-local host")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	store, pool := newF01TemporaryStore(t)
+	if err := app.EnsureInitialAdmin(ctx, store); err != nil {
+		t.Fatalf("seed the required isolated Portal administrator: %v", err)
+	}
+	owner := createF01User(t, ctx, store)
+	portalDSN := budgetCrashDSNForDatabase(t, dsn, pool.Config().ConnConfig.Database)
+
+	proxyEntered := make(chan struct{}, 1)
+	var proxyConnects atomic.Int32
+	var providerHTTPRequests atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodConnect && request.Host == "api.openai.com:443" {
+			proxyConnects.Add(1)
+			select {
+			case proxyEntered <- struct{}{}:
+			default:
+			}
+			// The model client waits for a successful CONNECT before sending TLS
+			// and provider HTTP. Holding this handler lets the parent kill Portal
+			// without putting a request on a provider connection.
+			<-request.Context().Done()
+			return
+		}
+		providerHTTPRequests.Add(1)
+		http.Error(writer, "unexpected non-CONNECT provider request", http.StatusBadRequest)
+	}))
+	t.Cleanup(proxy.Close)
+	openSandbox := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(writer, `{"items":[],"pagination":{"hasNextPage":false}}`)
+	}))
+	t.Cleanup(openSandbox.Close)
+
+	dataKey := bytes.Repeat([]byte{0x31}, 32)
+	sealer, err := app.NewSealer(dataKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	audit, err := app.NewAuditService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentials, err := app.NewCredentialService(store, store, store, audit, app.CredentialOptions{
+		SessionTTL: time.Hour, TicketTTL: time.Minute, LoginLimit: 5, LoginWindow: time.Minute,
+	}, f01DefaultHosts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionCredential := createF01Session(t, ctx, store, owner.ID)
+	principal, err := credentials.VerifySession(ctx, sessionCredential)
+	if err != nil || principal.Kind != identity.KindSession || principal.UserID != owner.ID {
+		t.Fatalf("verify synthetic Portal process-crash session: principal=%#v err=%v", principal, err)
+	}
+	connections, err := app.NewModelConnectionService(store, sealer, budgetCrashProviderBarrier{}, []string{"api.openai.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	contextWindow, modelMaxOutput := 32768, 8192
+	connection, err := connections.Create(ctx, principal, app.ModelConnectionCommand{
+		Name: "Portal process-crash synthetic route", BaseURL: "https://api.openai.com/v1", ModelName: budgetCrashProviderModel,
+		APIKey: budgetCrashProviderAPIKey, ContextWindowOverrideTokens: &contextWindow, ContextWindowOverridePresent: true,
+		MaxOutputOverrideTokens: &modelMaxOutput, MaxOutputOverridePresent: true,
+	})
+	if err != nil {
+		t.Fatalf("create synthetic Portal process-crash route: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE model_connections SET checked_at=clock_timestamp(),capability_text=true,
+capability_tools=false,capability_vision=false WHERE id=$1`, connection.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	tempDir := t.TempDir()
+	apiAddress := budgetCrashFreeLoopbackAddress(t)
+	configPath := writeBudgetCrashPortalConfig(t, tempDir, portalDSN, proxy.URL, openSandbox.URL, apiAddress,
+		budgetCrashFreeLoopbackAddress(t), budgetCrashFreeLoopbackAddress(t))
+	portalBinary := buildBudgetCrashPortalBinary(t, ctx, tempDir)
+	portalURL := "http://" + apiAddress
+	apiHost := "portal.test" + strings.TrimPrefix(apiAddress, "127.0.0.1")
+	httpClient := &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{Proxy: nil}}
+
+	firstPortal := startBudgetCrashPortalProcess(t, portalBinary, configPath, filepath.Join(tempDir, "portal-first.log"))
+	waitBudgetCrashPortalHealth(t, ctx, httpClient, portalURL, firstPortal)
+	callID := "portal-process-crash-call-001"
+	firstResponse := make(chan struct {
+		status int
+		err    error
+	}, 1)
+	go func() {
+		status, _, requestErr := budgetCrashPortalModelRequest(httpClient, portalURL, apiHost, sessionCredential,
+			connection.ID, callID)
+		firstResponse <- struct {
+			status int
+			err    error
+		}{status: status, err: requestErr}
+	}()
+	select {
+	case <-proxyEntered:
+	case <-ctx.Done():
+		t.Fatalf("wait for Portal model client to enter local CONNECT barrier: %v", ctx.Err())
+	}
+
+	var dispatchState string
+	if err := pool.QueryRow(ctx, `SELECT state FROM model_call_ledger
+WHERE owner_id=$1 AND source='client' AND call_id=$2`, owner.ID, callID).Scan(&dispatchState); err != nil {
+		t.Fatalf("read model ledger at Portal CONNECT barrier: %v", err)
+	}
+	if dispatchState != "dispatched" || proxyConnects.Load() != 1 || providerHTTPRequests.Load() != 0 {
+		t.Fatalf("Portal call at CONNECT barrier: ledger=%q proxy CONNECTs=%d provider HTTP=%d; want dispatched, one CONNECT, and no provider HTTP",
+			dispatchState, proxyConnects.Load(), providerHTTPRequests.Load())
+	}
+	if err := firstPortal.killGroup(); err != nil {
+		t.Fatalf("SIGKILL the Portal process: %v", err)
+	}
+	if waitErr := firstPortal.wait(ctx); waitErr == nil {
+		t.Fatal("Portal exited successfully; expected process-level SIGKILL")
+	}
+	select {
+	case result := <-firstResponse:
+		if result.err == nil {
+			t.Fatalf("killed Portal model API request unexpectedly returned status %d", result.status)
+		}
+	case <-ctx.Done():
+		t.Fatalf("wait for interrupted Portal API request to close: %v", ctx.Err())
+	}
+
+	// Stale only this synthetic client dispatch. This exercises the same
+	// production recovery threshold without waiting two minutes in the test.
+	if _, err := pool.Exec(ctx, `UPDATE model_call_ledger SET created_at=clock_timestamp()-interval '3 minutes'
+WHERE owner_id=$1 AND source='client' AND call_id=$2`, owner.ID, callID); err != nil {
+		t.Fatalf("age the interrupted Portal dispatch for reconciliation: %v", err)
+	}
+	secondPortal := startBudgetCrashPortalProcess(t, portalBinary, configPath, filepath.Join(tempDir, "portal-second.log"))
+	waitBudgetCrashPortalHealth(t, ctx, httpClient, portalURL, secondPortal)
+	waitBudgetCrashLedgerState(t, ctx, pool, owner.ID, callID, "unknown")
+
+	status, _, err := budgetCrashPortalModelRequest(httpClient, portalURL, apiHost, sessionCredential,
+		connection.ID, callID)
+	if err != nil {
+		t.Fatalf("replay model API request after Portal recovery: %v", err)
+	}
+	if status < http.StatusBadRequest || proxyConnects.Load() != 1 || providerHTTPRequests.Load() != 0 {
+		t.Fatalf("Portal replay after unknown recovery: status=%d proxy CONNECTs=%d provider HTTP=%d; want rejected replay and no second provider dispatch",
+			status, proxyConnects.Load(), providerHTTPRequests.Load())
+	}
+	var finalState string
+	if err := pool.QueryRow(ctx, `SELECT state FROM model_call_ledger
+WHERE owner_id=$1 AND source='client' AND call_id=$2`, owner.ID, callID).Scan(&finalState); err != nil {
+		t.Fatal(err)
+	}
+	if finalState != "unknown" {
+		t.Fatalf("Portal replay changed recovered ledger state to %q; want unknown", finalState)
+	}
+}
 
 type budgetCrashProcessSignal struct {
 	TaskID                  string `json:"task_id"`
@@ -406,7 +589,7 @@ func TestCloudDSHModelBudgetPostgresHTTPWorkerProcessKilledBeforeProviderHTTPHel
 
 func budgetCrashInstallStrategy(gateway *app.ModelGatewayService) error {
 	stages := []app.ModelOutputBudgetStageDefinition{
-		{Stage: "short_answer", GoalTokens: budgetCrashSignedOutputTokens, MinimumTokens: 64},
+		{Stage: "root_text_only", GoalTokens: budgetCrashSignedOutputTokens, MinimumTokens: 64},
 		{Stage: "tool_step", GoalTokens: budgetCrashSignedOutputTokens, MinimumTokens: 64},
 		{Stage: "subtask", GoalTokens: budgetCrashSignedOutputTokens, MinimumTokens: 64},
 		{Stage: "summary", GoalTokens: budgetCrashSignedOutputTokens, MinimumTokens: 64},
@@ -417,6 +600,253 @@ func budgetCrashInstallStrategy(gateway *app.ModelGatewayService) error {
 		Version: "budget-process-crash-v1",
 		Models:  []app.ModelOutputBudgetModelDefinition{{BaseURL: "https://api.openai.com/v1", Model: budgetCrashProviderModel, Stages: stages}},
 	})
+}
+
+func buildBudgetCrashPortalBinary(t *testing.T, ctx context.Context, directory string) string {
+	t.Helper()
+	if configured := strings.TrimSpace(os.Getenv(budgetCrashPortalBinaryEnv)); configured != "" {
+		info, err := os.Stat(configured)
+		if err != nil || !info.Mode().IsRegular() {
+			t.Fatalf("configured Portal binary is not a regular file: %v", err)
+		}
+		return configured
+	}
+	workingDirectory, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverRoot := filepath.Clean(filepath.Join(workingDirectory, "..", ".."))
+	binaryPath := filepath.Join(directory, "portal-budget-crash-test")
+	command := exec.CommandContext(ctx, "go", "build", "-o", binaryPath, "./cmd/portal")
+	command.Dir = serverRoot
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("build real Portal binary for process-crash integration: %v; output=%s", err, output)
+	}
+	return binaryPath
+}
+
+func startBudgetCrashPortalProcess(t *testing.T, binaryPath, configPath, outputPath string) *budgetCrashProcess {
+	t.Helper()
+	command := exec.Command(binaryPath, "serve", "--config", configPath)
+	command.Env = budgetCrashHelperEnvironment(nil)
+	output, err := os.Create(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command.Stdout, command.Stderr = output, output
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	process := &budgetCrashProcess{cmd: command, outputPath: outputPath, waitDone: make(chan error, 1)}
+	if err := command.Start(); err != nil {
+		_ = output.Close()
+		t.Fatalf("start real Portal process: %v", err)
+	}
+	go func() {
+		waitErr := command.Wait()
+		_ = output.Close()
+		process.waitDone <- waitErr
+	}()
+	t.Cleanup(func() {
+		if !process.waited {
+			_ = process.killGroup()
+			_ = process.wait(context.Background())
+		}
+	})
+	return process
+}
+
+func waitBudgetCrashPortalHealth(t *testing.T, ctx context.Context, client *http.Client, baseURL string, process *budgetCrashProcess) {
+	t.Helper()
+	deadline := time.NewTimer(45 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/healthz", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response, requestErr := client.Do(request)
+		if requestErr == nil {
+			_ = response.Body.Close()
+			if response.StatusCode == http.StatusOK {
+				return
+			}
+		}
+		select {
+		case processErr := <-process.waitDone:
+			process.waited, process.waitErr = true, processErr
+			output, _ := os.ReadFile(process.outputPath)
+			t.Fatalf("Portal exited before /healthz was ready: %v; output=%s", processErr, output)
+		case <-deadline.C:
+			_ = process.killGroup()
+			processErr := process.wait(context.Background())
+			output, _ := os.ReadFile(process.outputPath)
+			t.Fatalf("Portal /healthz did not become ready: process=%v; output=%s", processErr, output)
+		case <-ctx.Done():
+			t.Fatalf("wait for Portal /healthz: %v", ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func waitBudgetCrashLedgerState(t *testing.T, ctx context.Context, pool *pgxpool.Pool, ownerID, callID, expected string) {
+	t.Helper()
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var state string
+		if err := pool.QueryRow(ctx, `SELECT state FROM model_call_ledger
+WHERE owner_id=$1 AND source='client' AND call_id=$2`, ownerID, callID).Scan(&state); err == nil && state == expected {
+			return
+		} else if err != nil {
+			t.Fatalf("read Portal-recovered model ledger: %v", err)
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("wait for Portal reconciliation state %q; last state=%q", expected, state)
+		case <-ticker.C:
+		}
+	}
+}
+
+func budgetCrashPortalModelRequest(client *http.Client, baseURL, host, sessionCredential, modelID, callID string) (int, []byte, error) {
+	body, err := json.Marshal(map[string]any{
+		"model": modelID, "messages": []map[string]string{{"role": "user", "content": "Return one synthetic answer."}},
+		"max_tokens": budgetCrashSignedOutputTokens,
+	})
+	if err != nil {
+		return 0, nil, err
+	}
+	request, err := http.NewRequest(http.MethodPost, baseURL+"/api/model/v1/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return 0, nil, err
+	}
+	request.Host = host
+	request.Header.Set("Origin", "http://"+host)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Idempotency-Key", callID)
+	request.AddCookie(&http.Cookie{Name: "ch_portal", Value: sessionCredential})
+	response, err := client.Do(request)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer response.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+	return response.StatusCode, data, err
+}
+
+func writeBudgetCrashPortalConfig(t *testing.T, directory, dsn, modelProxyURL, openSandboxURL, apiAddress, gatewayAddress, metricsAddress string) string {
+	t.Helper()
+	workspaceData := "/dev/shm"
+	workspacePrefix := fmt.Sprintf("morde-budget-crash-%d", time.Now().UnixNano())
+	workspaceRoot := filepath.Join(workspaceData, workspacePrefix+"-blocks")
+	workspaceCurrent := filepath.Join(workspaceData, workspacePrefix+"-current")
+	t.Cleanup(func() {
+		_ = os.RemoveAll(workspaceRoot)
+		_ = os.RemoveAll(workspaceCurrent)
+	})
+	dockerData := filepath.Join(directory, "docker-data")
+	siteStorage := filepath.Join(directory, "site-storage")
+	workbench := filepath.Join(directory, "workbench")
+	portalWeb := filepath.Join(directory, "portal-web")
+	for _, path := range []string{workspaceRoot, workspaceCurrent, dockerData, siteStorage, workbench, portalWeb} {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			t.Fatalf("create isolated Portal directory: %v", err)
+		}
+	}
+	dataKeyPath := filepath.Join(directory, "data.key")
+	cookieKeyPath := filepath.Join(directory, "cookie.key")
+	if err := os.WriteFile(dataKeyPath, bytes.Repeat([]byte{0x31}, 32), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cookieKeyPath, bytes.Repeat([]byte{0x52}, 32), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	guardPath := filepath.Join(directory, "network-guard")
+	if err := os.WriteFile(guardPath, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	workingDirectory, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverRoot := filepath.Clean(filepath.Join(workingDirectory, "..", ".."))
+	templates, err := filepath.Abs(filepath.Join(serverRoot, "..", "deploy", "single", "templates"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dockerHost := "unix://" + filepath.Join(directory, "docker.sock")
+	configuration := map[string]any{
+		"instance": "budget-portal-process-crash-test",
+		"listen":   map[string]any{"api": apiAddress, "gateway": gatewayAddress, "metrics": metricsAddress},
+		"http": map[string]any{"read_header_timeout": "5s", "read_timeout": "30s", "write_timeout": "30s",
+			"idle_timeout": "60s", "shutdown_timeout": "1s", "api_max_body_bytes": 1048576, "mcp_max_body_bytes": 1048576},
+		"domains":  map[string]any{"scheme": "http", "portal": "portal.test", "host_suffix": "host.test", "cookie_secure": false},
+		"database": map[string]any{"dsn": dsn, "max_conns": 16},
+		"security": map[string]any{"data_key_file": dataKeyPath, "cookie_key_file": cookieKeyPath,
+			"session_ttl": "1h", "ticket_ttl": "1m", "host_cookie_ttl": "1h", "login_rate_limit": "5/min"},
+		"models": map[string]any{"allowed_hosts": []string{"api.openai.com"}, "proxy_url": modelProxyURL,
+			"project_rates": []any{}, "output_budget_admission_enabled": false,
+			"output_budget_shadow": map[string]any{"enabled": false, "sample_rate": float64(0)}},
+		"orchestrator": map[string]any{"profiles": map[string]any{"container": map[string]any{
+			"base_url": openSandboxURL, "api_key": "budget-portal-crash-test-key", "request_timeout": "1s",
+			"network_guard_path": guardPath, "network_policy_enabled": false}}},
+		"templates":  map[string]any{"dir": templates, "default": "std-1c2g"},
+		"hosts":      map[string]any{"ready_timeout": "1s", "ready_poll_interval": "100ms", "runtime_portal_url": "https://portal.test"},
+		"capacity":   map[string]any{"cpu_milli": 2000, "mem_mib": 4096},
+		"reconciler": map[string]any{"interval": "100ms", "renew_before": "1s", "activity_flush_interval": "100ms"},
+		"storage":    map[string]any{"driver": "docker", "docker_host": dockerHost, "docker_data_dir": dockerData, "min_free_bytes": 1},
+		"cloud_dsh":  map[string]any{"enabled": false, "builtin_search": map[string]any{"enabled": false}},
+		"workspace_storage": map[string]any{"root_dir": workspaceRoot, "max_workspace_bytes": 1048576,
+			"max_owner_bytes": 1048576, "min_free_bytes": 1},
+		"workspace_sync_node": map[string]any{"enabled": false, "project_upload_enabled": false,
+			"agent_workspace_host_mount_enabled": false, "agent_workspace_live_directory_source_enabled": false,
+			"data_root": workspaceData, "workspace_root": workspaceCurrent, "protected_storage_roots": []any{}},
+		"site_storage": map[string]any{"root_dir": siteStorage, "max_release_bytes": 1048576, "max_owner_bytes": 1048576, "min_free_bytes": 1},
+		"gateway": map[string]any{"workbench_dir": workbench, "upstream_cache_ttl": "30s", "credential_cache_ttl": "10s",
+			"preview_port_min": 1024, "preview_port_deny": []int{8080, 5900}, "max_body_bytes": 1048576},
+		"mcp":        map[string]any{"enabled": false, "max_output_bytes": 65536, "screenshot_max_width": 1280},
+		"portal_web": map[string]any{"dir": portalWeb},
+		"log":        map[string]any{"level": "error", "format": "json"},
+	}
+	contents, err := json.Marshal(configuration)
+	if err != nil {
+		t.Fatalf("encode isolated Portal configuration: %v", err)
+	}
+	configPath := filepath.Join(directory, "portal.yaml")
+	if err := os.WriteFile(configPath, contents, 0o600); err != nil {
+		t.Fatalf("write isolated Portal configuration: %v", err)
+	}
+	return configPath
+}
+
+func budgetCrashFreeLoopbackAddress(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return address
+}
+
+func budgetCrashDSNForDatabase(t *testing.T, dsn, databaseName string) string {
+	t.Helper()
+	if strings.Contains(dsn, "://") {
+		parsed, err := url.Parse(dsn)
+		if err != nil {
+			t.Fatalf("parse Portal crash-test database DSN: %v", err)
+		}
+		query := parsed.Query()
+		query.Set("dbname", databaseName)
+		parsed.RawQuery = query.Encode()
+		return parsed.String()
+	}
+	return strings.TrimSpace(dsn) + " dbname='" + databaseName + "'"
 }
 
 func startBudgetCrashProcess(t *testing.T, dsn, databaseName, taskID, modelID, signalPath, callPath string) *budgetCrashProcess {

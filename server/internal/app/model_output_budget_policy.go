@@ -12,7 +12,10 @@ import (
 type modelOutputBudgetStage string
 
 const (
-	modelOutputBudgetStageShortAnswer      modelOutputBudgetStage = "short_answer"
+	// modelOutputBudgetStageRootTextOnly is a neutral structural label for a
+	// root Agent call with no tools or tool-call history. It does not claim that
+	// the user asked for a short answer or a long-form response.
+	modelOutputBudgetStageRootTextOnly     modelOutputBudgetStage = "root_text_only"
 	modelOutputBudgetStageToolStep         modelOutputBudgetStage = "tool_step"
 	modelOutputBudgetStageSubtask          modelOutputBudgetStage = "subtask"
 	modelOutputBudgetStageSummary          modelOutputBudgetStage = "summary"
@@ -23,7 +26,7 @@ const (
 var (
 	modelOutputBudgetStrategyVersionPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`)
 	modelOutputBudgetRequiredStages         = [...]modelOutputBudgetStage{
-		modelOutputBudgetStageShortAnswer,
+		modelOutputBudgetStageRootTextOnly,
 		modelOutputBudgetStageToolStep,
 		modelOutputBudgetStageSubtask,
 		modelOutputBudgetStageSummary,

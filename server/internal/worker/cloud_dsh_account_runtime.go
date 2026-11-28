@@ -1181,6 +1181,32 @@ type cloudDSHAccountTaskPipes struct {
 	pending []byte
 }
 
+var cloudDSHAccountTaskStartKeys = map[string]struct{}{
+	"type": {}, "version": {}, "traceparent": {}, "task_id": {}, "owner_id": {}, "agent_id": {}, "session_id": {},
+	"generation": {}, "authorization_version": {}, "task_revision": {}, "conversation_id": {}, "model": {}, "tools": {},
+	"prompt": {}, "initial_message": {}, "initial_context": {}, "revision_messages": {}, "resume": {},
+	"checkpoint_through_seq": {}, "checkpoint_sha256": {}, "max_tokens": {}, "context_window_tokens": {},
+	"background_jobs": {}, "step_retry": {}, "model_budget_admission": {}, "model_recovery": {}, "agent_tool_profile": {},
+}
+
+func validCloudDSHAccountTaskStartFrame(frame map[string]any) bool {
+	if frame["type"] != "start" {
+		return false
+	}
+	for key := range frame {
+		if _, ok := cloudDSHAccountTaskStartKeys[key]; !ok {
+			return false
+		}
+	}
+	if profile, ok := frame["agent_tool_profile"]; ok {
+		profileValue, isString := profile.(string)
+		if !isString || profileValue != "web_research" {
+			return false
+		}
+	}
+	return true
+}
+
 func (p *cloudDSHAccountTaskPipes) Write(data []byte) (int, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -1219,6 +1245,9 @@ func (p *cloudDSHAccountTaskPipes) send(raw []byte) error {
 		}
 	}
 	if identity.SessionID == p.task.fence.AgentSessionID && frame["type"] == "start" {
+		if !validCloudDSHAccountTaskStartFrame(frame) {
+			return errors.New("account Task start frame is invalid")
+		}
 		frame["type"] = "task_start"
 		frame["server_instance_id"] = p.session.runtime.Fence.ServiceInstanceID
 		frame["runtime_id"] = p.session.runtime.Fence.RuntimeID

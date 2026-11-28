@@ -197,7 +197,7 @@ func TestCompleteTaskTerminalDeliveryModelReportsSafeAndUnknownOutcomes(t *testi
 
 func TestTaskTerminalDeliveryRecoveryDiagnosisIsSentAsSafeModelFact(t *testing.T) {
 	event := []byte(`{"reason":"dsh_recovery_unresolved","detail":{"phase":"recovery","failure_stage":"model_response_validation","failure_category":"unauthorized_tool","failure_reason":"tool_not_in_task_allowlist","tool_name":"morde_mcp_private","tool_call_id":"call_private","tool_dispatched":false}}`)
-	diagnosis := TaskTerminalDeliveryRecoveryDiagnosisFromEvent(event)
+	diagnosis := TaskTerminalDeliveryRecoveryDiagnosisFromEvent(event, TaskTerminalDeliveryReadOnlyToolExecution{})
 	const expected = "模型提出了当前任务未授权的工具操作，系统在派发前已拦截。"
 	if diagnosis != expected {
 		t.Fatalf("recovery diagnosis = %q, want %q", diagnosis, expected)
@@ -255,7 +255,7 @@ func TestTaskTerminalDeliveryRecoveryDiagnosisIsSentAsSafeModelFact(t *testing.T
 
 func TestTaskTerminalDeliveryRecoveryDiagnosisUsesPlainFallbackForUnknownCause(t *testing.T) {
 	event := []byte(`{"reason":"dsh_recovery_unresolved","detail":{"phase":"recovery","failure_category":"private_provider_failure","failure_reason":"private_reason","recovery_stage":"cloud_dsh_run","recovery_reason":"unclassified_runtime_error"}}`)
-	diagnosis := TaskTerminalDeliveryRecoveryDiagnosisFromEvent(event)
+	diagnosis := TaskTerminalDeliveryRecoveryDiagnosisFromEvent(event, TaskTerminalDeliveryReadOnlyToolExecution{})
 	if diagnosis != "模型请求未能得到确认，现有记录无法判定具体原因。" ||
 		strings.Contains(diagnosis, "private_provider_failure") || strings.Contains(diagnosis, "private_reason") {
 		t.Fatalf("unknown recovery diagnosis is not a safe plain fallback: %q", diagnosis)
@@ -264,8 +264,8 @@ func TestTaskTerminalDeliveryRecoveryDiagnosisUsesPlainFallbackForUnknownCause(t
 
 func TestTaskTerminalDeliveryExplainsTaskBudgetReservationFailure(t *testing.T) {
 	event := []byte(`{"reason":"dsh_recovery_unresolved","detail":{"phase":"recovery","failure_stage":"model_call_reservation","failure_category":"task_budget_exhausted","failure_reason":"task_budget_reservation_exceeded"}}`)
-	diagnosis := TaskTerminalDeliveryRecoveryDiagnosisFromEvent(event)
-	const expected = "模型调用前的任务预算检查未通过：本次请求所需的保守预算预留超过任务剩余额度，因此模型没有收到这次请求。"
+	diagnosis := TaskTerminalDeliveryRecoveryDiagnosisFromEvent(event, TaskTerminalDeliveryReadOnlyToolExecution{})
+	const expected = "模型请求在派发前被任务预算检查拦截；所需的保守预算预留超过任务剩余额度。"
 	if diagnosis != expected {
 		t.Fatalf("task budget diagnosis = %q, want %q", diagnosis, expected)
 	}
@@ -274,8 +274,79 @@ func TestTaskTerminalDeliveryExplainsTaskBudgetReservationFailure(t *testing.T) 
 		t.Fatalf("task budget diagnosis is not a safe model fact: %q", diagnosis)
 	}
 
-	unknown := TaskTerminalDeliveryRecoveryDiagnosisFromEvent([]byte(`{"reason":"dsh_recovery_unresolved","detail":{"phase":"recovery","failure_stage":"private_stage","failure_category":"task_budget_exhausted","failure_reason":"private_reason"}}`))
-	if unknown != "任务的模型预算不足，本次请求未能发送。" {
+	unknown := TaskTerminalDeliveryRecoveryDiagnosisFromEvent([]byte(`{"reason":"dsh_recovery_unresolved","detail":{"phase":"recovery","failure_stage":"private_stage","failure_category":"task_budget_exhausted","failure_reason":"private_reason"}}`), TaskTerminalDeliveryReadOnlyToolExecution{})
+	if unknown != "任务的模型预算不足，模型请求未能发送。" {
 		t.Fatalf("unrecognized budget details did not use the bounded fallback: %q", unknown)
+	}
+}
+
+func TestTaskTerminalDeliveryBudgetDiagnosisIncludesSafeExecutionCounts(t *testing.T) {
+	event := []byte(`{"reason":"dsh_recovery_unresolved","detail":{"phase":"recovery","failure_stage":"model_call_reservation","failure_category":"task_budget_exhausted","failure_reason":"task_budget_reservation_exceeded","query":"private query","url":"https://private.example/news","result":"private result","tool_call_id":"call_private"}}`)
+	execution := TaskTerminalDeliveryReadOnlyToolExecution{SuccessfulWebSearchCalls: 10, SuccessfulWebReadCalls: 3}
+	const base = "模型请求在派发前被任务预算检查拦截；所需的保守预算预留超过任务剩余额度。"
+	expected := "此前有10 次网页搜索和 3 次网页读取调用记录为成功；这只能说明调用完成，不能证明网页信息已核实或答复已完成。后续" + base
+	diagnosis := TaskTerminalDeliveryRecoveryDiagnosisFromEvent(event, execution)
+	if diagnosis != expected || !validTerminalDeliveryRecoveryDiagnosis(diagnosis) {
+		t.Fatalf("budget diagnosis with execution evidence = %q, want %q", diagnosis, expected)
+	}
+
+	eventDigest := sha256.Sum256(event)
+	objectiveDigest := sha256.Sum256([]byte("看看今天有什么新闻"))
+	facts := TaskTerminalDeliverySourceFacts{
+		Identity: TaskTerminalDeliveryIdentity{
+			DeliveryID: 42, TaskID: "q1234567", OwnerID: "u1234567", ConversationID: "c1234567", InitiatorID: "u1234567",
+			TaskRevision: 2, AuthorizationVersion: 1, SourceKind: TaskTerminalDeliverySourceWaiting,
+			SourceEventSequence: 9, SourceEventType: "task.waiting_user", SourceSHA256: eventDigest[:],
+		},
+		TaskStatus: "waiting_user", ModelID: "p1234567", ObjectiveSummary: "看看今天有什么新闻", ObjectiveSHA256: objectiveDigest[:],
+		WaitingReason: "external_dependency", RecoveryDiagnosis: diagnosis, ReadOnlyToolExecution: execution,
+	}
+	factsDigest, err := TaskTerminalDeliveryFactsDigest(facts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mismatchedFacts := facts
+	mismatchedFacts.ReadOnlyToolExecution.SuccessfulWebSearchCalls++
+	if _, err := TaskTerminalDeliveryFactsDigest(mismatchedFacts); err == nil {
+		t.Fatal("facts accepted execution counts that do not match the recovery diagnosis")
+	}
+	facts.FactsSHA256 = factsDigest
+	request, err := BuildTaskTerminalDeliveryDSHModelRequest(facts.ModelID, facts)
+	if err != nil {
+		t.Fatalf("build budget explanation request: %v", err)
+	}
+	var decoded struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(request, &decoded); err != nil || len(decoded.Messages) != 2 {
+		t.Fatalf("decode budget explanation request: messages=%+v err=%v", decoded.Messages, err)
+	}
+	var modelFacts struct {
+		RecoveryDiagnosis     string `json:"recovery_diagnosis"`
+		ReadOnlyToolExecution struct {
+			SuccessfulWebSearchCalls int64 `json:"successful_web_search_calls"`
+			SuccessfulWebReadCalls   int64 `json:"successful_web_read_calls"`
+		} `json:"read_only_tool_execution"`
+	}
+	if err := json.Unmarshal([]byte(decoded.Messages[1].Content[0].Text), &modelFacts); err != nil {
+		t.Fatalf("decode safe execution facts: %v", err)
+	}
+	if modelFacts.RecoveryDiagnosis != expected || modelFacts.ReadOnlyToolExecution.SuccessfulWebSearchCalls != 10 ||
+		modelFacts.ReadOnlyToolExecution.SuccessfulWebReadCalls != 3 {
+		t.Fatalf("model did not receive bounded execution facts: %+v", modelFacts)
+	}
+	for _, privateValue := range []string{"morde_web_search", "morde_web_read", "private query", "https://private.example/news",
+		"private result", "call_private", facts.Identity.TaskID, facts.Identity.ConversationID} {
+		if strings.Contains(string(request), privateValue) {
+			t.Fatalf("terminal explanation request exposed private value %q", privateValue)
+		}
+	}
+	if !strings.Contains(decoded.Messages[0].Content[0].Text, "Never claim that news results were verified") {
+		t.Fatal("model instructions did not explicitly forbid claiming that news results were verified")
 	}
 }

@@ -19398,6 +19398,9 @@ private struct MordeRoot: View {
                 designNavigationPath = []
                 selectedDesignTab = tab
                 selectedDesignRoute = tab.route
+                if tab == .chat {
+                    Task { await client.followMainConversation() }
+                }
             },
             onSelectRoute: selectDesignRoute,
             onSettings: { selectDesignRoute(.settings) },
@@ -19448,6 +19451,12 @@ private struct MordeRoot: View {
     private func selectDesignRoute(_ route: MordeDesignRoute) {
         designNavigationPath = []
         eventChainTaskID = nil
+        if case .chat = route {
+            selectedDesignRoute = .chat
+            selectedDesignTab = .chat
+            Task { await client.followMainConversation() }
+            return
+        }
         if case .chatConversation(let id) = route {
             selectedDesignTab = .chat
             selectedDesignRoute = .chat

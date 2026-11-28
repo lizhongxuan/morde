@@ -947,11 +947,22 @@ FROM task_agent_sessions WHERE task_id=$1 AND owner_id=$2 AND session_id=$3 FOR 
 	} else if err != nil {
 		return fmt.Errorf("lock task model Agent Session: %w", err)
 	}
+	recoveryCall := fence.RecoveryCallID != "" && fence.RecoveryDSHCallID != ""
+	rootCheckpointAdvanced := false
+	checkpointThrough := fence.ThroughSequence
 	if fence.AgentSessionID == rootSessionID {
-		recoveryCall := fence.RecoveryCallID != "" && fence.RecoveryDSHCallID != ""
-		if parentSessionID != "" || stepID != "" || sessionThrough != through || !bytes.Equal(sessionDigest, checkpointDigest) ||
-			(!recoveryCall && sessionThrough != fence.ThroughSequence) ||
-			(recoveryCall && sessionThrough < fence.ThroughSequence) {
+		if parentSessionID != "" || stepID != "" || sessionThrough != through || !bytes.Equal(sessionDigest, checkpointDigest) {
+			return domain.NewError(domain.CodeInvalidState, "task model root checkpoint is not committed")
+		}
+		if !recoveryCall && sessionThrough != fence.ThroughSequence {
+			if sessionThrough > fence.ThroughSequence {
+				rootCheckpointAdvanced = true
+				checkpointThrough = sessionThrough
+			} else {
+				return domain.NewError(domain.CodeInvalidState, "task model root checkpoint is not committed")
+			}
+		}
+		if recoveryCall && sessionThrough < fence.ThroughSequence {
 			return domain.NewError(domain.CodeInvalidState, "task model root checkpoint is not committed")
 		}
 	} else {
@@ -970,8 +981,7 @@ FROM task_agent_sessions WHERE task_id=$1 AND owner_id=$2 AND session_id=$3 FOR 
 			return domain.NewError(domain.CodeUnauthenticated, "task model child Agent Session is not running")
 		}
 	}
-	recoveryCall := fence.RecoveryCallID != "" && fence.RecoveryDSHCallID != ""
-	if (!recoveryCall && sessionThrough != fence.ThroughSequence) ||
+	if (!recoveryCall && sessionThrough != fence.ThroughSequence && !rootCheckpointAdvanced) ||
 		(recoveryCall && sessionThrough < fence.ThroughSequence) || len(sessionDigest) != 32 {
 		return domain.NewError(domain.CodeInvalidState, "task model Agent Session checkpoint head is not committed")
 	}
@@ -1004,7 +1014,7 @@ JOIN task_agent_instances i ON i.task_id=c.task_id AND i.owner_id=c.owner_id
 WHERE c.task_id=$1 AND c.owner_id=$2 AND c.agent_session_id=$3 AND c.agent_root_session_id=$4
  AND c.through_seq=$5 AND c.digest=$6 AND c.auth_version=$7 AND c.engine_version=$8 AND c.profile_version=$9
  AND ((c.agent_generation=$10 AND i.state='active') OR (c.agent_generation<$10 AND i.state='stopped')))`,
-			fence.TaskID, fence.OwnerID, fence.AgentSessionID, rootSessionID, fence.ThroughSequence, sessionDigest,
+			fence.TaskID, fence.OwnerID, fence.AgentSessionID, rootSessionID, checkpointThrough, sessionDigest,
 			fence.AuthorizationVersion, fence.EngineVersion, fence.ProfileVersion, fence.AgentGeneration).Scan(&checkpoint)
 	}
 	if err != nil {
@@ -1033,6 +1043,17 @@ WHERE c.task_id=$1 AND c.owner_id=$2 AND c.agent_session_id=$3 AND c.agent_root_
 			return domain.NewError(domain.CodeUnauthenticated, "task Workspace authorization is unavailable")
 		}
 	}
+	finishFenceAuthorization := func(err error) error {
+		if err != nil {
+			return err
+		}
+		if !rootCheckpointAdvanced {
+			return nil
+		}
+		checkpointErr := domain.NewError(domain.CodeInvalidState, "task model root checkpoint is not committed")
+		checkpointErr.Details["reason"] = "task_checkpoint_advanced"
+		return checkpointErr
+	}
 	permit, err := projectWorkspaceModelPermit(ctx, fence)
 	if err != nil {
 		return err
@@ -1045,7 +1066,7 @@ WHERE c.task_id=$1 AND c.owner_id=$2 AND c.agent_session_id=$3 AND c.agent_root_
 		if err != nil || !projectWorkspaceAuthorizationPermit(ctx, current) {
 			return domain.NewError(domain.CodeUnauthenticated, "task Workspace authorization changed")
 		}
-		return checkAgentCheckpointAuthorization(ctx, tx, fence.InitiatorID, fence.TaskID, authKind, tokenID, authScopes, installationID)
+		return finishFenceAuthorization(checkAgentCheckpointAuthorization(ctx, tx, fence.InitiatorID, fence.TaskID, authKind, tokenID, authScopes, installationID))
 	}
 	switch authKind {
 	case string(identity.KindScheduleTask):
@@ -1060,12 +1081,12 @@ WHERE c.task_id=$1 AND c.owner_id=$2 AND c.agent_session_id=$3 AND c.agent_root_
 		if err != nil || !linked {
 			return domain.NewError(domain.CodeUnauthenticated, "scheduled Task authorization is unavailable")
 		}
-		return nil
+		return finishFenceAuthorization(nil)
 	case string(identity.KindClient):
 		if !domain.ValidClientInstallationID(installationID) {
 			return domain.NewError(domain.CodeUnauthenticated, "task installation is unavailable")
 		}
-		return checkModelInstallation(ctx, tx, installationID, fence.InitiatorID)
+		return finishFenceAuthorization(checkModelInstallation(ctx, tx, installationID, fence.InitiatorID))
 	case string(identity.KindSession), string(identity.KindAPIKey):
 		if !domain.ValidTokenID(tokenID) {
 			return domain.NewError(domain.CodeUnauthenticated, "task credential is unavailable")
@@ -1079,9 +1100,9 @@ WHERE c.task_id=$1 AND c.owner_id=$2 AND c.agent_session_id=$3 AND c.agent_root_
 			return domain.NewError(domain.CodeUnauthenticated, "task credential is unavailable")
 		}
 		if installationID != "" {
-			return checkModelInstallation(ctx, tx, installationID, fence.InitiatorID)
+			return finishFenceAuthorization(checkModelInstallation(ctx, tx, installationID, fence.InitiatorID))
 		}
-		return nil
+		return finishFenceAuthorization(nil)
 	default:
 		return domain.NewError(domain.CodeUnauthenticated, "task authorization is unavailable")
 	}

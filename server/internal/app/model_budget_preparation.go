@@ -191,7 +191,7 @@ func (s *ModelGatewayService) SupportsTaskModelBudgetAdmission(ctx context.Conte
 	if routeKey == "" {
 		return false, nil
 	}
-	_, _, err = s.modelOutputBudgetStrategyForStage(routeKey, string(modelOutputBudgetStageShortAnswer))
+	_, _, err = s.modelOutputBudgetStrategyForStage(routeKey, string(modelOutputBudgetStageRootTextOnly))
 	return err == nil, nil
 }
 
@@ -271,7 +271,11 @@ func (s *ModelGatewayService) PrepareTaskModelBudget(ctx context.Context, input 
 		return TaskModelBudgetPlan{}, err
 	}
 	if !shadowPlan.Dispatchable {
-		return TaskModelBudgetPlan{}, domain.NewError(domain.CodeQuotaExceeded, "model budget cannot meet the selected stage minimum")
+		denied := domain.NewError(domain.CodeQuotaExceeded, "model budget cannot meet the selected stage minimum")
+		if shadowPlan.BlockReason == "below_stage_minimum" && containsModelBudgetLimit(shadowPlan.LimitingDimensions, "context_window") {
+			denied.Details["reason"] = "context_window_below_stage_minimum"
+		}
+		return TaskModelBudgetPlan{}, denied
 	}
 	failedCallID, err := DSHModelCallID(fence.TaskID, fence.AgentSessionID, fence.ThroughSequence)
 	if err != nil {
@@ -344,6 +348,15 @@ func (s *ModelGatewayService) PrepareTaskModelBudget(ctx context.Context, input 
 	return TaskModelBudgetPlan{PlanID: result.PlanID, MaxTokens: int(result.MaxOutputTokens)}, nil
 }
 
+func containsModelBudgetLimit(limits []string, target string) bool {
+	for _, limit := range limits {
+		if limit == target {
+			return true
+		}
+	}
+	return false
+}
+
 func taskModelOutputBudgetStage(fence ModelTaskFence, needsTools bool, purpose string) modelOutputBudgetStage {
 	if purpose == TaskModelBudgetPurposeCompaction {
 		return modelOutputBudgetStageSummary
@@ -354,7 +367,7 @@ func taskModelOutputBudgetStage(fence ModelTaskFence, needsTools bool, purpose s
 	if needsTools {
 		return modelOutputBudgetStageToolStep
 	}
-	return modelOutputBudgetStageShortAnswer
+	return modelOutputBudgetStageRootTextOnly
 }
 
 func (s *ModelGatewayService) waitForTaskModelBudgetCapacity(ctx context.Context, prepareErr error, fence ModelTaskFence,

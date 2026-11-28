@@ -3,7 +3,7 @@ import { once } from 'node:events'
 import { LlmError, textOnlyImageText } from '@deepseek-ai/dsh-llm'
 import {
   coordinatorCompactionModelCallID, coordinatorModelCallID, modelCallID, MODEL_FAILURE_SUMMARIES, TASK_VALIDATION_REVIEW_IDENTITY_FIELDS,
-  taskValidationReviewModelCallID, validDelegateSelection, validLateChildTools, validMessageDelivery,
+  MODEL_BUDGET_CONTEXT_PRESSURE_CODE, taskValidationReviewModelCallID, validDelegateSelection, validLateChildTools, validMessageDelivery,
 } from './engine.mjs'
 
 export const MAX_FRAME_BYTES = 4 * 1024 * 1024
@@ -17,6 +17,7 @@ const MAX_TOOL_IMAGE_CACHE_BYTES = 8 * 1024 * 1024
 // shortcut: keep a bounded window for late backend replies; expired tombstones fail closed when their reply arrives.
 const MAX_ABANDONED_RESPONSES = 4096
 const MODEL_BUDGET_TIMEOUT_MS = 30_000
+const MODEL_BUDGET_CONTEXT_PRESSURE_REASON = 'context_window_below_stage_minimum'
 const MAX_DELEGATE_TITLE_BYTES = 256
 const MAX_DELEGATE_OBJECTIVE_BYTES = 32 * 1024
 const TOOL_NAME = /^[A-Za-z][A-Za-z0-9_.-]{0,127}$/
@@ -93,12 +94,14 @@ function validModelBudgetPlanFrame(frame, pending) {
   const baseKeys = ['type', ...MODEL_BUDGET_IDENTITY_FIELDS, 'id', 'through_seq', 'call_id', 'dsh_call_id', 'request_digest', 'ok']
   const successKeys = [...baseKeys, 'budget_plan_id', 'max_tokens']
   if (!isObject(frame) || typeof frame.ok !== 'boolean' ||
-      !exactKeys(frame, frame.ok ? successKeys : baseKeys) || frame.id !== pending.id ||
+      frame.id !== pending.id ||
       frame.through_seq !== pending.through || frame.call_id !== pending.callID ||
       frame.dsh_call_id !== pending.dshCallID ||
       frame.request_digest !== pending.requestDigest ||
       !MODEL_BUDGET_IDENTITY_FIELDS.every(key => frame[key] === pending.identity[key])) return false
-  if (!frame.ok) return true
+  if (!frame.ok) return exactKeys(frame, baseKeys) ||
+    exactKeys(frame, [...baseKeys, 'denial_reason']) && frame.denial_reason === MODEL_BUDGET_CONTEXT_PRESSURE_REASON
+  if (!exactKeys(frame, successKeys)) return false
   return typeof frame.budget_plan_id === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(frame.budget_plan_id) &&
     Number.isSafeInteger(frame.max_tokens) && frame.max_tokens > 0
 }
@@ -431,7 +434,9 @@ export class WorkerIPC {
       clearTimeout(pending.timer)
       if (pending.abandoned) return
       if (!frame.ok) {
-        pending.reject(new Error('model budget admission was denied'))
+        const error = new Error('model budget admission was denied')
+        if (frame.denial_reason === MODEL_BUDGET_CONTEXT_PRESSURE_REASON) error.code = MODEL_BUDGET_CONTEXT_PRESSURE_CODE
+        pending.reject(error)
         return
       }
       pending.resolve({

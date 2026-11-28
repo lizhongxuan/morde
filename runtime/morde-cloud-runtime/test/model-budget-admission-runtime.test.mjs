@@ -48,6 +48,16 @@ function modelBudgetPlanResponse(request, { cap = 768, planID = 'budget_plan_123
   }
 }
 
+function modelBudgetDenialResponse(request, denialReason) {
+  return {
+    type: 'model_budget_plan', id: request.id,
+    ...Object.fromEntries(['task_id', 'owner_id', 'agent_id', 'generation', 'authorization_version', 'session_id']
+      .map(key => [key, request[key]])),
+    through_seq: request.through_seq, call_id: request.call_id, dsh_call_id: request.dsh_call_id,
+    request_digest: request.request_digest, ok: false, denial_reason: denialReason,
+  }
+}
+
 function modelChunks(identity, request, text = 'local reply') {
   const chunks = [
     { type: 'block-start', index: 0, blockType: 'text' },
@@ -90,6 +100,7 @@ async function runLocalRuntime({ sessionID, admission = true, cap = 768, start: 
   const output = new PassThrough()
   const ipc = new WorkerIPC(input, output)
   const frames = []
+  const planResponses = []
   let buffer = ''
   let prepareIndex = 0
   let modelIndex = 0
@@ -118,7 +129,11 @@ async function runLocalRuntime({ sessionID, admission = true, cap = 768, start: 
       } else if (frame.type === 'model_budget_prepare') {
         const selection = planForPrepare?.(frame, prepareIndex) ?? { cap, planID: `plan_${sessionID}` }
         prepareIndex++
-        writeFrame(input, modelBudgetPlanResponse(frame, selection))
+        const response = selection.denialReason
+          ? modelBudgetDenialResponse(frame, selection.denialReason)
+          : modelBudgetPlanResponse(frame, selection)
+        planResponses.push(response)
+        writeFrame(input, response)
       } else if (frame.type === 'model') {
         const frameIdentity = identityForFrame(frame)
         if (respondToModel) respondToModel(frame, { input, identity: frameIdentity, index: modelIndex })
@@ -137,7 +152,7 @@ async function runLocalRuntime({ sessionID, admission = true, cap = 768, start: 
   await ipc.start.promise
   try {
     const result = await runAgent(ipc, start)
-    return { frames, result }
+    return { frames, planResponses, result }
   } finally {
     input.destroy()
     output.destroy()
@@ -315,6 +330,46 @@ test('an explicit denial fails closed without turning it into a valid plan', asy
   assert.equal(ipc.failed, false)
   input.destroy()
   output.destroy()
+})
+
+test('only the typed context-window denial can request one compaction retry', async t => {
+  await t.test('preserves the safe context-pressure signal', async () => {
+    const { ipc, input, output } = await createIPC()
+    const framePromise = nextOutputFrame(output)
+    const promise = ipc.prepareModelBudget(taskIdentity(), 8, 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      draftPayload(new AbortController().signal))
+    const request = await framePromise
+    const denial = {
+      type: 'model_budget_plan', id: request.id, ...taskIdentity(), through_seq: request.through_seq,
+      call_id: request.call_id, dsh_call_id: request.dsh_call_id, request_digest: request.request_digest,
+      ok: false, denial_reason: 'context_window_below_stage_minimum',
+    }
+    const rejected = assert.rejects(promise, error => error.code === 'MODEL_BUDGET_CONTEXT_PRESSURE')
+    writeFrame(input, denial)
+    await rejected
+    assert.equal(ipc.failed, false)
+    input.destroy()
+    output.destroy()
+  })
+
+  await t.test('rejects any unrecognized denial reason', async () => {
+    const { ipc, input, output } = await createIPC()
+    const framePromise = nextOutputFrame(output)
+    const promise = ipc.prepareModelBudget(taskIdentity(), 8, 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+      draftPayload(new AbortController().signal))
+    const request = await framePromise
+    const denial = {
+      type: 'model_budget_plan', id: request.id, ...taskIdentity(), through_seq: request.through_seq,
+      call_id: request.call_id, dsh_call_id: request.dsh_call_id, request_digest: request.request_digest,
+      ok: false, denial_reason: 'account_budget_exhausted',
+    }
+    const rejected = assert.rejects(promise, /model budget response did not match its request/)
+    writeFrame(input, denial)
+    await rejected
+    assert.equal(ipc.failed, true)
+    input.destroy()
+    output.destroy()
+  })
 })
 
 test('an unknown budget capability fails closed', async () => {
@@ -746,7 +801,7 @@ test('opt-in Task compaction prepares its direct LLM stream against the final pr
     const sessionID = 'budget_session_compaction'
     const start = {
       type: 'start', version: 1, ...taskIdentity(sessionID), task_revision: 1, model: 'budget-test-model',
-      tools: [], context_window_tokens: 4_096,
+      tools: [], context_window_tokens: 16_384,
       initial_message: { message_id: 'mcompact', content: 'Preserve this opening requirement.', attachment_ids: [] },
       model_budget_admission: true,
     }
@@ -794,7 +849,8 @@ test('opt-in Task compaction prepares its direct LLM stream against the final pr
     }
 
     const events = frames.filter(frame => frame.type === 'checkpoint').flatMap(frame => JSON.parse(frame.payload).events)
-    assert.ok(events.some(event => event.type === 'compaction/summary'))
+    assert.ok(events.some(event => event.type === 'compaction/summary'),
+      `no compaction summary; compaction_errors=${JSON.stringify(events.filter(event => event.type === 'compaction/end').map(event => event.data.error).filter(Boolean))}; prepares=${prepareFrames.length}; models=${modelFrames.length}`)
     assert.ok(events.some(event => event.type === 'compaction/end' && !event.data.error))
     const firstCompactionPrepare = prepareFrames[0]
     const prefix = events.filter(event => event.seq <= firstCompactionPrepare.through_seq)
@@ -819,6 +875,71 @@ test('opt-in Task compaction prepares its direct LLM stream against the final pr
     }
     assert.equal(firstCompactionPrepare.turn, activeTurn)
     assert.equal(firstCompactionPrepare.step, activeStep ?? completedStep + 1)
+  })
+
+test('typed context-window denial compacts the live Task session and prepares a fresh request',
+  { timeout: 30_000 }, async () => {
+    const sessionID = 'budget_session_context_pressure'
+    const start = {
+      type: 'start', version: 1, ...taskIdentity(sessionID), task_revision: 1, model: 'budget-test-model',
+      tools: [], context_window_tokens: 131_072,
+      initial_message: { message_id: 'mpressur', content: 'Preserve this opening requirement.', attachment_ids: [] },
+      model_budget_admission: true,
+    }
+    let followupsDelivered = 0
+    let pressureDenied = false
+    let rootPrepareCount = 0
+    const { frames, planResponses, result } = await runLocalRuntime({
+      sessionID,
+      start,
+      planForPrepare: prepare => {
+        if (prepare.config.purpose !== 'compaction') rootPrepareCount++
+        if (!pressureDenied && prepare.config.purpose !== 'compaction' && rootPrepareCount >= 21) {
+          pressureDenied = true
+          return { denialReason: 'context_window_below_stage_minimum' }
+        }
+        return { cap: prepare.config.purpose === 'compaction' ? 384 : 768,
+          planID: `plan_pressure_${prepare.through_seq}` }
+      },
+      respondToModel: (frame, { input, identity }) => {
+        if (followupsDelivered < 20) {
+          followupsDelivered++
+          const followup = followupsDelivered
+          writeFrame(input, {
+            type: 'message_delivery', version: 2, ...identity,
+            message_id: `mp${String(followup).padStart(6, '0')}`,
+            content: `pressure-followup-${followup} ${'history '.repeat(275)}`,
+            attachment_ids: [],
+          })
+        }
+        modelChunks(identity, { ...frame, output: input }, 'context-aware reply')
+      },
+    })
+
+    assert.equal(result.type, 'settled')
+    assert.equal(followupsDelivered, 20)
+    const runtimeEvents = frames.filter(frame => frame.type === 'checkpoint').flatMap(frame => JSON.parse(frame.payload).events)
+    assert.equal(result.state, 'completed_candidate', JSON.stringify({ result,
+      turnEnds: runtimeEvents.filter(event => event.type === 'turn/end').map(event => event.data?.reason),
+      assistantTextLengths: runtimeEvents.filter(event => event.type === 'assistant/message').map(event =>
+        event.data?.message?.content?.filter(block => block.type === 'text').map(block => block.text.length)),
+      frames: frames.map(frame => ({
+      type: frame.type, purpose: frame.config?.purpose, denial_reason: frame.denial_reason, reason: frame.reason,
+    })) }))
+    const prepares = frames.filter(frame => frame.type === 'model_budget_prepare')
+    const denials = planResponses.filter(frame => !frame.ok)
+    const compactionPrepares = prepares.filter(frame => frame.config.purpose === 'compaction')
+    assert.equal(denials.length, 1)
+    assert.equal(denials[0].denial_reason, 'context_window_below_stage_minimum')
+    assert.ok(compactionPrepares.length > 0, `no pressure compaction prepare; frames=${frames.map(frame => frame.type).join(', ')}`)
+    const deniedPrepareIndex = prepares.findIndex(frame => frame.call_id === denials[0].call_id)
+    const pressureCompaction = compactionPrepares.find(frame => prepares.indexOf(frame) > deniedPrepareIndex)
+    assert.ok(pressureCompaction, 'context-pressure compaction was not planned after the typed denial')
+    const retryPrepare = prepares.find(frame => frame.through_seq > pressureCompaction.through_seq && frame.config.purpose !== 'compaction')
+    assert.ok(retryPrepare, 'no fresh root request was prepared after compaction')
+    assert.notEqual(retryPrepare.call_id, denials[0].call_id)
+    assert.ok(runtimeEvents.some(event => event.type === 'compaction/summary'))
+    assert.ok(runtimeEvents.some(event => event.type === 'compaction/end' && !event.data.error))
   })
 
 test('context-overflow compaction retry prepares a fresh plan after checkpointing the failed attempt',
