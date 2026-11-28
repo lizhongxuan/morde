@@ -34,8 +34,21 @@ function recordRequestTrace(requestHeaders: Headers, responseHeaders: Headers | 
 }
 const systemFetch: typeof fetch = (input, init) => tracedFetch(async (requestInput, requestInit) => {
   const headers = outgoingHeaders(requestInput, requestInit);
+  const url = typeof requestInput === "string" ? requestInput : requestInput instanceof URL ? requestInput.href : requestInput.url;
+  const method = (requestInit?.method ?? (requestInput instanceof Request ? requestInput.method : "GET")).toUpperCase();
+  const signal = requestInit?.signal ?? (requestInput instanceof Request ? requestInput.signal : undefined);
+  const fetchOnce = () => net.fetch(url, requestInit);
   try {
-    const response = await net.fetch(typeof requestInput === "string" ? requestInput : requestInput instanceof URL ? requestInput.href : requestInput.url, requestInit);
+    let response: Response;
+    try { response = await fetchOnce(); }
+    catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      const transientNetworkFailure = /\b(?:net::)?ERR_(?:HTTP2_PROTOCOL_ERROR|CONNECTION_RESET|CONNECTION_CLOSED|CONNECTION_ABORTED|NETWORK_CHANGED)\b/.test(errorMessage);
+      if ((method !== "GET" && method !== "HEAD") || !transientNetworkFailure || signal?.aborted) throw error;
+      await new Promise<void>((resolve) => setTimeout(resolve, 120));
+      if (signal?.aborted) throw error;
+      response = await fetchOnce();
+    }
     recordRequestTrace(headers, response.headers, response.status);
     return response;
   } catch (error) {

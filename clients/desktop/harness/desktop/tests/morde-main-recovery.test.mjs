@@ -183,6 +183,56 @@ test('one desktop login stores Client and Sync only, injects an HttpOnly Web coo
   } finally { globalThis.fetch = originalFetch; h.cleanup(); }
 });
 
+test('transient HTTP/2 failures retry one safe read, but never replay a request body', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  let failedCapabilitiesRead = false;
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url, options });
+    if (String(url).endsWith('/api/capabilities') && !failedCapabilitiesRead) {
+      failedCapabilitiesRead = true;
+      throw new TypeError('net::ERR_HTTP2_PROTOCOL_ERROR');
+    }
+    return loginFetch(url);
+  };
+  const h = harness();
+  try {
+    await h.ready();
+    const state = await h.invoke('morde:login', auth.origin, auth.accountName, 'password');
+    assert.equal(state.authenticated, true);
+    assert.deepEqual(calls.slice(0, 3).map((call) => call.url), [
+      `${auth.origin}/api/capabilities`, `${auth.origin}/api/capabilities`, `${auth.origin}/api/auth/client-login`,
+    ]);
+  } finally { globalThis.fetch = originalFetch; h.cleanup(); }
+
+  const beforeFailedRetry = globalThis.fetch;
+  const failedReads = [];
+  globalThis.fetch = async (url) => {
+    failedReads.push(url);
+    throw new TypeError('net::ERR_HTTP2_PROTOCOL_ERROR');
+  };
+  const failedReadHarness = harness();
+  try {
+    await failedReadHarness.ready();
+    await assert.rejects(failedReadHarness.invoke('morde:login', auth.origin, auth.accountName, 'password'), /无法确认 Morde 服务版本/);
+    assert.equal(failedReads.filter((url) => String(url).endsWith('/api/capabilities')).length, 2);
+  } finally { globalThis.fetch = beforeFailedRetry; failedReadHarness.cleanup(); }
+
+  const secondFetch = globalThis.fetch;
+  const postCalls = [];
+  globalThis.fetch = async (url, options) => {
+    postCalls.push({ url, options });
+    if (String(url).endsWith('/api/auth/client-login')) throw new TypeError('net::ERR_HTTP2_PROTOCOL_ERROR');
+    return loginFetch(url);
+  };
+  const postHarness = harness();
+  try {
+    await postHarness.ready();
+    await assert.rejects(postHarness.invoke('morde:login', auth.origin, auth.accountName, 'password'), /无法连接 Morde 服务/);
+    assert.equal(postCalls.filter((call) => String(call.url).endsWith('/api/auth/client-login')).length, 1);
+  } finally { globalThis.fetch = secondFetch; postHarness.cleanup(); }
+});
+
 test('renderer state exposes only a local directory label and a resumable Workspace checkpoint summary', async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url) => loginFetch(url);
