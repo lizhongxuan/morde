@@ -18,7 +18,6 @@ module.exports = async ({ electronPlatformName, appOutDir, packager }) => {
     'NSBluetoothAlwaysUsageDescription',
     'NSBluetoothPeripheralUsageDescription',
     'NSCameraUsageDescription',
-    'NSMicrophoneUsageDescription',
   ]) {
     const result = spawnSync('plutil', ['-remove', key, plist], { encoding: 'utf8' });
     if (result.status !== 0) throw new Error(`Could not remove unused macOS permission ${key}: ${result.stderr}`);

@@ -5,6 +5,7 @@ import { AssistantVoiceInput } from './AssistantVoiceInput';
 class FakeRecognition {
   static latest: FakeRecognition | null = null;
   static startThrows = false;
+  static omitStartEvent = false;
 
   lang = '';
   continuous = false;
@@ -15,7 +16,7 @@ class FakeRecognition {
   onend: (() => void) | null = null;
   start = vi.fn(() => {
     if (FakeRecognition.startThrows) throw new Error('start failed');
-    this.onstart?.();
+    if (!FakeRecognition.omitStartEvent) this.onstart?.();
   });
   stop = vi.fn();
   abort = vi.fn();
@@ -81,6 +82,7 @@ describe('AssistantVoiceInput', () => {
   beforeEach(() => {
     FakeRecognition.latest = null;
     FakeRecognition.startThrows = false;
+    FakeRecognition.omitStartEvent = false;
     FakeAudioContext.latest = null;
     previousMediaDevices = Object.getOwnPropertyDescriptor(navigator, 'mediaDevices');
     window.history.replaceState({}, '', '/assistant');
@@ -316,6 +318,34 @@ describe('AssistantVoiceInput', () => {
     expect(FakeAudioContext.latest?.close).toHaveBeenCalledOnce();
     expect(endVoiceRecording).toHaveBeenCalledWith('audio-token');
     expect(document.querySelector('.assistant-voice-waveform')).toBeNull();
+  });
+
+  it('starts the local meter when the browser omits the recognition start event', async () => {
+    FakeRecognition.omitStartEvent = true;
+    const { stream, track } = fakeStream();
+    const getUserMedia = vi.fn(async () => stream);
+    const endVoiceRecording = vi.fn(async () => ({ released: true }));
+    setMediaDevices(getUserMedia);
+    audioContextWindow.AudioContext = FakeAudioContext as unknown as typeof AudioContext;
+    supportedWindow.morde = {
+      voiceWaveformEnabled: true,
+      beginVoiceRecording: vi.fn(async () => 'no-start-event-token'),
+      endVoiceRecording,
+    };
+    render(<AssistantVoiceInput onTranscript={vi.fn()} />);
+
+    fireEvent.click(screen.getByRole('button', { name: '开始语音输入' }));
+    const waveform = await waitFor(() => {
+      const element = document.querySelector('.assistant-voice-waveform');
+      expect(element).not.toBeNull();
+      return element as HTMLElement;
+    });
+
+    expect(getUserMedia).toHaveBeenCalledWith({ audio: true, video: false });
+    expect(waveform.firstElementChild).toHaveStyle({ height: '3.8px' });
+    fireEvent.click(screen.getByRole('button', { name: '取消语音输入' }));
+    expect(track.stop).toHaveBeenCalledOnce();
+    expect(endVoiceRecording).toHaveBeenCalledWith('no-start-event-token');
   });
 
   it('keeps speech recognition running and hides the meter when microphone capture fails', async () => {

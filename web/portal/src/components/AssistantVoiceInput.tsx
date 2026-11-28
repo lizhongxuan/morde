@@ -224,10 +224,6 @@ export function AssistantVoiceInput({ onTranscript, disabled = false, language =
     waveformCaptureRef.current = capture;
     const isCurrent = () => waveformCaptureRef.current === capture &&
       waveformGenerationRef.current === capture.generation && recognitionRef.current === recognition && !capture.disposed;
-    recognition.onstart = () => {
-      if (!isCurrent()) return;
-      if (bridge.voiceWaveformEnabled) startWaveform(recognition, capture);
-    };
     const supportedWindow = typeof window === 'undefined' ? undefined : window as SpeechRecognitionWindow;
     const AudioContextConstructor = supportedWindow?.AudioContext ?? supportedWindow?.webkitAudioContext;
     if (bridge.voiceWaveformEnabled && AudioContextConstructor) {
@@ -252,6 +248,9 @@ export function AssistantVoiceInput({ onTranscript, disabled = false, language =
         }
         recognition.start();
         recognitionStartedRef.current = true;
+        // The browser may never emit SpeechRecognition's onstart event even
+        // though start() returned. Start the opt-in local meter independently.
+        if (bridge.voiceWaveformEnabled) startWaveform(recognition, capture);
         setStatus('正在聆听…');
       } catch {
         if (!isCurrent()) {

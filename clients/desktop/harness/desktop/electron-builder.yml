@@ -72,3 +72,5 @@ mac:
   category: public.app-category.productivity
   hardenedRuntime: false
   identity: null
+  extendInfo:
+    NSMicrophoneUsageDescription: Morde uses the microphone while you use voice input or enable microphone waveform display.

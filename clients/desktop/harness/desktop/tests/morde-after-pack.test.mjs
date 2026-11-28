@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -42,4 +42,26 @@ test('desktop packages include the morde-sync source license', () => {
   assert.match(builder, /from: \.\.\/\.\.\/\.\.\/\.\.\/runtime\/morde-sync\/LICENSE\s+to: legal\/LICENSE\.morde-sync/);
   assert.match(notice, /licensed under GNU GPL version 3 or later/);
   assert.match(license, /GNU GENERAL PUBLIC LICENSE\s+Version 3/);
+});
+
+test('macOS packages retain the microphone purpose string used by voice input', { skip: process.platform !== 'darwin' }, async () => {
+  const output = mkdtempSync(join(tmpdir(), 'morde-after-pack-macos-'));
+  const contents = join(output, 'morde-pc.app', 'Contents');
+  const plist = join(contents, 'Info.plist');
+  const purpose = 'Morde uses the microphone while you use voice input or enable microphone waveform display.';
+  mkdirSync(contents, { recursive: true });
+  writeFileSync(plist, `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n<key>NSAppTransportSecurity</key><dict/>\n<key>NSAudioCaptureUsageDescription</key><string>unused</string>\n<key>NSBluetoothAlwaysUsageDescription</key><string>unused</string>\n<key>NSBluetoothPeripheralUsageDescription</key><string>unused</string>\n<key>NSCameraUsageDescription</key><string>unused</string>\n<key>NSMicrophoneUsageDescription</key><string>${purpose}</string>\n</dict></plist>\n`);
+
+  try {
+    await afterPack({ electronPlatformName: 'darwin', appOutDir: output, packager: { appInfo: { productFilename: 'morde-pc' } } });
+    const packedPlist = readFileSync(plist, 'utf8');
+    assert.match(packedPlist, /<key>NSMicrophoneUsageDescription<\/key>/);
+    assert.ok(packedPlist.includes(`<string>${purpose}</string>`));
+    assert.doesNotMatch(packedPlist, /<key>NSCameraUsageDescription<\/key>/);
+
+    const builder = readFileSync(new URL('../electron-builder.yml', import.meta.url), 'utf8');
+    assert.match(builder, /NSMicrophoneUsageDescription:\s*Morde uses the microphone while you use voice input or enable microphone waveform display\./);
+  } finally {
+    rmSync(output, { recursive: true, force: true });
+  }
 });
