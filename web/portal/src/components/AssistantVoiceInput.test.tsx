@@ -190,6 +190,32 @@ describe('AssistantVoiceInput', () => {
     expect(onTranscript).toHaveBeenCalledWith('新会话文字');
   });
 
+  it('ignores callbacks from a cancelled session after recognition is reopened', () => {
+    const onTranscript = vi.fn();
+    render(<AssistantVoiceInput onTranscript={onTranscript} />);
+    fireEvent.click(screen.getByRole('button', { name: '开始语音输入' }));
+    const cancelled = FakeRecognition.latest;
+
+    fireEvent.click(screen.getByRole('button', { name: '取消语音输入' }));
+    fireEvent.click(screen.getByRole('button', { name: '开始语音输入' }));
+    const reopened = FakeRecognition.latest;
+    expect(reopened).not.toBe(cancelled);
+
+    act(() => {
+      cancelled?.emitFinal('取消后迟到的文字');
+      cancelled?.onerror?.({ error: 'aborted' });
+      cancelled?.onend?.();
+    });
+
+    expect(onTranscript).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: '停止语音输入' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByLabelText('语音输入状态')).toHaveTextContent('正在聆听');
+
+    act(() => reopened?.emitFinal('重新打开后的文字'));
+    expect(onTranscript).toHaveBeenCalledOnce();
+    expect(onTranscript).toHaveBeenCalledWith('重新打开后的文字');
+  });
+
   it('emits only non-empty final results beginning at resultIndex', () => {
     const onTranscript = vi.fn();
     render(<AssistantVoiceInput onTranscript={onTranscript} />);
@@ -356,6 +382,34 @@ describe('AssistantVoiceInput', () => {
     expect(document.querySelector('.assistant-voice-waveform')).toBeNull();
   });
 
+  it.each(['cancel', 'unmount'] as const)(
+    'does not start recognition and releases a pending voice recording lease after %s',
+    async (interruption) => {
+      let resolveLease: ((token: string) => void) | undefined;
+      const beginVoiceRecording = vi.fn(() => new Promise<string>((resolve) => { resolveLease = resolve; }));
+      const endVoiceRecording = vi.fn(async () => ({ released: true }));
+      supportedWindow.morde = { voiceWaveformEnabled: false, beginVoiceRecording, endVoiceRecording };
+      const onTranscript = vi.fn();
+      const view = render(<AssistantVoiceInput onTranscript={onTranscript} />);
+
+      fireEvent.click(screen.getByRole('button', { name: '开始语音输入' }));
+      const recognition = FakeRecognition.latest;
+      expect(recognition?.start).not.toHaveBeenCalled();
+      expect(beginVoiceRecording).toHaveBeenCalledOnce();
+
+      if (interruption === 'cancel') fireEvent.click(screen.getByRole('button', { name: '取消语音输入' }));
+      else view.unmount();
+
+      await act(async () => {
+        resolveLease?.(`late-${interruption}-token`);
+      });
+
+      await waitFor(() => expect(endVoiceRecording).toHaveBeenCalledWith(`late-${interruption}-token`));
+      expect(recognition?.start).not.toHaveBeenCalled();
+      expect(onTranscript).not.toHaveBeenCalled();
+    },
+  );
+
   it('returns to idle when the browser ends recognition unexpectedly', () => {
     render(<AssistantVoiceInput onTranscript={vi.fn()} />);
     fireEvent.click(screen.getByRole('button', { name: '开始语音输入' }));
@@ -400,13 +454,20 @@ describe('AssistantVoiceInput', () => {
     expect(screen.getByRole('button', { name: '开始语音输入' })).toBeEnabled();
   });
 
-  it('aborts browser recognition when the component unmounts', () => {
-    const view = render(<AssistantVoiceInput onTranscript={vi.fn()} />);
+  it('aborts browser recognition and ignores late callbacks when the component unmounts', () => {
+    const onTranscript = vi.fn();
+    const view = render(<AssistantVoiceInput onTranscript={onTranscript} />);
     fireEvent.click(screen.getByRole('button', { name: '开始语音输入' }));
     const recognition = FakeRecognition.latest;
 
     view.unmount();
 
     expect(recognition?.abort).toHaveBeenCalledOnce();
+    act(() => {
+      recognition?.emitFinal('窗口关闭后的迟到文字');
+      recognition?.onerror?.({ error: 'aborted' });
+      recognition?.onend?.();
+    });
+    expect(onTranscript).not.toHaveBeenCalled();
   });
 });
