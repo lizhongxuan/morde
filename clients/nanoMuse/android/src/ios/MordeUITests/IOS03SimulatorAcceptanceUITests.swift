@@ -563,9 +563,10 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
     @MainActor
     func testE02ReadsExistingPCConversationWithoutSending() throws {
         let environment = ProcessInfo.processInfo.environment
+        let checksMainConversation = environment["MORDE_E02_MAIN_CONVERSATION"] == "1"
         guard let username = environment["MORDE_E02_TEST_USERNAME"], !username.isEmpty,
               let password = environment["MORDE_E02_TEST_PASSWORD"], !password.isEmpty,
-              let conversationID = environment["MORDE_E02_CONVERSATION_ID"], !conversationID.isEmpty,
+              (checksMainConversation || !(environment["MORDE_E02_CONVERSATION_ID"] ?? "").isEmpty),
               let expectedText = environment["MORDE_E02_EXPECTED_TEXT"], !expectedText.isEmpty,
               let configuredOrigin = environment["MORDE_E02_PORTAL_ORIGIN"],
               var components = URLComponents(string: configuredOrigin),
@@ -612,16 +613,37 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         let menu = app.buttons["morde.nav.menu"]
         XCTAssertTrue(menu.waitForExistence(timeout: 10))
         menu.tap()
-        let conversation = app.buttons["morde.nav.drawer.conversation-\(conversationID)"]
-        XCTAssertTrue(conversation.waitForExistence(timeout: 30),
-                      "The PC conversation should be available in the same account's native conversation list.")
-        conversation.tap()
+        if checksMainConversation {
+            let mainConversation = app.buttons["morde.nav.drawer.chat"]
+            XCTAssertTrue(mainConversation.waitForExistence(timeout: 30),
+                          "The signed-in account should expose its primary chat route in the drawer.")
+            mainConversation.tap()
+        } else {
+            let conversationID = environment["MORDE_E02_CONVERSATION_ID"]!
+            let conversation = app.buttons["morde.nav.drawer.conversation-\(conversationID)"]
+            XCTAssertTrue(conversation.waitForExistence(timeout: 30),
+                          "The PC conversation should be available in the same account's native conversation list.")
+            conversation.tap()
+        }
 
         let existingMessages = app.staticTexts.matching(NSPredicate(
             format: "identifier BEGINSWITH %@ AND label CONTAINS %@",
             "morde.chat.message.content.", expectedText
         ))
         let existingMessage = existingMessages.firstMatch
+        let transcript = app.scrollViews["morde.chat.transcript"]
+        XCTAssertTrue(transcript.waitForExistence(timeout: 15),
+                      "The native client should expose the selected conversation transcript.")
+        _ = existingMessage.waitForExistence(timeout: 5)
+        for _ in 0..<8 where !existingMessage.exists {
+            transcript.swipeDown()
+            if existingMessage.waitForExistence(timeout: 1) { break }
+            let loadEarlier = app.buttons["morde.chat.messages.loadEarlier"]
+            if loadEarlier.isHittable {
+                loadEarlier.tap()
+                _ = existingMessage.waitForExistence(timeout: 5)
+            }
+        }
         XCTAssertTrue(existingMessage.waitForExistence(timeout: 40),
                       "The PC message should load into the native client's conversation history.")
         XCTAssertEqual(existingMessages.count, 1,
