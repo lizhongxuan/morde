@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -217,6 +218,165 @@ func TestSupplementalOutputCaptureDoesNotSurviveRuntimeRestartOrReplayTerminalOp
 	})
 	if err != nil || reconciled.Status != contract.OperationSucceeded || handler.calls != 1 {
 		t.Fatalf("terminal operation after Runtime restart=%#v err=%v handler calls=%d", reconciled, err, handler.calls)
+	}
+}
+
+func TestSupplementalOutputCaptureDoesNotSurviveSeparateHostProcessRestartOrReplayTerminalOperation(t *testing.T) {
+	dir := newStoreDir(t)
+	runSupplementalOutputCaptureProcessPhase(t, dir, "first")
+	runSupplementalOutputCaptureProcessPhase(t, dir, "second")
+}
+
+func TestSupplementalOutputCaptureProcessHelper(t *testing.T) {
+	phase := os.Getenv("MORDE_OUTPUT_CAPTURE_PROCESS_PHASE")
+	if phase == "" {
+		return
+	}
+	dir := os.Getenv("MORDE_OUTPUT_CAPTURE_PROCESS_STORE_DIR")
+	if dir == "" {
+		t.Fatal("process helper StoreDir is empty")
+	}
+
+	handler := &supplementalOutputCaptureRestartHandler{}
+	generation := int64(1)
+	if phase == "second" {
+		generation = 2
+	} else if phase != "first" {
+		t.Fatalf("unknown process helper phase %q", phase)
+	}
+	manager, err := Open(Options{
+		StoreDir: dir, ExpectedOwnerUID: uint32(os.Geteuid()), HostID: testHostID,
+		Generation: generation, ProtocolVersion: contract.ProtocolVersion, Handlers: []ActionHandler{handler},
+		TaskWorkspaceViews: testTaskWorkspaceViewStore{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if phase == "first" {
+		processCaptureFirstPhase(t, manager, handler)
+		// Intentionally bypass Manager.Close and deferred cleanup: the parent
+		// starts phase two only after this OS process has exited.
+		os.Exit(0)
+	}
+	processCaptureSecondPhase(t, manager, handler)
+	closeManager(t, manager)
+}
+
+func runSupplementalOutputCaptureProcessPhase(t *testing.T, dir, phase string) {
+	t.Helper()
+	command := exec.Command(os.Args[0], "-test.run=^TestSupplementalOutputCaptureProcessHelper$")
+	env := make([]string, 0, len(os.Environ())+2)
+	for _, entry := range os.Environ() {
+		if strings.HasPrefix(entry, "MORDE_OUTPUT_CAPTURE_PROCESS_PHASE=") || strings.HasPrefix(entry, "MORDE_OUTPUT_CAPTURE_PROCESS_STORE_DIR=") {
+			continue
+		}
+		env = append(env, entry)
+	}
+	command.Env = append(env,
+		"MORDE_OUTPUT_CAPTURE_PROCESS_PHASE="+phase,
+		"MORDE_OUTPUT_CAPTURE_PROCESS_STORE_DIR="+dir,
+	)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("%s Host process failed: %v\n%s", phase, err, output)
+	}
+}
+
+func processCaptureFirstPhase(t *testing.T, manager *Manager, handler *supplementalOutputCaptureRestartHandler) {
+	t.Helper()
+	fence := currentFence(t, manager)
+	if _, err := manager.SetControl(contract.SetControlRequest{
+		ProtocolVersion: contract.ProtocolVersion, HostFence: fence, Mode: contract.ModeAI,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.SetWorkspaceBindings(context.Background(), bindingSnapshot(fence, contract.WorkspaceBinding{
+		WorkspaceID: "w1234567", BindingVersion: 1, Directory: "w1234567",
+	})); err != nil {
+		t.Fatal(err)
+	}
+	view, err := manager.SetTaskWorkspaceView(context.Background(), testTaskID, contract.SetTaskWorkspaceViewRequest{
+		ProtocolVersion: contract.ProtocolVersion, HostFence: fence, TaskID: testTaskID,
+		WorkspaceID: "w1234567", BindingVersion: 1, InputRevision: 0,
+		WorkspaceCheckpointRevision: 0, ManifestSHA256: strings.Repeat("0", 64),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.SetTaskLease(testTaskID, testLease(fence, 1, time.Now().UTC().Add(20*time.Second))); err != nil {
+		t.Fatal(err)
+	}
+	identity := contract.SupplementalOutputCaptureIdentity{
+		OwnerID: "u1234567", TaskID: testTaskID, AuthorizationVersion: 1, TaskRevision: 1,
+		WorkspaceID: "w1234567", WorkspaceAuthorizationVersion: 1, WorkspaceBindingVersion: 1,
+		WorkspaceViewID: view.ViewID, WorkspaceCheckpointRevision: 0, StepID: "s1234567", CallID: "process-capture",
+	}
+	request := testExecute(fence, `{}`)
+	request.OperationID = "ocap0001"
+	request.Capability, request.Action = "shell.exec", "run"
+	request.WorkspaceID, request.BindingVersion = "w1234567", 1
+	request.WorkspaceViewID, request.WorkspaceCheckpointRevision = view.ViewID, 0
+	request.OutputCapture = &identity
+	if _, err := manager.Submit(context.Background(), request); err != nil {
+		t.Fatalf("submit captured Shell operation: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	var terminal contract.Operation
+	for time.Now().Before(deadline) {
+		terminal, err = manager.QueryOperation(contract.ProtocolVersion, request.OperationID, contract.OperationQuery{
+			HostFence: fence, TaskID: request.TaskID, LeaseVersion: request.LeaseVersion,
+		})
+		if err == nil && terminal.Status == contract.OperationSucceeded {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err != nil || terminal.Status != contract.OperationSucceeded || handler.calls != 1 {
+		t.Fatalf("captured Shell operation=%#v err=%v handler calls=%d", terminal, err, handler.calls)
+	}
+	page, err := manager.SupplementalOutputCapturePage(contract.SupplementalOutputCapturePageRequest{
+		ProtocolVersion: contract.ProtocolVersion, HostFence: fence, TaskID: testTaskID,
+		LeaseVersion: 1, OperationID: request.OperationID, Identity: identity,
+		Stream: contract.SupplementalOutputCaptureStdout, Offset: 0,
+	})
+	if err != nil || page.State != contract.SupplementalOutputCaptureComplete || !bytes.Equal(page.Data, []byte("spill-after-prefix")) {
+		t.Fatalf("captured output page=%#v err=%v", page, err)
+	}
+}
+
+func processCaptureSecondPhase(t *testing.T, manager *Manager, handler *supplementalOutputCaptureRestartHandler) {
+	t.Helper()
+	fence := currentFence(t, manager)
+	if _, err := manager.SetControl(contract.SetControlRequest{
+		ProtocolVersion: contract.ProtocolVersion, HostFence: fence, Mode: contract.ModeAI,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.SetTaskLease(testTaskID, testLease(fence, 1, time.Now().UTC().Add(20*time.Second))); err != nil {
+		t.Fatal(err)
+	}
+	operation, exists := manager.ops["ocap0001"]
+	if !exists || operation.Request == nil || operation.Request.OutputCapture == nil {
+		t.Fatalf("replayed operation missing output capture identity: %#v", operation)
+	}
+	identity := *operation.Request.OutputCapture
+	if operation.Operation.Status != contract.OperationSucceeded || operation.Operation.RuntimeInstanceID == fence.RuntimeInstanceID {
+		t.Fatalf("replayed terminal operation=%#v current fence=%#v", operation.Operation, fence)
+	}
+	if handler.calls != 0 {
+		t.Fatalf("terminal operation was replayed in new Host process: handler calls=%d", handler.calls)
+	}
+	if _, ok := manager.outputCaptures.page("ocap0001", identity, contract.SupplementalOutputCaptureStdout, 0); ok {
+		t.Fatal("supplemental output capture unexpectedly survived Host process restart")
+	}
+	page, err := manager.SupplementalOutputCapturePage(contract.SupplementalOutputCapturePageRequest{
+		ProtocolVersion: contract.ProtocolVersion, HostFence: fence, TaskID: testTaskID,
+		LeaseVersion: 1, OperationID: "ocap0001", Identity: identity,
+		Stream: contract.SupplementalOutputCaptureStdout, Offset: 0,
+	})
+	if !errors.Is(err, ErrFenceRejected) {
+		t.Fatalf("old capture page after Host process restart=(%#v, %v), want fence rejection", page, err)
 	}
 }
 
