@@ -72,7 +72,7 @@ type AssistantTaskAttentionView = {
   action: AssistantTaskAttention['action'];
 };
 
-function unverifiedTaskReply(task: TaskSummary): string {
+function unverifiedTaskReply(task: Pick<TaskSummary, 'waiting_reason'>): string {
   const diagnosis = task.waiting_reason === 'dsh_recovery_unresolved'
     ? '任务记录显示，模型服务未返回可确认的答复。'
     : '这次没有拿到可核实的结果。';
@@ -309,7 +309,7 @@ function taskAttentionPresentation(task: AssistantTaskStatusInput, actorID?: str
       }
     }
     if (task.status === 'waiting_user') {
-      return ['tool_result_unknown', 'usage_unknown', 'result_unknown', 'model_call_unknown'].includes(task.waiting_reason ?? '')
+      return ['tool_result_unknown', 'usage_unknown', 'result_unknown', 'model_call_unknown', 'dsh_recovery_unresolved'].includes(task.waiting_reason ?? '')
         ? { kind: 'result_unverified', label: '结果待核对', detail: '执行结果尚未确认，暂不能安全地重复操作。', action: null }
         : { kind: 'interrupted', label: '已中断', detail: '这次任务已暂停，当前没有可用的继续操作。', action: null };
     }
@@ -335,7 +335,7 @@ function taskAttentionPresentation(task: AssistantTaskStatusInput, actorID?: str
   if (taskAttentionActionIsAvailableForCurrentUser(task, 'clarify', actorID)) {
     return { kind: 'needs_user_action', label: '需要你操作', detail: '请在这条对话中补充所需信息。', action: 'clarify' };
   }
-  if (['tool_result_unknown', 'usage_unknown', 'result_unknown', 'model_call_unknown'].includes(task.waiting_reason ?? '')) {
+  if (['tool_result_unknown', 'usage_unknown', 'result_unknown', 'model_call_unknown', 'dsh_recovery_unresolved'].includes(task.waiting_reason ?? '')) {
     return { kind: 'result_unverified', label: '结果待核对', detail: '执行结果尚未确认，暂不能安全地重复操作。', action: null };
   }
   return { kind: 'interrupted', label: '已中断', detail: '这次任务已暂停，当前没有可用的继续操作。', action: null };
@@ -2617,10 +2617,15 @@ export function Assistant() {
       : [];
   });
   const latestUserMessageByTaskID = new Map<string, string>();
+  const relatedUserMessageByTaskID = new Map<string, string>();
+  const latestSourceUserMessageByTaskID = new Map<string, string>();
   for (const message of displayMessages) {
-    const linkedTaskID = message.task_id ?? message.related_task_id;
-    if (message.role === 'user' && linkedTaskID) latestUserMessageByTaskID.set(linkedTaskID, message.id);
+    if (message.role !== 'user') continue;
+    if (message.task_id) latestSourceUserMessageByTaskID.set(message.task_id, message.id);
+    else if (message.related_task_id) relatedUserMessageByTaskID.set(message.related_task_id, message.id);
   }
+  for (const [taskID, messageID] of relatedUserMessageByTaskID) latestUserMessageByTaskID.set(taskID, messageID);
+  for (const [taskID, messageID] of latestSourceUserMessageByTaskID) latestUserMessageByTaskID.set(taskID, messageID);
   const acknowledgedUserMessageByTaskID = new Map<string, string>();
   const ambiguousAcknowledgementTaskIDs = new Set<string>();
   for (const message of displayMessages) {
@@ -4220,21 +4225,28 @@ export function Assistant() {
                   const longReplyIsCancelled = message.role === 'user' && messageResponseMode === 'long_form' && messageRoutingStatus === 'cancelled';
                   const cancellingThisLongReply = cancelLongReply.isPending && cancelLongReply.variables?.messageID === message.id;
                   const messageTask = tasksByID.get(messageTaskID);
+                  const messageTaskSummary = taskPanelItemsByID.get(messageTaskID) ?? messageTask ?? null;
+                  const messageTaskAttentionSource = messageTask ?? messageTaskSummary;
                   const messageActorID = conversationMessageActorID(message);
                   const acknowledgedByServer = message.role === 'user' && message.agent_acknowledged === true &&
                     Boolean(user?.id) && messageActorID === user?.id &&
                     Boolean(messageTaskID) && !ambiguousAcknowledgementTaskIDs.has(messageTaskID) &&
                     acknowledgedUserMessageByTaskID.get(messageTaskID) === message.id &&
                     (!messageTask || messageTask.initiator_id === messageActorID);
-                  const taskAttention = messageTask?.conversation_id === conversationID && messageTask.initiator_id === messageActorID
-                    ? taskAttentionPresentation(messageTask, user?.id) : null;
-                  const taskHasTerminalReply = Boolean(messageTask && displayMessages.some((item) =>
-                    item.role === 'assistant' && item.task_id === messageTask.id && item.delivery_status === 'applied'));
-                  const showTaskAttention = Boolean(message.role === 'user' && messageTask && taskAttention &&
+                  const taskAttention = messageTaskAttentionSource?.conversation_id === conversationID && messageTaskAttentionSource.initiator_id === messageActorID
+                    ? taskAttentionPresentation(messageTaskAttentionSource, user?.id) : null;
+                  const taskHasTerminalReply = Boolean(messageTaskID && displayMessages.some((item) =>
+                    item.role === 'assistant' && item.task_id === messageTaskID && item.delivery_status === 'applied' &&
+                    item.sequence > message.sequence));
+                  const showTaskAttention = Boolean(message.role === 'user' && messageTaskAttentionSource && taskAttention &&
                     taskAttention.kind !== 'needs_user_action' && !ambiguousAcknowledgementTaskIDs.has(messageTaskID) &&
                     !taskHasTerminalReply &&
                     (acknowledgedUserMessageByTaskID.get(messageTaskID) ?? latestUserMessageByTaskID.get(messageTaskID)) === message.id);
-                  const showUnverifiedTaskReply = Boolean(showTaskAttention && taskAttention?.kind === 'result_unverified' && messageTask);
+                  const showUnverifiedTaskReply = Boolean(message.role === 'user' && message.task_id && messageTaskSummary &&
+                    messageActorID === user?.id && latestSourceUserMessageByTaskID.get(message.task_id) === message.id &&
+                    messageTaskAttentionSource?.conversation_id === conversationID &&
+                    messageTaskAttentionSource.initiator_id === messageActorID && taskAttention?.kind === 'result_unverified' &&
+                    !taskHasTerminalReply);
                   const canRetryModelRecovery = Boolean(user?.id && messageTask && taskAttention?.kind === 'paused_retryable' &&
                     taskAttention.action === 'retry' && taskModelRecoveryRetryIsAvailable(messageTask));
                   const retryingModelRecovery = messageTask ? modelRecoveryRetryingTaskIDs.has(messageTask.id) : false;
@@ -4319,18 +4331,18 @@ export function Assistant() {
                     </section>}
                     </div>
                     </div>
-                    {showUnverifiedTaskReply && messageTask && <div className="chat-message-row chat-message-row-assistant" role="group" aria-label="Morde 的任务结果说明">
+                    {showUnverifiedTaskReply && messageTaskSummary && <div className="chat-message-row chat-message-row-assistant" role="group" aria-label="Morde 的任务结果说明">
                       <span className="assistant-logo assistant-logo-message" aria-hidden="true" />
                       <div className="chat-message-body"><strong className="chat-message-author">Morde</strong>
                         <article className="chat-message chat-message-assistant" aria-label="Morde 的回复" role="status">
-                          <ChatMarkdown content={unverifiedTaskReply(messageTask)} />
+                          <ChatMarkdown content={unverifiedTaskReply(messageTaskSummary)} />
                         </article>
                         <button type="button" className="button button-small button-secondary" aria-label="查看任务详情"
                           onClick={() => {
                             setTaskDetailStepID(null);
                             setTaskPanelTab('tasks');
                             setTaskPanelOpen(true);
-                            setTaskDetailTaskID(messageTask.id);
+                            setTaskDetailTaskID(messageTaskSummary.id);
                           }}>查看任务动态</button>
                       </div>
                     </div>}

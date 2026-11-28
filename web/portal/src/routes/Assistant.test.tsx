@@ -5434,7 +5434,9 @@ describe('Assistant durable tasks', () => {
     expect(await within(activity).findByText('状态：状态待确认')).toBeInTheDocument();
     expect(screen.queryByText(/category:/)).not.toBeInTheDocument();
     expect(screen.queryByText('Review cloud task recovery')).not.toBeInTheDocument();
-    expect(await screen.findByRole('status', { name: '任务状态：已中断' })).toHaveTextContent('当前没有可用的继续操作');
+    const replyBubble = await screen.findByRole('status', { name: 'Morde 的回复' });
+    expect(replyBubble).toHaveTextContent('模型服务未返回可确认的答复');
+    expect(screen.queryByRole('status', { name: '任务状态：已中断' })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: '查看任务详情' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '等待接收' })).not.toBeInTheDocument();
     expect(within(activity).queryByRole('button', { name: /暂停任务|停止任务|补充任务/u })).not.toBeInTheDocument();
@@ -5461,6 +5463,105 @@ describe('Assistant durable tasks', () => {
     expect(activity.querySelector('.task-activity-status')).toHaveTextContent('结果待核对');
     expect(document.querySelector('.chat-message-task-attention')).not.toBeInTheDocument();
     expect(within(activity).queryByRole('button', { name: /暂停任务|停止任务|补充任务|再试一次/u })).not.toBeInTheDocument();
+  });
+
+  it('shows a safe assistant reply when a recovery attention snapshot is missing', async () => {
+    const source = { ...message, actor_id: authUser.id } as ConversationMessage;
+    const waitingTask = {
+      ...task, status: 'waiting_user' as const, result: null, waiting_reason: 'dsh_recovery_unresolved',
+      finished_at: null, event_sequence: 8, attention: null,
+    } as unknown as Task;
+    mockCommon({ conversations: [conversation], messages: [source] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(waitingTask);
+    renderPage();
+
+    const replyBubble = await screen.findByRole('status', { name: 'Morde 的回复' });
+    expect(replyBubble).toHaveTextContent('模型服务未返回可确认的答复');
+    expect(screen.queryByRole('status', { name: '任务状态：已中断' })).not.toBeInTheDocument();
+  });
+
+  it('keeps the recovery reply on the Task source message when a later related message exists', async () => {
+    const source = { ...message, actor_id: authUser.id } as ConversationMessage;
+    const relatedFollowup = { ...message, id: 'm2345678', sequence: 2, task_id: undefined,
+      related_task_id: task.id, actor_id: undefined, content: '我再补充一句' } as unknown as ConversationMessage;
+    const waitingTask = {
+      ...task, status: 'waiting_user' as const, result: null, waiting_reason: 'dsh_recovery_unresolved',
+      finished_at: null, event_sequence: 8, attention: null,
+    } as unknown as Task;
+    mockCommon({ conversations: [conversation], messages: [source, relatedFollowup] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(waitingTask);
+    renderPage();
+
+    expect(await screen.findByRole('status', { name: 'Morde 的回复' })).toHaveTextContent('模型服务未返回可确认的答复');
+    const sourceRow = screen.getAllByRole('article', { name: '你的消息' })[0]?.closest('.chat-message-row');
+    expect(sourceRow?.nextElementSibling).toHaveAttribute('aria-label', 'Morde 的任务结果说明');
+    expect(screen.getAllByRole('group', { name: 'Morde 的任务结果说明' })).toHaveLength(1);
+  });
+
+  it('keeps the safe recovery reply visible when acknowledgement anchors are ambiguous', async () => {
+    const source = { ...message, actor_id: authUser.id, agent_acknowledged: true } as ConversationMessage;
+    const laterSource = { ...message, id: 'm2345679', sequence: 2, actor_id: authUser.id,
+      agent_acknowledged: true, content: '同一任务的后续请求' } as ConversationMessage;
+    const waitingTask = {
+      ...task, status: 'waiting_user' as const, result: null, waiting_reason: 'dsh_recovery_unresolved',
+      finished_at: null, event_sequence: 8, attention: null,
+    } as unknown as Task;
+    mockCommon({ conversations: [conversation], messages: [source, laterSource] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(waitingTask);
+    renderPage();
+
+    const replyBubble = await screen.findByRole('status', { name: 'Morde 的回复' });
+    expect(replyBubble).toHaveTextContent('模型服务未返回可确认的答复');
+    expect(screen.getAllByRole('group', { name: 'Morde 的任务结果说明' })).toHaveLength(1);
+  });
+
+  it('shows the safe reply from a Task summary when Task detail is unavailable', async () => {
+    const source = { ...message, actor_id: authUser.id } as ConversationMessage;
+    const summary: TaskSummary = {
+      ...task, status: 'waiting_user', result: null, waiting_reason: 'dsh_recovery_unresolved',
+      finished_at: null, event_sequence: undefined, attention: undefined,
+    } as unknown as TaskSummary;
+    mockCommon({ conversations: [conversation], messages: [source], tasks: [summary] });
+    vi.spyOn(portalApi, 'task').mockRejectedValue(new Error('task detail unavailable'));
+    renderPage();
+
+    const replyBubble = await screen.findByRole('status', { name: 'Morde 的回复' });
+    expect(replyBubble).toHaveTextContent('模型服务未返回可确认的答复');
+    expect(replyBubble).toHaveTextContent('不会自动重复可能产生副作用的操作');
+    expect(screen.queryByText('task detail unavailable')).not.toBeInTheDocument();
+  });
+
+  it('shows the safe reply when the published marker has no visible assistant message', async () => {
+    const source = { ...message, actor_id: authUser.id } as ConversationMessage;
+    const attentionTask = {
+      ...task, status: 'waiting_user' as const, result: null, waiting_reason: 'dsh_recovery_unresolved',
+      finished_at: null, event_sequence: 8, result_message_published: true,
+      attention: { kind: 'result_unverified', reason: 'unknown', action: null, event_sequence: 8 },
+    } as unknown as Task;
+    mockCommon({ conversations: [conversation], messages: [source], tasks: [attentionTask] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(attentionTask);
+    renderPage();
+
+    expect(await screen.findByRole('status', { name: 'Morde 的回复' })).toHaveTextContent('模型服务未返回可确认的答复');
+    expect(screen.getAllByRole('group', { name: 'Morde 的任务结果说明' })).toHaveLength(1);
+  });
+
+  it('does not let a stale assistant reply from before the source message hide the recovery explanation', async () => {
+    const priorReply = { ...reply, id: 'm7654332', sequence: 1, task_id: task.id,
+      delivery_status: 'applied' as const };
+    const source = { ...message, sequence: 2, actor_id: authUser.id } as ConversationMessage;
+    const attentionTask = {
+      ...task, status: 'waiting_user' as const, result: null, waiting_reason: 'dsh_recovery_unresolved',
+      finished_at: null, event_sequence: 8, result_message_published: true,
+      attention: { kind: 'result_unverified', reason: 'outcome_unknown', action: null, event_sequence: 8 },
+    } as unknown as Task;
+    mockCommon({ conversations: [conversation], messages: [priorReply, source], tasks: [attentionTask] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(attentionTask);
+    renderPage();
+
+    const replyBubble = await screen.findByRole('status', { name: 'Morde 的回复' });
+    expect(replyBubble).toHaveTextContent('模型服务未返回可确认的答复');
+    expect(screen.getAllByRole('group', { name: 'Morde 的任务结果说明' })).toHaveLength(1);
   });
 
   it('does not duplicate an unverified-result reply when its applied assistant message is visible', async () => {
