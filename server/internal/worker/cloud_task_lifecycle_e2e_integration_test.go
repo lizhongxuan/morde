@@ -1859,7 +1859,9 @@ func newF01TemporaryStore(t *testing.T) (*storepostgres.Store, *pgxpool.Pool) {
 	if dsn == "" {
 		t.Skip("CH_TEST_DATABASE_URL is unset; local PostgreSQL end-to-end test was not run")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// Applying the full migration history to an isolated database can exceed
+	// the old 30-second setup budget on a small acceptance host.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	adminConfig, err := pgxpool.ParseConfig(dsn)
 	if err != nil {

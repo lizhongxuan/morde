@@ -9,6 +9,7 @@ commit=fcc0ad462172522aaf5c93a7b2e01f6b9f0b0159
 release_commit=66491b05e3f05ad35bcdd4f6cd7ed26041d9e3db
 package=packages/compaction/compaction-basic
 vendored="$runtime_dir/vendor/deepseek-harness/$package"
+local_patch="$vendored/patches/morde-output-budget-compaction-selection.patch"
 
 git -C "$dsh_root" cat-file -e "$commit^{commit}"
 git -C "$dsh_root" diff --exit-code "$release_commit" "$commit" -- "$package/package.json" "$package/src" >/dev/null
@@ -17,6 +18,7 @@ tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/morde-dsh-upstream.XXXXXX")
 trap 'rm -rf "$tmp_dir"' 0 HUP INT TERM
 git -C "$dsh_root" show "$commit:$package/package.json" > "$tmp_dir/package.json"
 cmp "$vendored/package.json" "$tmp_dir/package.json"
+mkdir -p "$tmp_dir/src"
 
 upstream_files=$(git -C "$dsh_root" ls-tree -r --name-only "$commit" -- "$package/src" | sed "s,^$package/src/,," | LC_ALL=C sort)
 vendored_files=$(find "$vendored/src" -type f | sed "s,^$vendored/src/,," | LC_ALL=C sort)
@@ -27,10 +29,23 @@ fi
 
 while IFS= read -r path; do
   [ -n "$path" ] || continue
-  git -C "$dsh_root" show "$commit:$package/src/$path" > "$tmp_dir/source"
-  cmp "$vendored/src/$path" "$tmp_dir/source"
+  git -C "$dsh_root" show "$commit:$package/src/$path" > "$tmp_dir/src/$path"
 done <<EOF
 $upstream_files
 EOF
 
-echo "DSH source matches $commit (release $release_commit)"
+(
+  cd "$tmp_dir/src"
+  patch -s -p1 < "$local_patch"
+)
+
+while IFS= read -r path; do
+  [ -n "$path" ] || continue
+  cmp "$vendored/src/$path" "$tmp_dir/src/$path"
+done <<EOF
+$upstream_files
+EOF
+
+(cd "$vendored" && shasum -a 256 -c source.sha256 >/dev/null)
+
+echo "DSH source $commit (release $release_commit) plus the recorded Morde output-budget patch verified"
