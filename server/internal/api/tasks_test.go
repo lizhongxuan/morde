@@ -1572,6 +1572,34 @@ func TestTaskStepOutputCaptureRouteRejectsInvalidQueryAndBody(t *testing.T) {
 	}
 }
 
+func TestTaskStepOutputCaptureRouteIsWiredThroughProductionAPI(t *testing.T) {
+	service := &taskServiceStub{outputCapturePage: app.TaskStepOutputCapturePage{
+		Stream: "stdout", State: app.TaskStepOutputCaptureStateComplete, Offset: 3, NextOffset: 11,
+		TotalBytes: 11, SourceBytes: 11, Data: []byte("tail-end"), EOF: true, Complete: true,
+	}}
+	services := newServices()
+	services.tasks = service
+	router := newRouter(t, services, Options{})
+
+	credential, _, err := identity.NewCredential(identity.KindSession, testTokenID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := requestWithCookie(router, http.MethodGet,
+		"/api/tasks/q1234567/steps/s1234567/output?stream=stdout&offset=3",
+		&http.Cookie{Name: portalCookieName, Value: credential}, "")
+	if response.Code != http.StatusOK || response.Header().Get("Cache-Control") != "no-store" ||
+		!strings.Contains(response.Body.String(), `"state":"complete"`) ||
+		!strings.Contains(response.Body.String(), `"data":"tail-end"`) ||
+		service.outputCaptureCalls != 1 || service.outputCaptureTaskID != "q1234567" ||
+		service.outputCaptureStepID != "s1234567" || service.outputCaptureStream != "stdout" ||
+		service.outputCaptureOffset != 3 || service.outputCapturePrincipal.UserID != testUserID ||
+		service.outputCapturePrincipal.Kind != identity.KindSession {
+		t.Fatalf("production API output route response=%d headers=%v body=%s calls=%d principal=%#v",
+			response.Code, response.Header(), response.Body.String(), service.outputCaptureCalls, service.outputCapturePrincipal)
+	}
+}
+
 func TestTaskStepRetryRouteBindsRequestAndRejectsReplacementArguments(t *testing.T) {
 	service := &taskServiceStub{stepRetryResult: app.TaskStepRetryResult{TaskID: "q1234567", SourceStepID: "s1234567",
 		AttemptStepID: "s7654321", Attempt: 2, Status: "queued"}}
