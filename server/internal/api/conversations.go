@@ -604,7 +604,8 @@ func (h *api) acceptConversationMessage(service TaskService) gin.HandlerFunc {
 				c.GetString("request_id"), message.ID); err != nil {
 				h.options.Logger.Warn("record conversation trace link failed", zap.Error(err),
 					zap.String("trace_id", traceID), zap.String("span_id", traceSpanID),
-					zap.String("request_id", c.GetString("request_id")), zap.String("message_id", message.ID))
+					zap.String("request_id", c.GetString("request_id")), zap.String("response_id", c.GetString("response_id")),
+					zap.String("message_id", message.ID))
 			}
 		}
 		view, err := toMessageResponse(message)

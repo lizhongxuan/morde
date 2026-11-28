@@ -1,8 +1,35 @@
 import { describe, expect, it, vi } from 'vitest';
-import { ResilientAssistantDraftStorage } from './assistant-drafts';
+import { AssistantDraftPreviewURLRegistry, ResilientAssistantDraftStorage } from './assistant-drafts';
 import type { AssistantComposerDraft, AssistantDraftStorage } from './assistant-drafts';
 
 describe('assistant draft recovery', () => {
+  it('scopes image preview URLs to the active draft and releases them when attachments leave it', () => {
+    const first = new Blob(['first image'], { type: 'image/png' });
+    const second = new Blob(['second image'], { type: 'image/jpeg' });
+    const createURL = vi.fn((blob: Blob) => `blob:preview-${blob.size}-${createURL.mock.calls.length}`);
+    const revokeURL = vi.fn();
+    const previews = new AssistantDraftPreviewURLRegistry(createURL, revokeURL);
+
+    const initial = previews.sync('scope:draft-one', [
+      { id: 'image-one', blob: first, mediaType: 'image/png' },
+      { id: 'office-one', blob: new Blob(['office']), mediaType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' },
+      { id: 'pending-image', blob: second, mediaType: 'image/jpeg', needsPreparation: true },
+    ]);
+    expect(Object.keys(initial)).toEqual(['image-one']);
+    expect(createURL).toHaveBeenCalledOnce();
+    expect(previews.sync('scope:draft-one', [{ id: 'image-one', blob: first, mediaType: 'image/png' }])).toEqual(initial);
+    expect(createURL).toHaveBeenCalledOnce();
+
+    expect(previews.sync('scope:draft-one', [])).toEqual({});
+    expect(revokeURL).toHaveBeenCalledWith(initial['image-one']);
+
+    const nextDraft = previews.sync('scope:draft-two', [{ id: 'image-two', blob: second, mediaType: 'image/jpeg' }]);
+    expect(Object.keys(nextDraft)).toEqual(['image-two']);
+    expect(revokeURL).toHaveBeenCalledTimes(1);
+    previews.clear();
+    expect(revokeURL).toHaveBeenCalledWith(nextDraft['image-two']);
+  });
+
   it('keeps a newer in-memory draft when a durable write fails', async () => {
     const old: AssistantComposerDraft = { id: 'c1234567', conversationID: 'c1234567', content: '旧草稿',
       modelID: '', hostID: '', mcpConnectorIDs: [], attachments: [], updatedAt: 1 };

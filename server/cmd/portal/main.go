@@ -880,7 +880,8 @@ func serve(ctx context.Context, configPath string) error {
 			return fmt.Errorf("initialize Task validation review worker: %w", err)
 		}
 		taskTerminalDeliveryWorker, err = worker.NewTaskTerminalDeliveryWorker(worker.TaskTerminalDeliveryWorkerOptions{
-			Store: store, Models: modelGateway, ReplySealer: sealer, WorkerID: workerSuffix + "-terminal-delivery",
+			Store: store, ObservabilityContext: store, TracerProvider: tracerProvider,
+			Models: modelGateway, ReplySealer: sealer, WorkerID: workerSuffix + "-terminal-delivery",
 			LeaseDuration: 30 * time.Second, PollInterval: 500 * time.Millisecond, Logger: logger,
 		})
 		if err != nil {

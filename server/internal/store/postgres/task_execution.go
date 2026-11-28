@@ -209,7 +209,7 @@ FROM task_pending_requests WHERE task_id=$1 ORDER BY version DESC LIMIT 1`, id).
 			}
 			pendingRequest = &pending
 		}
-		clarificationRows, err := tx.Query(ctx, `SELECT id, task_id, version, model_step_id, call_id, question, status, answer, created_at, responded_at
+		clarificationRows, err := tx.Query(ctx, `SELECT id, task_id, version, model_step_id, call_id, question, questions, status, answer, answer_format, created_at, responded_at
 FROM task_clarification_requests WHERE task_id=$1 ORDER BY version`, id)
 		if err != nil {
 			return fmt.Errorf("list task clarification requests: %w", err)
@@ -218,11 +218,16 @@ FROM task_clarification_requests WHERE task_id=$1 ORDER BY version`, id)
 		for clarificationRows.Next() {
 			var clarification task.ClarificationRequest
 			var respondedAt pgtype.Timestamptz
+			var questionsJSON []byte
 			if err := clarificationRows.Scan(&clarification.ID, &clarification.TaskID, &clarification.Version,
-				&clarification.ModelStepID, &clarification.CallID, &clarification.Question, &clarification.Status, &clarification.Answer,
-				&clarification.CreatedAt, &respondedAt); err != nil {
+				&clarification.ModelStepID, &clarification.CallID, &clarification.Question, &questionsJSON, &clarification.Status, &clarification.Answer,
+				&clarification.AnswerFormat, &clarification.CreatedAt, &respondedAt); err != nil {
 				clarificationRows.Close()
 				return fmt.Errorf("scan task clarification request: %w", err)
+			}
+			if err := json.Unmarshal(questionsJSON, &clarification.Questions); err != nil {
+				clarificationRows.Close()
+				return fmt.Errorf("decode task clarification questions: %w", err)
 			}
 			if respondedAt.Valid {
 				responded := respondedAt.Time
@@ -1789,6 +1794,14 @@ func (s *Store) CommitTaskProgress(ctx context.Context, progress app.TaskProgres
 			progress.WaitingReason != "clarification_required" {
 			return task.Event{}, domain.InvalidArgument("clarification_request", "task clarification request fields are invalid")
 		}
+		if len(clarification.Questions) > 0 {
+			if clarification.CallID == task.RouteFileDeliveryIntentClarificationCallID || clarification.CallID == app.FileDeliveryIntentClarificationCallID {
+				return task.Event{}, domain.InvalidArgument("clarification_request", "file delivery clarifications cannot use a structured question group")
+			}
+			if err := task.ValidateClarificationQuestions(clarification.Questions); err != nil {
+				return task.Event{}, domain.InvalidArgument("clarification_request", "structured clarification question group is invalid")
+			}
+		}
 	}
 	eventPayload, err := validateInitialTaskEvent(progress.Event.Type, progress.Event.Payload)
 	if err != nil {
@@ -2481,10 +2494,18 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'pending',$17,$18
 			}
 		}
 		if clarification := progress.ClarificationRequest; clarification != nil {
+			questions := clarification.Questions
+			if questions == nil {
+				questions = []task.ClarificationQuestion{}
+			}
+			questionsJSON, marshalErr := json.Marshal(questions)
+			if marshalErr != nil {
+				return task.Event{}, fmt.Errorf("encode task clarification questions: %w", marshalErr)
+			}
 			_, err = tx.Exec(ctx, `INSERT INTO task_clarification_requests
-(id, task_id, version, model_step_id, call_id, question, status)
-VALUES ($1,$2,$3,$4,$5,$6,'pending')`, clarification.ID, clarification.TaskID, clarification.Version,
-				clarification.ModelStepID, clarification.CallID, clarification.Question)
+(id, task_id, version, model_step_id, call_id, question, questions, status)
+VALUES ($1,$2,$3,$4,$5,$6,$7,'pending')`, clarification.ID, clarification.TaskID, clarification.Version,
+				clarification.ModelStepID, clarification.CallID, clarification.Question, questionsJSON)
 			if err != nil {
 				return fmt.Errorf("persist task clarification request: %w", err)
 			}

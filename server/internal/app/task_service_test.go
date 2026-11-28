@@ -53,6 +53,12 @@ type taskStoreStub struct {
 	clarificationIntent    task.FileDeliveryIntent
 	clarificationObjective string
 	clarificationCalls     int
+	answerRecord             IdempotencyRecord
+	answerTaskID             string
+	answerID                 string
+	answerVersion            int64
+	answers                  []task.ClarificationAnswer
+	answerCalls              int
 	actionResult           TaskActionResult
 	actionRecord           IdempotencyRecord
 	actionTaskID           string
@@ -367,6 +373,15 @@ func (s *taskStoreStub) AnswerClarificationRequest(_ context.Context, record Ide
 	s.clarificationCalls++
 	s.clarificationRecord, s.clarificationTaskID, s.clarificationID, s.clarificationVersion, s.clarificationAnswer = record, taskID, clarificationID, version, answer
 	s.clarificationIntent, s.clarificationObjective = intent, objective
+	return s.storeErr
+}
+
+func (s *taskStoreStub) AnswerStructuredClarificationRequest(_ context.Context, record IdempotencyRecord, taskID, clarificationID string,
+	version int64, answers []task.ClarificationAnswer) error {
+	s.answerCalls++
+	s.answerRecord, s.answerTaskID = record, taskID
+	s.answerID, s.answerVersion = clarificationID, version
+	s.answers = answers
 	return s.storeErr
 }
 
@@ -1649,6 +1664,59 @@ func TestTaskServiceAnswerClarificationRequiresControlAndBindsAnswerToVersion(t 
 	}
 	if err := service.AnswerClarificationRequest(context.Background(), taskTestPrincipal(), "q1234567", "r1234567", 4, "a\x00b", "", "clarify-key-004"); domain.CodeOf(err) != domain.CodeInvalidArgument || store.clarificationCalls != 2 {
 		t.Fatalf("NUL answer err=%v writes=%d", err, store.clarificationCalls)
+	}
+}
+
+func TestTaskServiceStructuredClarificationBindsAnswersAndRejectsLegacyFallback(t *testing.T) {
+	questions := []task.ClarificationQuestion{
+		{ID: "environment", Prompt: "Where?", Type: task.ClarificationSingleChoice, Required: true,
+			Options: []task.ClarificationQuestionOption{{ID: "staging", Label: "Staging"}, {ID: "prod", Label: "Production"}}},
+		{ID: "notes", Prompt: "Notes?", Type: task.ClarificationFreeText, AllowSkip: true, Options: []task.ClarificationQuestionOption{}},
+	}
+	request := task.ClarificationRequest{ID: "r1234567", TaskID: "q1234567", Version: 4, ModelStepID: "s1234567",
+		CallID: "call-ask-user", Question: "Please answer both questions.", Questions: questions, Status: task.ClarificationPending}
+	store := &taskStoreStub{details: TaskDetails{Task: task.Task{ID: "q1234567", OwnerID: "u1234567", HostID: "h1234567",
+		Status: task.StatusWaitingUser, WaitingReason: "clarification_required"}, ClarificationRequests: []task.ClarificationRequest{request}}}
+	authorizer := &taskAuthorizerStub{}
+	service, err := NewTaskService(store, authorizer, &modelCatalogStub{configured: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	answers := []task.ClarificationAnswer{
+		{QuestionID: "environment", OptionIDs: []string{"staging"}},
+		{QuestionID: "notes", Skipped: true, OptionIDs: []string{}},
+	}
+	for range 2 {
+		if err := service.AnswerStructuredClarificationRequest(context.Background(), taskTestPrincipal(), "q1234567", "r1234567", 4,
+			answers, "structured-answer-001"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if store.answerCalls != 2 || store.answerTaskID != "q1234567" ||
+		store.answerID != "r1234567" || store.answerVersion != 4 ||
+		store.answerRecord.Operation != "task.clarification.structured_answer" ||
+		store.answerRecord.OwnerID != "u1234567" || store.answerRecord.RelatedID != "r1234567" ||
+		store.answerRecord.Key != "structured-answer-001" || len(store.answers) != 2 ||
+		authorizer.lastHost != "h1234567" || authorizer.lastScope != identity.ScopeTaskControl {
+		t.Fatalf("structured clarification authorization/record mismatch: calls=%d record=%#v auth=%#v", store.answerCalls, store.answerRecord, authorizer)
+	}
+	if err := service.AnswerClarificationRequest(context.Background(), taskTestPrincipal(), "q1234567", "r1234567", 4,
+		"legacy answer", "", "legacy-answer-001"); domain.CodeOf(err) != domain.CodeConflict || store.clarificationCalls != 0 {
+		t.Fatalf("legacy free-text fallback for a structured group error=%v writes=%d", err, store.clarificationCalls)
+	}
+	if err := service.AnswerStructuredClarificationRequest(context.Background(), taskTestPrincipal(), "q1234567", "r1234567", 3,
+		answers, "structured-answer-stale"); domain.CodeOf(err) != domain.CodeConflict || store.answerCalls != 2 {
+		t.Fatalf("stale structured clarification error=%v writes=%d", err, store.answerCalls)
+	}
+	if err := service.AnswerStructuredClarificationRequest(context.Background(), taskTestPrincipal(), "q1234567", "r1234567", 4,
+		answers[:1], "structured-answer-incomplete"); domain.CodeOf(err) != domain.CodeInvalidArgument || store.answerCalls != 2 {
+		t.Fatalf("incomplete structured answer error=%v writes=%d", err, store.answerCalls)
+	}
+	principal := identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindAPIKey,
+		TokenID: "t1234567", HostIDs: []string{"h1234567"}, Scopes: []identity.Scope{identity.ScopeTaskRead}}
+	if err := service.AnswerStructuredClarificationRequest(context.Background(), principal, "q1234567", "r1234567", 4,
+		answers, "structured-answer-no-control"); domain.CodeOf(err) != domain.CodeNotFound || store.answerCalls != 2 {
+		t.Fatalf("unscoped structured answer error=%v writes=%d", err, store.answerCalls)
 	}
 }
 

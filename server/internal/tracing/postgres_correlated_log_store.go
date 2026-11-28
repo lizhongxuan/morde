@@ -184,12 +184,20 @@ func makeCorrelatedLogRecord(entry zapcore.Entry, fields []zapcore.Field) (corre
 	requestID := safeCorrelatedLogID(values["request_id"])
 	taskID := safeCorrelatedLogID(values["task_id"])
 	attributes := make(map[string]any)
-	for _, key := range []string{"user_id", "conversation_id", "message_id", "agent_session_id", "parent_agent_session_id", "model_call_id", "tool_call_id", "attempt", "error_code", "failure_code", "stage", "status", "duration_ms", "route", "method", "host_id", "operation", "source"} {
+	for _, key := range []string{"response_id", "user_id", "conversation_id", "message_id", "agent_session_id", "parent_agent_session_id", "model_call_id", "tool_call_id", "attempt", "delivery_id", "claim_generation", "error_code", "error_type", "failure_code", "stage", "status", "duration_ms", "route", "method", "host_id", "operation", "source", "source_kind"} {
 		value, exists := values[key]
 		if !exists {
 			continue
 		}
-		safe, ok := safeCorrelatedLogValue(key, value)
+		var safe any
+		var ok bool
+		if key == "response_id" {
+			if candidate := safeCorrelatedLogID(value); candidate != "" {
+				safe, ok = candidate, true
+			}
+		} else {
+			safe, ok = safeCorrelatedLogValue(key, value)
+		}
 		if ok {
 			attributes[key] = safe
 		}
@@ -217,10 +225,10 @@ func makeCorrelatedLogRecord(entry zapcore.Entry, fields []zapcore.Field) (corre
 
 func correlatedLogFieldAllowed(key string) bool {
 	switch key {
-	case "trace_id", "span_id", "request_id", "task_id", "service", "error",
+	case "trace_id", "span_id", "request_id", "response_id", "task_id", "service", "error",
 		"user_id", "conversation_id", "message_id", "agent_session_id", "parent_agent_session_id",
-		"model_call_id", "tool_call_id", "attempt", "error_code", "failure_code", "stage",
-		"status", "duration_ms", "route", "method", "host_id", "operation", "source":
+		"model_call_id", "tool_call_id", "attempt", "delivery_id", "claim_generation", "error_code", "error_type", "failure_code", "stage",
+		"status", "duration_ms", "route", "method", "host_id", "operation", "source", "source_kind":
 		return true
 	default:
 		return false

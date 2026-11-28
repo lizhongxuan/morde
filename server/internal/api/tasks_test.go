@@ -98,6 +98,12 @@ type taskServiceStub struct {
 	clarificationFileIntent      task.FileDeliveryIntent
 	clarificationKey             string
 	clarificationCalls           int
+	structuredClarificationTask  string
+	structuredClarificationID    string
+	structuredClarificationVer   int64
+	structuredClarification      []task.ClarificationAnswer
+	structuredClarificationKey   string
+	structuredClarificationCalls int
 	events                       []task.Event
 	eventPrincipal               identity.Principal
 	eventStatus                  task.Status
@@ -323,6 +329,15 @@ func (s *taskServiceStub) AnswerClarificationRequest(_ context.Context, _ identi
 	return s.err
 }
 
+func (s *taskServiceStub) AnswerStructuredClarificationRequest(_ context.Context, _ identity.Principal, taskID, clarificationID string,
+	version int64, answers []task.ClarificationAnswer, idempotencyKey string) error {
+	s.structuredClarificationCalls++
+	s.structuredClarificationTask, s.structuredClarificationID = taskID, clarificationID
+	s.structuredClarificationVer, s.structuredClarificationKey = version, idempotencyKey
+	s.structuredClarification = answers
+	return s.err
+}
+
 func (s *taskServiceStub) ListEvents(_ context.Context, principal identity.Principal, _ string, after int64, _ int32) (app.TaskEventPage, error) {
 	s.eventCalls++
 	s.eventPrincipal = principal
@@ -512,6 +527,51 @@ func TestTaskActionAnswersExactClarification(t *testing.T) {
 		service.clarificationFileIntent != task.FileDeliveryRequired ||
 		service.clarificationKey != "clarify-key-001" || body.TaskID != "q1234567" || body.Action != "answer_clarification" || body.Status != task.StatusQueued {
 		t.Fatalf("status=%d calls=%d request=%#v response=%#v body=%s", response.Code, service.clarificationCalls, service, body, response.Body.String())
+	}
+}
+
+func TestTaskStructuredClarificationUsesVersionedResponseContract(t *testing.T) {
+	service := &taskServiceStub{}
+	engine := taskAPIRouter(service, nil)
+	request := httptest.NewRequest(http.MethodPost,
+		"/api/v2/tasks/q1234567/clarifications/r1234567/responses",
+		strings.NewReader(`{"version":3,"answers":[{"question_id":"environment","option_ids":["staging"],"text":"","skipped":false},{"question_id":"notes","option_ids":[],"text":"skip this","skipped":false}]}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Idempotency-Key", "structured-clarify-001")
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, request)
+	var body taskActionResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if response.Code != http.StatusAccepted || service.structuredClarificationCalls != 1 ||
+		service.structuredClarificationTask != "q1234567" || service.structuredClarificationID != "r1234567" ||
+		service.structuredClarificationVer != 3 || service.structuredClarificationKey != "structured-clarify-001" ||
+		len(service.structuredClarification) != 2 || service.structuredClarification[0].QuestionID != "environment" ||
+		len(service.structuredClarification[0].OptionIDs) != 1 || service.structuredClarification[0].OptionIDs[0] != "staging" ||
+		service.structuredClarification[1].Text != "skip this" || body.Action != "answer_clarification" || body.Status != task.StatusQueued {
+		t.Fatalf("status=%d calls=%d service=%#v response=%#v body=%s", response.Code, service.structuredClarificationCalls, service, body, response.Body.String())
+	}
+}
+
+func TestTaskStructuredClarificationRejectsMissingAnswersBeforeService(t *testing.T) {
+	for _, body := range []string{
+		`{"version":1,"answers":[]}`,
+		`{"version":0,"answers":[{"question_id":"environment"}]}`,
+		`{"version":1,"answers":[{"question_id":"environment","text":"bad\u0000text"}]}`,
+		`{"version":1,"answers":[{"question_id":"environment","unexpected":true}]}`,
+	} {
+		service := &taskServiceStub{}
+		engine := taskAPIRouter(service, nil)
+		request := httptest.NewRequest(http.MethodPost,
+			"/api/v2/tasks/q1234567/clarifications/r1234567/responses", strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Idempotency-Key", "structured-clarify-invalid")
+		response := httptest.NewRecorder()
+		engine.ServeHTTP(response, request)
+		if response.Code != http.StatusBadRequest || service.structuredClarificationCalls != 0 {
+			t.Errorf("body=%s status=%d structured_clarification_calls=%d", body, response.Code, service.structuredClarificationCalls)
+		}
 	}
 }
 
@@ -1190,6 +1250,45 @@ func TestTaskResponseIncludesOnlyPendingClarificationForClarificationWait(t *tes
 	view, err = toTaskResponse(value)
 	if err != nil || view.ClarificationRequest != nil {
 		t.Fatalf("answered clarification should not be offered again: %#v, %v", view.ClarificationRequest, err)
+	}
+}
+
+func TestTaskResponseProjectsVersionBoundQuestionGroup(t *testing.T) {
+	current := apiTestTask()
+	current.Status, current.WaitingReason = task.StatusWaitingUser, "clarification_required"
+	questions := []task.ClarificationQuestion{
+		{ID: "environment", Prompt: "Which environment?", Type: task.ClarificationSingleChoice, Required: true,
+			AllowSkip: false, Options: []task.ClarificationQuestionOption{{ID: "staging", Label: "Staging"}, {ID: "production", Label: "Production"}}},
+		{ID: "notes", Prompt: "Any other requirements?", Type: task.ClarificationFreeText, Required: false, AllowSkip: true, Options: []task.ClarificationQuestionOption{}},
+	}
+	value := app.TaskDetails{Task: current, ClarificationRequests: []task.ClarificationRequest{{
+		ID: "r1234567", TaskID: current.ID, Version: 4, ModelStepID: "s1234567", CallID: "call-ask-user",
+		Question: "Please answer the following questions.", Questions: questions, Status: task.ClarificationPending,
+	}}}
+	view, err := toTaskResponse(value)
+	if err != nil || view.ClarificationRequest == nil || view.ClarificationRequest.QuestionGroup == nil ||
+		view.ClarificationRequest.QuestionGroup.ID != "r1234567" || view.ClarificationRequest.QuestionGroup.Version != 4 ||
+		len(view.ClarificationRequest.QuestionGroup.Questions) != 2 || view.ClarificationRequest.QuestionGroup.Questions[0].Options[0].ID != "staging" ||
+		view.ClarificationRequest.QuestionGroup.Questions[1].Options == nil {
+		t.Fatalf("structured clarification projection = %#v err=%v", view.ClarificationRequest, err)
+	}
+	encoded, err := json.Marshal(view.ClarificationRequest)
+	if err != nil || !strings.Contains(string(encoded), `"question_group":{"id":"r1234567","version":4`) ||
+		!strings.Contains(string(encoded), `"allow_skip":true`) {
+		t.Fatalf("structured clarification JSON = %s err=%v", encoded, err)
+	}
+	contract, err := os.ReadFile(filepath.Join("..", "..", "openapi", "portal.yaml"))
+	if err != nil {
+		t.Fatalf("read Portal OpenAPI contract: %v", err)
+	}
+	for _, required := range []string{
+		"/api/v2/tasks/{id}/clarifications/{clarification_id}/responses:",
+		"TaskClarificationQuestionGroup:", "TaskClarificationQuestion:", "TaskStructuredInputRequest:",
+		"A skip does not grant approval or change Task authorization",
+	} {
+		if !strings.Contains(string(contract), required) {
+			t.Fatalf("Portal OpenAPI structured clarification contract omits %q", required)
+		}
 	}
 }
 

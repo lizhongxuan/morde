@@ -82,6 +82,42 @@ describe('AssistantVoiceInput', () => {
     expect(screen.getByRole('button', { name: '开始语音输入' })).toHaveAttribute('aria-pressed', 'false');
   });
 
+  it('keeps final recognition results after stopping normally', () => {
+    const onTranscript = vi.fn();
+    render(<AssistantVoiceInput onTranscript={onTranscript} />);
+    fireEvent.click(screen.getByRole('button', { name: '开始语音输入' }));
+    const recognition = FakeRecognition.latest;
+
+    fireEvent.click(screen.getByRole('button', { name: '停止语音输入' }));
+    act(() => recognition?.emitFinal('停止前的收尾文字'));
+
+    expect(onTranscript).toHaveBeenCalledOnce();
+    expect(onTranscript).toHaveBeenCalledWith('停止前的收尾文字');
+  });
+
+  it('invalidates the active generation before cancelling and preserves text already delivered', () => {
+    const onTranscript = vi.fn();
+    render(<AssistantVoiceInput onTranscript={onTranscript} />);
+    fireEvent.click(screen.getByRole('button', { name: '开始语音输入' }));
+    const recognition = FakeRecognition.latest;
+    act(() => recognition?.emitFinal('已写入草稿的文字'));
+
+    fireEvent.click(screen.getByRole('button', { name: '取消语音输入' }));
+    expect(recognition?.abort).toHaveBeenCalledOnce();
+    expect(screen.queryByRole('button', { name: '取消语音输入' })).not.toBeInTheDocument();
+    expect(screen.getByLabelText('语音输入状态')).toHaveTextContent('语音输入已取消');
+
+    act(() => {
+      recognition?.emitFinal('取消后的迟到文字');
+      recognition?.onerror?.({ error: 'aborted' });
+      recognition?.onend?.();
+    });
+
+    expect(onTranscript).toHaveBeenCalledOnce();
+    expect(onTranscript).toHaveBeenCalledWith('已写入草稿的文字');
+    expect(screen.getByLabelText('语音输入状态')).toHaveTextContent('语音输入已取消');
+  });
+
   it('ignores late events from a stopped session after a new one starts', () => {
     const onTranscript = vi.fn();
     render(<AssistantVoiceInput onTranscript={onTranscript} />);

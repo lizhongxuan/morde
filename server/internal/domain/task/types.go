@@ -2,6 +2,8 @@ package task
 
 import (
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	"morde/server/internal/domain"
@@ -464,7 +466,165 @@ const (
 	ClarificationCancelled ClarificationStatus = "cancelled"
 )
 
-// ClarificationRequest is an Agent question awaiting a free-form user answer.
+type ClarificationAnswerFormat string
+
+const (
+	ClarificationAnswerFreeText   ClarificationAnswerFormat = "free_text"
+	ClarificationAnswerStructured ClarificationAnswerFormat = "structured"
+)
+
+// ClarificationQuestion is one stable input in a structured clarification.
+// Question and option IDs are opaque identifiers supplied by the Agent and
+// remain bound to the enclosing clarification request version.
+type ClarificationQuestion struct {
+	ID        string                        `json:"id"`
+	Prompt    string                        `json:"prompt"`
+	Type      ClarificationQuestionType     `json:"type"`
+	Required  bool                          `json:"required"`
+	AllowSkip bool                          `json:"allow_skip"`
+	Options   []ClarificationQuestionOption `json:"options"`
+}
+
+type ClarificationQuestionType string
+
+const (
+	ClarificationSingleChoice ClarificationQuestionType = "single_choice"
+	ClarificationMultiChoice  ClarificationQuestionType = "multi_choice"
+	ClarificationFreeText     ClarificationQuestionType = "free_text"
+)
+
+type ClarificationQuestionOption struct {
+	ID    string `json:"id"`
+	Label string `json:"label"`
+}
+
+// ClarificationAnswer is one explicit answer to one question. Skipping is
+// represented independently from an empty answer and does not grant approval
+// or change any Task authorization.
+type ClarificationAnswer struct {
+	QuestionID string   `json:"question_id"`
+	OptionIDs  []string `json:"option_ids"`
+	Text       string   `json:"text"`
+	Skipped    bool     `json:"skipped"`
+}
+
+// ValidateClarificationQuestions validates a bounded, stable question group.
+func ValidateClarificationQuestions(questions []ClarificationQuestion) error {
+	if len(questions) == 0 || len(questions) > 8 {
+		return errors.New("clarification question count is out of range")
+	}
+	questionIDs := make(map[string]struct{}, len(questions))
+	for _, question := range questions {
+		if !validClarificationItemID(question.ID) || !validClarificationText(question.Prompt, 1024) {
+			return errors.New("clarification question identity or prompt is invalid")
+		}
+		if _, exists := questionIDs[question.ID]; exists {
+			return errors.New("clarification question IDs must be unique")
+		}
+		questionIDs[question.ID] = struct{}{}
+		optionIDs := make(map[string]struct{}, len(question.Options))
+		switch question.Type {
+		case ClarificationSingleChoice, ClarificationMultiChoice:
+			if len(question.Options) < 2 || len(question.Options) > 12 {
+				return errors.New("clarification choice option count is out of range")
+			}
+			for _, option := range question.Options {
+				if !validClarificationItemID(option.ID) || !validClarificationText(option.Label, 256) {
+					return errors.New("clarification choice option is invalid")
+				}
+				if _, exists := optionIDs[option.ID]; exists {
+					return errors.New("clarification option IDs must be unique")
+				}
+				optionIDs[option.ID] = struct{}{}
+			}
+		case ClarificationFreeText:
+			if len(question.Options) != 0 {
+				return errors.New("free-text clarification cannot include options")
+			}
+		default:
+			return errors.New("clarification question type is invalid")
+		}
+	}
+	return nil
+}
+
+// ValidateClarificationAnswers requires one explicit answer or skip per
+// question and rejects values not offered by the bound question group.
+func ValidateClarificationAnswers(questions []ClarificationQuestion, answers []ClarificationAnswer) error {
+	if err := ValidateClarificationQuestions(questions); err != nil {
+		return fmt.Errorf("invalid clarification question group: %w", err)
+	}
+	if len(answers) != len(questions) {
+		return errors.New("every clarification question requires an explicit answer or skip")
+	}
+	byID := make(map[string]ClarificationQuestion, len(questions))
+	for _, question := range questions {
+		byID[question.ID] = question
+	}
+	seen := make(map[string]struct{}, len(answers))
+	for _, answer := range answers {
+		question, exists := byID[answer.QuestionID]
+		if !exists {
+			return errors.New("clarification answer references an unknown question")
+		}
+		if _, duplicate := seen[answer.QuestionID]; duplicate {
+			return errors.New("clarification answer repeats a question")
+		}
+		seen[answer.QuestionID] = struct{}{}
+		if answer.Skipped {
+			if !question.AllowSkip || answer.Text != "" || len(answer.OptionIDs) != 0 {
+				return errors.New("clarification question cannot be skipped with these values")
+			}
+			continue
+		}
+		switch question.Type {
+		case ClarificationFreeText:
+			if !validClarificationText(answer.Text, 4096) || len(answer.OptionIDs) != 0 {
+				return errors.New("free-text clarification answer is invalid")
+			}
+		case ClarificationSingleChoice, ClarificationMultiChoice:
+			if answer.Text != "" || len(answer.OptionIDs) == 0 ||
+				(question.Type == ClarificationSingleChoice && len(answer.OptionIDs) != 1) ||
+				(question.Type == ClarificationMultiChoice && len(answer.OptionIDs) > len(question.Options)) {
+				return errors.New("clarification choice answer is invalid")
+			}
+			allowed := make(map[string]struct{}, len(question.Options))
+			for _, option := range question.Options {
+				allowed[option.ID] = struct{}{}
+			}
+			selected := make(map[string]struct{}, len(answer.OptionIDs))
+			for _, optionID := range answer.OptionIDs {
+				if _, ok := allowed[optionID]; !ok {
+					return errors.New("clarification answer selects an unknown option")
+				}
+				if _, duplicate := selected[optionID]; duplicate {
+					return errors.New("clarification answer repeats an option")
+				}
+				selected[optionID] = struct{}{}
+			}
+		}
+	}
+	return nil
+}
+
+func validClarificationItemID(value string) bool {
+	if len(value) == 0 || len(value) > 64 || value[0] < 'a' || value[0] > 'z' {
+		return false
+	}
+	for _, character := range value[1:] {
+		if !((character >= 'a' && character <= 'z') || (character >= '0' && character <= '9') || character == '_' || character == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+func validClarificationText(value string, maxRunes int) bool {
+	return strings.TrimSpace(value) != "" && !strings.ContainsRune(value, '\x00') && len([]rune(value)) <= maxRunes
+}
+
+// ClarificationRequest is an Agent question awaiting an answer. Legacy
+// requests contain only Question; structured requests also contain Questions.
 // It is separate from PendingRequest, which represents an exact tool approval.
 type ClarificationRequest struct {
 	ID           string
@@ -473,6 +633,8 @@ type ClarificationRequest struct {
 	ModelStepID  string
 	CallID       string
 	Question     string
+	Questions    []ClarificationQuestion
+	AnswerFormat ClarificationAnswerFormat
 	BatchItemID  string
 	BatchAttempt int32
 	Status       ClarificationStatus

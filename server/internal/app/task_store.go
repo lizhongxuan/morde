@@ -688,6 +688,12 @@ type TaskPendingRequestExpirer interface {
 	ExpirePendingRequest(context.Context, string, string, string, int64) (bool, error)
 }
 
+// StructuredClarificationAnswerStore applies a version-bound structured answer
+// to the existing durable clarification request and Task waiting transition.
+type StructuredClarificationAnswerStore interface {
+	AnswerStructuredClarificationRequest(context.Context, IdempotencyRecord, string, string, int64, []task.ClarificationAnswer) error
+}
+
 // TaskActionRequester owns the atomic, idempotent user-facing state transition.
 type TaskActionRequester interface {
 	RequestTaskAction(context.Context, IdempotencyRecord, string, task.Action, task.Status, *TaskActionRevisionFence, string) (TaskActionResult, error)

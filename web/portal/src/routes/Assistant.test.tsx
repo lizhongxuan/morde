@@ -199,6 +199,17 @@ function taskWithStepEvidence(value: Task): Task {
         evidence_refs: [{ kind: 'action', id: step.id, task_revision: revision, sequence: step.sequence }] }] } };
 }
 
+function taskToolStep(id: string, sequence: number, overrides: Partial<Task['steps'][number]> = {}): Task['steps'][number] {
+  return { id, sequence, attempt: 1, retryable: false, kind: 'tool', status: 'succeeded',
+    title: 'Run cloud dsh MCP tool: morde_web_search',
+    summary: 'The cloud dsh MCP tool completed and its result was saved.', created_at: timestamp,
+    agent_id: 'main-agent', task_revision: 1, ...overrides };
+}
+
+function fileDragDataTransfer(files: File[], types = files.length ? ['Files'] : []): DataTransfer {
+  return { files: files as unknown as FileList, types, items: [] } as unknown as DataTransfer;
+}
+
 function mockCommon(options: { conversations?: Conversation[]; messages?: ConversationMessage[]; mainConversation?: MainConversation; cloudTasks?: boolean; capabilities?: Awaited<ReturnType<typeof portalApi.capabilities>>; hosts?: typeof targetHost[]; tasks?: TaskSummary[]; defaultHostID?: string | null } = {}) {
   const standard = options.cloudTasks === false ? clientContract.capabilities.queued_task_api : clientContract.capabilities.cloud_execution;
   vi.spyOn(portalApi, 'capabilities').mockResolvedValue(options.capabilities ??
@@ -1300,6 +1311,44 @@ describe('Assistant durable tasks', () => {
     await user.click(screen.getByRole('button', { name: /旁聊二/ }));
     expect(await screen.findByRole('button', { name: '移除附件 local.txt' })).toBeInTheDocument();
     expect(putChunk).not.toHaveBeenCalled();
+  });
+
+  it('keeps a dropped file in its original draft when preparation finishes after switching conversations', async () => {
+    vi.stubGlobal('crypto', webcrypto);
+    const main = { ...conversation, id: 'c0000001', title: '主会话' };
+    const side = { ...conversation, id: 'c0000002', is_main: false, title: '旁聊二' };
+    mockCommon({ conversations: [main, side], mainConversation: { status: 'ready', conversation_id: main.id, version: 1 } });
+    let finishDocument!: (value: unknown) => void;
+    const documentReady = new Promise((resolve) => { finishDocument = resolve; });
+    const destroyDocument = vi.fn().mockResolvedValue(undefined);
+    pdfMock.getDocument.mockReturnValue({ promise: documentReady, destroy: destroyDocument });
+    const createUpload = vi.spyOn(portalApi, 'createPersonalAttachmentUpload');
+    const user = userEvent.setup();
+    renderPage();
+    await findReadyComposer();
+    await user.click(screen.getByText('旁聊'));
+    await user.click(await screen.findByRole('button', { name: /旁聊二/ }));
+    await waitFor(() => expect(screen.getByRole('heading', { name: '旁聊二' })).toBeInTheDocument());
+    const file = new File(['local PDF bytes'], 'slow.pdf', { type: 'application/pdf' });
+    const form = (await findReadyComposer()).closest('form');
+    expect(form).not.toBeNull();
+    fireEvent.drop(form!, { dataTransfer: fileDragDataTransfer([file]) });
+    await waitFor(() => expect(pdfMock.getDocument).toHaveBeenCalled());
+    await user.click(screen.getByRole('button', { name: /主会话.*最近更新/ }));
+    await waitFor(() => expect(screen.getByRole('heading', { name: '主会话' })).toBeInTheDocument());
+
+    await act(async () => finishDocument({ numPages: 1, getPage: async () => ({
+      getTextContent: async () => ({ items: [{ str: '拖放得到的本地合成内容' }] }), cleanup: vi.fn(),
+    }) }));
+    await waitFor(() => expect(assistantDraftRecords.get(`${assistantComposerDraftScope(
+      clientContract.capabilities.cloud_execution.service_instance_id, authUser.id,
+    )}\u0000${side.id}`)?.attachments[0]?.name).toBe('slow.pdf.txt'));
+
+    await user.click(screen.getByRole('button', { name: /旁聊二/ }));
+    expect(await screen.findByRole('button', { name: '移除附件 slow.pdf.txt' })).toBeInTheDocument();
+    expect(screen.getByText('slow.pdf · 已提取文字')).toBeInTheDocument();
+    expect(destroyDocument).toHaveBeenCalledOnce();
+    expect(createUpload).not.toHaveBeenCalled();
   });
 
   it('does not restore a removed attachment when its local preparation finishes later', async () => {
@@ -2978,6 +3027,55 @@ describe('Assistant durable tasks', () => {
     expect(screen.getByText('synthetic.docx')).toBeInTheDocument();
   });
 
+  it('stages dropped Office files like file selection without sending or requesting a preview', async () => {
+    vi.stubGlobal('crypto', webcrypto);
+    mockCommon({ conversations: [conversation] });
+    const preview = vi.spyOn(portalApi, 'previewPersonalOfficeText').mockResolvedValue('synthetic local preview');
+    const send = vi.spyOn(portalApi, 'acceptConversationMessage');
+    const createUpload = vi.spyOn(portalApi, 'createPersonalAttachmentUpload');
+    const file = new File(['synthetic DOCX bytes'], 'synthetic.docx', {
+      type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    });
+    const user = userEvent.setup();
+    renderPage();
+
+    const picker = await screen.findByLabelText('添加附件');
+    await user.upload(picker, file);
+    expect(await screen.findByText('synthetic.docx')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '移除附件 synthetic.docx' }));
+    const form = (await findReadyComposer()).closest('form');
+    expect(form).not.toBeNull();
+    const transfer = fileDragDataTransfer([file]);
+    expect(fireEvent.dragOver(form!, { dataTransfer: transfer })).toBe(false);
+    expect(transfer.dropEffect).toBe('copy');
+    expect(fireEvent.drop(form!, { dataTransfer: transfer })).toBe(false);
+
+    expect(await screen.findByText('synthetic.docx')).toBeInTheDocument();
+    expect(preview).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+    expect(createUpload).not.toHaveBeenCalled();
+
+    const textTransfer = fileDragDataTransfer([], ['text/plain']);
+    expect(fireEvent.drop(form!, { dataTransfer: textTransfer })).toBe(true);
+  });
+
+  it('releases local image preview URLs when the attachment leaves its draft', async () => {
+    vi.stubGlobal('crypto', webcrypto);
+    mockCommon({ conversations: [conversation] });
+    const createURL = vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:synthetic-image-preview');
+    const revokeURL = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined);
+    const user = userEvent.setup();
+    renderPage();
+
+    const image = new File(['synthetic image bytes'], 'preview.png', { type: 'image/png' });
+    await user.upload(await screen.findByLabelText('添加附件'), image);
+    expect(await screen.findByRole('img', { name: '图片预览：preview.png' })).toHaveAttribute('src', 'blob:synthetic-image-preview');
+    expect(createURL).toHaveBeenCalledWith(image);
+    await user.click(screen.getByRole('button', { name: '移除附件 preview.png' }));
+    await waitFor(() => expect(revokeURL).toHaveBeenCalledWith('blob:synthetic-image-preview'));
+    expect(screen.queryByRole('img', { name: '图片预览：preview.png' })).not.toBeInTheDocument();
+  });
+
   it('keeps the attachment and message draft when Office text preview fails', async () => {
     mockCommon({ conversations: [conversation] });
     vi.spyOn(portalApi, 'previewPersonalOfficeText').mockRejectedValue(new Error('synthetic parse failure'));
@@ -4103,6 +4201,136 @@ describe('Assistant durable tasks', () => {
     const panel = await findTaskActivity(task.id);
     expect(within(panel).getByText('搜索网页')).toBeInTheDocument();
     expect(within(panel).queryByText('更多信息')).not.toBeInTheDocument();
+  });
+
+  it('collapses consecutive successful tool activity and keeps exceptions visible without loading details', async () => {
+    const mainAgentID = 'main-agent';
+    const groupedSteps = Array.from({ length: 12 }, (_, index) => taskToolStep(
+      `s${String(index + 1).padStart(7, '0')}`, index + 1, { agent_id: mainAgentID },
+    ));
+    const exceptionalSteps = [
+      taskToolStep('s0000013', 13, { agent_id: mainAgentID, status: 'failed', failure_reason: 'tool_execution_failed' }),
+      taskToolStep('s0000014', 14, { agent_id: mainAgentID, status: 'waiting_user' }),
+      taskToolStep('s0000015', 15, { agent_id: mainAgentID, status: 'unknown' }),
+    ];
+    const runningTask: Task = { ...task, status: 'running', result: null, finished_at: null, event_sequence: 15,
+      steps: [...groupedSteps, ...exceptionalSteps], agents: [{ id: mainAgentID, parent_id: null, step_id: null,
+        task_revision: 1, role: 'main', status: 'running', observed_at: timestamp }] };
+    mockCommon({ conversations: [conversation], messages: [message] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(runningTask);
+    const readDetail = vi.spyOn(portalApi, 'taskStepDetail').mockResolvedValue({ task_id: task.id, step_id: 's0000001',
+      event_sequence: runningTask.event_sequence, tool_name: 'morde_web_search', detail_state: 'not_recorded',
+      object: null, input: null, result: null, truncated: false });
+    const user = userEvent.setup();
+    renderPage();
+
+    const activity = await findTaskActivity(task.id);
+    const batchSummary = within(activity).getByText('12 项工具操作 · 已完成');
+    const batch = batchSummary.closest('details');
+    expect(batch).not.toBeNull();
+    expect(batch).not.toHaveAttribute('open');
+    expect(within(activity).getAllByRole('button', { name: /查看工作项：/u })).toHaveLength(3);
+    for (const step of exceptionalSteps) {
+      const row = activity.querySelector(`[data-task-step-id="${step.id}"]`);
+      expect(row).not.toBeNull();
+      expect(row?.closest('details')).toBeNull();
+    }
+    expect(readDetail).not.toHaveBeenCalled();
+
+    await user.click(batchSummary);
+    expect(within(batch!).getAllByRole('button', { name: /查看工作项：/u })).toHaveLength(12);
+    expect([...batch!.querySelectorAll<HTMLElement>('[data-task-step-id]')].map((element) => element.dataset.taskStepId))
+      .toEqual(groupedSteps.map((step) => step.id));
+    expect(readDetail).not.toHaveBeenCalled();
+
+    await user.click(within(batch!).getByRole('button', { name: '查看工作项：搜索网页' }));
+    await waitFor(() => expect(readDetail).toHaveBeenCalledOnce());
+  });
+
+  it('splits activity batches at sequence gaps, revision changes, missing identity, and agent boundaries', async () => {
+    const mainAgentID = 'main-agent';
+    const subagentID = 'subagent-one';
+    const mainSteps = [
+      taskToolStep('s0000001', 1, { agent_id: mainAgentID }),
+      taskToolStep('s0000002', 2, { agent_id: mainAgentID }),
+      taskToolStep('s0000003', 3, { agent_id: mainAgentID, kind: 'progress', title: '阶段进度' }),
+      taskToolStep('s0000004', 4, { agent_id: mainAgentID }),
+      taskToolStep('s0000005', 5, { agent_id: mainAgentID, kind: 'model', title: '模型步骤' }),
+      taskToolStep('s0000006', 6, { agent_id: mainAgentID }),
+      taskToolStep('s0000007', 7, { agent_id: mainAgentID, task_revision: 2 }),
+      taskToolStep('s0000008', 8, { agent_id: mainAgentID, task_revision: 2 }),
+      taskToolStep('s000000d', 13, { task_revision: 2 }),
+      taskToolStep('s000000e', 14, { task_revision: 2 }),
+    ];
+    const taskWithAgentBoundaries: Task = { ...task, status: 'completed', finished_at: timestamp, event_sequence: 14,
+      steps: [...mainSteps,
+        taskToolStep('s0000009', 9, { agent_id: subagentID, task_revision: 2 }),
+        taskToolStep('s000000a', 10, { agent_id: subagentID, task_revision: 2 })],
+      agents: [
+        { id: mainAgentID, parent_id: null, step_id: null, task_revision: 2, role: 'main', status: 'idle', observed_at: timestamp },
+        { id: subagentID, parent_id: mainAgentID, step_id: null, task_revision: 2, role: 'subagent', status: 'idle', observed_at: timestamp },
+      ] };
+    mockCommon({ conversations: [conversation], messages: [message] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(taskWithAgentBoundaries);
+    renderPage();
+
+    const activity = await findTaskActivity(task.id);
+    const batchSummaries = within(activity).getAllByText('2 项工具操作 · 已完成');
+    expect(batchSummaries).toHaveLength(3);
+    const mainGroup = within(activity).getByText('MAIN').closest('section');
+    const subagentGroup = within(activity).getByText('SUBAGENT 01').closest('section');
+    expect(mainGroup).not.toBeNull();
+    expect(subagentGroup).not.toBeNull();
+    const mainBatches = [...mainGroup!.querySelectorAll('details')];
+    expect(mainBatches).toHaveLength(2);
+    expect([...mainBatches[0]!.querySelectorAll<HTMLElement>('[data-task-step-id]')].map((element) => element.dataset.taskStepId))
+      .toEqual(['s0000001', 's0000002']);
+    expect([...mainBatches[1]!.querySelectorAll<HTMLElement>('[data-task-step-id]')].map((element) => element.dataset.taskStepId))
+      .toEqual(['s0000007', 's0000008']);
+    const subagentBatch = subagentGroup!.querySelector('details');
+    expect([...subagentBatch!.querySelectorAll<HTMLElement>('[data-task-step-id]')].map((element) => element.dataset.taskStepId))
+      .toEqual(['s0000009', 's000000a']);
+    for (const id of ['s0000004', 's0000006', 's000000d', 's000000e']) {
+      expect(activity.querySelector(`[data-task-step-id="${id}"]`)?.closest('details')).toBeNull();
+    }
+  });
+
+  it('rebuilds tool batches from resynced snapshots and ignores duplicate Task events', async () => {
+    const mainAgentID = 'main-agent';
+    const initial: Task = { ...task, status: 'running', result: null, finished_at: null, event_sequence: 2,
+      steps: [taskToolStep('s0000001', 1, { agent_id: mainAgentID }), taskToolStep('s0000002', 2, { agent_id: mainAgentID })],
+      agents: [{ id: mainAgentID, parent_id: null, step_id: null, task_revision: 1, role: 'main', status: 'running', observed_at: timestamp }] };
+    const updated: Task = { ...initial, event_sequence: 3,
+      steps: [...initial.steps, taskToolStep('s0000003', 3, { agent_id: mainAgentID })] };
+    mockCommon({ conversations: [conversation], messages: [message] });
+    const readTask = vi.spyOn(portalApi, 'task').mockResolvedValue(initial);
+    renderPage();
+
+    const activity = await findTaskActivity(task.id);
+    await waitFor(() => expect(taskEventStreams).toHaveLength(1));
+    expect(within(activity).getByText('2 项工具操作 · 已完成')).toBeInTheDocument();
+    readTask.mockResolvedValue(updated);
+    await act(async () => {
+      taskEventStreams[0]!.send('task.step', { task_id: task.id, sequence: 3 });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await waitFor(() => expect(within(activity).getByText('3 项工具操作 · 已完成')).toBeInTheDocument());
+    const readsAfterNewEvent = readTask.mock.calls.length;
+    await act(async () => {
+      taskEventStreams[0]!.send('task.step', { task_id: task.id, sequence: 3 });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(readTask).toHaveBeenCalledTimes(readsAfterNewEvent);
+
+    await act(async () => {
+      taskEventStreams[0]!.send('task.snapshot_required', { sequence: 3 });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await waitFor(() => expect(taskEventStreams).toHaveLength(2));
+    expect(taskEventStreams[1]!.url).toBe(`/api/tasks/${task.id}/events?after=3`);
+    const batch = within(activity).getByText('3 项工具操作 · 已完成').closest('details');
+    expect([...batch!.querySelectorAll<HTMLElement>('[data-task-step-id]')].map((element) => element.dataset.taskStepId))
+      .toEqual(['s0000001', 's0000002', 's0000003']);
   });
 
   it('summarizes real search, file, and command work without generic tool noise', async () => {

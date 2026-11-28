@@ -29,12 +29,15 @@ import (
 const (
 	statusClientClosedRequest = 499
 	requestIDHeader           = "X-Request-Id"
+	responseIDHeader          = "X-Response-Id"
 	traceIDHeader             = "X-Trace-Id"
 	requestIDKey              = "request_id"
+	responseIDKey             = "response_id"
 	traceIDKey                = "trace_id"
 	spanIDKey                 = "span_id"
 	traceStateKey             = "trace_export_state"
 	traceContextStateKey      = "trace_context_state"
+	correlationIssueKey       = "httpserver.correlation_issue"
 	authKindKey               = "auth_kind"
 	routeKey                  = "httpserver.route"
 	loggerKey                 = "httpserver.logger"
@@ -70,7 +73,7 @@ func Base(o Options) ([]gin.HandlerFunc, error) {
 	}
 	return []gin.HandlerFunc{
 		recovery(o.Server, o.Logger),
-		requestID(o.Logger),
+		requestID(),
 		traceContext(o.TracerProvider, o.Logger),
 		accessLog(o.Server, o.Logger),
 		metrics(o.Server, counter, histogram),
@@ -95,6 +98,7 @@ func WriteError(c *gin.Context, err error) {
 			if l, ok := logger.(*zap.Logger); ok && l != nil {
 				fields := []zap.Field{
 					zap.String("request_id", c.GetString(requestIDKey)),
+					zap.String("response_id", c.GetString(responseIDKey)),
 					zap.String("server", c.GetString(serverKey)),
 					zap.String("code", response.Error.Code),
 				}
@@ -142,6 +146,7 @@ func recovery(server string, logger *zap.Logger) gin.HandlerFunc {
 				}
 				fields := []zap.Field{
 					zap.String("request_id", c.GetString(requestIDKey)),
+					zap.String("response_id", c.GetString(responseIDKey)),
 					zap.String("server", c.GetString(serverKey)),
 					zap.String("stack", string(debug.Stack())),
 				}
@@ -160,19 +165,34 @@ func recovery(server string, logger *zap.Logger) gin.HandlerFunc {
 	}
 }
 
-func requestID(logger *zap.Logger) gin.HandlerFunc {
+func requestID() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		id := c.Request.Header.Get(requestIDHeader)
+		var issues []string
 		if !validRequestID(id) {
-			var err error
-			id, err = newRequestID()
+			generatedID, err := newRequestID()
 			if err != nil {
-				logger.Error("generate request id failed", zap.Error(err))
-				id = "unavailable"
+				id = fallbackHTTPID(c, "request")
+				issues = append(issues, "request_id_generation_failed")
+			} else {
+				if id != "" {
+					issues = append(issues, "request_id_invalid")
+				}
+				id = generatedID
 			}
 		}
+		responseID, err := newRequestID()
+		if err != nil {
+			responseID = fallbackHTTPID(c, "response")
+			issues = append(issues, "response_id_generation_failed")
+		}
 		c.Set(requestIDKey, id)
+		c.Set(responseIDKey, responseID)
+		if len(issues) != 0 {
+			c.Set(correlationIssueKey, strings.Join(issues, ","))
+		}
 		c.Writer.Header().Set(requestIDHeader, id)
+		c.Writer.Header().Set(responseIDHeader, responseID)
 		c.Next()
 	}
 }
@@ -214,11 +234,10 @@ func traceContext(provider trace.TracerProvider, logger *zap.Logger) gin.Handler
 		}
 
 		spanContext := span.SpanContext()
+		var traceIDGenerationErr error
 		if provider == nil || !spanContext.IsValid() || parentSC.IsValid() && spanContext.SpanID() == parentSC.SpanID() {
 			generatedTraceID, spanID, err := newTraceIDs(c.GetString(requestIDKey))
-			if err != nil && logger != nil {
-				logger.Error("generate trace context failed", zap.Error(err), zap.String("request_id", c.GetString(requestIDKey)))
-			}
+			traceIDGenerationErr = err
 			traceID := parentSC.TraceID()
 			if !traceID.IsValid() {
 				traceID = generatedTraceID
@@ -240,6 +259,29 @@ func traceContext(provider trace.TracerProvider, logger *zap.Logger) gin.Handler
 		c.Set(traceContextStateKey, contextState)
 		c.Writer.Header().Set(traceIDHeader, traceID)
 		c.Request = c.Request.WithContext(ctx)
+		if logger != nil {
+			commonFields := []zap.Field{
+				zap.String("request_id", c.GetString(requestIDKey)),
+				zap.String("response_id", c.GetString(responseIDKey)),
+				zap.String("trace_id", traceID),
+				zap.String("span_id", spanID),
+				zap.String("server", c.GetString(serverKey)),
+			}
+			if issue := c.GetString(correlationIssueKey); issue != "" {
+				fields := append(append([]zap.Field(nil), commonFields...), zap.String("stage", issue))
+				logger.Warn("http correlation identifier fallback used", fields...)
+			}
+			if traceIDGenerationErr != nil {
+				fields := append(append([]zap.Field(nil), commonFields...),
+					zap.String("stage", "trace_context_generation"),
+					zap.String("error_type", fmt.Sprintf("%T", traceIDGenerationErr)))
+				logger.Warn("http trace context generation used fallback", fields...)
+			}
+			if contextState == "invalid" {
+				fields := append(append([]zap.Field(nil), commonFields...), zap.String("status", "invalid_traceparent"))
+				logger.Warn("invalid W3C trace context ignored", fields...)
+			}
+		}
 
 		if state := getState(c); state != nil {
 			state.finalizers = append(state.finalizers, func(c *gin.Context) {
@@ -252,6 +294,7 @@ func traceContext(provider trace.TracerProvider, logger *zap.Logger) gin.Handler
 					attribute.Int("http.response.status_code", status),
 					attribute.String("morde.server", c.GetString(serverKey)),
 					attribute.String("morde.request_id", c.GetString(requestIDKey)),
+					attribute.String("morde.response_id", c.GetString(responseIDKey)),
 					attribute.String("morde.trace.context_state", c.GetString(traceContextStateKey)),
 				)
 				requestSpan.SetAttributes(attribute.Int64("morde.http.duration_ms", time.Since(started).Milliseconds()))
@@ -298,6 +341,20 @@ func fallbackTraceIDs(requestID string) (trace.TraceID, trace.SpanID) {
 	return traceID, spanID
 }
 
+func fallbackHTTPID(c *gin.Context, prefix string) string {
+	requestPath := ""
+	method := ""
+	remoteAddr := ""
+	if c != nil && c.Request != nil {
+		requestPath = c.Request.URL.Path
+		method = c.Request.Method
+		remoteAddr = c.Request.RemoteAddr
+	}
+	seed := prefix + ":" + method + ":" + requestPath + ":" + remoteAddr + ":" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	digest := sha256.Sum256([]byte(seed))
+	return prefix + "-" + hex.EncodeToString(digest[:16])
+}
+
 func traceLogFields(c *gin.Context) []zap.Field {
 	return []zap.Field{
 		zap.String("trace_id", c.GetString(traceIDKey)),
@@ -320,6 +377,7 @@ func accessLog(server string, logger *zap.Logger) gin.HandlerFunc {
 				}
 				fields := []zap.Field{
 					zap.String("request_id", c.GetString(requestIDKey)),
+					zap.String("response_id", c.GetString(responseIDKey)),
 					zap.String("server", server),
 					zap.String("route", route(c)),
 					zap.String("method", c.Request.Method),

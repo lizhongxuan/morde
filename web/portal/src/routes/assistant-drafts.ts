@@ -25,6 +25,69 @@ export type AssistantComposerDraft = {
   updatedAt: number;
 };
 
+export function assistantComposerDraftIdentity(scope: string, id: string): string {
+  return JSON.stringify([scope, id]);
+}
+
+export type AssistantDraftPreviewAttachment = Pick<AssistantComposerDraftAttachment, 'id' | 'mediaType' | 'blob'> & {
+  needsPreparation?: boolean;
+};
+
+/** Owns local image URLs for one active draft; URLs are never persisted with the draft. */
+export class AssistantDraftPreviewURLRegistry {
+  private identity: string | null = null;
+  private readonly urls = new Map<string, { blob: Blob; url: string }>();
+
+  constructor(
+    private readonly createURL: (blob: Blob) => string = (blob) =>
+      typeof URL.createObjectURL === 'function' ? URL.createObjectURL(blob) : '',
+    private readonly revokeURL: (url: string) => void = (url) => {
+      if (typeof URL.revokeObjectURL === 'function') URL.revokeObjectURL(url);
+    },
+  ) {}
+
+  sync(identity: string | null, attachments: AssistantDraftPreviewAttachment[]): Record<string, string> {
+    if (!identity) {
+      this.clear();
+      return {};
+    }
+    if (identity !== this.identity) {
+      this.releaseAll();
+      this.identity = identity;
+    }
+
+    const previewable = new Map(attachments.filter((item) => !item.needsPreparation &&
+      (item.mediaType === 'image/png' || item.mediaType === 'image/jpeg')).map((item) => [item.id, item.blob]));
+    for (const [id, current] of this.urls) {
+      const blob = previewable.get(id);
+      if (blob !== current.blob) {
+        this.revokeURL(current.url);
+        this.urls.delete(id);
+      }
+    }
+    for (const [id, blob] of previewable) {
+      if (this.urls.has(id)) continue;
+      try {
+        const url = this.createURL(blob);
+        if (url) this.urls.set(id, { blob, url });
+      } catch {
+        // A preview is optional; attachment staging and sending remain available.
+      }
+    }
+    return Object.fromEntries([...this.urls].map(([id, current]) => [id, current.url]));
+  }
+
+  clear(): void {
+    this.releaseAll();
+    this.identity = null;
+  }
+
+  private releaseAll(): void {
+    for (const current of this.urls.values()) this.revokeURL(current.url);
+    this.urls.clear();
+  }
+}
+
 export interface AssistantDraftStorage {
   get(scope: string, id: string): Promise<AssistantComposerDraft | null>;
   list(scope: string): Promise<AssistantComposerDraft[]>;

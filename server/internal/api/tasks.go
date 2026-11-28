@@ -41,6 +41,12 @@ type TaskService interface {
 	ListEvents(context.Context, identity.Principal, string, int64, int32) (app.TaskEventPage, error)
 }
 
+// StructuredTaskClarificationService adds the versioned multi-answer contract
+// without changing the legacy TaskService free-text input method.
+type StructuredTaskClarificationService interface {
+	AnswerStructuredClarificationRequest(context.Context, identity.Principal, string, string, int64, []task.ClarificationAnswer, string) error
+}
+
 type TaskApprovalQueryService interface {
 	ListTaskApprovals(context.Context, identity.Principal, string, app.PageRequest) (app.TaskApprovalPage, error)
 }
@@ -413,10 +419,31 @@ func validTaskCurrency(value string) bool {
 }
 
 type taskClarificationRequestResponse struct {
-	ID       string `json:"id"`
-	Version  int64  `json:"version"`
-	Question string `json:"question"`
-	CallID   string `json:"call_id"`
+	ID            string                                  `json:"id"`
+	Version       int64                                   `json:"version"`
+	Question      string                                  `json:"question"`
+	CallID        string                                  `json:"call_id"`
+	QuestionGroup *taskClarificationQuestionGroupResponse `json:"question_group,omitempty"`
+}
+
+type taskClarificationQuestionGroupResponse struct {
+	ID        string                              `json:"id"`
+	Version   int64                               `json:"version"`
+	Questions []taskClarificationQuestionResponse `json:"questions"`
+}
+
+type taskClarificationQuestionResponse struct {
+	ID        string                                    `json:"id"`
+	Prompt    string                                    `json:"prompt"`
+	Type      task.ClarificationQuestionType            `json:"type"`
+	Required  bool                                      `json:"required"`
+	AllowSkip bool                                      `json:"allow_skip"`
+	Options   []taskClarificationQuestionOptionResponse `json:"options"`
+}
+
+type taskClarificationQuestionOptionResponse struct {
+	ID    string `json:"id"`
+	Label string `json:"label"`
 }
 
 func validTaskText(value string, maxRunes int) bool {
@@ -617,6 +644,18 @@ type taskInputRequest struct {
 	FileDeliveryIntent   json.RawMessage `json:"file_delivery_intent"`
 }
 
+type taskStructuredInputRequest struct {
+	Version int64                         `json:"version"`
+	Answers []taskStructuredAnswerRequest `json:"answers"`
+}
+
+type taskStructuredAnswerRequest struct {
+	QuestionID string   `json:"question_id"`
+	OptionIDs  []string `json:"option_ids"`
+	Text       string   `json:"text"`
+	Skipped    bool     `json:"skipped"`
+}
+
 func parseFileDeliveryIntentRequest(raw json.RawMessage, allowUnclear bool) (task.FileDeliveryIntent, bool) {
 	if raw == nil {
 		return "", true
@@ -690,6 +729,9 @@ func (h *api) registerTasks(group *gin.RouterGroup, service TaskService) {
 	group.POST("/tasks/:id/workspace-view-deletions", h.requestTaskWorkspaceViewDeletion(service))
 	group.POST("/tasks/:id/actions", h.taskAction(service))
 	group.POST("/tasks/:id/inputs", h.addTaskInput(service))
+	if structuredService, ok := service.(StructuredTaskClarificationService); ok {
+		group.POST("/v2/tasks/:id/clarifications/:clarification_id/responses", h.addStructuredTaskInput(structuredService))
+	}
 	group.POST("/tasks/:id/approvals/:approval_id/responses", h.respondToTaskApproval(service))
 	group.GET("/tasks/:id/events", h.streamTaskEvents(service))
 }
@@ -1139,6 +1181,55 @@ func (h *api) addTaskInput(service TaskService) gin.HandlerFunc {
 		}
 		if err := service.AnswerClarificationRequest(c.Request.Context(), principal, taskID, request.ClarificationID,
 			request.ClarificationVersion, request.Answer, fileIntent, c.GetHeader("Idempotency-Key")); err != nil {
+			writeError(c, err)
+			return
+		}
+		c.JSON(http.StatusAccepted, taskActionResponse{TaskID: taskID, Action: "answer_clarification", Status: task.StatusQueued, UnsettledOperationIDs: []string{}})
+	}
+}
+
+func (h *api) addStructuredTaskInput(service StructuredTaskClarificationService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		principal, ok := principalFrom(c)
+		if !ok {
+			unauthenticated(c)
+			return
+		}
+		taskID, ok := safeID(c, "id", domain.ValidTaskID)
+		if !ok {
+			return
+		}
+		clarificationID, ok := safeIDParam(c, "clarification_id", "clarification_id", domain.ValidPendingRequestID)
+		if !ok {
+			return
+		}
+		var request taskStructuredInputRequest
+		if !decodeStrictTaskJSON(c, &request) {
+			return
+		}
+		if request.Version < 1 || len(request.Answers) == 0 || len(request.Answers) > 8 {
+			writeError(c, domain.InvalidArgument("clarification", "a positive version and a bounded set of structured answers are required"))
+			return
+		}
+		answers := make([]task.ClarificationAnswer, 0, len(request.Answers))
+		for _, answer := range request.Answers {
+			if !validTaskText(answer.QuestionID, 64) || strings.ContainsRune(answer.QuestionID, '\x00') ||
+				len(answer.OptionIDs) > 12 || len(answer.Text) > 16384 || !utf8.ValidString(answer.Text) || strings.ContainsRune(answer.Text, '\x00') {
+				writeError(c, domain.InvalidArgument("answers", "structured clarification answer fields are invalid"))
+				return
+			}
+			for _, optionID := range answer.OptionIDs {
+				if !validTaskText(optionID, 64) || strings.ContainsRune(optionID, '\x00') {
+					writeError(c, domain.InvalidArgument("answers", "structured clarification option identity is invalid"))
+					return
+				}
+			}
+			answers = append(answers, task.ClarificationAnswer{
+				QuestionID: answer.QuestionID, OptionIDs: append([]string(nil), answer.OptionIDs...), Text: answer.Text, Skipped: answer.Skipped,
+			})
+		}
+		if err := service.AnswerStructuredClarificationRequest(c.Request.Context(), principal, taskID, clarificationID,
+			request.Version, answers, c.GetHeader("Idempotency-Key")); err != nil {
 			writeError(c, err)
 			return
 		}
@@ -1689,6 +1780,31 @@ func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 			!domain.ValidStepID(clarification.ModelStepID) || clarification.CallID == "" || len(clarification.CallID) > 256 ||
 			!validTaskText(clarification.Question, 4096) || clarification.Answer != "" || clarification.RespondedAt != nil {
 			return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
+		}
+		if len(clarification.Questions) > 0 {
+			if routeFileDeliveryClarification || clarification.CallID == app.FileDeliveryIntentClarificationCallID ||
+				task.ValidateClarificationQuestions(clarification.Questions) != nil {
+				return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
+			}
+			group := &taskClarificationQuestionGroupResponse{
+				ID: clarification.ID, Version: clarification.Version,
+				Questions: make([]taskClarificationQuestionResponse, 0, len(clarification.Questions)),
+			}
+			for _, question := range clarification.Questions {
+				options := make([]taskClarificationQuestionOptionResponse, 0, len(question.Options))
+				for _, option := range question.Options {
+					options = append(options, taskClarificationQuestionOptionResponse{ID: option.ID, Label: option.Label})
+				}
+				group.Questions = append(group.Questions, taskClarificationQuestionResponse{
+					ID: question.ID, Prompt: question.Prompt, Type: question.Type, Required: question.Required,
+					AllowSkip: question.AllowSkip, Options: options,
+				})
+			}
+			response.ClarificationRequest = &taskClarificationRequestResponse{
+				ID: clarification.ID, Version: clarification.Version, Question: clarification.Question,
+				CallID: clarification.CallID, QuestionGroup: group,
+			}
+			continue
 		}
 		if response.ClarificationRequest != nil {
 			return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")

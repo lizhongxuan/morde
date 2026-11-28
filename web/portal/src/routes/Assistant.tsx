@@ -1,5 +1,5 @@
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import type { CSSProperties, FormEvent, KeyboardEvent as ReactKeyboardEvent } from 'react';
+import type { CSSProperties, DragEvent as ReactDragEvent, FormEvent, KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { Link, useLocation, useNavigate, useOutletContext } from 'react-router';
 import { useInfiniteQuery, useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
 import { errorDetails, newIdempotencyKey, portalApi } from '../app/api';
@@ -33,7 +33,7 @@ import { ScreenPagination } from '../components/ScreenPagination';
 import { TaskApprovalCard } from '../components/TaskApprovalCard';
 import { sha256Hex } from './personal-data-store';
 import { extractAssistantPDFText } from './assistant-pdf';
-import { assistantComposerDraftScope, assistantDraftStorage } from './assistant-drafts';
+import { assistantComposerDraftIdentity, AssistantDraftPreviewURLRegistry, assistantComposerDraftScope, assistantDraftStorage } from './assistant-drafts';
 import type { AssistantComposerDraft } from './assistant-drafts';
 import './AssistantSidebar.css';
 import './MessageVariants.css';
@@ -438,6 +438,11 @@ function assistantFileError(file: File, mediaType: string): string | null {
   return null;
 }
 
+function transferContainsFiles(dataTransfer: DataTransfer): boolean {
+  return dataTransfer.files.length > 0 || Array.from(dataTransfer.types).includes('Files') ||
+    Array.from(dataTransfer.items).some((item) => item.kind === 'file');
+}
+
 async function uploadAssistantAttachment(item: PendingMessageAttachment, serviceInstanceID: string, actorID: string, checkScope: () => void): Promise<string> {
   if (item.attachmentID) return item.attachmentID;
   const file = new File([item.blob], item.name, { type: item.mediaType });
@@ -756,6 +761,7 @@ function stepDetailObject(step: TaskStep, object: string | null): string | null 
 
 type TaskAgent = NonNullable<Task['agents']>[number];
 type TaskAgentActivityGroup = { id: string; title: string; currentActivity: string | null; steps: TaskStep[] };
+type TaskAgentActivityItem = { kind: 'step'; step: TaskStep } | { kind: 'tool_group'; id: string; steps: TaskStep[] };
 
 function taskAgentCurrentActivity(agent: TaskAgent): string | null {
   if (!agent.activity_phase || !agent.activity_state) return null;
@@ -1316,6 +1322,35 @@ function taskAgentActivityGroups(task: Task): TaskAgentActivityGroup[] {
   return [...groups, ...unassigned(steps.filter((step) => Boolean(step.agent_id) && !assignedStepIDs.has(step.id)))];
 }
 
+function taskAgentActivityItems(steps: TaskStep[]): TaskAgentActivityItem[] {
+  const idCounts = new Map<string, number>();
+  for (const step of steps) idCounts.set(step.id, (idCounts.get(step.id) ?? 0) + 1);
+  const items: TaskAgentActivityItem[] = [];
+  let run: TaskStep[] = [];
+  const flush = () => {
+    if (run.length > 1) items.push({ kind: 'tool_group', id: run[0]!.id, steps: run });
+    else if (run.length === 1) items.push({ kind: 'step', step: run[0]! });
+    run = [];
+  };
+  const canGroup = (step: TaskStep) => step.kind === 'tool' && step.status === 'succeeded' &&
+    typeof step.agent_id === 'string' && step.agent_id.length > 0 && Number.isSafeInteger(step.task_revision) &&
+    step.task_revision! >= 0 && Number.isSafeInteger(step.sequence) && step.sequence > 0 && idCounts.get(step.id) === 1;
+
+  for (const step of steps) {
+    if (!canGroup(step)) {
+      flush();
+      items.push({ kind: 'step', step });
+      continue;
+    }
+    const previous = run.at(-1);
+    if (previous && (previous.agent_id !== step.agent_id || previous.task_revision !== step.task_revision ||
+      step.sequence !== previous.sequence + 1)) flush();
+    run.push(step);
+  }
+  flush();
+  return items;
+}
+
 type TaskFeedState = 'connected' | 'disconnected' | 'resyncing';
 
 function TaskStream({ task, conversationID, onState }: {
@@ -1507,6 +1542,8 @@ export function Assistant() {
   const [responseMode, setResponseMode] = useState<ConversationResponseMode>('short');
   const [savingMessage, setSavingMessage] = useState(false);
   const [composerAttachments, setComposerAttachments] = useState<ComposerAttachment[]>([]);
+  const [composerAttachmentPreviewURLs, setComposerAttachmentPreviewURLs] = useState<Record<string, string>>({});
+  const [composerDraftPreviewURLRegistry] = useState(() => new AssistantDraftPreviewURLRegistry());
   const [officePreviews, setOfficePreviews] = useState<Record<string, OfficePreviewState>>({});
   const [preparingAttachmentCount, setPreparingAttachmentCount] = useState(0);
   const [preparingAttachmentIDsForRender, setPreparingAttachmentIDsForRender] = useState<ReadonlySet<string>>(() => new Set());
@@ -1831,7 +1868,7 @@ export function Assistant() {
     ? assistantComposerDraftScope(capabilities.data.service_instance_id, user.id) : null;
   const composerDraftID = selectedLocalDraftKey ? `local:${selectedLocalDraftKey}` : conversationID;
   const composerDraftIdentity = composerDraftScope && composerDraftID
-    ? JSON.stringify([composerDraftScope, composerDraftID]) : null;
+    ? assistantComposerDraftIdentity(composerDraftScope, composerDraftID) : null;
   const composerDrafts = useQuery({
     queryKey: ['assistant-composer-drafts', composerDraftScope],
     queryFn: () => assistantDraftStorage.list(composerDraftScope!),
@@ -3243,6 +3280,18 @@ export function Assistant() {
     if (incoming.length > available) notify('每条消息最多添加 16 个附件。', 'error');
   };
 
+  const handleComposerDragOver = (event: ReactDragEvent<HTMLFormElement>) => {
+    if (!transferContainsFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'copy';
+  };
+
+  const handleComposerDrop = (event: ReactDragEvent<HTMLFormElement>) => {
+    if (!transferContainsFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    if (event.dataTransfer.files.length) void addComposerFiles(event.dataTransfer.files);
+  };
+
   const previewOfficeAttachment = async (item: ComposerAttachment) => {
     const mediaType = assistantFileMediaType(item.file);
     if (!assistantOfficeAttachmentTypes.has(mediaType)) return;
@@ -3700,6 +3749,13 @@ export function Assistant() {
     : Boolean(selectedLocalDraftKey) && message.conversationCreateKey === selectedLocalDraftKey));
   const composerDraftReady = !composerDraftIdentity || hydratedComposerDraftKey === composerDraftIdentity;
   const visibleComposerContent = composerDraftReady ? content : '';
+  useEffect(() => {
+    const urls = composerDraftPreviewURLRegistry.sync(composerDraftReady ? composerDraftIdentity : null,
+      composerDraftReady ? composerAttachments.map((item) => ({ id: item.id, blob: item.file,
+        mediaType: assistantFileMediaType(item.file), needsPreparation: item.needsPreparation })) : []);
+    setComposerAttachmentPreviewURLs(urls);
+  }, [composerAttachments, composerDraftIdentity, composerDraftPreviewURLRegistry, composerDraftReady]);
+  useEffect(() => () => composerDraftPreviewURLRegistry.clear(), [composerDraftPreviewURLRegistry]);
   const resizeComposer = useCallback(() => {
     const textarea = composerTextarea.current;
     if (!textarea) return;
@@ -3773,6 +3829,20 @@ export function Assistant() {
     }
 
     const groups = taskAgentActivityGroups(task);
+    const renderActivityStep = (step: TaskStep) => {
+      const stepTitleText = safeTaskActivityText(conversationTitleFromText(taskActivityStepTitle(step)) ?? 'Agent 工作项', 120).value;
+      const stepSummaryText = taskActivitySnippet(taskActivityStepSummary(step), 120) ?? '';
+      const statusID = `task-step-status-${task.id}-${step.id}`;
+      return <button key={step.id} data-task-step-id={step.id} type="button" className="task-activity-step-button task-work-item"
+        aria-label={`查看工作项：${stepTitleText}`} aria-describedby={statusID} onClick={() => setTaskDetailStepID(step.id)}>
+        <span className={`task-step-icon status-${step.status}`} aria-hidden="true" />
+        <span className="task-work-copy"><strong>{stepTitleText}</strong>
+          {stepSummaryText && <small>{stepSummaryText}</small>}
+        </span>
+        <span className="task-work-status" id={statusID}>{taskStepStatusText(step.status)}</span>
+        <span className="task-work-arrow" aria-hidden="true">›</span>
+      </button>;
+    };
     const isRunning = taskActivityIsExecuting(task.status);
     const title = taskActivityTitle(task.objective);
     const taskStatus = taskStatusText(task, user?.id);
@@ -3835,20 +3905,11 @@ export function Assistant() {
         {groups.length ? groups.map((group) => <section className="task-agent-group" key={group.id}>
           <h4><strong>{group.title}</strong><span aria-hidden="true" /></h4>
           {group.currentActivity && <p className="muted task-agent-current-activity" role="status">{group.currentActivity}</p>}
-          {group.steps.map((step) => {
-            const stepTitleText = safeTaskActivityText(conversationTitleFromText(taskActivityStepTitle(step)) ?? 'Agent 工作项', 120).value;
-            const stepSummaryText = taskActivitySnippet(taskActivityStepSummary(step), 120) ?? '';
-            const statusID = `task-step-status-${task.id}-${step.id}`;
-            return <button key={step.id} type="button" className="task-activity-step-button task-work-item"
-              aria-label={`查看工作项：${stepTitleText}`} aria-describedby={statusID} onClick={() => setTaskDetailStepID(step.id)}>
-              <span className={`task-step-icon status-${step.status}`} aria-hidden="true" />
-              <span className="task-work-copy"><strong>{stepTitleText}</strong>
-                {stepSummaryText && <small>{stepSummaryText}</small>}
-              </span>
-              <span className="task-work-status" id={statusID}>{taskStepStatusText(step.status)}</span>
-              <span className="task-work-arrow" aria-hidden="true">›</span>
-            </button>;
-          })}
+          {taskAgentActivityItems(group.steps).map((item) => item.kind === 'step' ? renderActivityStep(item.step) :
+            <details className="task-detail-more" key={item.id} aria-label={`${item.steps.length} 项工具操作`}>
+              <summary>{item.steps.length} 项工具操作 · 已完成</summary>
+              {item.steps.map(renderActivityStep)}
+            </details>)}
         </section>) : <p className="muted task-work-empty">暂无已记录的工作项。</p>}
       </section>
     </section>;
@@ -4414,7 +4475,7 @@ export function Assistant() {
               })}
             </div>
           </details>}
-          <form onSubmit={submit}>
+          <form onSubmit={submit} onDragOver={handleComposerDragOver} onDrop={handleComposerDrop}>
             {!composerDraftReady && <p className="muted" role="status">正在恢复此会话草稿…</p>}
             {composerDraftError && <FloatingError className="error-inline" role="alert">草稿尚未可靠保存：{composerDraftError}。当前输入仍保留在页面中。</FloatingError>}
             <label className="sr-only" htmlFor="assistant-content">消息内容</label>
@@ -4435,6 +4496,9 @@ export function Assistant() {
                 const preview = officePreviews[item.id];
                 return <Fragment key={item.id}>
                   <span className="assistant-attachment-chip">
+                    {composerAttachmentPreviewURLs[item.id] && <img className="assistant-attachment-preview"
+                      src={composerAttachmentPreviewURLs[item.id]} width={32} height={32}
+                      alt={`图片预览：${item.displayName ?? item.file.name}`} />}
                     <span title={item.displayName ?? item.file.name}>{item.displayName ?? item.file.name}{item.attachmentID ? ' · 已准备' : item.needsPreparation ? item.preparationCancelled ? ' · 已暂停读取' : ' · 待读取' : ''}</span>
                     {item.needsPreparation && <button type="button" className="button button-small button-secondary"
                       disabled={preparingAttachmentIDsForRender.has(item.id)} onClick={() => void prepareComposerAttachmentItems([item], composerDraftScope, composerDraftID)}>

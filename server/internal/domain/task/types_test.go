@@ -72,3 +72,53 @@ func TestUnknownOperationMustBeReconciled(t *testing.T) {
 		t.Fatal("unknown external operation may be replayed without reconciliation")
 	}
 }
+
+func TestStructuredClarificationValidatesStableQuestionAndAnswerIDs(t *testing.T) {
+	questions := []ClarificationQuestion{
+		{ID: "environment", Prompt: "Where should this run?", Type: ClarificationSingleChoice, Required: true,
+			Options: []ClarificationQuestionOption{{ID: "staging", Label: "Staging"}, {ID: "production", Label: "Production"}}},
+		{ID: "channels", Prompt: "Which channels?", Type: ClarificationMultiChoice,
+			Options: []ClarificationQuestionOption{{ID: "web", Label: "Web"}, {ID: "mobile", Label: "Mobile"}}},
+		{ID: "notes", Prompt: "Additional notes", Type: ClarificationFreeText, AllowSkip: true, Options: []ClarificationQuestionOption{}},
+	}
+	if err := ValidateClarificationQuestions(questions); err != nil {
+		t.Fatalf("valid question group rejected: %v", err)
+	}
+	answers := []ClarificationAnswer{
+		{QuestionID: "environment", OptionIDs: []string{"staging"}},
+		{QuestionID: "channels", OptionIDs: []string{"web", "mobile"}},
+		{QuestionID: "notes", Skipped: true, OptionIDs: []string{}},
+	}
+	if err := ValidateClarificationAnswers(questions, answers); err != nil {
+		t.Fatalf("valid answer group rejected: %v", err)
+	}
+	invalidAnswers := []ClarificationAnswer{answers[0], answers[1]}
+	if err := ValidateClarificationAnswers(questions, invalidAnswers); err == nil {
+		t.Fatal("missing explicit answer or skip was accepted")
+	}
+	unknownOption := []ClarificationAnswer{
+		{QuestionID: "environment", OptionIDs: []string{"live"}}, answers[1], answers[2],
+	}
+	if err := ValidateClarificationAnswers(questions, unknownOption); err == nil {
+		t.Fatal("unknown choice was accepted")
+	}
+	implicitSkip := []ClarificationAnswer{answers[0], answers[1], {QuestionID: "notes"}}
+	if err := ValidateClarificationAnswers(questions, implicitSkip); err == nil {
+		t.Fatal("empty non-skip answer was accepted")
+	}
+}
+
+func TestStructuredClarificationRejectsAmbiguousQuestionGroups(t *testing.T) {
+	for _, questions := range [][]ClarificationQuestion{
+		{},
+		{{ID: "environment", Prompt: "Where?", Type: ClarificationSingleChoice,
+			Options: []ClarificationQuestionOption{{ID: "same", Label: "A"}, {ID: "same", Label: "B"}}}},
+		{{ID: "bad id", Prompt: "Where?", Type: ClarificationFreeText}},
+		{{ID: "notes", Prompt: "Notes", Type: ClarificationFreeText,
+			Options: []ClarificationQuestionOption{{ID: "unused", Label: "Unused"}}}},
+	} {
+		if err := ValidateClarificationQuestions(questions); err == nil {
+			t.Errorf("invalid question group accepted: %#v", questions)
+		}
+	}
+}

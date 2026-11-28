@@ -129,6 +129,16 @@ export function AssistantVoiceInput({ onTranscript, disabled = false, language =
     }
   };
 
+  const cancelRecognition = () => {
+    const recognition = recognitionRef.current;
+    // Invalidate the active generation before abort can synchronously emit
+    // result/error/end callbacks. Results already delivered stay in the draft.
+    recognitionRef.current = null;
+    recognition?.abort();
+    setListening(false);
+    setStatus('语音输入已取消。');
+  };
+
   return (
     <div className="assistant-voice-control" style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
       <button
@@ -144,6 +154,12 @@ export function AssistantVoiceInput({ onTranscript, disabled = false, language =
       >
         {compact ? <MordeIcon name="microphone" /> : listening ? '停止语音' : '语音输入'}
       </button>
+      {listening && <button
+        type="button"
+        className="button button-secondary button-small assistant-voice-cancel"
+        aria-label="取消语音输入"
+        onClick={cancelRecognition}
+      >取消</button>}
       <span
         className={`assistant-voice-status${compact && !status ? ' assistant-voice-status-idle' : ''}`}
         aria-label="语音输入状态"

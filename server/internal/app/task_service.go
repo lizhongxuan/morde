@@ -1298,6 +1298,9 @@ func (s *TaskService) AnswerClarificationRequest(ctx context.Context, principal 
 	fileDeliveryClarification := false
 	routeFileDeliveryClarification := false
 	for _, request := range details.ClarificationRequests {
+		if request.ID == clarificationID && len(request.Questions) > 0 {
+			return domain.NewError(domain.CodeConflict, "structured clarification requires the versioned structured response endpoint")
+		}
 		if request.ID != clarificationID || (request.CallID != FileDeliveryIntentClarificationCallID &&
 			request.CallID != RouteFileDeliveryIntentClarificationCallID) {
 			continue
@@ -1360,6 +1363,67 @@ func (s *TaskService) AnswerClarificationRequest(ctx context.Context, principal 
 		return err
 	}
 	return s.store.AnswerClarificationRequest(ctx, record, taskID, clarificationID, version, answer, fileIntent, objective)
+}
+
+// AnswerStructuredClarificationRequest records one complete, explicit answer
+// set against the exact active question-group version. It shares the durable
+// clarification row and waiting Task authorization with the legacy input path.
+func (s *TaskService) AnswerStructuredClarificationRequest(ctx context.Context, principal identity.Principal, taskID, clarificationID string,
+	version int64, answers []task.ClarificationAnswer, idempotencyKey string) error {
+	if err := validateTaskPrincipal(principal); err != nil {
+		return err
+	}
+	if !domain.ValidTaskID(taskID) || !domain.ValidPendingRequestID(clarificationID) {
+		return domain.NewError(domain.CodeNotFound, "task or clarification request not found")
+	}
+	if version < 1 || len(answers) == 0 || len(answers) > 8 {
+		return domain.InvalidArgument("clarification", "clarification version or answer set is invalid")
+	}
+	if err := validateIdempotencyKey(idempotencyKey); err != nil {
+		return err
+	}
+	details, err := s.store.GetTask(ctx, taskID, principal.UserID)
+	if err != nil {
+		return err
+	}
+	if details.Task.InternalTool {
+		return domain.NewError(domain.CodeNotFound, "task not found")
+	}
+	if _, err := s.authorizeTask(ctx, principal, details.Task.HostID, taskControlScope); err != nil {
+		return hideTaskAccessError(err)
+	}
+	var active *task.ClarificationRequest
+	for index := range details.ClarificationRequests {
+		request := &details.ClarificationRequests[index]
+		if request.ID == clarificationID {
+			active = request
+			break
+		}
+	}
+	if active == nil || active.Version != version || active.Status != task.ClarificationPending ||
+		len(active.Questions) == 0 || active.CallID == FileDeliveryIntentClarificationCallID ||
+		active.CallID == RouteFileDeliveryIntentClarificationCallID || active.BatchItemID != "" || active.BatchAttempt != 0 ||
+		details.Task.Status != task.StatusWaitingUser || details.Task.WaitingReason != "clarification_required" {
+		return domain.NewError(domain.CodeConflict, "structured clarification is no longer active")
+	}
+	if err := task.ValidateClarificationAnswers(active.Questions, answers); err != nil {
+		return domain.InvalidArgument("answers", "structured clarification answers do not match the active question group")
+	}
+	store, ok := s.store.(StructuredClarificationAnswerStore)
+	if !ok {
+		return domain.NewError(domain.CodeUnsupported, "structured clarification storage is unavailable")
+	}
+	record, err := idempotencyRecord(principal.UserID, "task.clarification.structured_answer", idempotencyKey, struct {
+		Action          string                     `json:"action"`
+		TaskID          string                     `json:"task_id"`
+		QuestionGroupID string                     `json:"question_group_id"`
+		Version         int64                      `json:"version"`
+		Answers         []task.ClarificationAnswer `json:"answers"`
+	}{"answer_clarification", taskID, clarificationID, version, answers}, taskID, clarificationID)
+	if err != nil {
+		return err
+	}
+	return store.AnswerStructuredClarificationRequest(ctx, record, taskID, clarificationID, version, answers)
 }
 
 func (s *TaskService) ListEvents(ctx context.Context, principal identity.Principal, id string, after int64, limit int32) (TaskEventPage, error) {

@@ -540,9 +540,9 @@ func allowedAttribute(key string, allow attributeAllowList) bool {
 	case spanAttributeList:
 		switch key {
 		case "http.request.method", "http.route", "http.response.status_code", "http.request.body.size", "http.response.body.size",
-			"network.protocol.version", "error.type", "exception.type", "exception.escaped", "morde.request_id",
+			"network.protocol.version", "error.type", "exception.type", "exception.escaped", "morde.request_id", "morde.response_id",
 			"morde.user_id", "morde.conversation_id", "morde.message_id", "morde.task_id", "morde.agent_session_id",
-			"morde.parent_agent_session_id", "morde.model_id", "morde.provider_model", "morde.tool_name", "morde.call_id",
+			"morde.parent_agent_session_id", "morde.model_id", "morde.provider_model", "morde.tool_name", "morde.call_id", "morde.delivery_id",
 			"morde.attempt", "morde.operation", "morde.failure_code", "morde.status", "morde.phase",
 			"morde.task_revision", "morde.event_sequence", "morde.source":
 			return true

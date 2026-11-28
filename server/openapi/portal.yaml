@@ -2,7 +2,8 @@ openapi: 3.1.0
 info:
   title: Morde Portal and Host Gateway API
   version: 1.0.0
-  description: Portal API, Host Gateway API, and platform MCP endpoint. Portal API keys are sent as bearer credentials; Host Gateway operations use the host-scoped ch_host cookie, while the Task observation routes use a separate narrowly scoped ch_task_read cookie.
+  description: >-
+    Portal API, Host Gateway API, and platform MCP endpoint. Portal API keys are sent as bearer credentials; Host Gateway operations use the host-scoped ch_host cookie, while the Task observation routes use a separate narrowly scoped ch_task_read cookie. Every HTTP response from Portal and Host Gateway includes X-Request-Id, X-Response-Id, and X-Trace-Id headers. X-Response-Id is a server-generated identifier for the response and is included in request-correlated logs.
 servers:
   - url: https://{portal}
     variables:
@@ -6270,7 +6271,8 @@ paths:
     post:
       tags: [Tasks]
       operationId: answerTaskInput
-      summary: Answer a versioned clarification and resume a task
+      summary: Answer a legacy free-text clarification and resume a task
+      description: Preserves the original single free-text clarification contract. A clarification with question_group must use the versioned structured response route; this endpoint rejects it.
       security: [{ portalSession: [] }, { clientCredential: [] }]
       parameters:
         - { $ref: '#/components/parameters/IdempotencyKey' }
@@ -6287,6 +6289,40 @@ paths:
               schema: { $ref: '#/components/schemas/TaskActionResponse' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/v2/tasks/{id}/clarifications/{clarification_id}/responses:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/TaskId' }
+      - name: clarification_id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/ClarificationId' }
+    post:
+      tags: [Tasks]
+      operationId: answerStructuredTaskClarification
+      summary: Answer every question in one versioned clarification group
+      description: Binds every answer to the question group ID and version. Each question requires either a value or an explicit allowed skip. A skip does not grant approval or change Task authorization, routing, or file-delivery intent.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TaskStructuredInputRequest' }
+      responses:
+        '202':
+          description: Structured answers accepted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskActionResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
         default: { $ref: '#/components/responses/Error' }
   /api/tasks/{id}/approvals/{approval_id}/responses:
     parameters:
@@ -13505,6 +13541,44 @@ components:
           minLength: 1
           maxLength: 256
           description: Opaque clarification identity used by clients to select any structured answer fields. Clients must not infer clarification type from question text.
+        question_group:
+          oneOf:
+            - { $ref: '#/components/schemas/TaskClarificationQuestionGroup' }
+            - { type: 'null' }
+          description: Present only for structured clarifications. Its id and version equal the enclosing clarification id and version. Clients must use the v2 response route for the whole group.
+    TaskClarificationQuestionGroup:
+      type: object
+      additionalProperties: false
+      required: [id, version, questions]
+      properties:
+        id: { $ref: '#/components/schemas/ClarificationId' }
+        version: { type: integer, minimum: 1 }
+        questions:
+          type: array
+          minItems: 1
+          maxItems: 8
+          items: { $ref: '#/components/schemas/TaskClarificationQuestion' }
+    TaskClarificationQuestion:
+      type: object
+      additionalProperties: false
+      required: [id, prompt, type, required, allow_skip, options]
+      properties:
+        id: { type: string, pattern: '^[a-z][a-z0-9_-]{0,63}$' }
+        prompt: { type: string, minLength: 1, maxLength: 1024 }
+        type: { type: string, enum: [single_choice, multi_choice, free_text] }
+        required: { type: boolean, description: Describes whether the Agent needs this value to complete the task; skipping does not grant additional permissions. }
+        allow_skip: { type: boolean, description: Whether the user may explicitly skip this question. }
+        options:
+          type: array
+          maxItems: 12
+          items: { $ref: '#/components/schemas/TaskClarificationQuestionOption' }
+    TaskClarificationQuestionOption:
+      type: object
+      additionalProperties: false
+      required: [id, label]
+      properties:
+        id: { type: string, pattern: '^[a-z][a-z0-9_-]{0,63}$' }
+        label: { type: string, minLength: 1, maxLength: 256 }
     TaskStopRequest:
       type: object
       required: [id, action, status, safe_after, unsettled_operation_ids]
@@ -13857,6 +13931,30 @@ components:
           type: string
           enum: [none, required]
           description: Required only when answering a file delivery clarification. This structured choice is authoritative; it is not inferred from answer text. `required` requires the Task to have a Workspace.
+    TaskStructuredInputRequest:
+      type: object
+      additionalProperties: false
+      required: [version, answers]
+      properties:
+        version: { type: integer, minimum: 1, description: Exact question-group version from the Task snapshot. The group ID is bound by the path. }
+        answers:
+          type: array
+          minItems: 1
+          maxItems: 8
+          items: { $ref: '#/components/schemas/TaskClarificationAnswer' }
+    TaskClarificationAnswer:
+      type: object
+      additionalProperties: false
+      required: [question_id, option_ids, text, skipped]
+      properties:
+        question_id: { type: string, pattern: '^[a-z][a-z0-9_-]{0,63}$' }
+        option_ids:
+          type: array
+          maxItems: 12
+          uniqueItems: true
+          items: { type: string, pattern: '^[a-z][a-z0-9_-]{0,63}$' }
+        text: { type: string, maxLength: 4096 }
+        skipped: { type: boolean, description: True only for an explicit skip allowed by the matching question; skip cannot carry text or selected options. }
     TaskApprovalResponseRequest:
       type: object
       additionalProperties: false

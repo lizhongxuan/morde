@@ -301,6 +301,122 @@ RETURNING event_seq`, taskID).Scan(&sequence)
 	return insertTaskEvent(ctx, tx, task.Event{TaskID: taskID, Sequence: sequence, Type: "task.response", Payload: payload})
 }
 
+// AnswerStructuredClarificationRequest stores one complete, version-bound
+// answer set in the existing clarification row and queues only its waiting
+// Task. The answer string is canonical JSON for the existing Agent call to
+// consume; this does not alter Task permissions or file-delivery intent.
+func (s *Store) AnswerStructuredClarificationRequest(ctx context.Context, record app.IdempotencyRecord, taskID, clarificationID string,
+	version int64, answers []task.ClarificationAnswer) error {
+	if !domain.ValidTaskID(taskID) || !domain.ValidPendingRequestID(clarificationID) || version < 1 || len(answers) == 0 || len(answers) > 8 {
+		return domain.InvalidArgument("clarification", "structured clarification response fields are invalid")
+	}
+	if err := validateIdempotency(record); err != nil {
+		return err
+	}
+	if record.Operation != "task.clarification.structured_answer" || record.ResourceID != taskID || record.RelatedID != clarificationID {
+		return domain.InvalidArgument("idempotency", "structured clarification idempotency identity is invalid")
+	}
+	return s.WithTx(ctx, func(tx pgx.Tx) error {
+		if _, replayed, err := findIdempotency(ctx, tx, record); err != nil {
+			return err
+		} else if replayed {
+			return nil
+		}
+		gate, err := requireOwnerExecutionEnabled(ctx, tx, record.OwnerID, nil)
+		if err != nil {
+			return err
+		}
+		taskOwnerID, err := taskOwnerIDForActor(ctx, tx, taskID, record.OwnerID, true, true)
+		if err != nil {
+			return err
+		}
+		var status, waitingReason, workspaceID, initiatorID string
+		var leaseVersion, taskEpoch int64
+		if err := tx.QueryRow(ctx, `SELECT status, waiting_reason, lease_version, execution_epoch,
+COALESCE(workspace_id, ''), initiator_id FROM tasks WHERE id=$1 AND owner_id=$2 FOR UPDATE`, taskID, taskOwnerID).
+			Scan(&status, &waitingReason, &leaseVersion, &taskEpoch, &workspaceID, &initiatorID); errors.Is(err, pgx.ErrNoRows) {
+			return missingTaskError()
+		} else if err != nil {
+			return fmt.Errorf("lock task for structured clarification answer: %w", err)
+		}
+		if err := lockTaskWorkspaceForExecution(ctx, tx, workspaceID, initiatorID); err != nil {
+			return err
+		}
+		if taskEpoch != gate.epoch {
+			return ownerExecutionDisabledError(gate)
+		}
+		if _, replayed, err := reserveIdempotency(ctx, tx, record, taskID, clarificationID); err != nil {
+			return err
+		} else if replayed {
+			return nil
+		}
+		var storedVersion int64
+		var requestStatus, callID string
+		var questionsJSON []byte
+		var batchItemID string
+		var batchAttempt int32
+		if err := tx.QueryRow(ctx, `SELECT version, status, call_id, questions, COALESCE(batch_item_id,''), COALESCE(batch_attempt,0)
+FROM task_clarification_requests WHERE id=$1 AND task_id=$2 FOR UPDATE`, clarificationID, taskID).
+			Scan(&storedVersion, &requestStatus, &callID, &questionsJSON, &batchItemID, &batchAttempt); errors.Is(err, pgx.ErrNoRows) {
+			return domain.NewError(domain.CodeConflict, "clarification request is no longer active")
+		} else if err != nil {
+			return fmt.Errorf("lock structured clarification request: %w", err)
+		}
+		if storedVersion != version || requestStatus != string(task.ClarificationPending) {
+			return domain.NewError(domain.CodeConflict, "clarification version is stale or already answered")
+		}
+		if callID == task.RouteFileDeliveryIntentClarificationCallID || callID == app.FileDeliveryIntentClarificationCallID ||
+			batchItemID != "" || batchAttempt != 0 {
+			return domain.NewError(domain.CodeConflict, "file delivery and batch clarifications require their existing response contract")
+		}
+		var questions []task.ClarificationQuestion
+		if err := json.Unmarshal(questionsJSON, &questions); err != nil {
+			return fmt.Errorf("decode structured clarification questions: %w", err)
+		}
+		if err := task.ValidateClarificationAnswers(questions, answers); err != nil {
+			return domain.InvalidArgument("answers", "structured clarification answers do not match the active question group")
+		}
+		if status != string(task.StatusWaitingUser) || waitingReason != "clarification_required" || leaseVersion == int64(^uint64(0)>>1) {
+			return domain.NewError(domain.CodeConflict, "task is no longer waiting for this clarification")
+		}
+		answerPayload, err := json.Marshal(struct {
+			QuestionGroupID string                     `json:"question_group_id"`
+			Version         int64                      `json:"version"`
+			Answers         []task.ClarificationAnswer `json:"answers"`
+		}{QuestionGroupID: clarificationID, Version: version, Answers: answers})
+		if err != nil {
+			return fmt.Errorf("encode structured clarification answer: %w", err)
+		}
+		answer := string(answerPayload)
+		if !validClarificationText(answer) {
+			return domain.InvalidArgument("answers", "structured clarification response is too large")
+		}
+		if _, err := tx.Exec(ctx, `UPDATE task_clarification_requests SET status='answered', answer=$3,
+answer_format='structured', responded_at=clock_timestamp() WHERE id=$1 AND task_id=$2`, clarificationID, taskID, answer); err != nil {
+			return fmt.Errorf("persist structured clarification answer: %w", err)
+		}
+		payload, err := json.Marshal(map[string]any{
+			"clarification_id": clarificationID, "clarification_version": version, "answer_format": string(task.ClarificationAnswerStructured),
+			"answer": answer, "idempotency_replayed": false, "status": string(task.StatusQueued), "lease_version": leaseVersion + 1,
+		})
+		if err != nil {
+			return fmt.Errorf("encode structured clarification response event: %w", err)
+		}
+		var sequence int64
+		err = tx.QueryRow(ctx, `UPDATE tasks SET status='queued', lease_version=lease_version+1, waiting_reason='',
+event_seq=event_seq+1, updated_at=clock_timestamp()
+WHERE id=$1 AND owner_id=$2 AND status='waiting_user' AND waiting_reason='clarification_required'
+AND lease_owner='' AND lease_expires_at IS NULL RETURNING event_seq`, taskID, taskOwnerID).Scan(&sequence)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.NewError(domain.CodeConflict, "task state changed while applying the structured clarification")
+		}
+		if err != nil {
+			return fmt.Errorf("queue task after structured clarification answer: %w", err)
+		}
+		return insertTaskEvent(ctx, tx, task.Event{TaskID: taskID, Sequence: sequence, Type: "task.response", Payload: payload})
+	})
+}
+
 // AnswerClarificationRequest stores a free-form answer and requeues only the
 // task waiting for the exact active clarification version.
 func (s *Store) AnswerClarificationRequest(ctx context.Context, record app.IdempotencyRecord, taskID, clarificationID string, version int64, answer string, fileIntent task.FileDeliveryIntent, objective string) error {
@@ -355,15 +471,19 @@ FROM tasks WHERE id=$1 AND owner_id=$2 FOR UPDATE`, taskID, taskOwnerID).
 		var storedVersion int64
 		var requestStatus, callID, clarificationBatchItemID string
 		var clarificationBatchAttempt int32
-		if err := tx.QueryRow(ctx, `SELECT version, status, call_id, COALESCE(batch_item_id,''), COALESCE(batch_attempt,0)
+		var questionCount int
+		if err := tx.QueryRow(ctx, `SELECT version, status, call_id, COALESCE(batch_item_id,''), COALESCE(batch_attempt,0), jsonb_array_length(questions)
 FROM task_clarification_requests WHERE id=$1 AND task_id=$2 FOR UPDATE`, clarificationID, taskID).
-			Scan(&storedVersion, &requestStatus, &callID, &clarificationBatchItemID, &clarificationBatchAttempt); errors.Is(err, pgx.ErrNoRows) {
+			Scan(&storedVersion, &requestStatus, &callID, &clarificationBatchItemID, &clarificationBatchAttempt, &questionCount); errors.Is(err, pgx.ErrNoRows) {
 			return domain.NewError(domain.CodeConflict, "clarification request is no longer active")
 		} else if err != nil {
 			return fmt.Errorf("lock task clarification request: %w", err)
 		}
 		if storedVersion != version || requestStatus != string(task.ClarificationPending) {
 			return domain.NewError(domain.CodeConflict, "clarification version is stale or already answered")
+		}
+		if questionCount > 0 {
+			return domain.NewError(domain.CodeConflict, "structured clarification requires the versioned structured response endpoint")
 		}
 		if callID == task.RouteFileDeliveryIntentClarificationCallID {
 			return answerConversationRouteFileDeliveryClarificationInTx(ctx, tx, record, taskID, clarificationID, version,
