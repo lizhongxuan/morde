@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"crypto/sha256"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -183,6 +184,145 @@ FROM stamp WHERE task_id=$1 AND step_id=$2`, current.ID, truncatedStepID); err !
 		remainingReceipts != 0 || remainingPages != 0 || remainingStatuses != 0 {
 		t.Fatalf("expired output rows remain: receipts=%d pages=%d statuses=%d err=%v", remainingReceipts,
 			remainingPages, remainingStatuses, err)
+	}
+}
+
+func TestPostgresTaskStepOutputCaptureSerializesConcurrentOwnerQuotaWrites(t *testing.T) {
+	fixture := createS03RunningAgentTask(t, newRouteActionsTestFixture(t), "output-capture-quota-pressure", true)
+	ctx := context.Background()
+	const seedRecords = 30
+	var workspaceID string
+	var bindingVersion int64
+	if err := fixture.route.store.pool.QueryRow(ctx, `SELECT workspace_id,binding_version FROM workspace_bindings
+WHERE host_id=$1 AND owner_id=$2 ORDER BY created_at DESC LIMIT 1`, fixture.host.ID, fixture.task.OwnerID).
+		Scan(&workspaceID, &bindingVersion); err != nil {
+		t.Fatalf("read Host Workspace binding: %v", err)
+	}
+	workspaceValue, err := fixture.route.store.GetWorkspace(ctx, workspaceID)
+	if err != nil {
+		t.Fatalf("read Host Workspace: %v", err)
+	}
+	binding, err := fixture.route.store.GetWorkspaceBinding(ctx, fixture.host.ID, workspaceID)
+	if err != nil {
+		t.Fatalf("read Host Workspace binding: %v", err)
+	}
+	if binding.State == workspace.BindingPreparing {
+		binding, err = fixture.route.store.TransitionWorkspaceBinding(ctx, fixture.host.ID, workspaceID, binding.BindingVersion,
+			workspace.BindingPreparing, workspace.BindingActive, workspaceValue.Revision, 0)
+		if err != nil {
+			t.Fatalf("activate Host Workspace binding: %v", err)
+		}
+	}
+	bindingVersion = binding.BindingVersion
+	checkpointRevision := workspaceValue.Revision
+	if _, err := fixture.route.store.pool.Exec(ctx, `UPDATE tasks SET budget_tool_calls=100,workspace_id=$2,workspace_owner_id=$3,
+input_revision=$4,workspace_checkpoint_revision=$4,context_digest=$5 WHERE id=$1`,
+		fixture.task.ID, workspaceID, fixture.task.OwnerID, checkpointRevision, hashBytes("output-capture quota pressure manifest")); err != nil {
+		t.Fatalf("bind Task to Host Workspace: %v", err)
+	}
+	loaded, err := fixture.route.store.GetTask(ctx, fixture.task.ID, fixture.task.OwnerID)
+	if err != nil || loaded.Task.Budget.ToolCalls < seedRecords+2 || loaded.Task.CurrentRevision == nil || loaded.Task.WorkspaceCheckpointRevision == nil ||
+		*loaded.Task.WorkspaceCheckpointRevision != checkpointRevision {
+		t.Fatalf("load Workspace-bound Task: task=%+v err=%v", loaded.Task, err)
+	}
+	sealer, err := app.NewSealer(bytesOf(32, 0x31))
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte(strings.Repeat("x", app.TaskStepOutputCaptureMaxBytes))
+	viewID := "v" + strings.Repeat("a", 64)
+	buildRecord := func(callID string) app.TaskStepOutputCaptureRecord {
+		current, err := fixture.route.store.GetTask(ctx, fixture.task.ID, fixture.task.OwnerID)
+		if err != nil {
+			t.Fatalf("reload Task for output receipt %s: %v", callID, err)
+		}
+		stepID, operation := createTerminalShellOutputCaptureExecution(t, fixture, current.Task, callID,
+			workspaceID, bindingVersion, checkpointRevision)
+		identityValue := app.TaskStepOutputCaptureIdentity{
+			OwnerID: current.Task.OwnerID, TaskID: current.Task.ID, AuthorizationVersion: current.Task.Authorization.Version,
+			TaskRevision: *current.Task.CurrentRevision, WorkspaceID: workspaceID, WorkspaceAuthorizationVersion: 0,
+			WorkspaceBindingVersion: bindingVersion, WorkspaceViewID: viewID, WorkspaceCheckpointRevision: checkpointRevision,
+			StepID: stepID, CallID: callID, OperationID: operation.ID,
+		}
+		record, err := app.SealTaskStepOutputCapture(sealer, identityValue, payload, nil)
+		if err != nil {
+			t.Fatalf("seal quota-pressure output %s: %v", callID, err)
+		}
+		return record
+	}
+	first := buildRecord("call_output_capture_quota_seed_00")
+	perRecordBytes := taskStepOutputCaptureStorageBytes(first)
+	remainingBytes := app.TaskStepOutputCaptureOwnerQuotaBytes - seedRecords*perRecordBytes
+	if perRecordBytes < 1 || remainingBytes < perRecordBytes || remainingBytes >= 2*perRecordBytes {
+		t.Fatalf("quota pressure fixture does not leave room for exactly one record: record=%d remaining=%d quota=%d",
+			perRecordBytes, remainingBytes, app.TaskStepOutputCaptureOwnerQuotaBytes)
+	}
+	if err := fixture.route.store.SaveTaskStepOutputCapture(ctx, first); err != nil {
+		t.Fatalf("save first quota seed receipt: %v", err)
+	}
+	for index := 1; index < seedRecords; index++ {
+		record := buildRecord(fmt.Sprintf("call_output_capture_quota_seed_%02d", index))
+		if storageBytes := taskStepOutputCaptureStorageBytes(record); storageBytes != perRecordBytes {
+			t.Fatalf("quota seed %d storage bytes=%d, want %d", index, storageBytes, perRecordBytes)
+		}
+		if err := fixture.route.store.SaveTaskStepOutputCapture(ctx, record); err != nil {
+			t.Fatalf("save quota seed receipt %d: %v", index, err)
+		}
+	}
+	candidates := []app.TaskStepOutputCaptureRecord{
+		buildRecord("call_output_capture_quota_contender_a"),
+		buildRecord("call_output_capture_quota_contender_b"),
+	}
+	start := make(chan struct{})
+	results := make(chan error, len(candidates))
+	for _, candidate := range candidates {
+		go func(record app.TaskStepOutputCaptureRecord) {
+			<-start
+			results <- fixture.route.store.SaveTaskStepOutputCapture(ctx, record)
+		}(candidate)
+	}
+	close(start)
+	succeeded, rejected := 0, 0
+	for range candidates {
+		err := <-results
+		switch {
+		case err == nil:
+			succeeded++
+		case domain.CodeOf(err) == domain.CodeQuotaExceeded:
+			rejected++
+		default:
+			t.Fatalf("concurrent output receipt failed outside quota: %v", err)
+		}
+	}
+	if succeeded != 1 || rejected != 1 {
+		t.Fatalf("concurrent quota results: succeeded=%d quota_rejected=%d; want 1 each", succeeded, rejected)
+	}
+	var ownerRows int
+	var ownerBytes int64
+	if err := fixture.route.store.pool.QueryRow(ctx, `SELECT count(*),COALESCE(sum(storage_bytes),0) FROM task_step_output_captures
+WHERE owner_id=$1 AND expires_at>clock_timestamp()`, fixture.task.OwnerID).Scan(&ownerRows, &ownerBytes); err != nil {
+		t.Fatalf("read post-race owner quota: %v", err)
+	}
+	if ownerRows != seedRecords+1 || ownerBytes > app.TaskStepOutputCaptureOwnerQuotaBytes {
+		t.Fatalf("owner quota after concurrent writes: rows=%d bytes=%d cap=%d; want %d rows within cap",
+			ownerRows, ownerBytes, app.TaskStepOutputCaptureOwnerQuotaBytes, seedRecords+1)
+	}
+	for _, candidate := range candidates {
+		var receiptExists bool
+		if err := fixture.route.store.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM task_step_output_captures
+WHERE task_id=$1 AND step_id=$2)`, candidate.Identity.TaskID, candidate.Identity.StepID).Scan(&receiptExists); err != nil {
+			t.Fatalf("check concurrent candidate receipt: %v", err)
+		}
+		if !receiptExists {
+			var pageCount int
+			if err := fixture.route.store.pool.QueryRow(ctx, `SELECT count(*) FROM task_step_output_capture_pages
+WHERE task_id=$1 AND step_id=$2`, candidate.Identity.TaskID, candidate.Identity.StepID).Scan(&pageCount); err != nil {
+				t.Fatalf("check rejected candidate pages: %v", err)
+			}
+			if pageCount != 0 {
+				t.Fatalf("rejected candidate left %d encrypted pages without a receipt", pageCount)
+			}
+		}
 	}
 }
 

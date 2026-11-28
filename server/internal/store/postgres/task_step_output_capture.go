@@ -61,12 +61,14 @@ WHERE owner_id=$1 AND expires_at>clock_timestamp()`, value.Identity.OwnerID).Sca
 			return fmt.Errorf("clear incomplete supplemental output status: %w", err)
 		}
 		stdout, stderr := value.Stdout, value.Stderr
+		// Use one stable statement clock for both timestamps; two independent
+		// clock_timestamp calls can cross the exact 24-hour database constraint.
 		_, err := tx.Exec(ctx, `INSERT INTO task_step_output_captures
 (task_id,owner_id,step_id,operation_id,call_id,task_revision,authorization_version,workspace_id,
  workspace_authorization_version,workspace_binding_version,workspace_view_id,workspace_checkpoint_revision,
  stdout_source_bytes,stdout_total_bytes,stdout_sha256,stderr_source_bytes,stderr_total_bytes,stderr_sha256,
- stored_bytes,storage_bytes,page_count,state,expires_at)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,'complete',clock_timestamp()+interval '24 hours')`,
+ stored_bytes,storage_bytes,page_count,state,created_at,expires_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,'complete',statement_timestamp(),statement_timestamp()+interval '24 hours')`,
 			value.Identity.TaskID, value.Identity.OwnerID, value.Identity.StepID, value.Identity.OperationID, value.Identity.CallID,
 			value.Identity.TaskRevision, value.Identity.AuthorizationVersion, value.Identity.WorkspaceID,
 			value.Identity.WorkspaceAuthorizationVersion, value.Identity.WorkspaceBindingVersion, value.Identity.WorkspaceViewID,
@@ -142,16 +144,18 @@ WHERE (task_id,step_id) IN (
 				}
 			}
 		}
+		// Keep both timestamps on one stable statement clock to satisfy the
+		// table's exact 24-hour retention bound under concurrent writes.
 		_, err := tx.Exec(ctx, `INSERT INTO task_step_output_capture_statuses
 (task_id,owner_id,step_id,operation_id,call_id,task_revision,authorization_version,workspace_id,
- workspace_authorization_version,workspace_binding_version,workspace_view_id,workspace_checkpoint_revision,state,expires_at)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,clock_timestamp()+interval '24 hours')
+ workspace_authorization_version,workspace_binding_version,workspace_view_id,workspace_checkpoint_revision,state,created_at,expires_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,statement_timestamp(),statement_timestamp()+interval '24 hours')
 ON CONFLICT (task_id,step_id) DO UPDATE SET
  owner_id=EXCLUDED.owner_id,operation_id=EXCLUDED.operation_id,call_id=EXCLUDED.call_id,task_revision=EXCLUDED.task_revision,
  authorization_version=EXCLUDED.authorization_version,workspace_id=EXCLUDED.workspace_id,
  workspace_authorization_version=EXCLUDED.workspace_authorization_version,workspace_binding_version=EXCLUDED.workspace_binding_version,
  workspace_view_id=EXCLUDED.workspace_view_id,workspace_checkpoint_revision=EXCLUDED.workspace_checkpoint_revision,
- state=EXCLUDED.state,created_at=clock_timestamp(),expires_at=EXCLUDED.expires_at`,
+ state=EXCLUDED.state,created_at=EXCLUDED.created_at,expires_at=EXCLUDED.expires_at`,
 			value.Identity.TaskID, value.Identity.OwnerID, value.Identity.StepID, value.Identity.OperationID, value.Identity.CallID,
 			value.Identity.TaskRevision, value.Identity.AuthorizationVersion, value.Identity.WorkspaceID,
 			value.Identity.WorkspaceAuthorizationVersion, value.Identity.WorkspaceBindingVersion,

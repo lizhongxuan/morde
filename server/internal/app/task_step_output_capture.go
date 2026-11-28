@@ -331,10 +331,9 @@ func sealTaskStepOutputCaptureStream(sealer *Sealer, identity TaskStepOutputCapt
 		end := offset + TaskStepOutputCapturePageBytes
 		if end > len(clean) {
 			end = len(clean)
-		} else {
-			for end > offset && !utf8.RuneStart(clean[end]) {
-				end--
-			}
+		}
+		for end > offset && end < len(clean) && !utf8.RuneStart(clean[end]) {
+			end--
 		}
 		plain := []byte(clean[offset:end])
 		pageDigest := sha256.Sum256(plain)
