@@ -65,11 +65,11 @@
 
 ## T07 · P0：合并和灰度门槛（进行中；发布验收未完成）
 
-- [ ] 待验证：已补齐 `dsh_recovery_unresolved` 的原对话安全中文兜底；待服务器恢复可访问后，用实际 `morde-pc` 验证截图对应任务的失败分类、终态回告与气泡可见性。服务端历史终态回告已因会话凭据过期被作废，无法由客户端重放。
-- [x] 隔离工作树回归：`go test ./internal/api ./internal/app ./cmd/portal -count=1`；恢复专属 Worker 测试（含完整搜索恢复 E2E）；本机 PostgreSQL `go test ./internal/store/postgres -run 'Test(DurableRecoveredToolAdmission|PostgresTaskModelRecovery)' -count=1`；DSH Runtime 恢复启动协议测试；PC `npm test -- src/routes/Assistant.test.tsx`（289/289）。2026-11-28 当前结果与命令见下方记录。
+- [ ] 实际 PC 验收仍待完成：错误分类、DSH 基于白名单事实生成的终态说明及原会话气泡尚未在新请求中观察。截图对应的历史终态回告已因会话凭据过期作废，不能由客户端重放；代码已部署到 `release@e76e03ad`，需在实际 `morde-pc` 新建请求验证。
+- [x] 自动化回归：`go test ./internal/api ./internal/app ./cmd/portal -count=1`；PostgreSQL `go test ./internal/store/postgres -run '^TestPostgresTaskModelRecovery' -count=1`；独立 Worker 进程重启 E2E `go test ./internal/worker -run '^TestCloudDSHModelRecoverySurvivesWorkerProcessRestart$' -count=1`；PC `Assistant.test.tsx` 既有回归、typecheck 与 DSH Runtime 恢复启动协议验证通过。具体执行环境与结果见 2026-11-28 续验记录。
 - [ ] 用打包 PC 完成端到端回归，保存目标 commit、任务/事件关联、三种页面状态与实际派发次数；全量 Worker 包仍未通过，2026-11-28 的具体失败见下方记录，修复/补齐对应测试环境后重跑。
 - [x] PostgreSQL + 两个独立 Go Worker 进程的恢复正例：首进程完成只读搜索、确认零用量失败并持久化计划后被强制终止；新进程从 PostgreSQL 恢复同一 Task，校验 lease/generation 与恢复 call ID 更新、搜索只派发一次、模型读到已结算结果、原会话只交付一条助手答案及一个 `task.result`。
-- [ ] 真实 `morde-pc` 交互尚未稳定通过：本轮 `make pc` 构建并启动客户端后，隔离旁聊的无工具快答一直停留在连接状态，未收到助手回复；早先一次快速问答通过不代表当前连接稳定。仍需确认未知结果只保留在任务详情、原对话只显示自然语言说明，且终态回告模型未知时仍能收到确定性说明。
+- [ ] 真实 `morde-pc` 交互仍未验收：当前桌面控制只观察到登录页，输入/点击返回 `noWindowsAvailable`，没有提交测试消息。既有低于 1 秒的短答样本和后端自动化不代表当前 PC 会话稳定；仍需核对快答、搜索、失败说明及未知结果不重放。
 - [ ] 正例：快答无 👌🏻；耗时任务一次 👌🏻；可重试故障自动恢复后出结果；耗尽后原对话收到说明；真实审批能继续。
 - [x] 双 Worker 同时竞争同一恢复尝试：PostgreSQL 用例断言恰好一个成功、另一个得到冲突；租约重启后不会再消费同一尝试额度。
 - [x] PostgreSQL 负例：已排队恢复后撤销授权版本、取消 Task 或破坏绑定的 checkpoint 历史，均拒绝 Begin；计划不进入 `attempting`，不写恢复模型调用账本/响应。
@@ -86,9 +86,9 @@
 - [x] 修复消息列表未完成首屏加载时丢失已受理 receipt 的缓存时序；receipt 出现后立即显示用户消息及 pending/processing 状态。覆盖“发送后回执”与“已加载的 pending/processing”自动化用例。
 - [x] 终态投递错误日志记录稳定 `failure_code`、stage 与现有追踪字段，不记录原始错误文本；增加安全字段单测。
 - [x] 增加 receipt 到 route claim 的等待时长，以及 DSH route 分类耗时直方图；使用无 ID 标签的低基数指标。
-- [ ] 已部署后端诊断日志并读取到线上 `read_source_facts / invalid_argument`。根因是普通长度的 Task 目标带结尾换行，模型摘要校验拒绝；本地修复及隔离 PostgreSQL 回归通过。待发布修复后确认 DSH 收到白名单事实，并只向原会话发布一条有真实原因差异的解释气泡。
+- [ ] 后端诊断与根因修复已部署到 `release@e76e03ad`：线上曾确认 `read_source_facts / invalid_argument`，原因是普通长度 Task 目标带结尾换行而严格摘要校验拒绝；修复及隔离 PostgreSQL 回归通过。仍需用 PC 新任务确认 DSH 收到白名单事实，并只向原会话发布一条内容有据的解释气泡。
 - [x] 路由模型兼容返回内置 search/read tool 意图时，统一转成普通 DSH Task 并请求受理标记；不再把 Broker 原始输出直接发布成助手答复。正常 Task 由 DSH Agent 执行工具和综合结果，失败走 DSH 安全事实终态回告。应用解析与 PostgreSQL 路由用例通过；实际 PC 工具派发与最终合成回复仍待验收。
-- [ ] 对普通短答完成 DSH 实际回复延迟验收并记录收据、claim、分类、首条持久 assistant 消息的时间。当前只有 receipt 和分类耗时指标，没有 first-delta 持久流；需实现有界增量写入及断线续读后再验收流式速度。
+- [ ] 对普通短答完成新的 DSH 延迟验收并记录 receipt、claim、分类和首条持久 assistant 消息时间。已有一个低于 1 秒的完整短答样本及 receipt/分类指标，但没有 first-delta 持久流；有界增量写入和断线续读协议仍未实现，不能宣称实时流式回复已完成。
 - [ ] 在实际 `morde-pc` 验证普通问答真实模型回复、一个只读工具请求和一个明确后台任务的进度/最终结果；检查现有 DSH 工具、MCP、子 Agent 和授权边界，不增加第二套 Agent Runtime。
 
 ### 2026-11-28 本轮验证
@@ -218,3 +218,13 @@
 - 服务器基线只读核验：`morde-portal.service` active，`/healthz` 和 `/readyz` 返回 200；`/opt/morde/.deployed-head` 指向 `38f610ce`，smoke 记录为 5 pass、0 fail、5 exception（无 `CH_TEST_DATABASE_URL` 的 PostgreSQL 门槛及真实 PC/DSH 门槛）。当前二进制 `vcs.revision=38f610ce` 且 `vcs.modified=true`；源码 checkout 无 tracked diff，但有一个既存未跟踪文件，本轮没有清理。此服务器基线还未包含本节新增代码。
 - 实际 PC 阻塞：`morde-pc` 窗口仍在登录页。CUA 能观察界面，但点击和输入返回 `noWindowsAvailable`；本轮未提交登录或测试消息，因此真实快答/搜索/失败气泡、阶段延迟与审批入口仍未验收。未通过后台 Web/API 代测。
 - 合并状态：GitHub `release@2120d0bb` 与此前本地 `release@d559c01a` 的 tree 相同（`10316138`）；已将该远端 release 合并到当前本地 `release`，避免从陈旧远端跟踪点发布。新增代码与本节 TODO 尚待提交、推送及部署；不得据以上本地隔离测试把 T07 标为完成。
+
+### 2026-11-28 最终复核（release 部署与 P0 smoke）
+
+- 发布状态：代码已提交并推送到 `release@e76e03ad1ee2e5ba84335585d35f610c55715bb5`，服务器 `/opt/morde/.deployed-head` 与源码 checkout 均指向该 commit。部署后 PostgreSQL migration 为 280，`morde-portal.service` active，`/healthz=ok`、`/readyz=200`。
+- Smoke 记录纠正：服务器旧的 `/opt/morde/update.sh` 早于仓库版本，没有 E10 环境检查和 P0 smoke gate，因此刚才部署虽通过构建、迁移与健康检查，未自动刷新正式 smoke 记录。现对已部署源码显式运行 `deploy/single/smoke.sh --commit e76e03ad1ee2e5ba84335585d35f610c55715bb5`：5 pass、0 fail、5 exception。例外为无 `CH_TEST_DATABASE_URL` 的 PostgreSQL 门槛（T01/T26/T36）及须真实 PC/DSH 的门槛（T10/T43）；未连接生产数据库运行测试。校验后已将记录写入 `/opt/morde/smoke-record.json`，commit、branch、计数匹配。
+- 部署脚本修复：保留旧 `/opt/morde/update.sh` 备份于 `/opt/morde/backups/update-script-pre-e76e03ad.sh`，再用当前 release 的 `deploy/single/update.sh` 原子替换，并通过 `bash -n`；后续更新会执行仓库定义的环境检查和 P0 smoke gate。
+- 自动恢复仍关闭：服务器 `MORDE_TASK_MODEL_RECOVERY_AUTO` 未设置，按默认 false 运行。此次发布没有启用自动恢复或灰度。
+- 代码验证：本机 App/API/Portal 定向回归、隔离 PostgreSQL 任务恢复与 auth/cancel/checkpoint 负例、独立 Worker 进程重启 E2E 均通过；E2E 验证仅为合成只读搜索且不调用真实 Provider。`git diff --check` 通过。全量 Worker 包既有失败仍待单独处理，不计为通过。
+- PC 验收仍阻塞：当前 `morde-pc` 仅能观察到登录页，桌面自动化输入/点击返回 `noWindowsAvailable`，本轮没有发送消息。真实快答、工具/搜索派发、Agent 最终回复、失败气泡与端到端延迟仍需在实际 PC 新会话验收；不以 Web/API 代替。此前观察到同文气泡各对应独立重复提交，尚无单条消息被重复发布的证据。
+- 未完成门槛：完整 PC 验收、未完成的未知用量/副作用自动恢复负例、全量 Worker 失败项、独立灰度 cohort 与低基数对比指标仍未通过。Taskless 持久增量流/断线续读尚未实现；响应及时性目前有受理状态与轮询补读保障，但不能称为 token 级实时回复。故 T07/T08 保持进行中，生产自动恢复保持关闭。
