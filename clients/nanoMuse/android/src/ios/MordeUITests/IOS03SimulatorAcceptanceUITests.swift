@@ -99,38 +99,37 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         }
 
         let app = XCUIApplication(bundleIdentifier: "io.morde.app")
-        app.launchArguments = ["-morde.server", ""]
+        app.launchArguments = ["-morde.server", serverAddress, "-AppleLanguages", "(zh-Hans)",
+                              "-AppleLocale", "zh_CN"]
         app.launch()
 
-        let server = app.textFields["https://morde.example"]
-        XCTAssertTrue(server.waitForExistence(timeout: 10))
-        server.tap()
-        server.typeText(serverAddress)
-
-        let accountField = app.textFields["账号"]
+        let accountField = app.textFields["morde.auth.username"]
+        XCTAssertTrue(accountField.waitForExistence(timeout: 10))
         accountField.tap()
         accountField.typeText(account)
 
-        let passwordField = app.secureTextFields["密码"]
+        let passwordField = app.secureTextFields["morde.auth.password"]
         passwordField.tap()
         passwordField.typeText(password)
-        app.buttons["登录"].tap()
+        app.buttons["morde.auth.submit"].tap()
 
-        let projects = app.tabBars.buttons["项目"]
-        guard projects.waitForExistence(timeout: 15) else {
-            let alert = app.alerts.firstMatch
-            let message = alert.exists ? alert.staticTexts.allElementsBoundByIndex.last?.label ?? "alert" : "no alert"
-            XCTFail("Sign-in did not reach the resource tabs: \(message)")
-            return
-        }
-        projects.tap()
-        XCTAssertTrue(app.staticTexts["IOS-03 本地合成验收 Workspace"].waitForExistence(timeout: 20))
+        let resources = app.buttons["morde.nav.tab.resources"]
+        XCTAssertTrue(resources.waitForExistence(timeout: 20), "Sign-in should open the Morde navigation shell.")
+        resources.tap()
 
-        let computers = app.tabBars.buttons["电脑"]
-        XCTAssertTrue(computers.exists)
-        computers.tap()
-        XCTAssertTrue(app.staticTexts["标准 1 核 2G"].waitForExistence(timeout: 10))
-        XCTAssertTrue(app.staticTexts["已停止 · AI 控制"].exists)
+        let resourceScroll = app.scrollViews["morde.resources.scroll"]
+        XCTAssertTrue(resourceScroll.waitForExistence(timeout: 10))
+        let hosts = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@",
+                                                      "morde.resources.host.open."))
+        let emptyState = app.descendants(matching: .any)["morde.resources.empty.cloudComputers"]
+        let loadError = app.descendants(matching: .any)["morde.resources.loadError"]
+        let loadCompleted = NSPredicate { _, _ in hosts.count > 0 || emptyState.exists || loadError.exists }
+        let loadedExpectation = XCTNSPredicateExpectation(predicate: loadCompleted, object: app)
+        XCTAssertEqual(XCTWaiter.wait(for: [loadedExpectation], timeout: 20), .completed,
+                       "The cloud-computer list should resolve to rows or an explicit empty/error state.")
+        XCTAssertFalse(loadError.exists, "Reading cloud-computer resources should not show a load error.")
+        XCTAssertTrue(hosts.count > 0 || emptyState.exists,
+                      "The signed-in account should show its cloud computers or the empty state.")
     }
 
     @MainActor

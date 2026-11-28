@@ -401,7 +401,8 @@ func legacyConversationRouteModelRequest(value ConversationRouteContext, request
 		return ModelRequest{}, domain.InvalidArgument("route_context", "legacy route request cannot be encoded")
 	}
 	request.Instructions = legacyConversationRouteInstructions + "\n\n" + conversationRouteAcknowledgementInstructions
-	if ConversationRouteDirectToolContextEligible(value) {
+	directToolContextEligible := ConversationRouteDirectToolContextEligible(value)
+	if directToolContextEligible {
 		request.Instructions += "\n\n" + conversationRouteDirectToolInstructions
 	}
 	request.Instructions += "\n\n" + conversationRouteJSONModeExample
@@ -416,6 +417,9 @@ func legacyConversationRouteModelRequest(value ConversationRouteContext, request
 	}
 	if historySearch {
 		request.Instructions += "\n\n" + conversationRouteHistorySearchTaskInstructions
+	}
+	if directToolContextEligible {
+		request.Instructions += "\n\n" + conversationRouteDirectToolJSONModeExample
 	}
 	request.Input[0].Text = string(body)
 	return request, nil
