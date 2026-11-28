@@ -40,6 +40,26 @@ func TestConversationRouteModelRequestCarriesStableLocalizedTime(t *testing.T) {
 		!strings.Contains(request.Instructions, "smallest exact question") {
 		t.Fatalf("direct chat and time rules missing from router instructions: %s", request.Instructions)
 	}
+	if !strings.Contains(request.Instructions, `"tool_arguments":{"query":"..."}`) ||
+		!strings.Contains(request.Instructions, "never a quoted JSON string") ||
+		!strings.Contains(request.Instructions, "Include only fields relevant to the selected action") {
+		t.Fatalf("JSON examples do not match the action-scoped tool schema: %s", request.Instructions)
+	}
+}
+
+func TestConversationRouteDirectSearchUsesObjectToolArguments(t *testing.T) {
+	value := ConversationRouteContext{ActorID: "u1234567", Content: "搜索 DeepSeek 官方网站并核实链接。"}
+	output := `{"action":"tool","tool_name":"morde_web_search","tool_arguments":{"query":"DeepSeek 官方网站"}}`
+	decision := ParseConversationRouteDecisionForContext(output, value)
+	if decision.InvalidOutput || decision.Action != ConversationRouteTool || decision.ToolName != "morde_web_search" ||
+		decision.ToolArguments != `{"query":"DeepSeek 官方网站"}` {
+		t.Fatalf("valid direct search response was rejected: %+v", decision)
+	}
+	quotedArguments := `{"action":"tool","tool_name":"morde_web_search","tool_arguments":"{\"query\":\"DeepSeek 官方网站\"}"}`
+	decision = ParseConversationRouteDecisionForContext(quotedArguments, value)
+	if !decision.InvalidOutput || decision.InvalidOutputCategory != "action_fields_invalid" {
+		t.Fatalf("quoted tool arguments did not fail with a safe structural category: %+v", decision)
+	}
 }
 
 func TestConversationRouteFileDeliveryIntentIsStructuredAndActionScoped(t *testing.T) {
@@ -123,16 +143,28 @@ func TestConversationRouteInvalidOutputStoresOnlyMetadata(t *testing.T) {
 	decision = ParseConversationRouteDecisionForContext(secret, context)
 	encoded, err := json.Marshal(decision)
 	if err != nil || !decision.InvalidOutput || decision.ModelOutput != "" || decision.InvalidOutputLengthBytes != len(secret) ||
-		!decision.InvalidOutputUTF8Valid || strings.Contains(string(encoded), secret) {
+		!decision.InvalidOutputUTF8Valid || decision.InvalidOutputCategory != "invalid_json" || strings.Contains(string(encoded), secret) {
 		t.Fatalf("invalid model text was persisted with its metadata: decision=%+v encoded=%s err=%v", decision, encoded, err)
 	}
 	decision = ParseConversationRouteDecisionForContext("", context)
-	if !decision.InvalidOutput || decision.ModelOutput != "" || decision.InvalidOutputLengthBytes != 0 || !decision.InvalidOutputUTF8Valid {
+	if !decision.InvalidOutput || decision.ModelOutput != "" || decision.InvalidOutputLengthBytes != 0 || !decision.InvalidOutputUTF8Valid ||
+		decision.InvalidOutputCategory != "empty_output" {
 		t.Fatalf("empty model output metadata is incorrect: %+v", decision)
 	}
 	decision = ParseConversationRouteDecisionForContext(string([]byte{0xff, 0xfe})+"abc", context)
-	if !decision.InvalidOutput || decision.ModelOutput != "" || decision.InvalidOutputLengthBytes != 5 || decision.InvalidOutputUTF8Valid {
+	if !decision.InvalidOutput || decision.ModelOutput != "" || decision.InvalidOutputLengthBytes != 5 || decision.InvalidOutputUTF8Valid ||
+		decision.InvalidOutputCategory != "output_size_or_encoding" {
 		t.Fatalf("invalid UTF-8 model output metadata is incorrect: %+v", decision)
+	}
+	for _, test := range []struct{ output, category string }{
+		{`{"action":"reply","mystery":"private content"}`, "unknown_json_field"},
+		{`{"action":7}`, "json_field_type"},
+		{`{"action":"reply","reply":"你好。"} {}`, "trailing_json_data"},
+	} {
+		got := ParseConversationRouteDecisionForContext(test.output, context)
+		if !got.InvalidOutput || got.InvalidOutputCategory != test.category || strings.Contains(got.ModelOutput, "private content") {
+			t.Errorf("structural failure category = %+v, want %q", got, test.category)
+		}
 	}
 }
 

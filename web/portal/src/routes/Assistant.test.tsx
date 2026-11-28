@@ -6028,6 +6028,42 @@ describe('Assistant durable tasks', () => {
     expect(screen.getAllByRole('article', { name: 'Morde 的回复' })).toHaveLength(1);
   });
 
+  it('waits for an in-flight message reload before polling a published task reply again', async () => {
+    const source = { ...message, actor_id: authUser.id, task_id: task.id } as ConversationMessage;
+    const terminalReply: ConversationMessage = { ...reply, id: 'm7654334', sequence: 3, content: '这次搜索请求没有执行。',
+      task_id: task.id, delivery_status: 'applied', sources: [{ user_message_id: source.id, task_id: task.id,
+        task_revision: 1, event_sequence: 9, content: '这次搜索请求没有执行。' }] };
+    const publishedTask = {
+      ...task, status: 'waiting_user' as const, result: null, waiting_reason: 'dsh_recovery_unresolved',
+      finished_at: null, event_sequence: 9, result_message_pending: false, result_message_published: true,
+      assistant_message: { ...reply, task_id: task.id, task_revision: 1, result_event_sequence: 9, status: 'completed' as const },
+      attention: { kind: 'result_unverified', reason: 'outcome_unknown', action: null, event_sequence: 9 },
+    } as unknown as Task;
+    mockCommon({ conversations: [conversation], messages: [source], tasks: [publishedTask] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(publishedTask);
+
+    let finishReload!: (value: Awaited<ReturnType<typeof portalApi.conversationMessages>>) => void;
+    let messageFetches = 0;
+    vi.spyOn(portalApi, 'conversationMessages').mockImplementation(async () => {
+      messageFetches++;
+      if (messageFetches === 1) return { items: [source], next_cursor: null };
+      if (messageFetches === 2) {
+        return await new Promise((resolve) => { finishReload = resolve; });
+      }
+      return { items: [source, terminalReply], next_cursor: null };
+    });
+    renderPage();
+
+    expect(await screen.findByRole('status', { name: '任务状态：结果待核对' })).toBeInTheDocument();
+    await waitFor(() => expect(messageFetches).toBe(2), { timeout: 3000 });
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    expect(messageFetches).toBe(2);
+
+    await act(async () => { finishReload({ items: [source, terminalReply], next_cursor: null }); });
+    expect(await screen.findByText('这次搜索请求没有执行。')).toBeInTheDocument();
+    expect(screen.queryByRole('status', { name: '任务状态：结果待核对' })).not.toBeInTheDocument();
+  });
+
   it('does not let a stale assistant reply from before the source message hide the recovery explanation', async () => {
     const priorReply = { ...reply, id: 'm7654332', sequence: 1, task_id: task.id,
       delivery_status: 'applied' as const };

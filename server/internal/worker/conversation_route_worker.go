@@ -327,10 +327,11 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 		w.options.Logger.Warn("conversation route model output is invalid; requesting safe clarification",
 			zap.String("job", "conversation_route"), zap.String("message_id", claim.Message.ID),
 			zap.String("failure_code", "invalid_model_output"),
+			zap.String("invalid_output_category", decision.InvalidOutputCategory),
 			zap.Int("invalid_output_length_bytes", decision.InvalidOutputLengthBytes),
 			zap.Bool("invalid_output_utf8_valid", decision.InvalidOutputUTF8Valid))
 		return true, w.failRoute(ctx, claim, "routing_action_unavailable",
-			errors.New("conversation route model output remained invalid after repair"))
+			domain.NewError(domain.CodeInvalidArgument, "conversation route model output remained invalid after repair"))
 	}
 	decision = safeConversationRouteDecision(classifyContext, decision)
 	if decision.InvalidOutput {

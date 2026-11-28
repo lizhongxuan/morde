@@ -1075,7 +1075,9 @@ WHERE message_id=$1 AND call_id=$3 AND state IN ('dispatched','unknown')`, call.
 func validStoredRouteDecision(value app.ConversationRouteDecision, context app.ConversationRouteContext, longReplyMode ...bool) bool {
 	allowLongReply := len(longReplyMode) == 1 && longReplyMode[0]
 	if !app.ValidConversationRouteModelOutput(value.ModelOutput) ||
-		!app.ValidConversationRouteFileDeliveryIntent(value.Action, value.FileDeliveryIntent) {
+		!app.ValidConversationRouteFileDeliveryIntent(value.Action, value.FileDeliveryIntent) ||
+		!app.ValidConversationRouteInvalidOutputCategory(value.InvalidOutputCategory) ||
+		(!value.InvalidOutput && value.InvalidOutputCategory != "") {
 		return false
 	}
 	if value.Cancelled {
@@ -1104,7 +1106,8 @@ func validStoredRouteDecision(value app.ConversationRouteDecision, context app.C
 		return value.Action == app.ConversationRouteClarify && value.TaskID == "" && value.TargetMessageID == "" &&
 			!value.Acknowledge && !value.ExplicitNew && value.ExpectedRevision == 0 && value.Reply == "" && len(value.DependencyTaskIDs) == 0 &&
 			len(value.AggregateMessageIDs) == 0 &&
-			value.Question != "" && utf8.ValidString(value.Question) && utf8.RuneCountInString(value.Question) <= 200
+			value.Question != "" && utf8.ValidString(value.Question) && utf8.RuneCountInString(value.Question) <= 200 &&
+			app.ValidConversationRouteInvalidOutputCategory(value.InvalidOutputCategory)
 	}
 	switch value.Action {
 	case app.ConversationRouteNew:

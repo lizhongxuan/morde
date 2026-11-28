@@ -42,7 +42,7 @@ type ConversationRouteCoordinatorOutputStore interface {
 
 var ErrRouteProjectReservationRequired = errors.New("route project reservation is required")
 
-const conversationRouteRuntimePromptReserveTokens = 800
+const conversationRouteRuntimePromptReserveTokens = 1_200
 
 // ConversationRouteInputFitsContextWindow uses the DSH TokenMeter's fixed
 // four UTF-16 characters-per-token estimate, with a CJK surcharge and room
@@ -565,7 +565,7 @@ func (s *ModelGatewayService) ClassifyConversationRoute(ctx context.Context, cla
 	if !unknown {
 		parsed := ParseConversationRouteDecisionForContext(response.Text, value)
 		if response.StopReason != "stop" || len(response.ToolCalls) != 0 {
-			parsed = invalidConversationRouteDecision(response.Text)
+			parsed = invalidConversationRouteDecision(response.Text, "model_completion_shape")
 		}
 		decision = &parsed
 	}
@@ -741,7 +741,7 @@ func (s *ModelGatewayService) CompleteConversationCoordinatorModel(ctx context.C
 		parsed := ParseConversationRouteDecisionForContext(response.Text, value)
 		if response.StopReason != "stop" || len(response.ToolCalls) != 0 ||
 			!utf8.ValidString(response.Text) || !ValidConversationRouteModelOutput(response.Text) {
-			parsed = invalidConversationRouteDecision(response.Text)
+			parsed = invalidConversationRouteDecision(response.Text, "model_completion_shape")
 		}
 		decision = &parsed
 	}

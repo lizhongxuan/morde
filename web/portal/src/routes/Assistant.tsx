@@ -2568,10 +2568,15 @@ export function Assistant() {
     !conversationMessageItems.some((message) => message.sources?.some((source) => source.task_id === task.id &&
       source.task_revision === task.assistant_message?.task_revision && source.event_sequence === task.assistant_message?.result_event_sequence))));
   useEffect(() => {
-    if (!conversationID || !resultsAwaitingMessages) return;
-    const timer = window.setInterval(() => { void client.invalidateQueries({ queryKey: ['conversation-messages', conversationID] }); }, 1000);
-    return () => window.clearInterval(timer);
-  }, [client, conversationID, resultsAwaitingMessages]);
+    // Do not invalidate while a message fetch is in flight. Repeating
+    // invalidateQueries on a fixed interval can cancel a slow request every
+    // second, preventing the durable assistant reply from ever arriving in
+    // the open conversation until the user switches away and back.
+    if (!conversationID || !resultsAwaitingMessages || messages.isFetching) return;
+    const queryKey = ['conversation-messages', conversationID] as const;
+    const timer = window.setTimeout(() => { void client.invalidateQueries({ queryKey, exact: true }); }, 1000);
+    return () => window.clearTimeout(timer);
+  }, [client, conversationID, messages.isFetching, resultsAwaitingMessages]);
   const tasksByID = new Map(tasks.map((task) => [task.id, task]));
   const activePanelTasks = tasks.filter((task) => !terminalTaskStatuses.has(task.status));
   const selectedActiveTask = activePanelTasks.find((task) => task.id === taskDetailTaskID);

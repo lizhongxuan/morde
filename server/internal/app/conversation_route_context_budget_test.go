@@ -101,7 +101,12 @@ func TestConversationRouteTaskObjectiveReferencesLargeSource(t *testing.T) {
 }
 
 func TestConversationRouteBudgetCountsMordeSoulOnceForPreflightAndDSH(t *testing.T) {
-	preflight := ModelRequest{Instructions: "route", Input: []ModelInput{{Role: "user", Text: strings.Repeat("x", 22_000)}}, MaxOutputTokens: 512}
+	soulTokens := conversationRouteTextTokenEstimate(strings.TrimSpace(mordeSoulFile))
+	if conversationRouteRuntimePromptReserveTokens < int(soulTokens)+4 {
+		t.Fatalf("runtime reserve=%d does not cover Morde SOUL estimate=%d plus system-role framing",
+			conversationRouteRuntimePromptReserveTokens, soulTokens)
+	}
+	preflight := ModelRequest{Instructions: "route", Input: []ModelInput{{Role: "user", Text: strings.Repeat("x", 20_000)}}, MaxOutputTokens: 512}
 	dsh := preflight
 	dsh.Instructions = strings.TrimSpace(mordeSoulFile) + "\n\n" + preflight.Instructions
 	preflightFits := ConversationRouteInputFitsContextWindow(preflight, 8192)

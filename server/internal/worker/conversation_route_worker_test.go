@@ -190,7 +190,7 @@ func TestConversationRouteInvalidOutputLogContainsMetadataOnly(t *testing.T) {
 	secret := "synthetic-private-model-output"
 	stub.decision = app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
 		Question: "请求暂时无法安全分类，请稍后重试。", InvalidOutput: true,
-		InvalidOutputLengthBytes: len(secret), InvalidOutputUTF8Valid: true}
+		InvalidOutputLengthBytes: len(secret), InvalidOutputUTF8Valid: true, InvalidOutputCategory: "unknown_json_field"}
 	stub.repairRequeues = 1
 	if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.failures) != 1 ||
 		stub.failures[0] != "routing_action_unavailable" || len(stub.applied) != 0 {
@@ -207,7 +207,7 @@ func TestConversationRouteInvalidOutputLogContainsMetadataOnly(t *testing.T) {
 			t.Fatalf("invalid output log leaked model text: %+v", fields)
 		}
 		if fmt.Sprint(fields["invalid_output_length_bytes"]) == fmt.Sprint(len(secret)) && fields["invalid_output_utf8_valid"] == true &&
-			fields["failure_code"] == "invalid_model_output" {
+			fields["failure_code"] == "invalid_model_output" && fields["invalid_output_category"] == "unknown_json_field" {
 			metadataLogged = true
 		}
 		if fields["failure_reason"] == "routing_action_unavailable" {

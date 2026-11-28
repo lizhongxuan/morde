@@ -392,6 +392,7 @@ func (c *CloudDSHConversationCoordinator) ClassifyConversationRoute(ctx context.
 				decision = app.ParseConversationRouteDecisionForContext("", value)
 				decision.InvalidOutputLengthBytes = len(frame.Result)
 				decision.InvalidOutputUTF8Valid = utf8.ValidString(frame.Result)
+				decision.InvalidOutputCategory = "model_completion_shape"
 			}
 			if !decision.InvalidOutput {
 				decision.ModelOutput = frame.Result

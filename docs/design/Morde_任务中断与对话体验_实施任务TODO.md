@@ -159,3 +159,12 @@
 - 修复：模型输入摘要始终去除 Unicode 首尾空白；原始 Task 目标 SHA-256 仍保持不变。新增覆盖聊天换行、Unicode 空白、UTF-8 截断及空白目标的单测，并扩展 PostgreSQL 恢复诊断用例验证换行目标可生成事实摘要且摘要哈希绑定原文。
 - 本地验证：`go test ./internal/store/postgres -run 'TestBoundedTerminalDeliveryObjective|TestPostgresTaskTerminalDeliveryRecoveryDiagnosisReachesModelFacts' -count=1` 通过；隔离 PostgreSQL 17 下 `go test ./internal/store/postgres -run 'TaskTerminalDelivery' -count=1` 通过（38.9 秒）。
 - 尚未完成：修复提交并部署后的真实 DSH 终态解释、实际 morde-pc 新短答/只读搜索及延迟样本；直接回复仍没有持久增量流。T07/T08 继续进行中，自动恢复仍关闭。
+
+### 2026-11-28 续验（路由输出与慢消息刷新）
+
+- 根因补充：线上上一版安全日志显示 route completion 无效，最终分类为 `routing_action_unavailable`；旧记录不能细分 JSON/字段类型等结构原因。解析器对 `tool_arguments` 要求对象值，旧提示没有给直接工具一份与该合同一致的示例。
+- 代码处理：按 action 明确可省略无关字段；新增普通回复、新任务及直接搜索 JSON 示例；保持严格 parser 和工具授权边界。无效输出只增加白名单结构类别，不保存或输出模型原文。route worker 将无效模型决策归为输入/格式错误，避免误记为内部故障。
+- PC 刷新处理：消息列表存在未完成请求时不重复触发每秒失效查询，改为在请求结束后安排一次刷新；否则慢请求可能一直被下一轮查询取消，已有的持久终态消息要等切换会话才显示。
+- 本地通过：`go test ./internal/app -count=1`；Worker route 无效输出安全日志和一次修复后兜底定向用例；`go test ./internal/store/postgres -run 'TestValidStoredRouteDecision|TestConversationRouteModelDecisionSemantic' -count=1`；PC 会话页 `npm test -- --run src/routes/Assistant.test.tsx`（331/331）；`npm run typecheck`；`git diff --check`。
+- 服务器当前 SSH 可用且 `morde-portal.service` active，运行源仍是 `release@1d65dba8`，尚未包含本轮改动。实际 `morde-pc` 窗口仍显示旧测试会话状态；本轮代码尚未发布，不能据此判定真实路由、搜索、Agent 执行或延迟已修复。
+- 待部署后验收：实际 PC 新建对话分别执行无工具快答、直接只读搜索和一个 DSH 后台只读任务；记录 receipt、route claim、分类、工具派发和第一条持久助手消息的耗时；检查消息在原会话自动显现。失败时依据新增安全错误类别继续定位，不重试旧的不确定任务。持久增量回复、Worker 全量包、旧任务安全反例与灰度基线仍未验收；T07/T08 保持进行中。
