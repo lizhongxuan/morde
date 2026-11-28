@@ -98,7 +98,6 @@ func TestCloudDSHWebResearchToolDenialBoundsPersistedCalls(t *testing.T) {
 			{"read_1", 1, "https://news.example.test/a"},
 			{"read_2", 2, "https://news.example.test/a"},
 			{"read_3", 3, "https://news.example.test/b"},
-			{"read_4", 4, "https://news.example.test/b"},
 		} {
 			start := 0
 			if entry.seq == 2 {
@@ -107,10 +106,10 @@ func TestCloudDSHWebResearchToolDenialBoundsPersistedCalls(t *testing.T) {
 			history.calls[entry.id] = webResearchReadCheckpoint(entry.seq,
 				`{"url":"`+entry.url+`","start_char":`+strconv.Itoa(start)+`}`)
 		}
-		history.calls["read_5"] = webResearchReadCheckpoint(5, `{"url":"https://news.example.test/d"}`)
-		if denial := cloudDSHWebResearchToolDenial(history, "read_5", cloudDSHWebResearchReadToolName,
-			[]byte(`{"url":"https://news.example.test/d"}`), false); denial != cloudDSHWebResearchBudgetFeedback {
-			t.Fatalf("fifth total read denial = %q, want bounded feedback", denial)
+		history.calls["read_4"] = webResearchReadCheckpoint(4, `{"url":"https://news.example.test/b","start_char":1200}`)
+		if denial := cloudDSHWebResearchToolDenial(history, "read_4", cloudDSHWebResearchReadToolName,
+			[]byte(`{"url":"https://news.example.test/b","start_char":1200}`), false); denial != cloudDSHWebResearchBudgetFeedback {
+			t.Fatalf("fourth total read denial = %q, want bounded feedback", denial)
 		}
 
 		distinctURLs := newCloudDSHCheckpointHistory("session_1")
@@ -145,7 +144,7 @@ func TestCloudDSHWebResearchToolDenialBoundsPersistedCalls(t *testing.T) {
 		totalHistory.calls["read_7"] = webResearchReadCheckpoint(7, `{"url":"https://news.example.test/b","start_char":2400}`)
 		if denial := cloudDSHWebResearchToolDenial(totalHistory, "read_7", cloudDSHWebResearchReadToolName,
 			[]byte(`{"url":"https://news.example.test/b","start_char":2400}`), false); denial != cloudDSHWebResearchBudgetFeedback {
-			t.Fatalf("fifth read denial = %q, want bounded feedback", denial)
+			t.Fatalf("seventh read denial = %q, want bounded feedback", denial)
 		}
 	})
 

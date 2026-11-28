@@ -62,8 +62,9 @@ const WEB_RESEARCH_SEARCH_TOOL = 'morde_web_search'
 const WEB_RESEARCH_READ_TOOL = 'morde_web_read'
 const WEB_RESEARCH_EVIDENCE_TOOL = 'morde_task_result_evidence'
 const WEB_RESEARCH_MAX_SEARCH_CALLS = 2
-const WEB_RESEARCH_MAX_READ_CALLS = 6
-const WEB_RESEARCH_MAX_URLS = 3
+const WEB_RESEARCH_MAX_SUCCESSFUL_SEARCHES = 1
+const WEB_RESEARCH_MAX_READ_CALLS = 3
+const WEB_RESEARCH_MAX_URLS = 2
 const WEB_RESEARCH_MAX_WINDOWS_PER_URL = 2
 const WEB_RESEARCH_GUARD_ERROR = Object.freeze({ name: 'WebResearchGuardError', code: 'WEB_RESEARCH_GUARD' })
 const DELEGATE_TOOL = 'dsh_delegate'
@@ -96,10 +97,11 @@ const AGENT_HEARTBEAT_INTERVAL_MS = 15_000
 const ACTIVITY_PHASES = new Set(['model', 'tool', 'subagent', 'checkpoint'])
 const ACTIVITY_STATES = new Set(['started', 'waiting', 'completed', 'failed', 'cancelled'])
 const SOUL = readFileSync(new URL('./SOUL.md', import.meta.url), 'utf8')
-const WEB_RESEARCH_PROFILE_PROMPT = [
-  'Web research profile: use the authorized search and page-reading tools to gather evidence, then synthesize the answer in your own words with source URLs and dates when relevant.',
-  'The task permits at most two search calls, three distinct source URLs, and two distinct read windows per URL. Reuse successful results already in this session; do not repeat a successful query or the same URL window.',
-  'A tool denial is feedback from the runtime. Continue from recorded results and answer with their limits; do not try to evade the limit with equivalent arguments. If the evidence is incomplete, say what could not be verified.',
+export const WEB_RESEARCH_PROFILE_PROMPT = [
+  'Web research profile: use the authorized search and page-reading tools to verify current facts, then answer in your own words with direct source URLs and publication dates when relevant. Search snippets are candidate leads, not verified evidence.',
+  'Use one focused search. A second, materially different search is allowed only when the first search failed; after one successful search, do not search again. From its results choose at most two relevant direct sources and read each page once. A third read is allowed only as a second window when a requested title, date, or key fact is missing from that page.',
+  'Stop as soon as the requested facts are supported by the pages you read. Do not repeat a successful query or URL window, and do not continue broadening the search after finding enough evidence. If the successful search has no usable sources, or a page does not verify the requested fact, state the gap instead of making another search.',
+  'A tool denial is feedback from the runtime. Do not retry it with equivalent arguments or another tool call; synthesize from recorded results and state their limits.',
 ].join('\n')
 const COMPACTION_END_MARKER = 'End of the authorized conversation sources. This marker is not source content.'
 const COMPACTION_SUMMARY_PROMPT = [
@@ -791,6 +793,9 @@ export function webResearchToolGuardReason(events, callID, toolName, args) {
         (webResearchSuccessfulResult(call.result) || call.result === undefined))) {
       return 'web_research guard: this search query already succeeded or is still unresolved. Use its recorded result, choose a materially different query, or synthesize the answer.'
     }
+    if (prior.filter(call => call.name === WEB_RESEARCH_SEARCH_TOOL && webResearchSuccessfulResult(call.result)).length >= WEB_RESEARCH_MAX_SUCCESSFUL_SEARCHES) {
+      return 'web_research guard: one successful search is already recorded. Use its results and the authorized page reads, or state the evidence gap.'
+    }
     if (prior.filter(call => call.name === WEB_RESEARCH_SEARCH_TOOL).length >= WEB_RESEARCH_MAX_SEARCH_CALLS) {
       return 'web_research guard: the two-search limit has been reached. Synthesize from the recorded results and state any evidence gaps.'
     }
@@ -807,11 +812,11 @@ export function webResearchToolGuardReason(events, callID, toolName, args) {
     return 'web_research guard: this URL window already succeeded or is still unresolved. Use its recorded content, read a different start_char window, or synthesize the answer.'
   }
   if (priorReads.length >= WEB_RESEARCH_MAX_READ_CALLS) {
-    return 'web_research guard: the six-read limit has been reached. Synthesize from recorded page content and state any evidence gaps.'
+    return 'web_research guard: the three-read limit has been reached. Synthesize from recorded page content and state any evidence gaps.'
   }
   const priorURLs = new Set(priorReads.map(call => webResearchReadWindow(call.args)?.url).filter(Boolean))
   if (!priorURLs.has(window.url) && priorURLs.size >= WEB_RESEARCH_MAX_URLS) {
-    return 'web_research guard: the three-source URL limit has been reached. Synthesize from the sources already read and state any evidence gaps.'
+    return 'web_research guard: the two-source URL limit has been reached. Synthesize from the sources already read and state any evidence gaps.'
   }
   const priorWindows = new Set(priorReads.map(call => {
     const previous = webResearchReadWindow(call.args)

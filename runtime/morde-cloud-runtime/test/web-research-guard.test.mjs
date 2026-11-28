@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { recoveryToolCalls, validStart, webResearchToolGuardReason } from '../src/engine.mjs'
+import { recoveryToolCalls, validStart, webResearchToolGuardReason, WEB_RESEARCH_PROFILE_PROMPT } from '../src/engine.mjs'
 
 const searchTool = {
   name: 'morde_web_search',
@@ -111,21 +111,37 @@ test('web_research start accepts only revision zero and the narrow tool set', ()
   }] }), false)
 })
 
-test('the persisted call/result history blocks successful duplicate queries but permits a different query', () => {
+test('the persisted call/result history blocks successful duplicate and follow-up queries', () => {
   const history = successfulCall('search_one', 'morde_web_search', { query: 'today news', category: 'news' }, 1, 2)
   const [duplicate] = currentCall(history, 'search_duplicate', 'morde_web_search', { category: 'news', query: 'TODAY   NEWS' })
   assert.match(duplicate, /already succeeded/)
   const [different] = currentCall(history, 'search_two', 'morde_web_search', { query: 'today technology news', category: 'news' })
-  assert.equal(different, undefined)
+  assert.match(different, /one successful search is already recorded/)
 })
 
 test('the two-search cap is reconstructed from DSH history', () => {
   const history = [
-    ...successfulCall('search_one', 'morde_web_search', { query: 'today finance', category: 'news' }, 1, 2),
-    ...successfulCall('search_two', 'morde_web_search', { query: 'today science', category: 'news' }, 3, 4),
+    call('search_one', 'morde_web_search', { query: 'today finance', category: 'news' }, 1),
+    result('search_one', 'Tool failed: temporary upstream failure', 2, { failed: true }),
+    call('search_two', 'morde_web_search', { query: 'today science', category: 'news' }, 3),
+    result('search_two', 'Tool failed: temporary upstream failure', 4, { failed: true }),
   ]
   const [reason] = currentCall(history, 'search_three', 'morde_web_search', { query: 'today culture', category: 'news' })
   assert.match(reason, /two-search limit/)
+})
+
+test('the web research prompt describes the same bounded one-pass workflow as the runtime guard', () => {
+  assert.match(WEB_RESEARCH_PROFILE_PROMPT, /one focused search/)
+  assert.match(WEB_RESEARCH_PROFILE_PROMPT, /after one successful search, do not search again/)
+  assert.match(WEB_RESEARCH_PROFILE_PROMPT, /at most two relevant direct sources/)
+  assert.match(WEB_RESEARCH_PROFILE_PROMPT, /A third read is allowed only as a second window/)
+  assert.match(WEB_RESEARCH_PROFILE_PROMPT, /do not continue broadening the search/)
+})
+
+test('one successful search blocks a different follow-up query', () => {
+  const history = successfulCall('search_one', 'morde_web_search', { query: 'today technology news', category: 'news' }, 1, 2)
+  const [reason] = currentCall(history, 'search_two', 'morde_web_search', { query: 'today science news', category: 'news' })
+  assert.match(reason, /one successful search is already recorded/)
 })
 
 test('failed searches may retry, and guard-denied calls do not consume the search cap', () => {
@@ -149,13 +165,12 @@ test('the persisted URL/window history blocks exact repeats but allows a new rea
 })
 
 test('web research bounds the number of sources, read windows, and total reads', () => {
-  const threeURLs = [
+  const twoURLs = [
     ...successfulCall('read_one', 'morde_web_read', { url: 'https://one.example/a' }, 1, 2),
     ...successfulCall('read_two', 'morde_web_read', { url: 'https://two.example/b' }, 3, 4),
-    ...successfulCall('read_three', 'morde_web_read', { url: 'https://three.example/c' }, 5, 6),
   ]
-  const [fourthURL] = currentCall(threeURLs, 'read_four', 'morde_web_read', { url: 'https://four.example/d' })
-  assert.match(fourthURL, /three-source URL limit/)
+  const [thirdURL] = currentCall(twoURLs, 'read_three', 'morde_web_read', { url: 'https://three.example/c' })
+  assert.match(thirdURL, /two-source URL limit/)
 
   const twoWindows = [
     ...successfulCall('window_zero', 'morde_web_read', { url: 'https://one.example/a', start_char: 0 }, 1, 2),
@@ -164,16 +179,15 @@ test('web research bounds the number of sources, read windows, and total reads',
   const [thirdWindow] = currentCall(twoWindows, 'window_4800', 'morde_web_read', { url: 'https://one.example/a', start_char: 4800 })
   assert.match(thirdWindow, /two-window limit/)
 
-  const sixReads = []
-  for (let index = 0; index < 6; index++) {
-    const urlIndex = Math.floor(index / 2) + 1
-    const startChar = index % 2 === 0 ? 0 : 2400
-    sixReads.push(...successfulCall(`read_${index}`, 'morde_web_read', {
-      url: `https://source${urlIndex}.example/article`, start_char: startChar,
-    }, index * 2 + 1, index * 2 + 2))
-  }
-  const [seventhRead] = currentCall(sixReads, 'read_seven', 'morde_web_read', { url: 'https://source1.example/another' })
-  assert.match(seventhRead, /six-read limit/)
+  const threeReads = [
+    ...successfulCall('read_1', 'morde_web_read', { url: 'https://source1.example/article', start_char: 0 }, 1, 2),
+    ...successfulCall('read_2', 'morde_web_read', { url: 'https://source1.example/article', start_char: 2400 }, 3, 4),
+    ...successfulCall('read_3', 'morde_web_read', { url: 'https://source2.example/article', start_char: 0 }, 5, 6),
+  ]
+  const [fourthRead] = currentCall(threeReads, 'read_4', 'morde_web_read', {
+    url: 'https://source2.example/article', start_char: 2400,
+  })
+  assert.match(fourthRead, /three-read limit/)
 })
 
 test('an unresolved prior call cannot be repeated before its outcome is known', () => {
