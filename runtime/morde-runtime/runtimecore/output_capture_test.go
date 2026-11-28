@@ -2,6 +2,11 @@ package runtimecore
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -109,6 +114,129 @@ func TestSupplementalOutputCaptureGlobalCapacityFailureIsIncomplete(t *testing.T
 	if !ok || page.State != contract.SupplementalOutputCaptureIncomplete {
 		t.Fatalf("capacity failure page=%#v ok=%v", page, ok)
 	}
+}
+
+func TestSupplementalOutputCaptureDoesNotSurviveRuntimeRestartOrReplayTerminalOperation(t *testing.T) {
+	dir := newStoreDir(t)
+	handler := &supplementalOutputCaptureRestartHandler{}
+	options := Options{
+		StoreDir: dir, ExpectedOwnerUID: uint32(os.Geteuid()), HostID: testHostID,
+		Generation: 1, ProtocolVersion: contract.ProtocolVersion, Handlers: []ActionHandler{handler},
+		TaskWorkspaceViews: testTaskWorkspaceViewStore{},
+	}
+	first, err := Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstFence := currentFence(t, first)
+	if _, err := first.SetControl(contract.SetControlRequest{
+		ProtocolVersion: contract.ProtocolVersion, HostFence: firstFence, Mode: contract.ModeAI,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.SetWorkspaceBindings(context.Background(), bindingSnapshot(firstFence, contract.WorkspaceBinding{
+		WorkspaceID: "w1234567", BindingVersion: 1, Directory: "w1234567",
+	})); err != nil {
+		t.Fatal(err)
+	}
+	view, err := first.SetTaskWorkspaceView(context.Background(), testTaskID, contract.SetTaskWorkspaceViewRequest{
+		ProtocolVersion: contract.ProtocolVersion, HostFence: firstFence, TaskID: testTaskID,
+		WorkspaceID: "w1234567", BindingVersion: 1, InputRevision: 0,
+		WorkspaceCheckpointRevision: 0, ManifestSHA256: strings.Repeat("0", 64),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.SetTaskLease(testTaskID, testLease(firstFence, 1, time.Now().UTC().Add(20*time.Second))); err != nil {
+		t.Fatal(err)
+	}
+	identity := contract.SupplementalOutputCaptureIdentity{
+		OwnerID: "u1234567", TaskID: testTaskID, AuthorizationVersion: 1, TaskRevision: 1,
+		WorkspaceID: "w1234567", WorkspaceAuthorizationVersion: 1, WorkspaceBindingVersion: 1,
+		WorkspaceViewID: view.ViewID, WorkspaceCheckpointRevision: 0, StepID: "s1234567", CallID: "restart-capture",
+	}
+	request := testExecute(firstFence, `{}`)
+	request.OperationID = "ocap0001"
+	request.Capability, request.Action = "shell.exec", "run"
+	request.WorkspaceID, request.BindingVersion = "w1234567", 1
+	request.WorkspaceViewID, request.WorkspaceCheckpointRevision = view.ViewID, 0
+	request.OutputCapture = &identity
+	if _, err := first.Submit(context.Background(), request); err != nil {
+		t.Fatalf("submit captured Shell operation: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	var terminal contract.Operation
+	for time.Now().Before(deadline) {
+		terminal, err = first.QueryOperation(contract.ProtocolVersion, request.OperationID, contract.OperationQuery{
+			HostFence: firstFence, TaskID: request.TaskID, LeaseVersion: request.LeaseVersion,
+		})
+		if err == nil && terminal.Status == contract.OperationSucceeded {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err != nil || terminal.Status != contract.OperationSucceeded || handler.calls != 1 {
+		t.Fatalf("captured Shell operation=%#v err=%v handler calls=%d", terminal, err, handler.calls)
+	}
+	pageRequest := contract.SupplementalOutputCapturePageRequest{
+		ProtocolVersion: contract.ProtocolVersion, HostFence: firstFence, TaskID: testTaskID,
+		LeaseVersion: 1, OperationID: request.OperationID, Identity: identity,
+		Stream: contract.SupplementalOutputCaptureStdout, Offset: 0,
+	}
+	page, err := first.SupplementalOutputCapturePage(pageRequest)
+	if err != nil || page.State != contract.SupplementalOutputCaptureComplete || !bytes.Equal(page.Data, []byte("spill-after-prefix")) {
+		t.Fatalf("captured output page=%#v err=%v", page, err)
+	}
+	closeManager(t, first)
+
+	options.Generation = 2
+	second, err := Open(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeManager(t, second)
+	secondFence := currentFence(t, second)
+	if secondFence.RuntimeInstanceID == firstFence.RuntimeInstanceID {
+		t.Fatal("runtime restart reused the prior instance ID")
+	}
+	if _, err := second.SetControl(contract.SetControlRequest{
+		ProtocolVersion: contract.ProtocolVersion, HostFence: secondFence, Mode: contract.ModeAI,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := second.SetTaskLease(testTaskID, testLease(secondFence, 1, time.Now().UTC().Add(20*time.Second))); err != nil {
+		t.Fatal(err)
+	}
+	pageRequest.HostFence = secondFence
+	if _, err := second.SupplementalOutputCapturePage(pageRequest); !errors.Is(err, ErrFenceRejected) {
+		t.Fatalf("old capture page after Runtime restart error=%v, want fence rejection", err)
+	}
+	reconciled, err := second.QueryOperation(contract.ProtocolVersion, request.OperationID, contract.OperationQuery{
+		HostFence: secondFence, TaskID: request.TaskID, LeaseVersion: request.LeaseVersion,
+	})
+	if err != nil || reconciled.Status != contract.OperationSucceeded || handler.calls != 1 {
+		t.Fatalf("terminal operation after Runtime restart=%#v err=%v handler calls=%d", reconciled, err, handler.calls)
+	}
+}
+
+type supplementalOutputCaptureRestartHandler struct{ calls int }
+
+func (*supplementalOutputCaptureRestartHandler) Capability() string { return "shell.exec" }
+func (*supplementalOutputCaptureRestartHandler) Action() string     { return "run" }
+func (*supplementalOutputCaptureRestartHandler) SupportsSupplementalOutputCapture() bool {
+	return true
+}
+func (h *supplementalOutputCaptureRestartHandler) Execute(ctx context.Context, _ contract.ExecuteRequest) (json.RawMessage, error) {
+	h.calls++
+	sink := contract.SupplementalOutputSinkFromContext(ctx)
+	if sink == nil || !sink.WriteSupplementalOutput(contract.SupplementalOutputCaptureStdout, []byte("spill-after-prefix")) {
+		return nil, errors.New("supplemental output sink unavailable")
+	}
+	return json.RawMessage(`{"ok":true}`), nil
+}
+func (*supplementalOutputCaptureRestartHandler) Stop(context.Context, contract.Operation) (StopResult, error) {
+	return StopResult{VerifiedStopped: true}, nil
 }
 
 func testSupplementalOutputIdentity() contract.SupplementalOutputCaptureIdentity {
