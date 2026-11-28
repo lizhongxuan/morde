@@ -15,7 +15,7 @@
 ## PR A · 先交付两个纯交互收益
 
 - [ ] **待 PC 实测 · M01 折叠工具活动。** `Assistant.tsx`：保留 MAIN / SUBAGENT 和现有 `TaskStepDetails`，二级分组按 Task、Agent、修订、相邻原序号；保守拆开身份缺失、修订不同或原日志有断点的项。同一失败步骤仍有详情入口，等候/失败/待核对不被默认折叠遮住。**验收：**12 条同组成功步骤折叠时只见 1 项，展开是原 12 个 ID；0 个提前详情请求；失败最多一次展开可达；覆盖序号断点、修订变化、主/子 Agent、重复事件与断线重连（基线 E1）。定向测试、类型检查通过；尚未用 `make pc` 实测。
-- [ ] **待 PC 实测 · M08 附件拖放。** `Assistant.tsx`、`assistant-drafts.ts`：仅拦截输入区文件拖放并阻止导航；复用 `addComposerFiles` 的 staging、16 项上限和既有校验。预览对象 URL 生命周期跟随草稿；保留原文件选择、移除、错误恢复。**验收：**用合成文件对同一组执行「点击选文件」与「拖入」得到相同接受/拒绝结果；慢准备期间切会话仍进原草稿。拖入、移除和开草稿不触发附件发送或 Office POST；显式点既有 Office 预览才走受提示的服务端解析（E2）。联测用替身，不上传个人文件。自动化测试通过；尚未用 `make pc` 实测。
+- [ ] **PC 局部实测，拖放未观察到附件入草稿 · M08 附件拖放。** `Assistant.tsx`、`assistant-drafts.ts`：仅拦截输入区文件拖放并阻止导航；复用 `addComposerFiles` 的 staging、16 项上限和既有校验。预览对象 URL 生命周期跟随草稿；保留原文件选择、移除、错误恢复。**验收：**用合成文件对同一组执行「点击选文件」与「拖入」得到相同接受/拒绝结果；慢准备期间切会话仍进原草稿。拖入、移除和开草稿不触发附件发送或 Office POST；显式点既有 Office 预览才走受提示的服务端解析（E2）。联测用替身，不上传个人文件。自动化测试通过；2026-11-28 使用源码 `morde-pc` 和合成文件实测：选择器可将文件加入“待发送附件”并可移除；Finder 拖放尝试未见草稿变化，拖放验收仍未完成，未发送消息或打开 Office 预览。
 
 ## PR B · 追问沿用 Morde；语音先修正确性
 
@@ -50,3 +50,4 @@
 - 本次续做基线为本地 `release@79eb5c73`、`origin/release@ee618bed`；服务端/API/PC 分页代码提交 `09bbde23` 已落在本地 `release`。文档随后单独提交；未推送或部署。
 - 续做验证：`web/portal` 执行 `npm run generate:api`；`npm test -- src/routes/Assistant.test.tsx src/app/api.test.ts src/components/AssistantVoiceInput.test.tsx src/routes/AccountSettings.test.tsx` 421/421，`npm run typecheck` 通过。`server` 执行 `go test ./internal/app ./internal/api -count=1` 通过，输出捕获 exact terminal recovery 定向测试通过；PG16 临时容器中 `TestPostgresTaskStepOutputCapturePersistsPagesAndRechecksAuthorization` 通过，覆盖分页密文、账号隔离、授权撤销、元数据-only 不完整状态及过期清理；`gofmt` 与 `git diff --check` 通过。Runtime Go、HTTPS Runner、M02 定向 Broker/runtimeclient 测试和 DSH Runtime 235/235 的结果见 M02 行；没有修改测试服务器/生产服务，也没有使用用户提供的模型密钥。
 - 未覆盖：M01/M07/M08/M09a 的实际 PC 入口、M02/M04 在客户端读取旧 64 KiB 外合成尾标记、已部署 API 联测、quota 高并发压力；M09b 真实麦克风电平与 M11 签名系统通知；M06 Worker 全量 suite 仍有 499 PASS / 2 FAIL，失败为 `TestConversationSummaryDSHMainAndSideChatsContinueAfterLongHistoryRestart`（summary version 2→3）与 `TestCloudDSHModelBudgetPostgresHTTPWorkerProcessKilledBeforeProviderHTTP`（stale recovery marked=0），其余取消/并发/旧 checkpoint 项的单独验收仍待补。统一视觉规范文件 `docs/design/ice-cream-blue/morde-icecream-blue-ui-spec.html` 当前不存在；外观对照待核对。此 TODO 和 M12 仍未勾选，直至必需的真实客户端路径与未完成矩阵有证据。
+- 新增 PC 局部实测：`MORDE_TEST_USER_DATA=/tmp/morde-pc-todo-client-check make pc` 完成 Portal、Workbench、Desktop 构建并启动源码 Electron；隔离用户目录中的对话页已渲染。用 `/tmp/morde-pc-attachment-smoke.txt` 验证附件选择器 staging 和移除；尝试从 Finder 拖放后没有观察到附件进入草稿。未发送消息、未打开 Office 预览；此结果不能替代拖放、M01/M07/M09a 或服务端分页 API 的 PC 联验。随后以 Ctrl-C 停止隔离实例。
