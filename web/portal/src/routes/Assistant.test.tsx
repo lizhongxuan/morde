@@ -206,8 +206,8 @@ function taskToolStep(id: string, sequence: number, overrides: Partial<Task['ste
     agent_id: 'main-agent', task_revision: 1, ...overrides };
 }
 
-function fileDragDataTransfer(files: File[], types = files.length ? ['Files'] : []): DataTransfer {
-  return { files: files as unknown as FileList, types, items: [] } as unknown as DataTransfer;
+function fileDragDataTransfer(files: File[], types = files.length ? ['Files'] : [], items: DataTransferItem[] = []): DataTransfer {
+  return { files: files as unknown as FileList, types, items } as unknown as DataTransfer;
 }
 
 type CompleteTaskStepOutputPage = Extract<Awaited<ReturnType<typeof portalApi.taskStepOutputPage>>, { state: 'complete' }>;
@@ -3159,12 +3159,11 @@ describe('Assistant durable tasks', () => {
     await user.upload(picker, file);
     expect(await screen.findByText('synthetic.docx')).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '移除附件 synthetic.docx' }));
-    const form = (await findReadyComposer()).closest('form');
-    expect(form).not.toBeNull();
-    const transfer = fileDragDataTransfer([file]);
-    expect(fireEvent.dragOver(form!, { dataTransfer: transfer })).toBe(false);
+    const composer = await findReadyComposer();
+    const transfer = fileDragDataTransfer([], ['Files'], [{ kind: 'file', getAsFile: () => file } as DataTransferItem]);
+    expect(fireEvent.dragOver(composer, { dataTransfer: transfer })).toBe(false);
     expect(transfer.dropEffect).toBe('copy');
-    expect(fireEvent.drop(form!, { dataTransfer: transfer })).toBe(false);
+    expect(fireEvent.drop(composer, { dataTransfer: transfer })).toBe(false);
 
     expect(await screen.findByText('synthetic.docx')).toBeInTheDocument();
     expect(preview).not.toHaveBeenCalled();
@@ -3172,7 +3171,7 @@ describe('Assistant durable tasks', () => {
     expect(createUpload).not.toHaveBeenCalled();
 
     const textTransfer = fileDragDataTransfer([], ['text/plain']);
-    expect(fireEvent.drop(form!, { dataTransfer: textTransfer })).toBe(true);
+    expect(fireEvent.drop(composer, { dataTransfer: textTransfer })).toBe(true);
   });
 
   it('rejects the same oversized file from the picker and composer drop', async () => {
@@ -3195,6 +3194,27 @@ describe('Assistant durable tasks', () => {
     const transfer = fileDragDataTransfer([file]);
     expect(fireEvent.drop(form!, { dataTransfer: transfer })).toBe(false);
     expect(await screen.findByRole('alert')).toHaveTextContent('oversized.png：图片不能超过 512 KiB。');
+    expect(send).not.toHaveBeenCalled();
+    expect(createUpload).not.toHaveBeenCalled();
+  });
+
+  it('applies the 16 attachment limit across picker selection and composer drop', async () => {
+    vi.stubGlobal('crypto', webcrypto);
+    mockCommon({ conversations: [conversation] });
+    const send = vi.spyOn(portalApi, 'acceptConversationMessage');
+    const createUpload = vi.spyOn(portalApi, 'createPersonalAttachmentUpload');
+    const user = userEvent.setup();
+    renderPage();
+
+    const selectedFiles = Array.from({ length: 16 }, (_, index) => new File([`local ${index}`], `picker-${index}.txt`, { type: 'text/plain' }));
+    await user.upload(await screen.findByLabelText('添加附件'), selectedFiles);
+    await waitFor(() => expect(screen.getAllByRole('button', { name: /移除附件/ })).toHaveLength(16));
+
+    const composer = await findReadyComposer();
+    const transfer = fileDragDataTransfer([new File(['extra'], 'drop-extra.txt', { type: 'text/plain' })]);
+    expect(fireEvent.drop(composer, { dataTransfer: transfer })).toBe(false);
+    expect(await screen.findByRole('alert')).toHaveTextContent('每条消息最多添加 16 个附件。');
+    expect(screen.getAllByRole('button', { name: /移除附件/ })).toHaveLength(16);
     expect(send).not.toHaveBeenCalled();
     expect(createUpload).not.toHaveBeenCalled();
   });

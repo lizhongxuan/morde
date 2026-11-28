@@ -473,6 +473,15 @@ function transferContainsFiles(dataTransfer: DataTransfer): boolean {
     Array.from(dataTransfer.items).some((item) => item.kind === 'file');
 }
 
+function filesFromTransfer(dataTransfer: DataTransfer): File[] {
+  const files = Array.from(dataTransfer.files);
+  if (files.length) return files;
+  return Array.from(dataTransfer.items)
+    .filter((item) => item.kind === 'file')
+    .map((item) => item.getAsFile())
+    .filter((file): file is File => file !== null);
+}
+
 async function uploadAssistantAttachment(item: PendingMessageAttachment, serviceInstanceID: string, actorID: string, checkScope: () => void): Promise<string> {
   if (item.attachmentID) return item.attachmentID;
   const file = new File([item.blob], item.name, { type: item.mediaType });
@@ -3518,7 +3527,7 @@ export function Assistant() {
     }
   }, [notify, persistComposerDraft, preparationKeysForIdentity]);
 
-  const addComposerFiles = async (fileList: FileList | null) => {
+  const addComposerFiles = async (fileList: FileList | File[] | null) => {
     if (!fileList) return;
     composerEditRevision.current += 1;
     if (!conversationID && !selectedLocalDraftKey) ensureLocalConversationKey();
@@ -3576,7 +3585,8 @@ export function Assistant() {
   const handleComposerDrop = (event: ReactDragEvent<HTMLFormElement>) => {
     if (!transferContainsFiles(event.dataTransfer)) return;
     event.preventDefault();
-    if (event.dataTransfer.files.length) void addComposerFiles(event.dataTransfer.files);
+    const files = filesFromTransfer(event.dataTransfer);
+    if (files.length) void addComposerFiles(files);
   };
 
   const previewOfficeAttachment = async (item: ComposerAttachment) => {
