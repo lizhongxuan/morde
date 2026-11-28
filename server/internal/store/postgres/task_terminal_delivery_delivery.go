@@ -15,9 +15,11 @@ import (
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/conversation"
+	"morde/server/internal/domain/identity"
 	"morde/server/internal/store/postgres/sqlcgen"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 func (s *Store) ClaimTaskTerminalDeliverySources(ctx context.Context, workerID string,
@@ -339,7 +341,88 @@ func taskTerminalDeliveryCurrentAndAuthorizedInTx(ctx context.Context, tx pgx.Tx
 	if row.AuthVersion != claim.AuthorizationVersion || row.ConversationID != claim.ConversationID || row.InitiatorID != claim.InitiatorID {
 		return false, nil
 	}
-	return requireCurrentTaskAuthorization(ctx, tx, row)
+	return requireTaskTerminalDeliveryAuthorization(ctx, tx, row)
+}
+
+// A terminal explanation only writes a bounded assistant message to the
+// conversation already bound to the stopped Task. It does not resume Task
+// work or dispatch tools, so expiration of the original token alone must not
+// suppress that explanation. Keep account, project, token identity, revocation,
+// installation, and the immutable delivery fences checked as usual.
+func requireTaskTerminalDeliveryAuthorization(ctx context.Context, tx pgx.Tx, value sqlcgen.Task) (bool, error) {
+	if value.AuthTokenID == "" || value.AuthVersion < 1 || !domain.ValidUserID(value.InitiatorID) {
+		return false, nil
+	}
+	if projectWorkspaceAuthorizationPermit(ctx, value) {
+		return requireTaskTerminalDeliveryCredentialAuthorization(ctx, tx, value, false)
+	}
+	projectID, err := lockTaskInitiatorInTx(ctx, tx, value.ID, value.OwnerID, value.InitiatorID)
+	if err != nil {
+		switch domain.CodeOf(err) {
+		case domain.CodeUnauthenticated, domain.CodeForbidden, domain.CodeNotFound:
+			return false, nil
+		default:
+			return false, err
+		}
+	}
+	if value.ProjectID.Valid != (projectID != "") || value.ProjectID.Valid && value.ProjectID.String != projectID {
+		return false, nil
+	}
+	return requireTaskTerminalDeliveryCredentialAuthorization(ctx, tx, value, true)
+}
+
+func requireTaskTerminalDeliveryCredentialAuthorization(ctx context.Context, tx pgx.Tx, value sqlcgen.Task,
+	lockRows bool) (bool, error) {
+	// Scheduled Tasks are bound to a durable schedule run, not a user token
+	// expiry. Reuse the standard check for their run linkage and account state.
+	if value.AuthKind == string(identity.KindScheduleTask) {
+		return requireCurrentTaskCredentialAuthorization(ctx, tx, value, lockRows)
+	}
+	lock := ""
+	if lockRows {
+		lock = " FOR SHARE"
+	}
+	var approved bool
+	err := tx.QueryRow(ctx, `SELECT status='approved' FROM users WHERE id=$1`+lock, value.InitiatorID).Scan(&approved)
+	if errors.Is(err, pgx.ErrNoRows) || err == nil && !approved {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("check terminal delivery account authorization: %w", err)
+	}
+	var kind string
+	var installationID pgtype.Text
+	var revokedAt pgtype.Timestamptz
+	err = tx.QueryRow(ctx, `SELECT kind,client_installation_id,revoked_at
+FROM tokens WHERE id=$1 AND owner_id=$2`+lock, value.AuthTokenID, value.InitiatorID).
+		Scan(&kind, &installationID, &revokedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("check terminal delivery source token: %w", err)
+	}
+	if kind != value.AuthKind || kind == string(identity.KindClient) && !installationID.Valid ||
+		installationID.Valid != (value.AuthClientInstallationID.String != "") ||
+		installationID.Valid && installationID.String != value.AuthClientInstallationID.String {
+		return false, nil
+	}
+	if revokedAt.Valid && (!installationID.Valid || !value.CreatedAt.Time.Before(revokedAt.Time)) {
+		return false, nil
+	}
+	if installationID.Valid {
+		var installationActive bool
+		err := tx.QueryRow(ctx, `SELECT COALESCE(expires_at>clock_timestamp(),false) AND revoked_at IS NULL
+FROM client_installations WHERE id=$1 AND owner_id=$2`+lock, installationID.String, value.InitiatorID).
+			Scan(&installationActive)
+		if errors.Is(err, pgx.ErrNoRows) || err == nil && !installationActive {
+			return false, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("check terminal delivery client installation: %w", err)
+		}
+	}
+	return true, nil
 }
 
 func invalidateTaskTerminalDeliveryInTx(ctx context.Context, tx pgx.Tx, claim TaskTerminalDeliveryClaim) error {

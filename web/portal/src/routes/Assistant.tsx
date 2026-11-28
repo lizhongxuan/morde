@@ -72,6 +72,13 @@ type AssistantTaskAttentionView = {
   action: AssistantTaskAttention['action'];
 };
 
+function unverifiedTaskReply(task: TaskSummary): string {
+  const diagnosis = task.waiting_reason === 'dsh_recovery_unresolved'
+    ? '任务记录显示，模型服务未返回可确认的答复。'
+    : '这次没有拿到可核实的结果。';
+  return `${diagnosis}我暂时不能确认任务已经完成，也不会自动重复可能产生副作用的操作。已确认的进度保留在任务动态中，请先核对后再决定下一步。`;
+}
+
 function taskModelRecoveryRetryIsAvailable(task: AssistantTaskStatusInput): boolean {
   const rawAttention = task.attention;
   if (!rawAttention || typeof rawAttention !== 'object' || Array.isArray(rawAttention)) return false;
@@ -4221,13 +4228,13 @@ export function Assistant() {
                     (!messageTask || messageTask.initiator_id === messageActorID);
                   const taskAttention = messageTask?.conversation_id === conversationID && messageTask.initiator_id === messageActorID
                     ? taskAttentionPresentation(messageTask, user?.id) : null;
-                  const taskHasTerminalReply = Boolean(messageTask?.result_message_published) || Boolean(messageTask && displayMessages.some((item) =>
+                  const taskHasTerminalReply = Boolean(messageTask && displayMessages.some((item) =>
                     item.role === 'assistant' && item.task_id === messageTask.id && item.delivery_status === 'applied'));
                   const showTaskAttention = Boolean(message.role === 'user' && messageTask && taskAttention &&
                     taskAttention.kind !== 'needs_user_action' && !ambiguousAcknowledgementTaskIDs.has(messageTaskID) &&
-                    taskAttention.kind !== 'result_unverified' &&
                     !taskHasTerminalReply &&
                     (acknowledgedUserMessageByTaskID.get(messageTaskID) ?? latestUserMessageByTaskID.get(messageTaskID)) === message.id);
+                  const showUnverifiedTaskReply = Boolean(showTaskAttention && taskAttention?.kind === 'result_unverified' && messageTask);
                   const canRetryModelRecovery = Boolean(user?.id && messageTask && taskAttention?.kind === 'paused_retryable' &&
                     taskAttention.action === 'retry' && taskModelRecoveryRetryIsAvailable(messageTask));
                   const retryingModelRecovery = messageTask ? modelRecoveryRetryingTaskIDs.has(messageTask.id) : false;
@@ -4292,7 +4299,7 @@ export function Assistant() {
                         title={message.role === 'assistant' ? '复制回复' : '复制消息'}
                         onClick={() => void copyConversationMessage(message.content, message.role)}><MordeIcon name="copy" /></button>
                     </div>
-                    {showTaskAttention && taskAttention && <section className={`chat-message-task-attention task-attention-${taskAttention.kind}`}
+                    {showTaskAttention && taskAttention && !showUnverifiedTaskReply && <section className={`chat-message-task-attention task-attention-${taskAttention.kind}`}
                       role="status" aria-label={`任务状态：${taskAttention.label}`}>
                       <strong>{taskAttention.label}</strong>
                       <p>{taskAttention.detail}</p>
@@ -4312,6 +4319,21 @@ export function Assistant() {
                     </section>}
                     </div>
                     </div>
+                    {showUnverifiedTaskReply && messageTask && <div className="chat-message-row chat-message-row-assistant" role="group" aria-label="Morde 的任务结果说明">
+                      <span className="assistant-logo assistant-logo-message" aria-hidden="true" />
+                      <div className="chat-message-body"><strong className="chat-message-author">Morde</strong>
+                        <article className="chat-message chat-message-assistant" aria-label="Morde 的回复" role="status">
+                          <ChatMarkdown content={unverifiedTaskReply(messageTask)} />
+                        </article>
+                        <button type="button" className="button button-small button-secondary" aria-label="查看任务详情"
+                          onClick={() => {
+                            setTaskDetailStepID(null);
+                            setTaskPanelTab('tasks');
+                            setTaskPanelOpen(true);
+                            setTaskDetailTaskID(messageTask.id);
+                          }}>查看任务动态</button>
+                      </div>
+                    </div>}
                     {(longReplyIsPending || longReplyIsProcessing || longReplyIsCancelRequested || longReplyIsPartial || longReplyIsCancelled) && <div
                       className="chat-message-row chat-message-row-assistant" role="group"
                       aria-label={`长回复状态：${longReplyIsPartial ? '部分完成' : longReplyIsCancelled ? '已取消' : longReplyIsCancelRequested ? '正在取消' : longReplyIsPending ? '等待处理' : '正在生成'}`}>

@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -13,6 +14,8 @@ import (
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/task"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 func modelBudgetCapacityWaitFixture(t *testing.T, accountLimit int64, maxConcurrent int32) (routeActionsTestFixture, app.ModelTaskFence, app.TaskModelBudgetCapacityWaitRequest) {
@@ -433,6 +436,36 @@ func TestPostgresModelBudgetCapacityWaitReplayPreservesMigratedEpisodeExpiry(t *
 	if err := f.store.WaitForTaskModelBudgetCapacity(ctx, request); err != nil {
 		t.Fatalf("persist capacity wait before rolling-migration replay: %v", err)
 	}
+	confirmCapacityWaitAgentStopped(t, f, fence, 128)
+	var exactStoppedCheckpointCandidates int
+	if err := f.store.pool.QueryRow(ctx, `SELECT count(*) FROM model_budget_capacity_waits AS wait
+JOIN task_agent_sessions AS session ON session.task_id=wait.task_id AND session.owner_id=wait.task_owner_id
+ AND session.session_id=wait.agent_session_id AND session.checkpoint_through_seq=wait.through_sequence
+ AND octet_length(session.checkpoint_digest)=32
+WHERE wait.task_id=$1 AND EXISTS (
+ SELECT 1 FROM task_agent_checkpoints AS checkpoint
+ JOIN task_agent_instances AS instance ON instance.task_id=checkpoint.task_id
+  AND instance.owner_id=checkpoint.owner_id AND instance.agent_generation=checkpoint.agent_generation
+  AND instance.agent_instance_id=checkpoint.agent_instance_id AND instance.agent_session_id=checkpoint.agent_root_session_id
+ WHERE checkpoint.task_id=wait.task_id AND checkpoint.owner_id=wait.task_owner_id
+  AND checkpoint.agent_instance_id=wait.agent_instance_id AND checkpoint.agent_generation=wait.agent_generation
+  AND checkpoint.agent_session_id=wait.agent_session_id AND checkpoint.agent_root_session_id=wait.agent_root_session_id
+  AND checkpoint.through_seq=wait.through_sequence AND checkpoint.digest=session.checkpoint_digest
+  AND checkpoint.auth_version=wait.authorization_version AND checkpoint.engine_version=wait.engine_version
+  AND checkpoint.profile_version=wait.profile_version AND checkpoint.lease_version=wait.lease_version
+  AND instance.state='stopped' AND instance.stop_receipt IS NOT NULL
+  AND instance.stop_receipt_digest=sha256(instance.stop_receipt))`, fence.TaskID).Scan(&exactStoppedCheckpointCandidates); err != nil {
+		t.Fatalf("check exact stopped checkpoint before compatibility migration: %v", err)
+	}
+	if exactStoppedCheckpointCandidates != 1 {
+		t.Fatalf("compatibility migration fixture has %d exact stopped checkpoint candidates, want 1", exactStoppedCheckpointCandidates)
+	}
+	var checkpointDigest []byte
+	if err := f.store.pool.QueryRow(ctx, `SELECT checkpoint_digest FROM task_agent_sessions
+WHERE task_id=$1 AND owner_id=$2 AND session_id=$3 AND checkpoint_through_seq=$4`,
+		fence.TaskID, fence.OwnerID, fence.AgentSessionID, fence.ThroughSequence).Scan(&checkpointDigest); err != nil {
+		t.Fatalf("read exact checkpoint that admitted the waiter: %v", err)
+	}
 	firstWaitAt, _ := readCapacityCallDeadline(t, f, f.ownerID, request.BudgetCallID)
 	var originalExpiry time.Time
 	if err := f.store.pool.QueryRow(ctx, `SELECT expires_at FROM model_budget_capacity_waits WHERE task_id=$1`, fence.TaskID).
@@ -453,6 +486,10 @@ SET expires_at=expires_at-interval '1 microsecond' WHERE task_id=$1`, fence.Task
 	if !migratedExpiry.Before(originalExpiry) {
 		t.Fatalf("legacy episode expiry was not made earlier for replay check: %s >= %s", migratedExpiry, originalExpiry)
 	}
+	if _, err := f.store.pool.Exec(ctx, `UPDATE model_budget_capacity_call_deadlines SET slot_reserved_at=NULL
+WHERE owner_id=$1 AND budget_call_id=$2`, f.ownerID, request.BudgetCallID); err != nil {
+		t.Fatalf("release migrated slot reservation before rolling schema back: %v", err)
+	}
 	if _, err := f.store.pool.Exec(ctx, `DELETE FROM model_budget_capacity_call_deadlines WHERE owner_id=$1 AND budget_call_id=$2`,
 		f.ownerID, request.BudgetCallID); err != nil {
 		t.Fatalf("remove new-version marker before migration replay: %v", err)
@@ -466,6 +503,9 @@ SET expires_at=expires_at-interval '1 microsecond' WHERE task_id=$1`, fence.Task
 		t.Fatalf("roll back empty 00270 marker table to simulate an existing 00269 deployment: %v", err)
 	}
 	closeProvider()
+	// Recreate the schema that was actually published with 00269: its table
+	// lacks checkpoint_digest, last_reconciled_at, and the owner fairness index.
+	simulatePublished269CapacityWaitSchema(t, f.store.pool)
 	provider, closeProvider, err = newMigrationProvider(f.store.pool)
 	if err != nil {
 		t.Fatalf("reopen migration provider for 00270 compatibility check: %v", err)
@@ -475,6 +515,22 @@ SET expires_at=expires_at-interval '1 microsecond' WHERE task_id=$1`, fence.Task
 		t.Fatalf("apply 00270 over the existing 00269 waiter: %v", err)
 	}
 	closeProvider()
+	var migratedCheckpointDigest []byte
+	if err := f.store.pool.QueryRow(ctx, `SELECT checkpoint_digest FROM model_budget_capacity_waits WHERE task_id=$1`,
+		fence.TaskID).Scan(&migratedCheckpointDigest); err != nil || !bytes.Equal(migratedCheckpointDigest, checkpointDigest) {
+		t.Fatalf("00270 did not restore the exact durable checkpoint: digest=%x want=%x err=%v",
+			migratedCheckpointDigest, checkpointDigest, err)
+	}
+	var reconciledColumn, fairnessIndex bool
+	if err := f.store.pool.QueryRow(ctx, `SELECT
+ EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema()
+   AND table_name='model_budget_capacity_waits' AND column_name='last_reconciled_at'),
+ EXISTS(SELECT 1 FROM pg_indexes WHERE schemaname=current_schema()
+   AND indexname='model_budget_capacity_waits_owner_fair')`).Scan(&reconciledColumn, &fairnessIndex); err != nil ||
+		!reconciledColumn || !fairnessIndex {
+		t.Fatalf("00270 did not restore the 00269 compatibility schema: last_reconciled_at=%t owner_fair=%t err=%v",
+			reconciledColumn, fairnessIndex, err)
+	}
 	migratedFirstWaitAt, migratedDeadline := readCapacityCallDeadline(t, f, f.ownerID, request.BudgetCallID)
 	if !migratedFirstWaitAt.Equal(firstWaitAt) || !migratedDeadline.Equal(migratedExpiry) ||
 		!migratedDeadline.After(migratedFirstWaitAt) || migratedDeadline.After(migratedFirstWaitAt.Add(5*time.Minute)) {
@@ -493,6 +549,74 @@ SET expires_at=expires_at-interval '1 microsecond' WHERE task_id=$1`, fence.Task
 	if !retainedExpiry.Equal(migratedExpiry) || !gotFirstWaitAt.Equal(migratedFirstWaitAt) || !gotDeadlineAt.Equal(migratedDeadline) {
 		t.Fatalf("rolling migration replay changed expiry/deadline: expiry=%s ledger=%s/%s; want %s and %s/%s",
 			retainedExpiry, gotFirstWaitAt, gotDeadlineAt, migratedExpiry, migratedFirstWaitAt, migratedDeadline)
+	}
+}
+
+func TestPostgresModelBudgetCapacityDeadlineMigrationRejectsUnmatchedLegacyCheckpoint(t *testing.T) {
+	f, fence, request := modelBudgetCapacityWaitFixture(t, 1000, 5)
+	ctx := context.Background()
+	if err := f.store.WaitForTaskModelBudgetCapacity(ctx, request); err != nil {
+		t.Fatalf("persist legacy capacity waiter: %v", err)
+	}
+	confirmCapacityWaitAgentStopped(t, f, fence, 129)
+	if _, err := f.store.pool.Exec(ctx, `UPDATE model_budget_capacity_call_deadlines SET slot_reserved_at=NULL
+WHERE owner_id=$1 AND budget_call_id=$2`, f.ownerID, request.BudgetCallID); err != nil {
+		t.Fatalf("release capacity slot before rolling schema back: %v", err)
+	}
+	if _, err := f.store.pool.Exec(ctx, `DELETE FROM model_budget_capacity_call_deadlines WHERE owner_id=$1 AND budget_call_id=$2`,
+		f.ownerID, request.BudgetCallID); err != nil {
+		t.Fatalf("remove deadline marker before simulating the legacy schema: %v", err)
+	}
+	provider, closeProvider, err := newMigrationProvider(f.store.pool)
+	if err != nil {
+		t.Fatalf("open migration provider before legacy-schema simulation: %v", err)
+	}
+	if _, err := provider.DownTo(ctx, 269); err != nil {
+		closeProvider()
+		t.Fatalf("roll back deadline migration before legacy-schema simulation: %v", err)
+	}
+	closeProvider()
+	simulatePublished269CapacityWaitSchema(t, f.store.pool)
+	if _, err := f.store.pool.Exec(ctx, `UPDATE model_budget_capacity_waits
+SET agent_session_id='missing_checkpoint_session' WHERE task_id=$1`, fence.TaskID); err != nil {
+		t.Fatalf("make the legacy checkpoint evidence unavailable: %v", err)
+	}
+	provider, closeProvider, err = newMigrationProvider(f.store.pool)
+	if err != nil {
+		t.Fatalf("open migration provider for fail-closed check: %v", err)
+	}
+	if _, err := provider.UpTo(ctx, 270); err == nil {
+		closeProvider()
+		t.Fatal("00270 accepted a legacy waiter without an exact checkpoint proof")
+	}
+	closeProvider()
+	var version270Applied, deadlineTable, digestColumn bool
+	var waitRows int
+	if err := f.store.pool.QueryRow(ctx, `SELECT
+ EXISTS(SELECT 1 FROM goose_db_version WHERE version_id=270 AND is_applied),
+ to_regclass('model_budget_capacity_call_deadlines') IS NOT NULL,
+ EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema=current_schema()
+   AND table_name='model_budget_capacity_waits' AND column_name='checkpoint_digest'),
+ (SELECT count(*) FROM model_budget_capacity_waits WHERE task_id=$1)`, fence.TaskID).
+		Scan(&version270Applied, &deadlineTable, &digestColumn, &waitRows); err != nil {
+		t.Fatalf("read state after rejected legacy migration: %v", err)
+	}
+	if version270Applied || deadlineTable || digestColumn || waitRows != 1 {
+		t.Fatalf("failed legacy migration changed durable state: version270=%t deadline_table=%t digest_column=%t wait_rows=%d",
+			version270Applied, deadlineTable, digestColumn, waitRows)
+	}
+}
+
+func simulatePublished269CapacityWaitSchema(t *testing.T, pool interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(), `DROP INDEX IF EXISTS model_budget_capacity_waits_owner_fair`); err != nil {
+		t.Fatalf("remove post-deployment fairness index: %v", err)
+	}
+	if _, err := pool.Exec(context.Background(), `ALTER TABLE model_budget_capacity_waits
+DROP COLUMN checkpoint_digest, DROP COLUMN last_reconciled_at`); err != nil {
+		t.Fatalf("recreate published 00269 waiter schema: %v", err)
 	}
 }
 

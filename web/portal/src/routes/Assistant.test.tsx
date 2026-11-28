@@ -5441,23 +5441,89 @@ describe('Assistant durable tasks', () => {
     expect(screen.getByRole('textbox', { name: '消息内容' })).toBeEnabled();
   });
 
-  it('keeps an unverified result in Task details without adding a chat bubble or button', async () => {
+  it('shows a safe assistant reply for an unverified result when the published marker has no visible message', async () => {
     const source = { ...message, actor_id: authUser.id } as ConversationMessage;
     const attentionTask = {
       ...task, status: 'waiting_user' as const, result: null, waiting_reason: 'dsh_recovery_unresolved',
-      finished_at: null, event_sequence: 8,
+      finished_at: null, event_sequence: 8, result_message_published: true,
       attention: { kind: 'result_unverified', reason: 'do-not-display-provider-diagnostic', action: null, event_sequence: 8 },
     } as unknown as Task;
     mockCommon({ conversations: [conversation], messages: [source], tasks: [attentionTask] });
     vi.spyOn(portalApi, 'task').mockResolvedValue(attentionTask);
     renderPage();
 
-    expect(screen.queryByRole('status', { name: '任务状态：结果待核对' })).not.toBeInTheDocument();
+    const replyBubble = await screen.findByRole('status', { name: 'Morde 的回复' });
+    expect(within(replyBubble).getByText(/任务记录显示，模型服务未返回可确认的答复/)).toBeInTheDocument();
+    expect(within(replyBubble).getByText(/不能确认任务已经完成，也不会自动重复可能产生副作用的操作/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '查看任务详情' })).toBeInTheDocument();
     expect(screen.queryByText('do-not-display-provider-diagnostic')).not.toBeInTheDocument();
     const activity = await findTaskActivity(task.id);
     expect(activity.querySelector('.task-activity-status')).toHaveTextContent('结果待核对');
     expect(document.querySelector('.chat-message-task-attention')).not.toBeInTheDocument();
     expect(within(activity).queryByRole('button', { name: /暂停任务|停止任务|补充任务|再试一次/u })).not.toBeInTheDocument();
+  });
+
+  it('does not duplicate an unverified-result reply when its applied assistant message is visible', async () => {
+    const source = { ...message, actor_id: authUser.id } as ConversationMessage;
+    const terminalReply = { ...reply, task_id: task.id, delivery_status: 'applied' as const };
+    const attentionTask = {
+      ...task, status: 'waiting_user' as const, result: null, waiting_reason: 'dsh_recovery_unresolved',
+      finished_at: null, event_sequence: 8, result_message_published: true,
+      attention: { kind: 'result_unverified', reason: 'outcome_unknown', action: null, event_sequence: 8 },
+    } as unknown as Task;
+    mockCommon({ conversations: [conversation], messages: [source, terminalReply], tasks: [attentionTask] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(attentionTask);
+    renderPage();
+
+    expect(await screen.findByText('你好！')).toBeInTheDocument();
+    expect(screen.queryByRole('group', { name: 'Morde 的任务结果说明' })).not.toBeInTheDocument();
+  });
+
+  it('replaces the unverified-result fallback when the applied assistant message arrives later', async () => {
+    const source = { ...message, actor_id: authUser.id } as ConversationMessage;
+    const attentionTask = {
+      ...task, status: 'waiting_user' as const, result: null, waiting_reason: 'dsh_recovery_unresolved',
+      finished_at: null, event_sequence: 8, result_message_published: true,
+      attention: { kind: 'result_unverified', reason: 'outcome_unknown', action: null, event_sequence: 8 },
+    } as unknown as Task;
+    mockCommon({ conversations: [conversation], messages: [source], tasks: [attentionTask] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(attentionTask);
+    const { client } = renderPage();
+
+    expect(await screen.findByRole('status', { name: 'Morde 的回复' })).toBeInTheDocument();
+    const queryKey = ['conversation-messages', conversation.id] as const;
+    await waitFor(() => expect(client.getQueryData(queryKey)).toBeDefined());
+    const current = client.getQueryData<{ pages: Array<{ items: ConversationMessage[] }>; pageParams: unknown[] }>(queryKey);
+    expect(current).toBeDefined();
+    const terminalReply = { ...reply, id: 'm7654333', sequence: 3, content: '真实诊断回复已送达。',
+      task_id: task.id, delivery_status: 'applied' as const };
+
+    act(() => client.setQueryData(queryKey, {
+      ...current!,
+      pages: current!.pages.map((page, index) => index === 0
+        ? { ...page, items: [...page.items, terminalReply] }
+        : page),
+    }));
+
+    expect(await screen.findByText('真实诊断回复已送达。')).toBeInTheDocument();
+    expect(screen.queryByRole('status', { name: 'Morde 的回复' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('group', { name: 'Morde 的任务结果说明' })).not.toBeInTheDocument();
+    expect(screen.getAllByRole('article', { name: 'Morde 的回复' })).toHaveLength(1);
+  });
+
+  it('does not attach an unverified-result reply to another user’s message', async () => {
+    const otherUserMessage = { ...message, actor_id: 'u7654321' } as ConversationMessage;
+    const attentionTask = {
+      ...task, status: 'waiting_user' as const, result: null, waiting_reason: 'dsh_recovery_unresolved',
+      finished_at: null, event_sequence: 8, result_message_published: true,
+      attention: { kind: 'result_unverified', reason: 'outcome_unknown', action: null, event_sequence: 8 },
+    } as unknown as Task;
+    mockCommon({ conversations: [conversation], messages: [otherUserMessage], tasks: [attentionTask] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(attentionTask);
+    renderPage();
+
+    await screen.findByRole('article', { name: '你的消息' });
+    expect(screen.queryByRole('group', { name: 'Morde 的任务结果说明' })).not.toBeInTheDocument();
   });
 
   it('offers a fenced model recovery retry only for the current server-confirmed retry snapshot', async () => {

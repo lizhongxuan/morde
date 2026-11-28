@@ -149,6 +149,108 @@ WHERE id=$1 AND task_id=$2 AND role='assistant' AND content=$3`, messageID, read
 	}
 }
 
+func TestPostgresTaskTerminalDeliveryWaitingReplyPublishesOnceAfterTokenExpiry(t *testing.T) {
+	f := newAgentLifecycleFixture(t)
+	ctx := context.Background()
+	if _, err := f.store.pool.Exec(ctx, `UPDATE tasks SET model_id='p1234567' WHERE id=$1`, f.request.Fence.TaskID); err != nil {
+		t.Fatalf("set Task model identity for delivery facts: %v", err)
+	}
+	sequence := commitTaskTerminalDeliveryWaiting(t, f, "dsh_recovery_unresolved")
+	if _, err := f.store.pool.Exec(ctx, `UPDATE tasks SET auth_expires_at=clock_timestamp()-interval '1 second' WHERE id=$1`,
+		f.request.Fence.TaskID); err != nil {
+		t.Fatalf("expire the Task authorization snapshot after queuing: %v", err)
+	}
+	if _, err := f.store.pool.Exec(ctx, `UPDATE tokens SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1 AND owner_id=$2`,
+		f.principal.TokenID, f.principal.UserID); err != nil {
+		t.Fatalf("expire the original authorization token after queuing: %v", err)
+	}
+
+	claims, err := f.store.ClaimTaskTerminalDeliverySources(ctx, "terminal-expired-token-publisher", 30*time.Second, 1)
+	if err != nil || len(claims) != 1 {
+		t.Fatalf("claim waiting delivery after token expiry: claims=%+v err=%v", claims, err)
+	}
+	claim := claims[0]
+	if claim.SourceKind != app.TaskTerminalDeliverySourceWaiting || claim.SourceEventSequence != sequence ||
+		claim.TaskID != f.request.Fence.TaskID || claim.OwnerID != f.principal.UserID || claim.InitiatorID != f.principal.UserID {
+		t.Fatalf("waiting delivery identity changed after token expiry: %+v", claim)
+	}
+	facts, found, err := f.store.ReadTaskTerminalDeliverySourceFacts(ctx, claim)
+	if err != nil || !found || !app.ValidTaskTerminalDeliverySourceFacts(claim, facts) {
+		t.Fatalf("read waiting delivery facts after token expiry: found=%t err=%v facts=%+v", found, err, facts)
+	}
+	if facts.WaitingReason != "reconciliation_required" {
+		t.Fatalf("waiting reason was not kept within the safe public vocabulary: %q", facts.WaitingReason)
+	}
+
+	const replyText = "这次任务没有形成可核实的答复。现有记录无法确定具体的中断原因，也无法确认上一步操作是否完成。执行进度保留在任务详情中。"
+	sealer, err := app.NewSealer(bytes.Repeat([]byte{0x3b}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ciphertext, err := app.SealTaskTerminalDeliveryReply(sealer, claim, app.TaskTerminalDeliveryReply{
+		Kind: app.TaskTerminalDeliveryReplySystemState,
+		Text: replyText,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready, changed, err := f.store.PersistTaskTerminalDeliveryReplyReady(ctx, claim, ciphertext)
+	if err != nil || !changed || ready.State != TaskTerminalDeliveryStateReplyReady {
+		t.Fatalf("persist waiting explanation after token expiry: ready=%+v changed=%t err=%v", ready, changed, err)
+	}
+	published, messageID, err := f.store.PublishTaskTerminalDeliveryReply(ctx, ready, replyText)
+	if err != nil || !published || !domain.ValidMessageID(messageID) {
+		t.Fatalf("publish waiting explanation after token expiry: published=%t message=%q err=%v", published, messageID, err)
+	}
+	replayed, replayMessageID, err := f.store.PublishTaskTerminalDeliveryReply(ctx, ready, replyText)
+	if err != nil || replayed || replayMessageID != messageID {
+		t.Fatalf("replay waiting explanation after token expiry: published=%t message=%q err=%v", replayed, replayMessageID, err)
+	}
+
+	var messageCount int
+	if err := f.store.pool.QueryRow(ctx, `SELECT count(*) FROM conversation_messages
+WHERE id=$1 AND task_id=$2 AND owner_id=$3 AND actor_id=$4 AND conversation_id=$5
+  AND role='assistant' AND source_kind='task' AND delivery_status='applied' AND content=$6`,
+		messageID, claim.TaskID, claim.OwnerID, claim.InitiatorID, claim.ConversationID, replyText).Scan(&messageCount); err != nil {
+		t.Fatal(err)
+	}
+	if messageCount != 1 {
+		t.Fatalf("waiting explanation messages=%d, want exactly one bound to the original conversation", messageCount)
+	}
+	var state, storedMessageID string
+	if err := f.store.pool.QueryRow(ctx, `SELECT state,published_message_id FROM task_terminal_delivery_outbox WHERE id=$1`,
+		claim.DeliveryID).Scan(&state, &storedMessageID); err != nil {
+		t.Fatal(err)
+	}
+	if state != TaskTerminalDeliveryStatePublished || storedMessageID != messageID {
+		t.Fatalf("waiting delivery state=%q message=%q, want published message %q", state, storedMessageID, messageID)
+	}
+}
+
+func TestPostgresTaskTerminalDeliveryStillInvalidatesAfterInstallationRevocation(t *testing.T) {
+	f := newAgentLifecycleFixture(t)
+	ctx := context.Background()
+	commitTaskTerminalDeliveryWaiting(t, f, "dsh_recovery_unresolved")
+	claims, err := f.store.ClaimTaskTerminalDeliverySources(ctx, "terminal-revoked-installation", 30*time.Second, 1)
+	if err != nil || len(claims) != 1 {
+		t.Fatalf("claim waiting delivery before revocation: claims=%+v err=%v", claims, err)
+	}
+	if _, err := f.store.pool.Exec(ctx, `UPDATE client_installations SET revoked_at=clock_timestamp()
+WHERE id=$1 AND owner_id=$2`, f.principal.ClientInstallationID, f.principal.UserID); err != nil {
+		t.Fatalf("revoke the task's client installation: %v", err)
+	}
+	if _, found, err := f.store.ReadTaskTerminalDeliverySourceFacts(ctx, claims[0]); err != nil || found {
+		t.Fatalf("delivery remained authorized after installation revocation: found=%t err=%v", found, err)
+	}
+	var state string
+	if err := f.store.pool.QueryRow(ctx, `SELECT state FROM task_terminal_delivery_outbox WHERE id=$1`, claims[0].DeliveryID).Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != TaskTerminalDeliveryStateInvalidated {
+		t.Fatalf("delivery state after installation revocation=%q, want invalidated", state)
+	}
+}
+
 func TestPostgresTaskTerminalDeliveryInvalidatesAfterLaterConversationInput(t *testing.T) {
 	f := newAgentLifecycleFixture(t)
 	ctx := context.Background()
