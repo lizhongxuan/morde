@@ -34,26 +34,25 @@ func TestConversationRouteModelRequestCarriesStableLocalizedTime(t *testing.T) {
 		!strings.Contains(request.Instructions, "only on expected duration, never on the topic") ||
 		!strings.Contains(request.Instructions, "small code") ||
 		!strings.Contains(request.Instructions, "File/document create, write, export, save or delivery") ||
-		!strings.Contains(request.Instructions, "bounded direct-tool rule below") ||
+		!strings.Contains(request.Instructions, "public web search/page reading") ||
 		!strings.Contains(request.Instructions, conversationRouteDirectToolInstructions) ||
 		!strings.Contains(request.Instructions, "delegation requires a Task") ||
 		!strings.Contains(request.Instructions, "smallest exact question") {
 		t.Fatalf("direct chat and time rules missing from router instructions: %s", request.Instructions)
 	}
-	if !strings.Contains(request.Instructions, `"tool_arguments":{"query":"..."}`) ||
-		!strings.Contains(request.Instructions, "never a quoted JSON string") ||
+	if !strings.Contains(request.Instructions, `{"action":"new","acknowledge":true}`) ||
+		!strings.Contains(request.Instructions, "Leave tool_name and tool_arguments empty") ||
 		!strings.Contains(request.Instructions, "Include only fields relevant to the selected action") {
 		t.Fatalf("JSON examples do not match the action-scoped tool schema: %s", request.Instructions)
 	}
 }
 
-func TestConversationRouteDirectSearchUsesObjectToolArguments(t *testing.T) {
+func TestConversationRouteSearchIntentUsesDSHTaskAgent(t *testing.T) {
 	value := ConversationRouteContext{ActorID: "u1234567", Content: "搜索 DeepSeek 官方网站并核实链接。"}
 	output := `{"action":"tool","tool_name":"morde_web_search","tool_arguments":{"query":"DeepSeek 官方网站"}}`
 	decision := ParseConversationRouteDecisionForContext(output, value)
-	if decision.InvalidOutput || decision.Action != ConversationRouteTool || decision.ToolName != "morde_web_search" ||
-		decision.ToolArguments != `{"query":"DeepSeek 官方网站"}` {
-		t.Fatalf("valid direct search response was rejected: %+v", decision)
+	if decision.InvalidOutput || decision.Action != ConversationRouteNew || !decision.Acknowledge || decision.ToolName != "" || decision.ToolArguments != "" {
+		t.Fatalf("valid search intent was not assigned to the DSH Task Agent: %+v", decision)
 	}
 	quotedArguments := `{"action":"tool","tool_name":"morde_web_search","tool_arguments":"{\"query\":\"DeepSeek 官方网站\"}"}`
 	decision = ParseConversationRouteDecisionForContext(quotedArguments, value)
@@ -249,8 +248,8 @@ func TestConversationRouteModelRequestsUseConsistentJSONFieldContract(t *testing
 				`Use "required" only when the user requests a file to be delivered, downloaded, exported, or saved, or a Workspace artifact`,
 				`Empty string means no explicit override`,
 				conversationRouteExplicitNewInstructions,
-				`Only action "tool" may set tool_name/tool_arguments`,
-				`Tool calls require the bounded direct-tool rule below`,
+				`Leave tool_name and tool_arguments empty`,
+				`choose action "new" so the DSH Task Agent`,
 				`Actions:`,
 			} {
 				if !strings.Contains(prompt.instructions, required) {
@@ -778,7 +777,7 @@ func TestConversationRouteModelActionIsPreservedAcrossSemanticRewrites(t *testin
 		{name: "status paraphrase", content: "这件事目前到哪一步了？", output: `{"action":"status","task_id":"q1234567"}`, want: ConversationRouteStatus},
 		{name: "stop paraphrase", content: "把这项工作结束掉。", output: `{"action":"stop","task_id":"q1234567"}`, want: ConversationRouteStop},
 		{name: "stop all paraphrase", content: "把还没有结束的工作全部撤掉。", output: `{"action":"stop_all"}`, want: ConversationRouteStopAll},
-		{name: "tool paraphrase", content: "请帮我查找日本央行利率政策的公开网页", output: `{"action":"tool","tool_name":"morde_web_search","tool_arguments":{"query":"日本央行利率政策"}}`, want: ConversationRouteTool},
+		{name: "tool paraphrase", content: "请帮我查找日本央行利率政策的公开网页", output: `{"action":"tool","tool_name":"morde_web_search","tool_arguments":{"query":"日本央行利率政策"}}`, want: ConversationRouteNew},
 		{name: "news routes to multi-step task", content: "帮我搜索今天的 AI 新闻", output: `{"action":"new","explicit_new":false,"dependency_task_ids":[]}`, want: ConversationRouteNew},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -803,8 +802,8 @@ func TestConversationRouteModelActionIsPreservedAcrossSemanticRewrites(t *testin
 		"有没有关于日本央行利率政策的最新公开信息？",
 	} {
 		decision := ParseConversationRouteDecisionForContext(toolOutput, ConversationRouteContext{ActorID: "u1234567", Content: content})
-		if decision.Action != ConversationRouteTool {
-			t.Errorf("same structured tool action changed for semantic rephrase %q: %+v", content, decision)
+		if decision.Action != ConversationRouteNew {
+			t.Errorf("lookup intent did not reach DSH Task Agent for semantic rephrase %q: %+v", content, decision)
 		}
 	}
 }
@@ -1072,7 +1071,7 @@ func TestConversationRouteDirectReplyRequiresValidTargetlessText(t *testing.T) {
 	}
 }
 
-func TestConversationRouteDirectToolIsExplicitAndReadOnly(t *testing.T) {
+func TestConversationRouteWebLookupUsesTaskAgentAndSynthesis(t *testing.T) {
 	value := ConversationRouteContext{ActorID: "u1234567", Content: "请搜索公开网站关于日本央行利率政策的说明页"}
 	for _, test := range []struct {
 		name   string
@@ -1083,18 +1082,18 @@ func TestConversationRouteDirectToolIsExplicitAndReadOnly(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			decision := ParseConversationRouteDecisionForContext(test.output, value)
-			if decision.Action != ConversationRouteTool || decision.ToolName == "" ||
-				!ValidConversationRouteDirectToolCall(decision.ToolName, json.RawMessage(decision.ToolArguments)) || decision.ModelOutput != test.output {
-				t.Fatalf("valid direct read-only tool call was rejected: %+v", decision)
+			if decision.Action != ConversationRouteNew || !decision.Acknowledge || decision.ToolName != "" ||
+				decision.ToolArguments != "" || decision.ModelOutput != test.output {
+				t.Fatalf("valid lookup intent was not handed to the DSH Task Agent: %+v", decision)
 			}
 		})
 	}
 	request, err := ConversationRouteModelRequest(value)
 	if err != nil || !strings.Contains(request.Instructions, `"tool_name"`) ||
-		!strings.Contains(request.Instructions, `"morde_web_search"`) || !strings.Contains(request.Instructions, `action "tool"`) ||
-		!strings.Contains(request.Instructions, `For news, current/recent/latest facts`) ||
-		!strings.Contains(request.Instructions, `use action "new"`) {
-		t.Fatalf("direct tool contract missing from model request: err=%v instructions=%s", err, request.Instructions)
+		!strings.Contains(request.Instructions, `choose action "new"`) ||
+		!strings.Contains(request.Instructions, `DSH Task Agent`) ||
+		strings.Contains(request.Instructions, `one-call search`) {
+		t.Fatalf("DSH lookup handoff contract missing or direct shortcut still advertised: err=%v instructions=%s", err, request.Instructions)
 	}
 	if ValidConversationRouteDirectToolCall(cloudDSHWebSearchToolName,
 		json.RawMessage(`{"query":"AI news","category":"news","time_range":"day"}`)) {
@@ -1119,8 +1118,8 @@ func TestConversationRouteDirectToolIsExplicitAndReadOnly(t *testing.T) {
 	mixedControl := value
 	mixedControl.Content += "，顺便停止当前任务"
 	decision := ParseConversationRouteDecisionForContext(`{"action":"tool","tool_name":"morde_web_search","tool_arguments":{"query":"日本央行利率政策"}}`, mixedControl)
-	if decision.Action != ConversationRouteTool {
-		t.Fatalf("text control keywords vetoed a structurally valid model tool action: %+v", decision)
+	if decision.Action != ConversationRouteNew || !decision.Acknowledge {
+		t.Fatalf("valid lookup intent was not delegated to DSH Task Agent: %+v", decision)
 	}
 	truncatedDigest := sha256.Sum256([]byte(value.Content))
 	for _, restricted := range []struct {

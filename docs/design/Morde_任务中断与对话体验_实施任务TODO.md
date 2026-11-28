@@ -84,6 +84,7 @@
 - [x] 终态投递错误日志记录稳定 `failure_code`、stage 与现有追踪字段，不记录原始错误文本；增加安全字段单测。
 - [x] 增加 receipt 到 route claim 的等待时长，以及 DSH route 分类耗时直方图；使用无 ID 标签的低基数指标。
 - [ ] 已部署后端诊断日志并读取到线上 `read_source_facts / invalid_argument`。根因是普通长度的 Task 目标带结尾换行，模型摘要校验拒绝；本地修复及隔离 PostgreSQL 回归通过。待发布修复后确认 DSH 收到白名单事实，并只向原会话发布一条有真实原因差异的解释气泡。
+- [x] 路由模型兼容返回内置 search/read tool 意图时，统一转成普通 DSH Task 并请求受理标记；不再把 Broker 原始输出直接发布成助手答复。正常 Task 由 DSH Agent 执行工具和综合结果，失败走 DSH 安全事实终态回告。应用解析与 PostgreSQL 路由用例通过；实际 PC 工具派发与最终合成回复仍待验收。
 - [ ] 对普通短答完成 DSH 实际回复延迟验收并记录收据、claim、分类、首条持久 assistant 消息的时间。当前只有 receipt 和分类耗时指标，没有 first-delta 持久流；需实现有界增量写入及断线续读后再验收流式速度。
 - [ ] 在实际 `morde-pc` 验证普通问答真实模型回复、一个只读工具请求和一个明确后台任务的进度/最终结果；检查现有 DSH 工具、MCP、子 Agent 和授权边界，不增加第二套 Agent Runtime。
 
@@ -177,3 +178,12 @@
 - 本地修复：只有 `InternalTool` 且 revision 两侧都缺失时使用其持久 fence revision 0；普通 Task 仍要求 revision 已存在且一致。实际 Task 存储集成用例验证隐藏 Task 从路由写入、队列 claim、单次 Broker 调用到原会话助手消息完成；本地 PostgreSQL 通过 `TestConversationRouteDirectToolPersistsHiddenBrokerTask`。还通过 `go test ./internal/app -count=1`、`go test ./internal/worker -run 'Test(CloudDSHModelBudget|ConversationRouteInternalTool|CloudDSHCoordinatorRunsMatchingTextOnlyTurn)' -count=1`、`go test ./internal/store/postgres -run '^TestConversationRouteDirectToolPersistsHiddenBrokerTask$|^TestPostgresAdaptiveCompactionBudgetPlannerUsesSummaryStageAndSettlesOneOutputCap$' -count=1`、`git diff --check`。
 - 同轮核对 DSH compaction 模型预算协议：Runtime 会声明 `purpose=compaction`，Portal adapter 丢掉它造成摘要被短答 stage 预算。现改为只允许 `compaction` 枚举并转成 summary stage；PostgreSQL 集成用例通过。此项修正摘要预算，不宣称修复完整长会话质量。
 - 下一步：部署内部工具 revision 修复，再用 `morde-pc` 在全新旁聊重跑只读搜索，并跑一条真实 DSH 长任务；核对工具账本恰好一次、搜索结果由模型综合后回到原对话、任务状态/结果一致、消息在当前会话自动显现。随后记录端到端阶段时间。当前补丁尚未部署，T07/T08 继续进行中；Taskless 持久增量流、Worker 全量包、旧任务安全反例与灰度 cohort/基线仍未验收，自动恢复保持关闭。
+
+### 2026-11-28 续验（搜索由 DSH Agent 总结）
+
+- 设计决策：移除新请求的“路由模型选工具 → Broker 原样回发”捷径。公开搜索和网页读取统一创建普通 DSH Task，让 Task Agent 调用现有授权工具、核实来源并组织答案；失败由现有 DSH 安全事实终态回告链路解释并回到原对话。工具意图转为后台任务时立即请求确认标记，用户可见受理状态；确认标记不是完成答复。
+- 修复：结构化路由即使收到兼容旧模型的 `action=tool` 结果，也只在上下文完整且参数合法时转为 `action=new`；不持久化隐藏直连工具 Task、不展示工具原始输出。上下文不完整或参数非法仍澄清；普通文字快答保持单次 DSH 路由。
+- 自动化通过：`go test ./internal/app -count=1`（34.5 秒）；PostgreSQL `go test ./internal/store/postgres -run '^TestConversationRouteModelToolDecisionRoutesLookupToDSHTask$' -count=1`；Worker `go test ./internal/worker -run '^(TestDSHSearchThenReadCompletesThroughWorkerWithSourceDate|TestDSHSearchToolCompletesThroughWorkerAndPersistsOperation)$' -count=1`。PostgreSQL 用例确认工具意图写成正常队列 Task、请求了确认标记、没有隐藏 direct-tool Task；Worker 用例确认 DSH 搜索/读取可实际合成带来源答案并持久化一次工具操作。
+- 服务器只读核对：`morde-portal.service` active、healthz 返回 `ok`，但 `/opt/morde-src` 当前仍是 `release@8c46fee0`，尚未包含本轮改动。未向旧会话重放失败任务；本地分支 HEAD 为 `release@ca897b29`。
+- 待验收：合并并部署本轮路由修复后，用实际 `morde-pc` 新建旁聊执行一个真实只读搜索和一个普通快答，观察收到状态、正常 DSH Task、MCP operation 恰好一次、AI 综合答复回到原会话，并记录阶段时间。目前没有真实 PC 证据，也没有实现 Taskless 持久 token 流；因此不宣称搜索回复已修复或延迟已满足。
+- T07/T08 继续进行中；错误气泡/真实 AI 失败解释、PC 快答与搜索端到端、延迟样本、Worker 全量失败项、安全恢复反例及灰度 cohort/基线仍需分别验收。自动恢复保持关闭。

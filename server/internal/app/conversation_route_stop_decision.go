@@ -16,7 +16,7 @@ func ValidConversationRouteStopDecision(value ConversationRouteContext, decision
 		return false
 	}
 	parsed := parseConversationRouteDecision(decision.ModelOutput, value.Content, value.Candidates, value.RequestCandidates,
-		value.AggregationCandidates, value.ReferenceUnavailable)
+		value.AggregationCandidates, value.ReferenceUnavailable, false)
 	return !parsed.InvalidOutput && parsed.Action == decision.Action && parsed.TaskID == decision.TaskID &&
 		parsed.TargetMessageID == decision.TargetMessageID && parsed.ExpectedRevision == decision.ExpectedRevision
 }
