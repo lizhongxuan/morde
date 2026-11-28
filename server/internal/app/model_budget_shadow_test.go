@@ -209,22 +209,24 @@ func TestTaskModelBudgetShadowUsesAdaptiveProtocolCapacityAboveLegacyLimit(t *te
 	}
 }
 
-func TestTaskModelBudgetShadowDoesNotGuessRootTextOnlyStage(t *testing.T) {
+func TestTaskModelBudgetShadowUsesNeutralRootTextOnlyStage(t *testing.T) {
 	run := newModelBudgetShadowTestRun(t, "session-child", modelBudgetShadowTestPreview(900), nil, 1, nil)
 	response := run.complete(t)
 
-	if response.Text == "" || run.client.calls != 1 || run.store.reserveN != 1 || run.store.dispatchN != 1 || run.store.previewN != 0 {
-		t.Fatalf("unknown-stage shadow blocked or previewed a normal Task call: response=%+v provider=%d reserve=%d dispatch=%d preview=%d",
+	if response.Text == "" || run.client.calls != 1 || run.store.reserveN != 1 || run.store.dispatchN != 1 || run.store.previewN != 1 {
+		t.Fatalf("root-text shadow did not remain observational: response=%+v provider=%d reserve=%d dispatch=%d preview=%d",
 			response, run.client.calls, run.store.reserveN, run.store.dispatchN, run.store.previewN)
 	}
 	if len(run.observations) != 2 {
-		t.Fatalf("unknown-stage plan and result observations = %d, want 2: %+v", len(run.observations), run.observations)
+		t.Fatalf("root-text plan and result observations = %d, want 2: %+v", len(run.observations), run.observations)
 	}
-	for _, observation := range run.observations {
-		if observation.Stage != modelBudgetShadowStageUnknown || observation.BlockReason != modelBudgetShadowStageUnknown ||
-			observation.Outcome != "blocked" {
-			t.Fatalf("root text-only stage was guessed instead of marked unknown: %+v", observation)
-		}
+	plan, result := run.observations[0], run.observations[1]
+	if plan.Stage != string(modelOutputBudgetStageRootTextOnly) || plan.Outcome != "calculated" ||
+		plan.GoalTokens != 4_096 || plan.MinimumTokens != 512 || plan.SafeTokens != 900 || plan.SendTokens != 900 {
+		t.Fatalf("root-text stage did not preserve structural semantics and exact-route policy: %+v", plan)
+	}
+	if result.Stage != plan.Stage || result.Phase != "result" || result.UsageKnown != true {
+		t.Fatalf("root-text result observation does not match plan: plan=%+v result=%+v", plan, result)
 	}
 }
 

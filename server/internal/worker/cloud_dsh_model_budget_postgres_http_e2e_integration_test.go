@@ -467,7 +467,7 @@ capability_tools=false,capability_vision=false WHERE id=$1`, connection.ID); err
 		t.Fatal(err)
 	}
 	stages := []app.ModelOutputBudgetStageDefinition{
-		{Stage: "short_answer", GoalTokens: outputCap, MinimumTokens: 64},
+		{Stage: "root_text_only", GoalTokens: outputCap, MinimumTokens: 64},
 		{Stage: "tool_step", GoalTokens: outputCap, MinimumTokens: 64},
 		{Stage: "subtask", GoalTokens: outputCap, MinimumTokens: 64},
 		{Stage: "summary", GoalTokens: outputCap, MinimumTokens: 64},
@@ -826,7 +826,7 @@ capability_tools=false,capability_vision=false WHERE id=$1`, connection.ID); err
 		t.Fatal(err)
 	}
 	stages := []app.ModelOutputBudgetStageDefinition{
-		{Stage: "short_answer", GoalTokens: outputCap, MinimumTokens: 64},
+		{Stage: "root_text_only", GoalTokens: outputCap, MinimumTokens: 64},
 		{Stage: "tool_step", GoalTokens: outputCap, MinimumTokens: 64},
 		{Stage: "subtask", GoalTokens: outputCap, MinimumTokens: 64},
 		{Stage: "summary", GoalTokens: summaryCap, MinimumTokens: 64},
@@ -1323,7 +1323,7 @@ capability_tools=false,capability_vision=false WHERE id=$1`, connection.ID); err
 		t.Fatal(err)
 	}
 	stages := []app.ModelOutputBudgetStageDefinition{
-		{Stage: "short_answer", GoalTokens: outputCap, MinimumTokens: 128},
+		{Stage: "root_text_only", GoalTokens: outputCap, MinimumTokens: 128},
 		{Stage: "tool_step", GoalTokens: outputCap, MinimumTokens: 128},
 		{Stage: "subtask", GoalTokens: outputCap, MinimumTokens: 128},
 		{Stage: "summary", GoalTokens: outputCap, MinimumTokens: 128},
@@ -1565,7 +1565,7 @@ capability_tools=false,capability_vision=false WHERE id=$1`, connection.ID); err
 		t.Fatal(err)
 	}
 	stages := []app.ModelOutputBudgetStageDefinition{
-		{Stage: "short_answer", GoalTokens: outputCap, MinimumTokens: 64},
+		{Stage: "root_text_only", GoalTokens: outputCap, MinimumTokens: 64},
 		{Stage: "tool_step", GoalTokens: outputCap, MinimumTokens: 64},
 		{Stage: "subtask", GoalTokens: outputCap, MinimumTokens: 64},
 		{Stage: "summary", GoalTokens: outputCap, MinimumTokens: 64},

@@ -125,10 +125,10 @@ func modelBudgetShadowStage(fence *ModelTaskFence, request ModelRequest) string 
 			return string(modelOutputBudgetStageToolStep)
 		}
 	}
-	// A root-session text-only request might be a short answer, a summary, a
-	// long-form response, or a continuation. The current DSH frame does not
-	// carry trustworthy stage metadata, so do not infer a phase from its prompt.
-	return modelBudgetShadowStageUnknown
+	// The root/no-tool shape is trustworthy, but it does not say whether the
+	// requested answer is short or long. Keep that distinction out of prompt
+	// heuristics and let the exact-route policy define a neutral root-text goal.
+	return string(modelOutputBudgetStageRootTextOnly)
 }
 
 func (s *ModelGatewayService) planTaskModelBudgetShadow(ctx context.Context, call ModelCall,

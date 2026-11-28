@@ -191,7 +191,7 @@ func (s *ModelGatewayService) SupportsTaskModelBudgetAdmission(ctx context.Conte
 	if routeKey == "" {
 		return false, nil
 	}
-	_, _, err = s.modelOutputBudgetStrategyForStage(routeKey, string(modelOutputBudgetStageShortAnswer))
+	_, _, err = s.modelOutputBudgetStrategyForStage(routeKey, string(modelOutputBudgetStageRootTextOnly))
 	return err == nil, nil
 }
 
@@ -367,7 +367,7 @@ func taskModelOutputBudgetStage(fence ModelTaskFence, needsTools bool, purpose s
 	if needsTools {
 		return modelOutputBudgetStageToolStep
 	}
-	return modelOutputBudgetStageShortAnswer
+	return modelOutputBudgetStageRootTextOnly
 }
 
 func (s *ModelGatewayService) waitForTaskModelBudgetCapacity(ctx context.Context, prepareErr error, fence ModelTaskFence,

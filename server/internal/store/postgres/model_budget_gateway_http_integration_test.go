@@ -179,7 +179,7 @@ max_output_catalog_version=NULL,max_output_source_url=NULL,updated_at=clock_time
 		t.Fatal(err)
 	}
 	stages := []app.ModelOutputBudgetStageDefinition{
-		{Stage: "short_answer", GoalTokens: 3072, MinimumTokens: 64},
+		{Stage: "root_text_only", GoalTokens: 3072, MinimumTokens: 64},
 		{Stage: "tool_step", GoalTokens: 3072, MinimumTokens: 64},
 		{Stage: "subtask", GoalTokens: 3072, MinimumTokens: 64},
 		{Stage: "summary", GoalTokens: 3072, MinimumTokens: 64},

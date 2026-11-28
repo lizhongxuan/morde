@@ -11,8 +11,159 @@ import (
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/project"
 	"morde/server/internal/domain/task"
 )
+
+func TestPostgresSharedProjectCapacityWaitMakesProgressUnderOtherOwnerTraffic(t *testing.T) {
+	const projectLimitMicros = int64(650)
+	ownerA, projectID, ownerAFence := newProjectBudgetTaskFixture(t, "cross-owner capacity fairness", projectLimitMicros, 10_000)
+	ownerB, ownerBWaitFence := newOtherOwnerProjectBudgetTaskFixture(t, ownerA, projectID)
+	ctx := context.Background()
+	if _, err := ownerA.store.pool.Exec(ctx, `UPDATE model_account_budgets SET token_limit=10000,max_concurrent=1 WHERE owner_id=$1`, ownerB.ownerID); err != nil {
+		t.Fatalf("configure waiting owner's independent account concurrency: %v", err)
+	}
+
+	rate := project.RateSnapshot{Provider: "budget-test", ModelID: "p1234567", Model: "test", Currency: "USD", Version: 1,
+		InputMicrosPerMillion: 1_000_000, OutputMicrosPerMillion: 1_000_000}
+	ownerBActiveFence := createSecondProjectBudgetTaskFence(t, ownerB, projectID)
+	ownerBActiveFence = setCapacityFairnessAgentID(t, ownerB, ownerBActiveFence, 100)
+	ownerBActivePreparation, rate := projectBudgetPreparationForFence(t, ownerA.store, ownerB.ownerID, projectID,
+		ownerBActiveFence, "fair-owner-b-active-plan", "fair-owner-b-active-budget", rate)
+	ownerBActivePlan, err := ownerA.store.PrepareTaskModelBudget(ctx, ownerBActivePreparation)
+	if err != nil || ownerBActivePlan.MaxOutputTokens < ownerBActivePreparation.MinimumTokens {
+		t.Fatalf("prepare waiting owner's active slot: plan=%+v err=%v", ownerBActivePlan, err)
+	}
+	ownerBActiveReservation := finalizeTestModelBudgetReservation(t, ownerBActivePreparation, ownerBActivePlan)
+	if err := ownerA.store.BeginModelCallDispatch(ctx, ownerBActiveReservation); err != nil {
+		t.Fatalf("dispatch waiting owner's active call: %v", err)
+	}
+	ownerBWaitRequest := projectCapacityFairnessWaitRequest(t, ownerBWaitFence, projectID)
+	if err := ownerA.store.WaitForTaskModelBudgetCapacity(ctx, ownerBWaitRequest); err != nil {
+		t.Fatalf("persist other owner's shared-project waiter: %v", err)
+	}
+	confirmCapacityWaitAgentStoppedWithSupervisor(t, ownerB, ownerBWaitFence, 151, "budget-multi-owner-supervisor")
+	firstWaitAt, deadlineAt := readCapacityCallDeadline(t, ownerA, ownerB.ownerID, ownerBWaitRequest.BudgetCallID)
+
+	calls := make([]app.ModelCallReservation, 0, 7)
+	for round := range 5 {
+		fence := ownerAFence
+		if round > 0 {
+			fence = createSecondProjectBudgetTaskFence(t, ownerA, projectID)
+			fence = setCapacityFairnessAgentID(t, ownerA, fence, round)
+		}
+		preparation, _ := projectBudgetPreparationForFence(t, ownerA.store, ownerA.ownerID, projectID, fence,
+			fmt.Sprintf("fair-owner-a-plan-%02d", round), fmt.Sprintf("fair-owner-a-budget-%02d", round), rate)
+		plan, err := ownerA.store.PrepareTaskModelBudget(ctx, preparation)
+		if err != nil || plan.MaxOutputTokens < preparation.MinimumTokens {
+			t.Fatalf("owner A fresh project call round %d: plan=%+v err=%v", round, plan, err)
+		}
+		if round == 4 && plan.MaxOutputTokens >= preparation.GoalTokens {
+			t.Fatalf("owner A's last request should be reduced by shared project pressure: plan=%+v", plan)
+		}
+		reservation := finalizeTestModelBudgetReservation(t, preparation, plan)
+		if err := ownerA.store.BeginModelCallDispatch(ctx, reservation); err != nil {
+			t.Fatalf("dispatch owner A project call round %d: %v", round, err)
+		}
+		calls = append(calls, reservation)
+		if err := settleCapacityFairnessProjectCall(t, ownerA.store, projectID, reservation); err != nil {
+			t.Fatalf("settle owner A project call round %d: %v", round, err)
+		}
+		result, err := ownerA.store.ReconcileTaskModelBudgetCapacityWaits(ctx, 10)
+		if err != nil || result.Deferred != 1 || result.Requeued != 0 || result.Paused != 0 {
+			t.Fatalf("reconcile other owner's waiter during traffic round %d: %+v err=%v", round, result, err)
+		}
+		assertCapacityWaitTaskState(t, ownerB, ownerBWaitFence.TaskID, string(task.StatusWaitingUser), app.TaskModelBudgetCapacityWaitReason)
+		currentFirstWaitAt, currentDeadlineAt := readCapacityCallDeadline(t, ownerA, ownerB.ownerID, ownerBWaitRequest.BudgetCallID)
+		if !currentFirstWaitAt.Equal(firstWaitAt) || !currentDeadlineAt.Equal(deadlineAt) || !deadlineAt.After(time.Now().UTC()) {
+			t.Fatalf("other owner's wait deadline changed or expired under traffic: first=%s/%s deadline=%s/%s",
+				firstWaitAt, currentFirstWaitAt, deadlineAt, currentDeadlineAt)
+		}
+	}
+
+	if err := settleCapacityFairnessProjectCall(t, ownerA.store, projectID, ownerBActiveReservation); err != nil {
+		t.Fatalf("settle waiting owner's prior active call: %v", err)
+	}
+	reconciled, err := ownerA.store.ReconcileTaskModelBudgetCapacityWaits(ctx, 10)
+	if err != nil || reconciled.Requeued != 1 || reconciled.Deferred != 0 || reconciled.Paused != 0 {
+		t.Fatalf("reconcile other owner's waiter after its slot frees: %+v err=%v", reconciled, err)
+	}
+	assertCapacityWaitTaskState(t, ownerB, ownerBWaitFence.TaskID, string(task.StatusQueued), "")
+	if !deadlineAt.After(time.Now().UTC()) {
+		t.Fatalf("other owner's waiter missed its deadline before requeue: %s", deadlineAt)
+	}
+	claimed, found, err := ownerA.store.ClaimNextTask(ctx, "shared-project-capacity-fairness-worker", time.Minute)
+	if err != nil || !found || claimed.ID != ownerBWaitFence.TaskID || claimed.CurrentRevision == nil {
+		t.Fatalf("claim other owner's requeued Task: task=%+v found=%t err=%v", claimed, found, err)
+	}
+	resumedFence := startCapacityWaitAgentAfterClaim(t, ownerB, ownerBWaitFence, claimed,
+		"agent-shared-project-capacity-fairness", 152)
+	ownerBWaitRequest.Fence = resumedFence
+	var deadlineStillActive bool
+	if err := ownerA.store.pool.QueryRow(ctx, `SELECT deadline_at>clock_timestamp() FROM model_budget_capacity_call_deadlines
+WHERE owner_id=$1 AND task_id=$2 AND budget_call_id=$3`, ownerB.ownerID, resumedFence.TaskID, ownerBWaitRequest.BudgetCallID).
+		Scan(&deadlineStillActive); err != nil || !deadlineStillActive {
+		t.Fatalf("other owner's waiter deadline before prepare = %t err=%v", deadlineStillActive, err)
+	}
+	ownerBWaitPreparation, rate := projectBudgetPreparationForFence(t, ownerA.store, ownerB.ownerID, projectID,
+		resumedFence, "fair-owner-b-wait-plan", ownerBWaitRequest.BudgetCallID, rate)
+	ownerBWaitPlan, err := ownerA.store.PrepareTaskModelBudget(ctx, ownerBWaitPreparation)
+	if err != nil || ownerBWaitPlan.MaxOutputTokens < ownerBWaitPreparation.MinimumTokens ||
+		ownerBWaitPlan.MaxOutputTokens >= ownerBWaitPreparation.GoalTokens {
+		t.Fatalf("prepare other owner's waiting call before deadline: plan=%+v err=%v", ownerBWaitPlan, err)
+	}
+	ownerBWaitReservation := finalizeTestModelBudgetReservation(t, ownerBWaitPreparation, ownerBWaitPlan)
+	if err := ownerA.store.BeginModelCallDispatch(ctx, ownerBWaitReservation); err != nil {
+		t.Fatalf("dispatch other owner's waiting call: %v", err)
+	}
+	if err := settleCapacityFairnessProjectCall(t, ownerA.store, projectID, ownerBWaitReservation); err != nil {
+		t.Fatalf("settle other owner's waiting call: %v", err)
+	}
+	calls = append(calls, ownerBActiveReservation, ownerBWaitReservation)
+
+	var actualMicros, reservedMicros int64
+	var unknownRows int
+	if err := ownerA.store.pool.QueryRow(ctx, `SELECT
+COALESCE(sum(actual_micros) FILTER (WHERE status='settled'),0),
+COALESCE(sum(reserved_micros) FILTER (WHERE status='reserved'),0),
+count(*) FILTER (WHERE status='unknown')
+FROM project_budget_ledger WHERE project_id=$1 AND source='task'`, projectID).
+		Scan(&actualMicros, &reservedMicros, &unknownRows); err != nil {
+		t.Fatal(err)
+	}
+	if actualMicros+reservedMicros > projectLimitMicros || unknownRows != 0 {
+		t.Fatalf("shared project spend/reservations/unknown = %d/%d/%d, exceeds hard limit or leaves an unknown call",
+			actualMicros, reservedMicros, unknownRows)
+	}
+	accountTokensByOwner := make(map[string]int64)
+	for _, reservation := range calls {
+		var accountOwner, accountTask, accountState string
+		var accountInputTokens, accountOutputTokens int64
+		if err := ownerA.store.pool.QueryRow(ctx, `SELECT owner_id,task_id,state,input_tokens,output_tokens
+FROM model_call_ledger WHERE source='task' AND call_id=$1`, reservation.CallID).
+			Scan(&accountOwner, &accountTask, &accountState, &accountInputTokens, &accountOutputTokens); err != nil {
+			t.Fatalf("read account ledger attribution for %q: %v", reservation.CallID, err)
+		}
+		accountTokensByOwner[accountOwner] += accountInputTokens + accountOutputTokens
+		var projectActor, projectTask, projectStatus string
+		if err := ownerA.store.pool.QueryRow(ctx, `SELECT actor_id,task_id,status FROM project_budget_ledger
+WHERE project_id=$1 AND source='task' AND call_id=$2`, projectID, reservation.CallID).
+			Scan(&projectActor, &projectTask, &projectStatus); err != nil {
+			t.Fatalf("read project ledger attribution for %q: %v", reservation.CallID, err)
+		}
+		if accountOwner != reservation.OwnerID || accountTask != reservation.Task.TaskID || accountState != "settled" ||
+			projectActor != reservation.OwnerID || projectTask != reservation.Task.TaskID || projectStatus != "settled" {
+			t.Fatalf("cross-owner ledger attribution for %q: account=%s/%s/%s project=%s/%s/%s want owner/task=%s/%s settled",
+				reservation.CallID, accountOwner, accountTask, accountState, projectActor, projectTask, projectStatus,
+				reservation.OwnerID, reservation.Task.TaskID)
+		}
+	}
+	for ownerID, usedTokens := range accountTokensByOwner {
+		if usedTokens > 10_000 {
+			t.Fatalf("owner %s settled %d tokens beyond its 10000-token account hard limit", ownerID, usedTokens)
+		}
+	}
+}
 
 func TestPostgresModelBudgetCapacitySlotClaimProtectsFIFOWaiter(t *testing.T) {
 	f, waitingFence, waitingRequest := modelBudgetCapacityWaitFixture(t, 10_000, 1)
@@ -84,6 +235,25 @@ func TestPostgresModelBudgetCapacitySlotClaimProtectsFIFOWaiter(t *testing.T) {
 		t.Fatalf("fresh Task should acquire a later free slot after FIFO preparation: plan=%+v err=%v", freshPlan, err)
 	}
 	assertCapacityFairnessSlotMarker(t, f, waitingFence, waitingRequest.BudgetCallID, false)
+}
+
+func projectCapacityFairnessWaitRequest(t *testing.T, fence app.ModelTaskFence, projectID string) app.TaskModelBudgetCapacityWaitRequest {
+	t.Helper()
+	callID, err := app.DSHModelCallID(fence.TaskID, fence.AgentSessionID, fence.ThroughSequence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256([]byte("canonical provider request\n" + callID))
+	return app.TaskModelBudgetCapacityWaitRequest{Fence: fence, ModelID: "p1234567", ProjectID: projectID,
+		DSHCallID: callID, LedgerCallID: callID, BudgetCallID: "fair-owner-b-budget-" + fence.TaskID,
+		RequestDigest: hex.EncodeToString(digest[:]), InputTokenReservation: 50, MinimumOutputTokens: 16,
+		MinimumProjectMicros: 66, ProjectBudgetCurrency: "USD"}
+}
+
+func settleCapacityFairnessProjectCall(t *testing.T, store *Store, projectID string, reservation app.ModelCallReservation) error {
+	t.Helper()
+	return store.SettleProjectModelCall(context.Background(), app.SettleProjectModelCallCommand{ProjectID: projectID,
+		Source: app.ModelCallTask, CallID: reservation.CallID, Usage: project.Usage{InputTokens: 50, OutputTokens: 10}})
 }
 
 func setCapacityFairnessAgentID(t *testing.T, f routeActionsTestFixture, fence app.ModelTaskFence, index int) app.ModelTaskFence {

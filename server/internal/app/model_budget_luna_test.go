@@ -136,7 +136,7 @@ func modelBudgetLunaFixture(t *testing.T, modelMax, contextWindow int, goal int6
 	definition.Models[0].BaseURL = "https://api.openai.com/v1"
 	definition.Models[0].Model = "gpt-6-luna"
 	for index := range definition.Models[0].Stages {
-		if definition.Models[0].Stages[index].Stage == string(modelOutputBudgetStageShortAnswer) {
+		if definition.Models[0].Stages[index].Stage == string(modelOutputBudgetStageRootTextOnly) {
 			definition.Models[0].Stages[index].GoalTokens = goal
 		}
 	}

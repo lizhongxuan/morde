@@ -14,7 +14,7 @@ func syntheticModelOutputBudgetStrategy() ModelOutputBudgetStrategyDefinition {
 			BaseURL: testModelBudgetBaseURL,
 			Model:   testModelBudgetModel,
 			Stages: []ModelOutputBudgetStageDefinition{
-				{Stage: string(modelOutputBudgetStageShortAnswer), GoalTokens: 128, MinimumTokens: 32},
+				{Stage: string(modelOutputBudgetStageRootTextOnly), GoalTokens: 4_096, MinimumTokens: 512},
 				{Stage: string(modelOutputBudgetStageToolStep), GoalTokens: 640, MinimumTokens: 256},
 				{Stage: string(modelOutputBudgetStageSubtask), GoalTokens: 1_024, MinimumTokens: 512},
 				{Stage: string(modelOutputBudgetStageSummary), GoalTokens: 768, MinimumTokens: 256},
@@ -40,7 +40,7 @@ func TestModelOutputBudgetPolicyBindsVersionRouteAndStageToPlanInput(t *testing.
 	definition.Models[0].Stages[0].GoalTokens = 2_000_000
 
 	stageValues := map[string][2]int64{
-		string(modelOutputBudgetStageShortAnswer):      {128, 32},
+		string(modelOutputBudgetStageRootTextOnly):     {4_096, 512},
 		string(modelOutputBudgetStageToolStep):         {640, 256},
 		string(modelOutputBudgetStageSubtask):          {1_024, 512},
 		string(modelOutputBudgetStageSummary):          {768, 256},
