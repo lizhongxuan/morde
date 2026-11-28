@@ -1,12 +1,14 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
 
+	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/notification"
@@ -15,6 +17,21 @@ import (
 type notificationPageResponse struct {
 	Items      []notificationResponse `json:"items"`
 	NextCursor *string                `json:"next_cursor"`
+}
+
+type notificationUpdatesResponse struct {
+	Items   []notificationUpdateItemResponse `json:"items"`
+	Cursor  string                           `json:"cursor"`
+	HasMore bool                             `json:"has_more"`
+}
+
+type notificationUpdateItemResponse struct {
+	ID   string `json:"id"`
+	Kind string `json:"kind"`
+}
+
+type notificationIncrementalService interface {
+	Incremental(context.Context, identity.Principal, app.PageRequest) (app.NotificationUpdatePage, error)
 }
 
 type notificationResponse struct {
@@ -38,6 +55,7 @@ func (h *api) registerNotifications(group *gin.RouterGroup, service Notification
 		return
 	}
 	group.GET("/notifications", h.listNotifications(service))
+	group.GET("/notifications/incremental", h.incrementalNotifications(service))
 	group.POST("/notifications/:id/read", h.markNotificationRead(service))
 }
 
@@ -74,6 +92,40 @@ func (h *api) listNotifications(service NotificationService) gin.HandlerFunc {
 				return
 			}
 			response.Items = append(response.Items, value)
+		}
+		c.JSON(http.StatusOK, response)
+	}
+}
+
+func (h *api) incrementalNotifications(service NotificationService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		principal, ok := principalFrom(c)
+		if !ok {
+			unauthenticated(c)
+			return
+		}
+		incremental, ok := service.(notificationIncrementalService)
+		if !ok {
+			writeError(c, domain.NewError(domain.CodeNotFound, "notification updates not found"))
+			return
+		}
+		page, ok := requestPage(c)
+		if !ok {
+			return
+		}
+		result, err := incremental.Incremental(c.Request.Context(), principal, page)
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		response := notificationUpdatesResponse{Items: make([]notificationUpdateItemResponse, 0, len(result.Items)), Cursor: result.Cursor, HasMore: result.HasMore}
+		for _, item := range result.Items {
+			value, err := toNotificationResponse(principal, item)
+			if err != nil {
+				writeError(c, err)
+				return
+			}
+			response.Items = append(response.Items, notificationUpdateItemResponse{ID: value.ID, Kind: value.Kind})
 		}
 		c.JSON(http.StatusOK, response)
 	}

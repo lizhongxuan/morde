@@ -11,6 +11,14 @@ type NotificationPage struct {
 	NextCursor string
 }
 
+// NotificationUpdatePage is a bounded continuation of the durable notification stream.
+// Cursor is always returned, including on the first call that establishes a baseline.
+type NotificationUpdatePage struct {
+	Items   []notification.Notification
+	Cursor  string
+	HasMore bool
+}
+
 // NotificationStore consumes durable task events and stores owner-scoped notices.
 type NotificationStore interface {
 	ListUnprocessedNotificationEvents(context.Context, int32) ([]notification.TaskEvent, error)
@@ -18,5 +26,6 @@ type NotificationStore interface {
 	ListUnprocessedNotificationSourceEvents(context.Context, int32) ([]notification.SourceEvent, error)
 	ConsumeNotificationSourceEvent(context.Context, notification.SourceEvent, notification.Notification) (bool, error)
 	ListNotifications(context.Context, string, bool, PageRequest) (NotificationPage, error)
+	ListNotificationUpdates(context.Context, string, PageRequest) (NotificationUpdatePage, error)
 	MarkNotificationRead(context.Context, string, string) (notification.Notification, error)
 }

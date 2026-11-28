@@ -1774,6 +1774,10 @@ func TestCloudDSHToolBrokerPersistsAndReconcilesClarification(t *testing.T) {
 	if err != nil || len(definitions) != 1 || definitions[0].Name != agentAskUserToolName {
 		t.Fatalf("hostless definitions = %#v, err=%v; want only ask_user", definitions, err)
 	}
+	lockedDefinition := CloudDSHAskUserToolDefinition()
+	if definitions[0].Description != lockedDefinition.Description || !bytes.Equal(definitions[0].Parameters, lockedDefinition.Parameters) || !definitions[0].Strict {
+		t.Fatalf("clarification tool was not locked to the structured Morde definition: got=%#v want=%#v", definitions[0], lockedDefinition)
+	}
 	claimed := store.details.Task
 	call := ModelToolCall{CallID: "call_dsh_clarify", Name: agentAskUserToolName,
 		Arguments: `{"question":"Which environment should I use?"}`}
@@ -1813,6 +1817,102 @@ func TestCloudDSHToolBrokerPersistsAndReconcilesClarification(t *testing.T) {
 		store.details.Task.Usage.ToolCalls != 4 || len(store.operations) != 0 {
 		t.Fatalf("answered clarification reconcile = %#v, err=%v; usage=%d operations=%#v",
 			answer, err, store.details.Task.Usage.ToolCalls, store.operations)
+	}
+}
+
+func TestCloudDSHToolBrokerPersistsAndReconcilesStructuredClarification(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, nil)
+	store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+	fixture.executor.store = store
+	store.details.Task.HostID = ""
+	store.details.Task.Usage.ToolCalls = 3
+	broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := ModelToolCall{CallID: "call_dsh_group", Name: agentAskUserToolName, Arguments: `{"question":null,"questions":[{"id":"environment","prompt":"Which environment should I use?","type":"single_choice","required":true,"allow_skip":false,"options":[{"id":"staging","label":"Staging"},{"id":"production","label":"Production"}]},{"id":"notes","prompt":"Any other constraints?","type":"free_text","required":false,"allow_skip":true,"options":[]}]}`}
+	claimed := store.details.Task
+	first, err := broker.Execute(context.Background(), claimed, call)
+	if err != nil || first.Status != AgentToolNeedsUser {
+		t.Fatalf("structured clarification result = %#v, err=%v; want waiting user", first, err)
+	}
+	details, err := store.GetTask(context.Background(), claimed.ID, claimed.OwnerID)
+	if err != nil || details.Task.Status != task.StatusWaitingUser || details.Task.WaitingReason != "clarification_required" ||
+		details.Task.Lease.Owner != "" || details.Task.Usage.ToolCalls != 4 || len(details.ClarificationRequests) != 1 {
+		t.Fatalf("persisted structured clarification state = %#v, err=%v", details, err)
+	}
+	request := details.ClarificationRequests[0]
+	if request.TaskID != claimed.ID || request.CallID != call.CallID || request.Version != 1 ||
+		request.Question != "Which environment should I use?" || request.AnswerFormat != task.ClarificationAnswerStructured ||
+		request.Status != task.ClarificationPending || len(request.Questions) != 2 || request.Questions[0].ID != "environment" ||
+		request.Questions[1].ID != "notes" || request.Questions[1].Options == nil || len(details.ClarificationRequests) != 1 {
+		t.Fatalf("structured clarification request = %#v", request)
+	}
+	pending, err := broker.Reconcile(context.Background(), claimed, call, nil)
+	if err != nil || pending.Status != AgentToolNeedsUser || store.details.Task.Usage.ToolCalls != 4 || len(store.operations) != 0 {
+		t.Fatalf("pending structured clarification reconcile = %#v, err=%v; task=%#v operations=%#v",
+			pending, err, store.details.Task, store.operations)
+	}
+	answers := []task.ClarificationAnswer{
+		{QuestionID: "environment", OptionIDs: []string{"staging"}, Text: ""},
+		{QuestionID: "notes", OptionIDs: []string{}, Text: "Keep the current defaults."},
+	}
+	answerBytes, err := json.Marshal(struct {
+		QuestionGroupID string                     `json:"question_group_id"`
+		Version         int64                      `json:"version"`
+		Answers         []task.ClarificationAnswer `json:"answers"`
+	}{QuestionGroupID: request.ID, Version: request.Version, Answers: answers})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	responded := time.Now().UTC()
+	store.details.ClarificationRequests[0].Status = task.ClarificationAnswered
+	store.details.ClarificationRequests[0].Answer = string(answerBytes)
+	store.details.ClarificationRequests[0].AnswerFormat = task.ClarificationAnswerStructured
+	store.details.ClarificationRequests[0].RespondedAt = &responded
+	expires := time.Now().Add(time.Minute).UTC()
+	store.details.Task.Status = task.StatusRunning
+	store.details.Task.WaitingReason = ""
+	store.details.Task.Lease = task.Lease{Owner: "worker-2", Version: claimed.Lease.Version + 1, ExpiresAt: &expires}
+	resumed := store.details.Task
+	store.mu.Unlock()
+	for range 2 {
+		answerResult, err := broker.Reconcile(context.Background(), resumed, call, nil)
+		if err != nil || answerResult.Status != AgentToolSucceeded || answerResult.Output != string(answerBytes) {
+			t.Fatalf("answered structured clarification reconcile = %#v, err=%v; want persisted group answer", answerResult, err)
+		}
+	}
+	if store.details.Task.Usage.ToolCalls != 4 || len(store.details.ClarificationRequests) != 1 || len(store.operations) != 0 {
+		t.Fatalf("structured clarification replay changed Task state: task=%#v requests=%#v operations=%#v",
+			store.details.Task, store.details.ClarificationRequests, store.operations)
+	}
+}
+
+func TestCloudDSHToolBrokerRejectsChildAndUpstreamClarificationTools(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, nil)
+	store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+	fixture.executor.store = store
+	store.details.Task.HostID = ""
+	store.details.Task.AgentSessionID = "session_root"
+	broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childCall := ModelToolCall{CallID: "call_child_ask", Name: agentAskUserToolName,
+		Arguments: `{"question":"Which environment?","questions":null}`,
+		TaskFence: &ModelTaskFence{AgentSessionID: "session_child", AgentRootSessionID: "session_root"}}
+	if _, err := broker.Execute(context.Background(), store.details.Task, childCall); domain.CodeOf(err) != domain.CodeForbidden {
+		t.Fatalf("child clarification error = %v; want forbidden", err)
+	}
+	if _, err := broker.Execute(context.Background(), store.details.Task, ModelToolCall{
+		CallID: "call_upstream_ask", Name: agentAskUserQuestionToolName, Arguments: `{}`,
+	}); domain.CodeOf(err) != domain.CodeForbidden {
+		t.Fatalf("upstream clarification extension error = %v; want forbidden", err)
+	}
+	if len(store.details.ClarificationRequests) != 0 || len(store.events) != 0 || store.details.Task.Usage.ToolCalls != 0 {
+		t.Fatalf("rejected clarification tools changed Task state: task=%#v requests=%#v events=%#v",
+			store.details.Task, store.details.ClarificationRequests, store.events)
 	}
 }
 

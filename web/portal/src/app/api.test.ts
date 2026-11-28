@@ -673,6 +673,24 @@ describe('typed Portal API client', () => {
       answer: 'Use the reports directory.' });
   });
 
+  it('answers a structured clarification through the versioned route with its idempotency key', async () => {
+    let request: Request | undefined;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      request = new Request(input, init);
+      return Response.json({ task_id: 'q1234567', action: 'answer_clarification', status: 'queued', unsettled_operation_ids: [] }, { status: 202 });
+    }));
+    const body = { version: 4, answers: [
+      { question_id: 'output_format', option_ids: ['markdown'], text: '', skipped: false },
+      { question_id: 'extra_notes', option_ids: [], text: '', skipped: true },
+    ] } satisfies import('../api/schema').components['schemas']['TaskStructuredInputRequest'];
+
+    await portalApi.answerStructuredTaskClarification('q1234567', 'k7654321', body, 'structured-clarification-key');
+
+    expect(new URL(request!.url).pathname).toBe('/api/v2/tasks/q1234567/clarifications/k7654321/responses');
+    expect(request!.headers.get('Idempotency-Key')).toBe('structured-clarification-key');
+    expect(await request!.json()).toEqual(body);
+  });
+
   it('retries one persisted Task step with only its current revision and attempt', async () => {
     let request: Request | undefined;
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {

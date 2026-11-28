@@ -603,6 +603,99 @@ func (c *Client) Execute(ctx context.Context, request ExecuteRequest) (Operation
 	return response.Operation, nil
 }
 
+// SupplementalOutputCapturePage reads one bounded page from the separate
+// opt-in sideband. Callers must recheck Task and Workspace authorization
+// before every page; Runtime only checks the Host operation fence and exact
+// capture identity supplied here.
+func (c *Client) SupplementalOutputCapturePage(ctx context.Context, request SupplementalOutputCapturePageRequest) (SupplementalOutputCapturePage, error) {
+	if !validSupplementalOutputCapturePageRequest(request) {
+		return SupplementalOutputCapturePage{}, invalidRequest()
+	}
+	query := url.Values{
+		"host_id":                         {request.HostID},
+		"runtime_generation":              {fmt.Sprint(request.RuntimeGeneration)},
+		"runtime_instance_id":             {request.RuntimeInstanceID},
+		"control_version":                 {fmt.Sprint(request.ControlVersion)},
+		"task_id":                         {request.TaskID},
+		"lease_version":                   {fmt.Sprint(request.LeaseVersion)},
+		"owner_id":                        {request.Identity.OwnerID},
+		"authorization_version":           {fmt.Sprint(request.Identity.AuthorizationVersion)},
+		"task_revision":                   {fmt.Sprint(request.Identity.TaskRevision)},
+		"workspace_id":                    {request.Identity.WorkspaceID},
+		"workspace_authorization_version": {fmt.Sprint(request.Identity.WorkspaceAuthorizationVersion)},
+		"workspace_binding_version":       {fmt.Sprint(request.Identity.WorkspaceBindingVersion)},
+		"workspace_view_id":               {request.Identity.WorkspaceViewID},
+		"workspace_checkpoint_revision":   {fmt.Sprint(request.Identity.WorkspaceCheckpointRevision)},
+		"step_id":                         {request.Identity.StepID},
+		"call_id":                         {request.Identity.CallID},
+		"stream":                          {string(request.Stream)},
+		"offset":                          {fmt.Sprint(request.Offset)},
+	}
+	var wire json.RawMessage
+	path := "/runtime/v1/operations/" + url.PathEscape(request.OperationID) + "/output-capture/page"
+	if err := c.doJSON(ctx, http.MethodGet, path, query, nil, &wire); err != nil {
+		return SupplementalOutputCapturePage{}, err
+	}
+	if err := rejectDuplicateJSONKeys(wire); err != nil {
+		return SupplementalOutputCapturePage{}, invalidResponse()
+	}
+	var page SupplementalOutputCapturePage
+	decoder := json.NewDecoder(bytes.NewReader(wire))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&page); err != nil || decoder.Decode(new(any)) != io.EOF || !validSupplementalOutputCapturePage(page, request) {
+		return SupplementalOutputCapturePage{}, invalidResponse()
+	}
+	return page, nil
+}
+
+func (c *Client) ReleaseSupplementalOutputCapture(ctx context.Context, operationID string, request SupplementalOutputCaptureReleaseRequest) (SupplementalOutputCaptureReleaseResponse, error) {
+	if !validOperationID(operationID) || validateHostFence(request.HostFence) != nil || !validTaskID(request.TaskID) || request.LeaseVersion < 1 ||
+		!contract.ValidSupplementalOutputCaptureIdentity(request.Identity) || request.Identity.TaskID != request.TaskID {
+		return SupplementalOutputCaptureReleaseResponse{}, invalidRequest()
+	}
+	if request.ProtocolVersion != "" && request.ProtocolVersion != ProtocolVersion {
+		return SupplementalOutputCaptureReleaseResponse{}, incompatibleProtocol()
+	}
+	request.ProtocolVersion = ProtocolVersion
+	var response SupplementalOutputCaptureReleaseResponse
+	path := "/runtime/v1/operations/" + url.PathEscape(operationID) + "/output-capture/release"
+	if err := c.doJSON(ctx, http.MethodPost, path, nil, request, &response); err != nil {
+		return SupplementalOutputCaptureReleaseResponse{}, err
+	}
+	if response.HostFence != request.HostFence || response.TaskID != request.TaskID || response.LeaseVersion != request.LeaseVersion ||
+		response.OperationID != operationID || !response.Released {
+		return SupplementalOutputCaptureReleaseResponse{}, invalidResponse()
+	}
+	return response, nil
+}
+
+func validSupplementalOutputCapturePageRequest(request SupplementalOutputCapturePageRequest) bool {
+	return validateHostFence(request.HostFence) == nil && validTaskID(request.TaskID) && request.LeaseVersion > 0 &&
+		validOperationID(request.OperationID) && contract.ValidSupplementalOutputCaptureIdentity(request.Identity) &&
+		request.Identity.TaskID == request.TaskID && contract.ValidSupplementalOutputCaptureStream(request.Stream) && request.Offset >= 0 &&
+		request.Offset <= SupplementalOutputCaptureMaxBytes
+}
+
+func validSupplementalOutputCapturePage(page SupplementalOutputCapturePage, request SupplementalOutputCapturePageRequest) bool {
+	if page.ProtocolVersion != ProtocolVersion || page.HostFence != request.HostFence || page.TaskID != request.TaskID ||
+		page.LeaseVersion != request.LeaseVersion || page.OperationID != request.OperationID || page.Identity != request.Identity ||
+		page.Stream != request.Stream || page.Offset != request.Offset || page.Offset < 0 || page.TotalBytes < 0 ||
+		page.TotalBytes > SupplementalOutputCaptureMaxBytes || page.NextOffset < page.Offset || page.NextOffset > page.TotalBytes ||
+		len(page.Data) > SupplementalOutputCapturePageBytes || page.NextOffset-page.Offset != len(page.Data) {
+		return false
+	}
+	if page.State != SupplementalOutputCaptureComplete && page.State != SupplementalOutputCaptureIncomplete && page.State != SupplementalOutputCaptureFailed {
+		return false
+	}
+	if page.EOF != (page.NextOffset == page.TotalBytes) || (!page.EOF && len(page.Data) == 0) {
+		return false
+	}
+	if page.Reason != "" && (page.State == SupplementalOutputCaptureComplete || len(page.Reason) > 64) {
+		return false
+	}
+	return true
+}
+
 func (c *Client) GetOperation(ctx context.Context, operationID string, query OperationQuery) (Operation, error) {
 	if !validOperationID(operationID) || validateHostFence(query.HostFence) != nil || !validTaskID(query.TaskID) || query.LeaseVersion < 1 {
 		return Operation{}, invalidRequest()
@@ -801,6 +894,13 @@ func validateHostFence(fence HostFence) error {
 
 func validateExecute(request ExecuteRequest) error {
 	if validateHostFence(request.HostFence) != nil || !validTaskID(request.TaskID) || !validOperationID(request.OperationID) || request.LeaseVersion < 1 || request.Capability == "" || request.Action == "" || len(request.Arguments) == 0 || !json.Valid(request.Arguments) || !isJSONObject(request.Arguments) {
+		return invalidRequest()
+	}
+	if request.OutputCapture != nil && (!contract.ValidSupplementalOutputCaptureIdentity(*request.OutputCapture) ||
+		request.Capability != "shell.exec" || request.Action != "run" || request.OutputCapture.TaskID != request.TaskID ||
+		request.OutputCapture.WorkspaceID != request.WorkspaceID || request.OutputCapture.WorkspaceBindingVersion != request.BindingVersion ||
+		request.OutputCapture.WorkspaceViewID != request.WorkspaceViewID ||
+		request.OutputCapture.WorkspaceCheckpointRevision != request.WorkspaceCheckpointRevision) {
 		return invalidRequest()
 	}
 	if contract.WorkspaceScopedCapability(request.Capability) {

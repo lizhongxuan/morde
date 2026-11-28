@@ -1,0 +1,37 @@
+--- a/index.ts
++++ b/index.ts
+@@ -16,0 +17 @@
++import type { TokenMeasurement } from '@deepseek-ai/dsh-token-meter'
+@@ -141,0 +143,11 @@
++  /** Selection seam for backends that need a different safe surface window. */
++  protected selectRange(
++    session: Session,
++    measurement: TokenMeasurement,
++    retainTokens: number,
++    _contextWindow?: number,
++    _outputTokens = 0,
++  ): { start: SessionSeq; end: SessionSeq } | null {
++    return selectCompactableRange(session, measurement, retainTokens)
++  }
++
+@@ -305 +317 @@
+-        const range = selectCompactableRange(agent.session, measurement, 0)
++        const range = this.selectRange(agent.session, measurement, 0)
+@@ -337,5 +349,2 @@
+-    const spec = resolveCompactSpec(
+-      policy,
+-      info.context.contextWindow,
+-      reservedCompletionTokens(header, info.defaultMaxTokens),
+-    )
++    const outputTokens = reservedCompletionTokens(header, info.defaultMaxTokens)
++    const spec = resolveCompactSpec(policy, info.context.contextWindow, outputTokens)
+@@ -354 +363,2 @@
+-      const range = selectCompactableRange(agent.session, measurement, spec.retainTokens)
++      const range = this.selectRange(agent.session, measurement, spec.retainTokens,
++        info.context.contextWindow, outputTokens)
+@@ -418 +428 @@
+-          const range = selectCompactableRange(
++          const range = this.selectRange(
+@@ -421,0 +432,2 @@
++            agent.session.requestContext()?.contextWindow,
++            agent.session.requestHeader()?.config.maxTokens ?? 0,

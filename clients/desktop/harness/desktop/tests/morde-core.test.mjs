@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { MordeAPI, checkedId, credentialExpired, credentialExpiresSoon, gatewayURL, mordeUserDataDirectory, portalOrigin, tracedFetch, withTimeout } from '../out/morde-core.js';
+import { MordeAPI, NotificationCursorExpiredError, checkedId, credentialExpired, credentialExpiresSoon, gatewayURL, mordeUserDataDirectory, portalOrigin, tracedFetch, withTimeout } from '../out/morde-core.js';
 
 const future = '2099-01-01T00:00:00Z';
 const serviceInstanceID = '12345678-1234-4234-8234-123456789abc';
@@ -103,6 +103,38 @@ test('Morde API uses the injected network stack for remote calls', async () => {
   });
   assert.deepEqual(await api.userPreferences({ credential: 'web-secret', expiresAt: future }), { defaultHostID: 'h1234567' });
   assert.equal(calls[0].url, 'https://portal.example/api/me/preferences');
+});
+
+test('desktop notification polling uses the Client credential and only exposes IDs and kinds', async () => {
+  const calls = [];
+  const api = new MordeAPI(() => credentials, undefined, async (url, options) => {
+    calls.push({ url: String(url), options });
+    if (calls.length === 1) return json({ items: [], cursor: 'baseline-cursor', has_more: false });
+    return json({ items: [{ id: 'n1234567', kind: 'completed', summary: 'private title and body', task_id: 't1234567' }], cursor: 'cursor-next', has_more: false });
+  });
+
+  assert.deepEqual(await api.notificationUpdates(), { items: [], cursor: 'baseline-cursor', hasMore: false });
+  assert.deepEqual(await api.notificationUpdates('baseline-cursor'), { items: [{ id: 'n1234567', kind: 'completed' }], cursor: 'cursor-next', hasMore: false });
+  assert.equal(calls[0].url, 'https://portal.example/api/notifications/incremental?limit=100');
+  assert.equal(new URL(calls[1].url).searchParams.get('cursor'), 'baseline-cursor');
+  assert.equal(new Headers(calls[0].options.headers).get('authorization'), 'Bearer client-secret');
+  assert.equal(calls[0].options.cache, 'no-store');
+  await assert.rejects(() => api.notificationUpdates('x'.repeat(1025)), /Invalid Morde notification cursor/);
+});
+
+test('expired desktop notification cursors are distinguished for safe list reconciliation', async () => {
+  const api = new MordeAPI(() => credentials, undefined, async () => json({ error: { code: 'event_cursor_expired' } }, 409));
+  await assert.rejects(() => api.notificationUpdates('expired'), (error) => error instanceof NotificationCursorExpiredError);
+});
+
+test('notification list reconciliation returns only opaque IDs and kinds', async () => {
+  let requestedURL = '';
+  const api = new MordeAPI(() => credentials, undefined, async (url) => {
+    requestedURL = String(url);
+    return json({ items: [{ id: 'n1234567', kind: 'completed', summary: 'must stay in the normal UI' }], next_cursor: null });
+  });
+  assert.deepEqual(await api.notificationListPage(), { items: [{ id: 'n1234567', kind: 'completed' }], nextCursor: null });
+  assert.equal(requestedURL, 'https://portal.example/api/notifications?limit=100');
 });
 
 test('project sync reads the account default computer through its short-lived Portal session', async () => {

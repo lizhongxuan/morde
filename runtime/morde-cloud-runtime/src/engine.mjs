@@ -55,6 +55,7 @@ export const TASK_VALIDATION_REVIEW_IDENTITY_FIELDS = Object.freeze([
 const SCHEMA_TYPES = new Set(['object', 'array', 'string', 'number', 'integer', 'boolean', 'null'])
 const SCHEMA_ANNOTATIONS = new Set(['description', 'title', 'default', 'examples'])
 const CLARIFICATION_TOOL = 'ask_user'
+const UPSTREAM_ASK_USER_TOOL = 'ask_user_question'
 const DELEGATE_TOOL = 'dsh_delegate'
 const MORDE_MCP_TOOL_PREFIX = 'mcp_'
 const MORDE_BUDGET_CONTINUATION_PLUGIN = 'morde-budget-continuation'
@@ -65,6 +66,10 @@ const JOB_OUTPUT_TOOL = 'dsh_job_output'
 const JOB_CANCEL_TOOL = 'dsh_job_cancel'
 const JOB_TOOLS = new Set([JOB_LIST_TOOL, JOB_GET_TOOL, JOB_OUTPUT_TOOL, JOB_CANCEL_TOOL])
 const JOB_STATUSES = new Set(['queued', 'running', 'cancelling', 'waiting_user', 'succeeded', 'cancelled', 'failed', 'unknown'])
+
+function isClarificationToolName(name) {
+  return name === CLARIFICATION_TOOL || name === UPSTREAM_ASK_USER_TOOL
+}
 const MAX_DELEGATE_TITLE_BYTES = 256
 const MAX_DELEGATE_OBJECTIVE_BYTES = 32 * 1024
 const MAX_CHILD_SUMMARY_BYTES = 1024 * 1024
@@ -669,7 +674,7 @@ function validTools(tools) {
   if (!Array.isArray(tools) || tools.length > 64) return false
   const names = new Set()
   for (const tool of tools) {
-    if (!validToolDefinition(tool) || names.has(tool.name)) return false
+    if (!validToolDefinition(tool) || tool.name === UPSTREAM_ASK_USER_TOOL || names.has(tool.name)) return false
     names.add(tool.name)
   }
   return true
@@ -714,10 +719,10 @@ function validDelegateArguments(args, appTools) {
       typeof args.objective !== 'string' || !args.objective.trim() || Buffer.byteLength(args.objective) > MAX_DELEGATE_OBJECTIVE_BYTES ||
       (Object.hasOwn(args, 'run_in_background') && typeof args.run_in_background !== 'boolean') ||
       !Array.isArray(args.tool_names) || args.tool_names.length > 64) return false
-  const available = new Set(appTools.map(tool => tool.name).filter(name => name !== CLARIFICATION_TOOL && name !== DELEGATE_TOOL && !JOB_TOOLS.has(name)))
+  const available = new Set(appTools.map(tool => tool.name).filter(name => !isClarificationToolName(name) && name !== DELEGATE_TOOL && !JOB_TOOLS.has(name)))
   const names = new Set()
   return args.tool_names.every(name => typeof name === 'string' && TOOL_NAME.test(name) &&
-    name !== CLARIFICATION_TOOL && name !== DELEGATE_TOOL && !JOB_TOOLS.has(name) && available.has(name) && !names.has(name) && names.add(name))
+    !isClarificationToolName(name) && name !== DELEGATE_TOOL && !JOB_TOOLS.has(name) && available.has(name) && !names.has(name) && names.add(name))
 }
 
 function validBackgroundJobHandle(output, sessionID) {
@@ -754,7 +759,7 @@ function childIdentity(frame, parent) {
 function validChildTools(tools, requestedNames, parentTools, parentDepth) {
   if (!validTools(tools) || !Array.isArray(tools) || !Array.isArray(parentTools)) return false
   const ordinary = tools.filter(tool => tool.name !== DELEGATE_TOOL && !JOB_TOOLS.has(tool.name))
-  if (ordinary.some(tool => tool.name === CLARIFICATION_TOOL)) return false
+  if (ordinary.some(tool => isClarificationToolName(tool.name))) return false
   const names = ordinary.map(tool => tool.name).sort()
   if (JSON.stringify([...requestedNames].sort()) !== JSON.stringify(names) ||
       ordinary.some(tool => !parentTools.some(parent => parent.name === tool.name &&
@@ -772,7 +777,7 @@ function validChildTools(tools, requestedNames, parentTools, parentDepth) {
 export function validLateChildTools(tools, expectedNamesDigest, allowControls) {
   if (!validTools(tools) || !Array.isArray(tools) || typeof expectedNamesDigest !== 'string') return false
   const ordinary = tools.filter(tool => tool.name !== DELEGATE_TOOL && !JOB_TOOLS.has(tool.name))
-  if (ordinary.some(tool => tool.name === CLARIFICATION_TOOL)) return false
+  if (ordinary.some(tool => isClarificationToolName(tool.name))) return false
   const names = ordinary.map(tool => tool.name).sort()
   if (createHash('sha256').update(JSON.stringify(names)).digest('hex') !== expectedNamesDigest) return false
   const delegate = tools.find(tool => tool.name === DELEGATE_TOOL)
@@ -2102,7 +2107,7 @@ export async function runAgent(ipc, frame) {
           Array.isArray(event.data.message.content) &&
           event.data.message.content.some(block => block.type === 'tool-call' && block.id === exec.callId))
         const turnCalls = assistantMessage?.data.message.content.filter(block => block.type === 'tool-call')
-        if (!turnCalls || (turnCalls.some(block => block.name === CLARIFICATION_TOOL) && turnCalls.length !== 1)) {
+        if (!turnCalls || (turnCalls.some(block => isClarificationToolName(block.name)) && turnCalls.length !== 1)) {
           state.toolFailure = true
           agent.cancel({ kind: 'hook', reason: 'clarification must be the only tool call in its model turn' })
           return { kind: 'deny', reason: 'clarification must be the only tool call in its model turn' }

@@ -45,8 +45,9 @@ var (
 	// ErrOperationUncertain marks an action whose side effect may have started,
 	// but whose handler could not prove a terminal result. Such operations must
 	// remain queryable as unknown instead of being reported as ordinary failure.
-	ErrOperationUncertain = errors.New("operation result is uncertain")
-	ErrOperationsPending  = errors.New("operations remain unresolved")
+	ErrOperationUncertain                   = errors.New("operation result is uncertain")
+	ErrOperationsPending                    = errors.New("operations remain unresolved")
+	ErrSupplementalOutputCaptureUnavailable = errors.New("supplemental output capture unavailable")
 )
 
 type RuntimeError struct{ Code string }
@@ -159,6 +160,7 @@ type Manager struct {
 	blockedWorkspaceBindings  map[string]struct{}
 	workspaceBindingsUpdating bool
 	ops                       map[string]operationRecord
+	outputCaptures            *supplementalOutputCaptureStore
 	handlers                  map[string]ActionHandler
 	active                    map[string]activeOperation
 	protocol                  string
@@ -212,6 +214,7 @@ func Open(options Options) (*Manager, error) {
 	m := &Manager{
 		store: store, legacyStore: preservedLegacy, ops: make(map[string]operationRecord), handlers: make(map[string]ActionHandler),
 		active: make(map[string]activeOperation), protocol: options.ProtocolVersion, now: options.Now,
+		outputCaptures:    newSupplementalOutputCaptureStore(options.Now),
 		workspaceBindings: make(map[string]contract.WorkspaceBinding), workspaceBindingVersions: make(map[string]workspaceBindingVersion),
 		taskWorkspaceViews: make(map[string]taskWorkspaceView), taskWorkspaceAdvancing: make(map[string]bool),
 		taskWorkspacePublishing:  make(map[string]taskWorkspacePublish),
@@ -506,6 +509,12 @@ func (m *Manager) Capabilities(request contract.CapabilitiesRequest) (contract.C
 		if _, exists := seen[handler.Capability()]; !exists {
 			capabilities = append(capabilities, handler.Capability())
 			seen[handler.Capability()] = struct{}{}
+		}
+		if provider, ok := handler.(interface{ SupportsSupplementalOutputCapture() bool }); ok && provider.SupportsSupplementalOutputCapture() {
+			if _, exists := seen[contract.SupplementalOutputCaptureCapability]; !exists {
+				capabilities = append(capabilities, contract.SupplementalOutputCaptureCapability)
+				seen[contract.SupplementalOutputCaptureCapability] = struct{}{}
+			}
 		}
 	}
 	sort.Strings(capabilities)
@@ -836,6 +845,7 @@ func (m *Manager) DeleteTaskWorkspaceView(ctx context.Context, taskID string, re
 
 	m.mu.Lock()
 	delete(m.taskWorkspaceViews, taskID)
+	m.outputCaptures.deleteTask(taskID)
 	delete(m.taskWorkspacePublishing, taskID)
 	delete(m.taskWorkspaceDeleting, taskID)
 	m.taskWorkspaceDeleted[taskID] = request.RequestID
@@ -1450,6 +1460,7 @@ func (m *Manager) Close() error {
 		return ErrOperationsPending
 	}
 	m.closed = true
+	m.outputCaptures.close()
 	m.mu.Unlock()
 	m.wg.Wait()
 	return m.closeStores()
@@ -1480,7 +1491,17 @@ func (m *Manager) runOperation(ctx context.Context, id string, handler ActionHan
 	active.started = true
 	m.active[id] = active
 	m.mu.Unlock()
+	var capture *supplementalOutputCapture
+	if request.OutputCapture != nil {
+		capture = m.outputCaptures.begin(id, *request.OutputCapture)
+		if capture != nil {
+			ctx = contract.WithSupplementalOutputSink(ctx, capture)
+		}
+	}
 	result, err := handler.Execute(ctx, request)
+	if capture != nil {
+		m.outputCaptures.finish(id, err == nil && ctx.Err() == nil)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.active, id)
@@ -1738,6 +1759,9 @@ func normalizedRequest(request contract.ExecuteRequest) (json.RawMessage, string
 	if len(request.Arguments) == 0 || len(request.Arguments) > MaxRequestBytes || !isJSONObject(request.Arguments) {
 		return nil, "", ErrInvalidRequest
 	}
+	if request.OutputCapture != nil && !validExecuteOutputCapture(request) {
+		return nil, "", ErrInvalidRequest
+	}
 	decoder := json.NewDecoder(bytes.NewReader(request.Arguments))
 	decoder.UseNumber()
 	var value any
@@ -1752,21 +1776,22 @@ func normalizedRequest(request contract.ExecuteRequest) (json.RawMessage, string
 		return nil, "", err
 	}
 	stable := struct {
-		ProtocolVersion    string          `json:"protocol_version"`
-		HostID             string          `json:"host_id"`
-		Generation         int64           `json:"runtime_generation"`
-		InstanceID         string          `json:"runtime_instance_id"`
-		ControlVersion     int64           `json:"control_version"`
-		TaskID             string          `json:"task_id"`
-		WorkspaceID        string          `json:"workspace_id,omitempty"`
-		BindingVersion     int64           `json:"binding_version,omitempty"`
-		WorkspaceViewID    string          `json:"workspace_view_id,omitempty"`
-		CheckpointRevision int64           `json:"workspace_checkpoint_revision,omitempty"`
-		OperationID        string          `json:"operation_id"`
-		LeaseVersion       int64           `json:"lease_version"`
-		Capability         string          `json:"capability"`
-		Action             string          `json:"action"`
-		Arguments          json.RawMessage `json:"arguments"`
+		ProtocolVersion    string                                      `json:"protocol_version"`
+		HostID             string                                      `json:"host_id"`
+		Generation         int64                                       `json:"runtime_generation"`
+		InstanceID         string                                      `json:"runtime_instance_id"`
+		ControlVersion     int64                                       `json:"control_version"`
+		TaskID             string                                      `json:"task_id"`
+		WorkspaceID        string                                      `json:"workspace_id,omitempty"`
+		BindingVersion     int64                                       `json:"binding_version,omitempty"`
+		WorkspaceViewID    string                                      `json:"workspace_view_id,omitempty"`
+		CheckpointRevision int64                                       `json:"workspace_checkpoint_revision,omitempty"`
+		OperationID        string                                      `json:"operation_id"`
+		LeaseVersion       int64                                       `json:"lease_version"`
+		Capability         string                                      `json:"capability"`
+		Action             string                                      `json:"action"`
+		Arguments          json.RawMessage                             `json:"arguments"`
+		OutputCapture      *contract.SupplementalOutputCaptureIdentity `json:"output_capture,omitempty"`
 	}{
 		ProtocolVersion: request.ProtocolVersion, HostID: request.HostID,
 		Generation: request.RuntimeGeneration, InstanceID: request.RuntimeInstanceID,
@@ -1774,7 +1799,7 @@ func normalizedRequest(request contract.ExecuteRequest) (json.RawMessage, string
 		WorkspaceID: request.WorkspaceID, BindingVersion: request.BindingVersion,
 		WorkspaceViewID: request.WorkspaceViewID, CheckpointRevision: request.WorkspaceCheckpointRevision,
 		OperationID: request.OperationID, LeaseVersion: request.LeaseVersion,
-		Capability: request.Capability, Action: request.Action, Arguments: arguments,
+		Capability: request.Capability, Action: request.Action, Arguments: arguments, OutputCapture: request.OutputCapture,
 	}
 	encoded, err := json.Marshal(stable)
 	if err != nil {
@@ -1782,6 +1807,14 @@ func normalizedRequest(request contract.ExecuteRequest) (json.RawMessage, string
 	}
 	digest := sha256.Sum256(encoded)
 	return arguments, hex.EncodeToString(digest[:]), nil
+}
+
+func validExecuteOutputCapture(request contract.ExecuteRequest) bool {
+	identity := request.OutputCapture
+	return identity != nil && request.Capability == "shell.exec" && request.Action == "run" &&
+		contract.ValidSupplementalOutputCaptureIdentity(*identity) && identity.TaskID == request.TaskID &&
+		identity.WorkspaceID == request.WorkspaceID && identity.WorkspaceBindingVersion == request.BindingVersion &&
+		identity.WorkspaceViewID == request.WorkspaceViewID && identity.WorkspaceCheckpointRevision == request.WorkspaceCheckpointRevision
 }
 
 func decodeStrict(data []byte, target any) error {
@@ -1962,6 +1995,10 @@ func cloneRequest(request *contract.ExecuteRequest) *contract.ExecuteRequest {
 	}
 	copyOfRequest := *request
 	copyOfRequest.Arguments = append(json.RawMessage(nil), request.Arguments...)
+	if request.OutputCapture != nil {
+		identity := *request.OutputCapture
+		copyOfRequest.OutputCapture = &identity
+	}
 	return &copyOfRequest
 }
 

@@ -6,7 +6,7 @@ const require = createRequire(import.meta.url);
 const Module = require('node:module');
 const preloadPath = require.resolve('../out/morde-preload.js');
 
-function loadBridge(mode) {
+function loadBridge(mode, voiceWaveformEnabled = false) {
   let exposed;
   const calls = [], listeners = new Map(), removed = [];
   const electron = {
@@ -18,6 +18,9 @@ function loadBridge(mode) {
     },
   };
   const previousArgv = [...process.argv];
+  const previousVoiceWaveformSetting = process.env.MORDE_ENABLE_VOICE_WAVEFORM;
+  if (voiceWaveformEnabled) process.env.MORDE_ENABLE_VOICE_WAVEFORM = '1';
+  else delete process.env.MORDE_ENABLE_VOICE_WAVEFORM;
   const originalLoad = Module._load;
   process.argv.splice(0, process.argv.length, ...previousArgv.filter((argument) => !argument.startsWith('--morde-preload-mode=')));
   if (mode) process.argv.push(`--morde-preload-mode=${mode}`);
@@ -30,6 +33,8 @@ function loadBridge(mode) {
   finally {
     Module._load = originalLoad;
     process.argv.splice(0, process.argv.length, ...previousArgv);
+    if (previousVoiceWaveformSetting === undefined) delete process.env.MORDE_ENABLE_VOICE_WAVEFORM;
+    else process.env.MORDE_ENABLE_VOICE_WAVEFORM = previousVoiceWaveformSetting;
     delete require.cache[preloadPath];
   }
   return { exposed, calls, listeners, removed };
@@ -38,17 +43,23 @@ function loadBridge(mode) {
 test('Portal preload exposes project and restricted local recovery operations', async () => {
   const bridge = loadBridge('portal');
   assert.equal(bridge.exposed.name, 'morde');
+  assert.equal(bridge.exposed.value.voiceWaveformEnabled, false);
   assert.deepEqual(Object.keys(bridge.exposed.value).sort(), [
-    'closeHostWorkbenchEmbed', 'codexAddProfile', 'codexAuthorizeProfile', 'codexAuthorizeThread', 'codexListThreads', 'codexRevoke', 'codexRevokeProfile', 'codexSelectProfile', 'codexState', 'codexUpdateScopes',
-    'deletePreserved', 'legacyDiscardSync', 'legacyPauseSync', 'legacyResumeSync', 'legacyStopLiveSync', 'legacyStopSync', 'legacySyncState',
+    'beginVoiceRecording', 'closeHostWorkbenchEmbed', 'codexAddProfile', 'codexAuthorizeProfile', 'codexAuthorizeThread', 'codexListThreads', 'codexRevoke', 'codexRevokeProfile', 'codexSelectProfile', 'codexState', 'codexUpdateScopes',
+    'deletePreserved', 'desktopNotificationSettings', 'endVoiceRecording',
+    'legacyDiscardSync', 'legacyPauseSync', 'legacyResumeSync', 'legacyStopLiveSync', 'legacyStopSync', 'legacySyncState',
     'onCodexState', 'onHostWorkbenchMessage', 'onState', 'onSync', 'openHostWorkbenchEmbed', 'preserved', 'projectLocalStatus', 'projectUploadTargets',
-    'restorePreserved', 'selectProjectDirectory', 'sendHostWorkbenchCommand', 'setHostWorkbenchBounds', 'state', 'stopProjectSync', 'uploadProject',
+    'restorePreserved', 'selectProjectDirectory', 'sendHostWorkbenchCommand', 'setDesktopNotificationsEnabled', 'setHostWorkbenchBounds', 'state', 'stopProjectSync', 'uploadProject', 'voiceWaveformEnabled',
   ]);
+  await bridge.exposed.value.beginVoiceRecording();
+  await bridge.exposed.value.endVoiceRecording('voice-token');
   await bridge.exposed.value.projectUploadTargets();
   await bridge.exposed.value.selectProjectDirectory('h1234567', 'w1234567');
   await bridge.exposed.value.uploadProject('selection', 'project');
   await bridge.exposed.value.projectLocalStatus('selection');
   await bridge.exposed.value.stopProjectSync('selection');
+  await bridge.exposed.value.desktopNotificationSettings();
+  await bridge.exposed.value.setDesktopNotificationsEnabled(true);
   await bridge.exposed.value.state();
   await bridge.exposed.value.legacySyncState();
   await bridge.exposed.value.restorePreserved('w1234567', 'a'.repeat(32));
@@ -66,11 +77,15 @@ test('Portal preload exposes project and restricted local recovery operations', 
   await bridge.exposed.value.sendHostWorkbenchCommand('nonce-1', controlLock);
   await bridge.exposed.value.closeHostWorkbenchEmbed('nonce-1');
   assert.deepEqual(bridge.calls, [
+    ['morde:voice-recording-begin'],
+    ['morde:voice-recording-end', 'voice-token'],
     ['morde:portal-project-upload-targets'],
     ['morde:portal-project-select-directory', 'h1234567', 'w1234567'],
     ['morde:portal-project-upload', 'selection', 'project'],
     ['morde:portal-project-local-status', 'selection'],
     ['morde:portal-project-stop', 'selection'],
+    ['morde:desktop-notification-settings'],
+    ['morde:desktop-notification-toggle', true],
     ['morde:portal-state'],
     ['morde:portal-legacy-state'],
     ['morde:portal-preserved-restore', 'w1234567', 'a'.repeat(32)],
@@ -102,6 +117,17 @@ test('Portal preload exposes project and restricted local recovery operations', 
   assert.deepEqual(workbenchMessages, [workbenchMessage]);
   unsubscribeWorkbench();
   assert.equal(bridge.removed.at(-1)[0], 'morde:portal-workbench-message');
+});
+
+test('Portal preload enables waveform capture only with the explicit local setting', async () => {
+  const bridge = loadBridge('portal', true);
+  assert.equal(bridge.exposed.value.voiceWaveformEnabled, true);
+  await bridge.exposed.value.beginVoiceRecording();
+  await bridge.exposed.value.endVoiceRecording('local-voice-token');
+  assert.deepEqual(bridge.calls, [
+    ['morde:voice-recording-begin'],
+    ['morde:voice-recording-end', 'local-voice-token'],
+  ]);
 });
 
 test('Codex settings preload exposes profile connection consent and revocation', async () => {

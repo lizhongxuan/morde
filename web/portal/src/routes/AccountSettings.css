@@ -22,8 +22,19 @@
 .account-settings-page .account-settings-action-row .button { min-height: 32px; padding: 7px 11px; border-radius: 7px; font-size: 12px; }
 .account-settings-info-block { padding: 18px 0; display: grid; gap: 10px; }
 .account-settings-info-block + .account-settings-info-block { border-top: 1px solid var(--line); }
+.account-settings-card-body > .account-settings-info-block { border-top: 1px solid var(--line); }
 .account-settings-page .account-settings-info-block h3 { margin: 0; color: var(--ink); font-size: 13px; font-weight: 600; }
 .account-settings-info-block > div > p { margin: 5px 0 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.account-settings-toggle-row { display: flex; align-items: center; justify-content: space-between; gap: 18px; }
+.account-settings-toggle-row > div { min-width: 0; }
+.account-settings-toggle-row p { margin: 5px 0 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
+.account-settings-page .account-settings-switch { width: 38px; height: 22px; flex: none; padding: 2px; border: 1px solid var(--line); border-radius: 999px; background: #d6dce4; cursor: pointer; transition: background-color 120ms ease, border-color 120ms ease; }
+.account-settings-page .account-settings-switch[aria-checked="true"] { border-color: #4263d6; background: #4263d6; }
+.account-settings-page .account-settings-switch:disabled { cursor: default; opacity: .55; }
+.account-settings-page .account-settings-switch:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
+.account-settings-switch span { display: block; width: 16px; height: 16px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgb(18 42 55 / 18%); transition: transform 120ms ease; }
+.account-settings-switch[aria-checked="true"] span { transform: translateX(16px); }
+.account-settings-page .account-settings-info-block > .notice button { margin-left: 8px; }
 .account-settings-page .account-settings-info-block > .notice { width: 100%; max-width: none; margin: 0; }
 .account-settings-page .account-settings-info-block > .error-inline { margin: 0; }
 @media (max-width: 900px) { .account-settings-page { margin-top: 28px; } }

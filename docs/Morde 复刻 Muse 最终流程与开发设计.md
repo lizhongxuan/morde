@@ -2,7 +2,7 @@
 
 > 本文是 Harness 的精简总览：上半部分描述当前源码流程，下半部分列出 Muse 体验差距和实施入口。Muse 内部未被逆向材料证实的机制不作事实陈述。
 >
-> **源码基线：**2026-11-28，本地 `release`，HEAD `e689a8e8`。图中“代码接入”表示有对应源码路径，不代表已部署或端到端验收通过。逐项进度以[实施任务总大纲](实施任务TODO/00-总大纲.md)和分步 TODO 为准。
+> **源码基线：**本轮 PC 交互移植开工时 HEAD `8c87122f`；本地存在未提交候选改动。图中“代码接入”表示有对应源码路径，不代表已部署或端到端验收通过。逐项进度以[实施任务总大纲](实施任务TODO/00-总大纲.md)、分步 TODO 和[PC 交互移植 TODO](<design/Muse Desktop PC交互移植实施任务TODO（Morde审查修订版）.md>)为准。
 
 ## Morde Harness 总览 · 收件到交付
 
@@ -101,3 +101,21 @@ B03 另实现默认关闭的 Task-only 影子路径：用只读 repeatable-read 
 2. 打通真实新闻搜索配置与来源核验；上游不可达时不伪造结果、不关闭 TLS 验证，并让失败原因回到对话。
 3. 补齐 H07 的实际 runner、测试清单与覆盖范围证据；没有这些证据时不把任务标为验证通过。
 4. 完成真实 DSH 下的追问/任务关联、审批恢复、未知结果对账、长上下文理解、并发委派及默认 Workspace 同步验收。
+
+## 本轮结构化追问移植状态（2026-11-28）
+
+M05–M07 已在本地代码中形成同一条持久化路径：`task.ClarificationRequest` 保存单题或结构化题组、稳定题目/选项 ID、版本与答案格式；PostgreSQL 写入时同步持久化 `answer_format` 并校验其与题组一致，`POST /api/v2/tasks/{id}/clarifications/{clarification_id}/responses` 将答复绑定请求版本和幂等键；`CloudDSHToolBroker` 在原 `ask_user` DSH 调用下创建或恢复待答项，答复返回时校验原 CallID、题组和版本。旧单题 schema 与旧 checkpoint 仍保留兼容；旧 checkpoint 的本地恢复测试尚待补。PC 聊天气泡提供单选、多选、自填、可跳过和提交/冲突/失败/结果未知状态，侧栏仅展示只读详情。
+
+没有直接加载上游 `dsh-tool-ask-user`：本地 DSH 版本没有 Morde 所需的结构化问答 provider seam；该插件通过 `ctx.userQuestions`/answerer 交互，无法替代 Morde 已持久化的 PG Request、原工具调用 ID 和恢复合同（参见 DSH [官方工具目录](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/tool-catalog.md) 和 [ask-user 插件源码](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/interaction/tool-ask-user/src/index.ts)）。实现只适配 Morde Broker，没有增加第二套 Agent Runtime，也没有调整 DSH 依赖/锁文件。仓库引用的 `docs/muse_docs/muse_steps/` 上游归档目录当前不存在；本节以本文件、设计方案和实际代码为准。
+
+本地验证记录：M05 domain/app/API 包测试通过，结构化答复版本绑定、幂等和用户隔离 PostgreSQL 集成用例在隔离工作树通过；M06 DSH Runtime 全套 `node --test --test-concurrency=1 test/runtime.test.mjs` 通过 235/235。新增真实 `TaskWorker + DSH + CloudDSHToolBroker + PostgreSQL 16` 恢复用例在格式持久化修复后 `-count=3` 通过，覆盖过期版本冲突、答复持久化/重排队、Worker 重启恢复原 session/CallID、一次 reconciliation 及单次结果交付；旧 checkpoint、取消中任务、两个 Task 并发隔离仍待覆盖。M07 Portal 路由/API 定向组合测试现为 409/409 且 typecheck 通过；M10 接口稳定后，Go app/worker 全包及 API/app/worker 联测均通过。上述为本地代码/隔离测试证据，不代表服务端已部署或真实 PC + DSH 跨端闭环已验；结构化追问仍列为真实 `morde-pc` 验收待办。
+
+桌面通知增量（M10）已实现：所有任务通知和来源通知在各自插入事务内锁定同一账号的 sequence 行，再写通知并提交序号；增量读以该已提交顺序为准，不按时间戳排序。`GET /api/notifications/incremental` 首次无游标请求只建立基线、不回补历史；续页游标签名并绑定账号，30 天后过期，扫描会跨越已撤权的项目通知推进游标。为避免完成摘要进入 Electron 主进程，增量记录只返回通知 `id` 和 `kind`；现有站内列表和已读合同未变。隔离 PostgreSQL 16 集成测试通过 3 项，覆盖反向时间戳的双连接提交顺序、分页/断线续读、基线、过期重建、撤权过滤及 Task completed 通知。M11 的 Electron 轮询、默认关闭的按账号设置、凭据安全存储、去重、过期游标恢复与通用通知文案已接入；桌面逻辑 51/51、Portal 设置 3/3、类型检查和 desktop build 通过。签名 macOS 包的真实系统弹窗仍待验收。
+
+## 本轮 Muse Desktop PC 交互移植状态（2026-11-28）
+
+M01 活动折叠、M08 附件草稿拖放、M07 结构化追问卡片、M09a 语音取消和 M09b 默认关闭的真波形已在代码/自动化层实现；Portal 定向组合测试 409/409、Portal 类型检查通过。新增的超限合成图片用例确认 M08 的 picker/drop 两个入口给出同样的拒绝结果且不上传、不发送。M09b 设备电平未验：本轮 macOS 客户端报告未获麦克风权限，未接受系统权限提示。M01/M07/M08/M09a 的源码候选入口尚未完成真实 `morde-pc` 交互验收。
+
+M02 长输出新增 opt-in Runtime/client sideband transport：默认不发 capture descriptor；Shell 旧 `Operation.Result` 与执行次数保持不变，只有明确启用时才可分页读取 sideband。Runtime 包、runtimeclient 及定向 HTTPS Runner 测试通过，覆盖身份、释放后拒读和不重跑。它仍未接入 Worker/Task 持久化：缺少服务端跨页脱敏、加密 PostgreSQL 原子回执、当前授权复核、配额/保留期和清理。M02 完整功能、M03 加密与授权读取、M04 PC 分页均未完成，不得把 transport 测试写成可持久读取能力。
+
+本轮验证基线为 HEAD `8c87122f`，OS macOS 27.0.1（Build 26A434，arm64），Morde PC `0.1.0` / Electron `44.7.0`；候选代码尚未提交。Portal 定向组合测试 409/409、Portal/Desktop 类型检查、Desktop 通知/桥接 51/51、Desktop 全量 `npm test` 308/308、Go domain/app/API/worker、Runtime Go、Runtime client/Runner 和 DSH Runtime 235/235 通过；新增真实 Broker+DSH+PostgreSQL 16 Worker 恢复用例 `-count=3` 3/3 通过。变更文件范围的 `gofmt -d` 与 `git diff --check` 通过；全仓 `git diff --check` 另报告未触碰的模型预算 TODO 文档第 398 行 EOF 多余空行。首轮 Desktop 全量测试发现 main-path/recovery 的 Electron Session mock 缺少 `setPermissionCheckHandler`；补齐两个测试夹具后 main-path 2/2、recovery 63/63 和全量套件均通过。`make pc` 已完成 Portal、Workbench 与 Desktop 构建并启动客户端。CUA 绑定到同路径的既有 Electron/默认用户目录实例，无法确认它是隔离构建窗口；因此可见 UI 的附件选取/移除只作观察，未计候选验收，拖放没有可见变化。未向会话发送消息；未部署服务端更改。统一视觉规范路径 `docs/design/ice-cream-blue/morde-icecream-blue-ui-spec.html` 在当前工作树不存在，外观对照待核对。详细测试命令、状态和未覆盖项见[PC 交互移植 TODO 的 M12 记录](<design/Muse Desktop PC交互移植实施任务TODO（Morde审查修订版）.md>).

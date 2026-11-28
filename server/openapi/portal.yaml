@@ -3458,6 +3458,30 @@ paths:
               schema: { $ref: '#/components/schemas/NotificationPage' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         default: { $ref: '#/components/responses/Error' }
+  /api/notifications/incremental:
+    get:
+      tags: [Notifications]
+      operationId: listNotificationUpdates
+      summary: Read the durable notification update stream
+      description: Portal sessions and native client credentials may consume owner-scoped notifications in per-account commit order. The first request omits cursor and returns an empty page with a baseline cursor, so earlier notices are not backfilled. Later requests pass the returned cursor; each response returns a renewed cursor. The bounded scan advances across notices that are no longer authorized, so filtered project notices do not stall continuation. Cursors are opaque and account-scoped, expire after 30 days, and return event_cursor_expired; reconcile through the existing notification list, then retry without cursor to establish a new baseline.
+      security:
+        - portalSession: []
+        - bearerToken: []
+      parameters:
+        - $ref: '#/components/parameters/PageLimit'
+        - name: cursor
+          in: query
+          description: Opaque account-scoped continuation cursor. Omit to establish a no-backfill baseline.
+          schema: { type: string, maxLength: 1024 }
+      responses:
+        '200':
+          description: Bounded page of currently authorized notification identifiers and kinds in durable commit order; an empty items list may still advance the cursor over inaccessible notices. Notification text and resource identifiers are omitted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NotificationUpdates' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict', description: The continuation cursor expired; reconcile through the existing notification list, then retry without cursor to establish a fresh baseline. }
+        default: { $ref: '#/components/responses/Error' }
   /api/notifications/{id}/read:
     parameters:
       - $ref: '#/components/parameters/NotificationId'
@@ -13567,11 +13591,17 @@ components:
         prompt: { type: string, minLength: 1, maxLength: 1024 }
         type: { type: string, enum: [single_choice, multi_choice, free_text] }
         required: { type: boolean, description: Describes whether the Agent needs this value to complete the task; skipping does not grant additional permissions. }
-        allow_skip: { type: boolean, description: Whether the user may explicitly skip this question. }
+        allow_skip: { type: boolean, description: Whether the user may explicitly skip this optional question. Required questions must set allow_skip to false. }
         options:
           type: array
           maxItems: 12
           items: { $ref: '#/components/schemas/TaskClarificationQuestionOption' }
+      allOf:
+        - not:
+            required: [required, allow_skip]
+            properties:
+              required: { const: true }
+              allow_skip: { const: true }
     TaskClarificationQuestionOption:
       type: object
       additionalProperties: false
@@ -13990,6 +14020,7 @@ components:
       properties:
         id: { $ref: '#/components/schemas/NotificationId' }
         kind: { type: string, enum: [completed, failed, waiting_user, goal_step_blocked, goal_completed, project_work_item_blocked, project_work_item_delivered] }
+      additionalProperties: false
         task_id: { oneOf: [{ $ref: '#/components/schemas/TaskId' }, { type: 'null' }] }
         event_sequence: { type: integer, minimum: 0, description: Positive for Task-backed notices and 0 for source notices. }
         source_kind: { type: string, enum: [goal, project_work_item], description: Omitted for Task-backed notices. }
@@ -14007,6 +14038,20 @@ components:
       properties:
         items: { type: array, items: { $ref: '#/components/schemas/Notification' } }
         next_cursor: { type: [string, 'null'] }
+    NotificationUpdates:
+      type: object
+      required: [items, cursor, has_more]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/NotificationUpdateItem' } }
+        cursor: { type: string, minLength: 1, maxLength: 1024, description: Renewed opaque owner-scoped continuation cursor. }
+        has_more: { type: boolean, description: True when at least one additional sequenced notice remains after this bounded page; immediately continue with cursor to drain remaining updates. }
+    NotificationUpdateItem:
+      type: object
+      description: Minimal notification identity for native clients to deduplicate and select event kinds. Notification text and associated Task, project, or source identifiers are omitted.
+      required: [id, kind]
+      properties:
+        id: { $ref: '#/components/schemas/NotificationId' }
+        kind: { type: string, enum: [completed, failed, waiting_user, goal_step_blocked, goal_completed, project_work_item_blocked, project_work_item_delivered] }
     HostResourcesTarget:
       type: object
       required: [cpu_milli, mem_mib]

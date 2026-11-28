@@ -4390,8 +4390,34 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Answer a versioned clarification and resume a task */
+        /**
+         * Answer a legacy free-text clarification and resume a task
+         * @description Preserves the original single free-text clarification contract. A clarification with question_group must use the versioned structured response route; this endpoint rejects it.
+         */
         post: operations["answerTaskInput"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v2/tasks/{id}/clarifications/{clarification_id}/responses": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+                clarification_id: components["schemas"]["ClarificationId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Answer every question in one versioned clarification group
+         * @description Binds every answer to the question group ID and version. Each question requires either a value or an explicit allowed skip. A skip does not grant approval or change Task authorization, routing, or file-delivery intent.
+         */
+        post: operations["answerStructuredTaskClarification"];
         delete?: never;
         options?: never;
         head?: never;
@@ -10300,6 +10326,28 @@ export interface components {
             question: string;
             /** @description Opaque clarification identity used by clients to select any structured answer fields. Clients must not infer clarification type from question text. */
             call_id: string;
+            /** @description Present only for structured clarifications. Its id and version equal the enclosing clarification id and version. Clients must use the v2 response route for the whole group. */
+            question_group?: components["schemas"]["TaskClarificationQuestionGroup"] | null;
+        };
+        TaskClarificationQuestionGroup: {
+            id: components["schemas"]["ClarificationId"];
+            version: number;
+            questions: components["schemas"]["TaskClarificationQuestion"][];
+        };
+        TaskClarificationQuestion: {
+            id: string;
+            prompt: string;
+            /** @enum {string} */
+            type: "single_choice" | "multi_choice" | "free_text";
+            /** @description Describes whether the Agent needs this value to complete the task; skipping does not grant additional permissions. */
+            required: boolean;
+            /** @description Whether the user may explicitly skip this optional question. Required questions must set allow_skip to false. */
+            allow_skip: boolean;
+            options: components["schemas"]["TaskClarificationQuestionOption"][];
+        } & unknown;
+        TaskClarificationQuestionOption: {
+            id: string;
+            label: string;
         };
         TaskStopRequest: {
             id: string;
@@ -10674,6 +10722,18 @@ export interface components {
              * @enum {string}
              */
             file_delivery_intent?: "none" | "required";
+        };
+        TaskStructuredInputRequest: {
+            /** @description Exact question-group version from the Task snapshot. The group ID is bound by the path. */
+            version: number;
+            answers: components["schemas"]["TaskClarificationAnswer"][];
+        };
+        TaskClarificationAnswer: {
+            question_id: string;
+            option_ids: string[];
+            text: string;
+            /** @description True only for an explicit skip allowed by the matching question; skip cannot carry text or selected options. */
+            skipped: boolean;
         };
         TaskApprovalResponseRequest: {
             version: number;
@@ -19177,6 +19237,41 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    answerStructuredTaskClarification: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["schemas"]["TaskId"];
+                clarification_id: components["schemas"]["ClarificationId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TaskStructuredInputRequest"];
+            };
+        };
+        responses: {
+            /** @description Structured answers accepted */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskActionResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
             default: components["responses"]["Error"];
         };
     };

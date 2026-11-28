@@ -518,6 +518,9 @@ func ValidateClarificationQuestions(questions []ClarificationQuestion) error {
 		if !validClarificationItemID(question.ID) || !validClarificationText(question.Prompt, 1024) {
 			return errors.New("clarification question identity or prompt is invalid")
 		}
+		if question.Required && question.AllowSkip {
+			return errors.New("required clarification questions cannot allow skipping")
+		}
 		if _, exists := questionIDs[question.ID]; exists {
 			return errors.New("clarification question IDs must be unique")
 		}
@@ -572,7 +575,7 @@ func ValidateClarificationAnswers(questions []ClarificationQuestion, answers []C
 		}
 		seen[answer.QuestionID] = struct{}{}
 		if answer.Skipped {
-			if !question.AllowSkip || answer.Text != "" || len(answer.OptionIDs) != 0 {
+			if question.Required || !question.AllowSkip || answer.Text != "" || len(answer.OptionIDs) != 0 {
 				return errors.New("clarification question cannot be skipped with these values")
 			}
 			continue

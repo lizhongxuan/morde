@@ -90,13 +90,22 @@ FROM notification_source_events WHERE id=$1 FOR UPDATE`, event.ID).Scan(
 				return fmt.Errorf("recheck project notification recipient: %w", err)
 			}
 		}
-		_, err = tx.Exec(ctx, `INSERT INTO notifications
-(id,owner_id,source_event_id,source_kind,source_id,source_version,project_id,kind,summary)
-VALUES ($1,$2,$3,$4,$5,$6,NULLIF($7,''),$8,$9)
+		deliverySequence, err := nextNotificationDeliverySequence(ctx, tx, value.OwnerID)
+		if err != nil {
+			return fmt.Errorf("reserve notification delivery sequence: %w", err)
+		}
+		inserted, err := tx.Exec(ctx, `INSERT INTO notifications
+(id,owner_id,source_event_id,source_kind,source_id,source_version,project_id,kind,summary,delivery_sequence)
+VALUES ($1,$2,$3,$4,$5,$6,NULLIF($7,''),$8,$9,$10)
 ON CONFLICT (source_event_id) DO NOTHING`, value.ID, value.OwnerID, value.SourceEventID,
-			value.SourceKind, value.SourceID, value.SourceVersion, value.ProjectID, string(value.Kind), value.Summary)
+			value.SourceKind, value.SourceID, value.SourceVersion, value.ProjectID, string(value.Kind), value.Summary, deliverySequence)
 		if err != nil {
 			return fmt.Errorf("create source notification: %w", err)
+		}
+		if inserted.RowsAffected() == 1 {
+			if err := commitNotificationDeliverySequence(ctx, tx, value.OwnerID, deliverySequence); err != nil {
+				return fmt.Errorf("commit notification delivery sequence: %w", err)
+			}
 		}
 		if _, err := tx.Exec(ctx, `UPDATE notification_source_events SET processed_at=clock_timestamp() WHERE id=$1`, event.ID); err != nil {
 			return fmt.Errorf("mark notification source event processed: %w", err)

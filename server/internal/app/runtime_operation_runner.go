@@ -52,14 +52,34 @@ func RuntimeComputerTools() []RuntimeComputerToolDefinition {
 // response by querying the same ID and retries only when the exact runtime
 // instance reports that ID as not found.
 func (r *RuntimeOperationRunner) Execute(ctx context.Context, session *RuntimeSession, runtimeTaskID, operationID string, leaseVersion int64, capability, action string, arguments []byte, workspaceID string, bindingVersion int64, workspaceViewID string, workspaceCheckpointRevision int64, inputRevision *int64) (runtimeclient.Operation, error) {
+	return r.execute(ctx, session, runtimeTaskID, operationID, leaseVersion, capability, action, arguments,
+		workspaceID, bindingVersion, workspaceViewID, workspaceCheckpointRevision, inputRevision, nil)
+}
+
+func (r *RuntimeOperationRunner) ExecuteWithSupplementalOutputCapture(ctx context.Context, session *RuntimeSession, runtimeTaskID, operationID string,
+	leaseVersion int64, capability, action string, arguments []byte, workspaceID string, bindingVersion int64, workspaceViewID string,
+	workspaceCheckpointRevision int64, inputRevision *int64, identity runtimeclient.SupplementalOutputCaptureIdentity) (runtimeclient.Operation, error) {
+	if capability != "shell.exec" || action != "run" || identity.TaskID != runtimeTaskID || identity.WorkspaceID != workspaceID ||
+		identity.WorkspaceBindingVersion != bindingVersion || identity.WorkspaceViewID != workspaceViewID ||
+		identity.WorkspaceCheckpointRevision != workspaceCheckpointRevision || !runtimeclient.ValidSupplementalOutputCaptureIdentity(identity) {
+		return runtimeclient.Operation{}, domain.NewError(domain.CodeInvalidArgument, "supplemental output capture identity is invalid")
+	}
+	return r.execute(ctx, session, runtimeTaskID, operationID, leaseVersion, capability, action, arguments,
+		workspaceID, bindingVersion, workspaceViewID, workspaceCheckpointRevision, inputRevision, &identity)
+}
+
+func (r *RuntimeOperationRunner) execute(ctx context.Context, session *RuntimeSession, runtimeTaskID, operationID string, leaseVersion int64, capability, action string, arguments []byte, workspaceID string, bindingVersion int64, workspaceViewID string, workspaceCheckpointRevision int64, inputRevision *int64, outputCapture *runtimeclient.SupplementalOutputCaptureIdentity) (runtimeclient.Operation, error) {
 	if err := validateRuntimeOperationCall(session, runtimeTaskID, operationID, leaseVersion, capability, action); err != nil {
 		return runtimeclient.Operation{}, err
+	}
+	if outputCapture != nil && !session.Supports(runtimeclient.SupplementalOutputCaptureCapability) {
+		return runtimeclient.Operation{}, domain.NewError(domain.CodeUnsupported, "Host runtime does not support supplemental output capture")
 	}
 	trimmed := bytes.TrimSpace(arguments)
 	if !json.Valid(trimmed) || len(trimmed) < 2 || trimmed[0] != '{' || trimmed[len(trimmed)-1] != '}' {
 		return runtimeclient.Operation{}, domain.NewError(domain.CodeInvalidArgument, "runtime operation arguments are invalid")
 	}
-	operation, err := session.Execute(ctx, runtimeTaskID, operationID, leaseVersion, capability, action, arguments, workspaceID, bindingVersion, workspaceViewID, workspaceCheckpointRevision, inputRevision)
+	operation, err := session.execute(ctx, runtimeTaskID, operationID, leaseVersion, capability, action, arguments, workspaceID, bindingVersion, workspaceViewID, workspaceCheckpointRevision, inputRevision, outputCapture)
 	if err == nil {
 		return operation, nil
 	}
@@ -75,7 +95,7 @@ func (r *RuntimeOperationRunner) Execute(ctx context.Context, session *RuntimeSe
 		return runtimeclient.Operation{}, queryErr
 	}
 
-	operation, retryErr := session.Execute(ctx, runtimeTaskID, operationID, leaseVersion, capability, action, arguments, workspaceID, bindingVersion, workspaceViewID, workspaceCheckpointRevision, inputRevision)
+	operation, retryErr := session.execute(ctx, runtimeTaskID, operationID, leaseVersion, capability, action, arguments, workspaceID, bindingVersion, workspaceViewID, workspaceCheckpointRevision, inputRevision, outputCapture)
 	if retryErr == nil {
 		return operation, nil
 	}

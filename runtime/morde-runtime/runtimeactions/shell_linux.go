@@ -206,6 +206,8 @@ func (h *ShellHandler) Capability() string { return shellCapability }
 
 func (h *ShellHandler) Action() string { return shellAction }
 
+func (h *ShellHandler) SupportsSupplementalOutputCapture() bool { return true }
+
 func (h *ShellHandler) Execute(ctx context.Context, request contract.ExecuteRequest) (json.RawMessage, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -285,8 +287,12 @@ func (h *ShellHandler) Execute(ctx context.Context, request contract.ExecuteRequ
 			return nil, fmt.Errorf("scan Task Workspace snapshot before shell execution: %w", err)
 		}
 	}
+	captureSink := contract.SupplementalOutputSinkFromContext(operationContext)
 	if spec, recognized := parseShellGoTestSpec(args.Command); recognized && h.goPath != "" &&
 		request.WorkspaceViewID != "" && relativeCWD == "." {
+		if captureSink != nil {
+			captureSink.MarkSupplementalOutputUnsupported("trusted_go_runner")
+		}
 		result, receipt, runErr := h.executeTrustedGoTest(operationContext, request, args.Command, spec,
 			workspaceRoot, workspaceDir, jailWorkspace, jailCWD, workspaceSnapshotBefore)
 		if runErr != nil {
@@ -334,8 +340,8 @@ func (h *ShellHandler) Execute(ctx context.Context, request contract.ExecuteRequ
 	command.Dir = string(filepath.Separator)
 	command.Env = []string{"PATH=/usr/bin:/bin"}
 	budget := &outputBudget{limit: h.outputLimit}
-	stdout := &boundedBuffer{limit: h.outputLimit, budget: budget}
-	stderr := &boundedBuffer{limit: h.outputLimit, budget: budget}
+	stdout := &boundedBuffer{limit: h.outputLimit, budget: budget, supplemental: captureSink, stream: contract.SupplementalOutputCaptureStdout}
+	stderr := &boundedBuffer{limit: h.outputLimit, budget: budget, supplemental: captureSink, stream: contract.SupplementalOutputCaptureStderr}
 	command.Stdout = stdout
 	command.Stderr = stderr
 	command.SysProcAttr = &syscall.SysProcAttr{
@@ -380,7 +386,13 @@ func (h *ShellHandler) Execute(ctx context.Context, request contract.ExecuteRequ
 	// This loop only returns after an empty cgroup is proven; a persistent
 	// kernel failure keeps the operation unresolved rather than claiming stop.
 	h.killUntilEmpty(groupPath)
+	if captureSink != nil && timedOut {
+		captureSink.MarkSupplementalOutputIncomplete("source_interrupted")
+	}
 	if ctx.Err() != nil && !timedOut {
+		if captureSink != nil {
+			captureSink.MarkSupplementalOutputIncomplete("operation_cancelled")
+		}
 		return nil, ErrShellOperationCancelled
 	}
 

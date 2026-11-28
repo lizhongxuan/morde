@@ -102,6 +102,28 @@ type WorkspaceBinding = contract.WorkspaceBinding
 type SetWorkspaceBindingsRequest = contract.SetWorkspaceBindingsRequest
 type SetWorkspaceBindingsResponse = contract.SetWorkspaceBindingsResponse
 type ExecuteRequest = contract.ExecuteRequest
+type SupplementalOutputCaptureIdentity = contract.SupplementalOutputCaptureIdentity
+type SupplementalOutputCapturePageRequest = contract.SupplementalOutputCapturePageRequest
+type SupplementalOutputCapturePage = contract.SupplementalOutputCapturePage
+type SupplementalOutputCaptureReleaseRequest = contract.SupplementalOutputCaptureReleaseRequest
+type SupplementalOutputCaptureReleaseResponse = contract.SupplementalOutputCaptureReleaseResponse
+type SupplementalOutputCaptureStream = contract.SupplementalOutputCaptureStream
+
+func ValidSupplementalOutputCaptureIdentity(value SupplementalOutputCaptureIdentity) bool {
+	return contract.ValidSupplementalOutputCaptureIdentity(value)
+}
+
+const (
+	SupplementalOutputCaptureCapability = contract.SupplementalOutputCaptureCapability
+	SupplementalOutputCaptureStdout     = contract.SupplementalOutputCaptureStdout
+	SupplementalOutputCaptureStderr     = contract.SupplementalOutputCaptureStderr
+	SupplementalOutputCaptureComplete   = contract.SupplementalOutputCaptureComplete
+	SupplementalOutputCaptureIncomplete = contract.SupplementalOutputCaptureIncomplete
+	SupplementalOutputCaptureFailed     = contract.SupplementalOutputCaptureFailed
+	SupplementalOutputCaptureMaxBytes   = contract.SupplementalOutputCaptureMaxBytes
+	SupplementalOutputCapturePageBytes  = contract.SupplementalOutputCapturePageBytes
+)
+
 type Operation = contract.Operation
 type OperationResponse = contract.OperationResponse
 type OperationQuery = contract.OperationQuery

@@ -342,6 +342,19 @@ type TaskStepDetailReader interface {
 	GetTaskStepDetail(context.Context, string, string, string) (TaskStepDetailRecord, error)
 }
 
+// TaskStepOutputCaptureWriter persists one fully redacted, fully encrypted
+// supplemental Shell capture as a single durable receipt. Implementations must
+// reject a capture unless its operation and terminal Task step match identity.
+type TaskStepOutputCaptureWriter interface {
+	SaveTaskStepOutputCapture(context.Context, TaskStepOutputCaptureRecord) error
+}
+
+// TaskStepOutputCaptureReader returns one encrypted page for an actor. The
+// caller must reauthorize the Task and Workspace before every page read.
+type TaskStepOutputCaptureReader interface {
+	GetTaskStepOutputCapturePage(context.Context, string, string, string, string, int) (TaskStepOutputCapturePageRecord, error)
+}
+
 type TaskStepRetryRequest struct {
 	TaskID               string
 	StepID               string

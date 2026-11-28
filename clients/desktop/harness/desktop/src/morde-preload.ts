@@ -29,7 +29,12 @@ if (mode === "codex") {
   });
 } else if (mode === "portal") {
   contextBridge.exposeInMainWorld("morde", {
+    voiceWaveformEnabled: process.env.MORDE_ENABLE_VOICE_WAVEFORM === "1",
+    beginVoiceRecording: () => call("morde:voice-recording-begin"),
+    endVoiceRecording: (token: string) => call("morde:voice-recording-end", token),
     projectUploadTargets: () => call("morde:portal-project-upload-targets"),
+    desktopNotificationSettings: () => call("morde:desktop-notification-settings"),
+    setDesktopNotificationsEnabled: (enabled: boolean) => call("morde:desktop-notification-toggle", enabled),
     openHostWorkbenchEmbed: (request: { hostID: string; conversationID: string; initialTarget: string; targets: string[]; shared: boolean }) => call("morde:portal-workbench-open", request),
     setHostWorkbenchBounds: (nonce: string, bounds: { x: number; y: number; width: number; height: number }) => call("morde:portal-workbench-bounds", nonce, bounds),
     sendHostWorkbenchCommand: (nonce: string, command: HostWorkbenchCommand) => call("morde:portal-workbench-command", nonce, command),

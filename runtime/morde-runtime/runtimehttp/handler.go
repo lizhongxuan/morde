@@ -277,6 +277,38 @@ func (h *handler) dispatch(writer http.ResponseWriter, request *http.Request) er
 
 	case strings.HasPrefix(path, "/runtime/v1/operations/"):
 		parts := strings.Split(path, "/")
+		if len(parts) == 7 && parts[1] == "runtime" && parts[2] == "v1" && parts[3] == "operations" &&
+			parts[4] != "" && parts[5] == "output-capture" && parts[6] == "page" {
+			if request.Method != http.MethodGet || !validOperationID(parts[4]) || !noBody(request) {
+				return runtimecore.ErrInvalidRequest
+			}
+			pageRequest, err := supplementalOutputCapturePageRequest(request, parts[4])
+			if err != nil {
+				return err
+			}
+			page, err := h.manager.SupplementalOutputCapturePage(pageRequest)
+			if err != nil {
+				return err
+			}
+			setNoStore(writer)
+			return writeJSON(writer, page)
+		}
+		if len(parts) == 7 && parts[1] == "runtime" && parts[2] == "v1" && parts[3] == "operations" &&
+			parts[4] != "" && parts[5] == "output-capture" && parts[6] == "release" {
+			if request.Method != http.MethodPost || !validOperationID(parts[4]) {
+				return runtimecore.ErrInvalidRequest
+			}
+			var release contract.SupplementalOutputCaptureReleaseRequest
+			if err := readJSON(request, &release); err != nil {
+				return err
+			}
+			response, err := h.manager.ReleaseSupplementalOutputCapture(parts[4], release)
+			if err != nil {
+				return err
+			}
+			setNoStore(writer)
+			return writeJSON(writer, response)
+		}
 		if len(parts) == 6 && parts[1] == "runtime" && parts[2] == "v1" && parts[3] == "operations" && parts[4] != "" && parts[5] == "cancel" {
 			if request.Method != http.MethodPost || !validOperationID(parts[4]) {
 				return runtimecore.ErrInvalidRequest
@@ -327,6 +359,40 @@ func (h *handler) dispatch(writer http.ResponseWriter, request *http.Request) er
 	default:
 		return runtimecore.ErrInvalidRequest
 	}
+}
+
+func supplementalOutputCapturePageRequest(request *http.Request, operationID string) (contract.SupplementalOutputCapturePageRequest, error) {
+	query, err := strictQuery(request,
+		"host_id", "runtime_generation", "runtime_instance_id", "control_version", "task_id", "lease_version",
+		"owner_id", "authorization_version", "task_revision", "workspace_id", "workspace_authorization_version",
+		"workspace_binding_version", "workspace_view_id", "workspace_checkpoint_revision", "step_id", "call_id", "stream", "offset")
+	if err != nil {
+		return contract.SupplementalOutputCapturePageRequest{}, err
+	}
+	generation, generationErr := parseInt(query["runtime_generation"], 1)
+	controlVersion, controlErr := parseInt(query["control_version"], 0)
+	leaseVersion, leaseErr := parseInt(query["lease_version"], 1)
+	authorizationVersion, authorizationErr := parseInt(query["authorization_version"], 1)
+	taskRevision, taskRevisionErr := parseInt(query["task_revision"], 0)
+	workspaceAuthorizationVersion, workspaceAuthorizationErr := parseInt(query["workspace_authorization_version"], 0)
+	workspaceBindingVersion, workspaceBindingErr := parseInt(query["workspace_binding_version"], 1)
+	workspaceCheckpointRevision, workspaceCheckpointErr := parseInt(query["workspace_checkpoint_revision"], 0)
+	offset, offsetErr := parseInt(query["offset"], 0)
+	if generationErr != nil || controlErr != nil || leaseErr != nil || authorizationErr != nil || taskRevisionErr != nil ||
+		workspaceAuthorizationErr != nil || workspaceBindingErr != nil || workspaceCheckpointErr != nil || offsetErr != nil ||
+		offset > int64(^uint(0)>>1) {
+		return contract.SupplementalOutputCapturePageRequest{}, runtimecore.ErrInvalidRequest
+	}
+	identity := contract.SupplementalOutputCaptureIdentity{
+		OwnerID: query["owner_id"], TaskID: query["task_id"], AuthorizationVersion: authorizationVersion, TaskRevision: taskRevision,
+		WorkspaceID: query["workspace_id"], WorkspaceAuthorizationVersion: workspaceAuthorizationVersion,
+		WorkspaceBindingVersion: workspaceBindingVersion, WorkspaceViewID: query["workspace_view_id"],
+		WorkspaceCheckpointRevision: workspaceCheckpointRevision, StepID: query["step_id"], CallID: query["call_id"],
+	}
+	return contract.SupplementalOutputCapturePageRequest{ProtocolVersion: request.Header.Get(contract.ProtocolHeader),
+		HostFence: contract.HostFence{HostID: query["host_id"], RuntimeGeneration: generation, RuntimeInstanceID: query["runtime_instance_id"], ControlVersion: controlVersion},
+		TaskID:    query["task_id"], LeaseVersion: leaseVersion, OperationID: operationID, Identity: identity,
+		Stream: contract.SupplementalOutputCaptureStream(query["stream"]), Offset: int(offset)}, nil
 }
 
 func (h *handler) launchApplication(writer http.ResponseWriter, request *http.Request, applicationID string) error {

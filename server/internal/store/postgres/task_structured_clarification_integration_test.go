@@ -37,7 +37,7 @@ func TestPostgresStructuredClarificationIsVersionBoundIdempotentAndIsolated(t *t
 	}
 	request := &task.ClarificationRequest{ID: requestID, TaskID: claimed.ID, Version: 3, ModelStepID: modelStepID,
 		CallID: "call-ask-user", Question: "Please answer the deployment questions.", Questions: questions, Status: task.ClarificationPending}
-	if _, err := store.CommitTaskProgress(ctx, app.TaskProgress{
+	progress := app.TaskProgress{
 		TaskID: claimed.ID, LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version,
 		Status: task.StatusWaitingUser, CurrentStep: stepID, WaitingReason: "clarification_required",
 		Usage: task.Usage{ActiveSeconds: 2, ToolCalls: 1},
@@ -46,7 +46,33 @@ func TestPostgresStructuredClarificationIsVersionBoundIdempotentAndIsolated(t *t
 			{ID: stepID, TaskID: claimed.ID, Sequence: 2, Kind: "clarification", Status: task.StepWaitingUser, Title: "The Agent needs input", Summary: request.Question},
 		},
 		Event: task.Event{TaskID: claimed.ID, Type: "task.waiting_user", Payload: []byte(`{"reason":"clarification_required"}`)}, ClarificationRequest: request,
-	}); err != nil {
+	}
+	for _, invalid := range []task.ClarificationRequest{
+		func() task.ClarificationRequest {
+			value := *request
+			value.CallID = task.RouteFileDeliveryIntentClarificationCallID
+			return value
+		}(),
+		func() task.ClarificationRequest {
+			value := *request
+			value.CallID = app.FileDeliveryIntentClarificationCallID
+			return value
+		}(),
+		func() task.ClarificationRequest {
+			value := *request
+			value.BatchItemID = "b1234567"
+			value.BatchAttempt = 1
+			return value
+		}(),
+	} {
+		invalidProgress := progress
+		invalidRequest := invalid
+		invalidProgress.ClarificationRequest = &invalidRequest
+		if _, err := store.CommitTaskProgress(ctx, invalidProgress); domain.CodeOf(err) != domain.CodeInvalidArgument {
+			t.Fatalf("non-general structured clarification source was accepted: call_id=%q batch=%q err=%v", invalid.CallID, invalid.BatchItemID, err)
+		}
+	}
+	if _, err := store.CommitTaskProgress(ctx, progress); err != nil {
 		t.Fatal(err)
 	}
 	details, err := store.GetTask(ctx, claimed.ID, owner.ID)

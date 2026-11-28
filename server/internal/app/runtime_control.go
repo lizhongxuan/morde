@@ -349,8 +349,19 @@ func boundedRuntimeLeaseExpiry(now, taskExpiry time.Time) time.Time {
 }
 
 func (s *RuntimeSession) Execute(ctx context.Context, taskID, operationID string, leaseVersion int64, capability, action string, arguments json.RawMessage, workspaceID string, bindingVersion int64, workspaceViewID string, workspaceCheckpointRevision int64, inputRevision *int64) (runtimeclient.Operation, error) {
+	return s.execute(ctx, taskID, operationID, leaseVersion, capability, action, arguments, workspaceID,
+		bindingVersion, workspaceViewID, workspaceCheckpointRevision, inputRevision, nil)
+}
+
+func (s *RuntimeSession) execute(ctx context.Context, taskID, operationID string, leaseVersion int64, capability, action string, arguments json.RawMessage, workspaceID string, bindingVersion int64, workspaceViewID string, workspaceCheckpointRevision int64, inputRevision *int64, outputCapture *runtimeclient.SupplementalOutputCaptureIdentity) (runtimeclient.Operation, error) {
 	if s == nil || s.client == nil {
 		return runtimeclient.Operation{}, domain.NewError(domain.CodeInvalidState, "runtime session is unavailable")
+	}
+	if outputCapture != nil && (!s.Supports(runtimeclient.SupplementalOutputCaptureCapability) || outputCapture.TaskID != taskID ||
+		outputCapture.WorkspaceID != workspaceID || outputCapture.WorkspaceBindingVersion != bindingVersion ||
+		outputCapture.WorkspaceViewID != workspaceViewID || outputCapture.WorkspaceCheckpointRevision != workspaceCheckpointRevision ||
+		!runtimeclient.ValidSupplementalOutputCaptureIdentity(*outputCapture)) {
+		return runtimeclient.Operation{}, domain.NewError(domain.CodeInvalidArgument, "supplemental output capture identity is invalid")
 	}
 	if runtimeclient.WorkspaceScopedCapability(capability) {
 		if inputRevision == nil || *inputRevision < 0 || workspaceCheckpointRevision < *inputRevision {
@@ -371,7 +382,30 @@ func (s *RuntimeSession) Execute(ctx context.Context, taskID, operationID string
 		WorkspaceID: workspaceID, BindingVersion: bindingVersion,
 		WorkspaceViewID: workspaceViewID, WorkspaceCheckpointRevision: workspaceCheckpointRevision,
 		LeaseVersion: leaseVersion, Capability: capability, Action: action, Arguments: arguments,
+		OutputCapture: outputCapture,
 	})
+}
+
+func (s *RuntimeSession) SupplementalOutputCapturePage(ctx context.Context, taskID, operationID string, leaseVersion int64,
+	identity runtimeclient.SupplementalOutputCaptureIdentity, stream runtimeclient.SupplementalOutputCaptureStream, offset int) (runtimeclient.SupplementalOutputCapturePage, error) {
+	if s == nil || s.client == nil {
+		return runtimeclient.SupplementalOutputCapturePage{}, domain.NewError(domain.CodeInvalidState, "runtime session is unavailable")
+	}
+	return s.client.SupplementalOutputCapturePage(ctx, runtimeclient.SupplementalOutputCapturePageRequest{
+		HostFence: s.Fence, TaskID: taskID, LeaseVersion: leaseVersion, OperationID: operationID,
+		Identity: identity, Stream: stream, Offset: offset,
+	})
+}
+
+func (s *RuntimeSession) ReleaseSupplementalOutputCapture(ctx context.Context, taskID, operationID string, leaseVersion int64,
+	identity runtimeclient.SupplementalOutputCaptureIdentity) error {
+	if s == nil || s.client == nil {
+		return domain.NewError(domain.CodeInvalidState, "runtime session is unavailable")
+	}
+	_, err := s.client.ReleaseSupplementalOutputCapture(ctx, operationID, runtimeclient.SupplementalOutputCaptureReleaseRequest{
+		HostFence: s.Fence, TaskID: taskID, LeaseVersion: leaseVersion, Identity: identity,
+	})
+	return err
 }
 
 // SyncWorkspaceBindings refreshes Runtime's in-memory binding registry from

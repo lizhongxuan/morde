@@ -102,6 +102,12 @@ func TestStructuredClarificationValidatesStableQuestionAndAnswerIDs(t *testing.T
 	if err := ValidateClarificationAnswers(questions, unknownOption); err == nil {
 		t.Fatal("unknown choice was accepted")
 	}
+	requiredSkip := []ClarificationAnswer{
+		{QuestionID: "environment", Skipped: true, OptionIDs: []string{}}, answers[1], answers[2],
+	}
+	if err := ValidateClarificationAnswers(questions, requiredSkip); err == nil {
+		t.Fatal("required clarification question was skipped")
+	}
 	implicitSkip := []ClarificationAnswer{answers[0], answers[1], {QuestionID: "notes"}}
 	if err := ValidateClarificationAnswers(questions, implicitSkip); err == nil {
 		t.Fatal("empty non-skip answer was accepted")
@@ -114,6 +120,7 @@ func TestStructuredClarificationRejectsAmbiguousQuestionGroups(t *testing.T) {
 		{{ID: "environment", Prompt: "Where?", Type: ClarificationSingleChoice,
 			Options: []ClarificationQuestionOption{{ID: "same", Label: "A"}, {ID: "same", Label: "B"}}}},
 		{{ID: "bad id", Prompt: "Where?", Type: ClarificationFreeText}},
+		{{ID: "required", Prompt: "Required", Type: ClarificationFreeText, Required: true, AllowSkip: true}},
 		{{ID: "notes", Prompt: "Notes", Type: ClarificationFreeText,
 			Options: []ClarificationQuestionOption{{ID: "unused", Label: "Unused"}}}},
 	} {

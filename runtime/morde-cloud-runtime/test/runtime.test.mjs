@@ -10,7 +10,8 @@ import test from 'node:test'
 import { AccountRuntime, workspaceWorkingDirectory } from '../src/account-runtime.mjs'
 import {
   coordinatorCompactionModelCallID, coordinatorModelCallID, DurableSession, ENGINE_VERSION, modelCallID, modelRecoveryCallIDs,
-  TASK_VALIDATION_REVIEW_IDENTITY_FIELDS, runAgent, taskValidationReviewModelCallID, validDelegateSelection, validMessageDelivery, validStart,
+  TASK_VALIDATION_REVIEW_IDENTITY_FIELDS, runAgent, taskValidationReviewModelCallID, validDelegateSelection, validLateChildTools,
+  validMessageDelivery, validStart,
 } from '../src/engine.mjs'
 import { WorkerIPC } from '../src/ipc.mjs'
 
@@ -367,6 +368,39 @@ const fileReadTool = {
   name: 'file_read', description: 'Read a file from the task workspace.',
   parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'], additionalProperties: false },
 }
+const structuredAskUserTool = {
+  name: 'ask_user', description: 'Ask the user a persisted clarification question group.',
+  parameters: {
+    type: 'object',
+    properties: {
+      question: { type: ['string', 'null'], minLength: 1, maxLength: 4096 },
+      questions: {
+        type: ['array', 'null'], minItems: 1, maxItems: 8,
+        items: {
+          type: 'object',
+          properties: {
+            id: { type: 'string', minLength: 1, maxLength: 64 },
+            prompt: { type: 'string', minLength: 1, maxLength: 1024 },
+            type: { type: 'string', enum: ['single_choice', 'multi_choice', 'free_text'] },
+            required: { type: 'boolean' },
+            allow_skip: { type: 'boolean' },
+            options: { type: 'array', maxItems: 12, items: { type: 'object', properties: {
+              id: { type: 'string', minLength: 1, maxLength: 64 }, label: { type: 'string', minLength: 1, maxLength: 256 },
+            }, required: ['id', 'label'], additionalProperties: false } },
+          },
+          required: ['id', 'prompt', 'type', 'required', 'allow_skip', 'options'],
+          additionalProperties: false,
+        },
+      },
+    },
+    required: ['question', 'questions'],
+    additionalProperties: false,
+  },
+}
+const upstreamAskUserQuestionTool = {
+  name: 'ask_user_question', description: 'Upstream DSH question plugin.',
+  parameters: { type: 'object', properties: { questions: { type: 'array', items: { type: 'object' } } }, required: ['questions'], additionalProperties: false },
+}
 const delegateTool = {
   name: 'dsh_delegate', description: 'Delegate a bounded task to a child agent.',
   parameters: {
@@ -402,6 +436,11 @@ test('task start accepts only paired delegate plan selector schemas', () => {
   const invalid = structuredClone(planDelegateTool)
   invalid.parameters.properties.morde_plan_revision.minimum = 0
   assert.equal(validStart({ ...start, tools: [invalid, fileReadTool] }), false)
+})
+
+test('task start rejects the upstream ask_user_question extension entry', () => {
+  assert.equal(validStart({ ...start, tools: [upstreamAskUserQuestionTool] }), false)
+  assert.equal(validStart({ ...start, tools: [structuredAskUserTool] }), true)
 })
 
 test('task start accepts only a valid versioned W3C trace context', () => {
@@ -4158,6 +4197,37 @@ test('child response rejects an escalated delegate tool allowlist', { timeout: 1
   assert.equal(frames.some(frame => frame.type === 'model' && frame.session_id === 'child_escalation'), false)
 })
 
+test('child agents cannot receive Morde or upstream clarification tools', { timeout: 10000 }, async t => {
+  const { child, frames } = launch((frame, proc) => {
+    if (frame.type === 'ready') send(proc, { ...start, tools: [delegateTool, fileReadTool, structuredAskUserTool] })
+    if (frame.type === 'checkpoint') acknowledgeCheckpoint(proc, frame)
+    if (frame.type === 'model' && frame.session_id === start.session_id) {
+      const chunks = [
+        { type: 'tool-call-delta', index: 0, id: 'call_child_no_ask', name: delegateTool.name,
+          argumentsDelta: JSON.stringify({ title: 'Inspect', objective: 'Read the notes.', tool_names: ['file_read'] }) },
+        { type: 'finish', reason: { kind: 'tool-calls' } },
+      ]
+      chunks.forEach((chunk, index) => send(proc, { type: 'model_chunk', id: frame.id, index, chunk }))
+      send(proc, { type: 'model_end', id: frame.id, ok: true })
+    }
+    if (frame.type === 'child_create') send(proc, { type: 'child_session', ...taskFence(frame), session_id: 'child_no_ask',
+      parent_session_id: frame.session_id, call_id: frame.call_id, objective: frame.arguments.objective,
+      tools: [fileReadTool, structuredAskUserTool, ...jobTools], checkpoint_through_seq: -1, checkpoint_sha256: '',
+      step_status: 'running', summary: '' })
+  })
+  t.after(() => { if (child.exitCode === null) child.kill() })
+  await once(child, 'close')
+  assert.ok(frames.some(frame => frame.type === 'settled'))
+  assert.ok(frames.some(frame => frame.type === 'child_create'))
+  assert.equal(frames.some(frame => frame.type === 'model' && frame.session_id === 'child_no_ask'), false)
+
+  assert.equal(validStart({ ...start, tools: [delegateTool, fileReadTool, upstreamAskUserQuestionTool] }), false)
+  const askUserNamesDigest = createHash('sha256').update(JSON.stringify(['ask_user'])).digest('hex')
+  const upstreamAskUserNamesDigest = createHash('sha256').update(JSON.stringify(['ask_user_question'])).digest('hex')
+  assert.equal(validLateChildTools([structuredAskUserTool], askUserNamesDigest, false), false)
+  assert.equal(validLateChildTools([upstreamAskUserQuestionTool], upstreamAskUserNamesDigest, false), false)
+})
+
 test('a nested worker model failure is settled locally and its sibling continues', { timeout: 15000 }, async t => {
   const coordinatorID = 'failure_coordinator'
   const workers = new Map()
@@ -5299,16 +5369,6 @@ test('cancelling a running child never sends a successful settlement', async () 
 })
 
 test('rejects ask_user mixed with a Host tool before dispatching either tool', async () => {
-  const clarification = {
-    name: 'ask_user',
-    description: 'Ask the user for one missing detail. Use alone.',
-    parameters: {
-      type: 'object',
-      properties: { question: { type: 'string' } },
-      required: ['question'],
-      additionalProperties: false,
-    },
-  }
   const hostTool = {
     name: 'file_read',
     description: 'Read a workspace file.',
@@ -5318,7 +5378,7 @@ test('rejects ask_user mixed with a Host tool before dispatching either tool', a
   let modelCalls = 0
   let toolCalls = 0
   const { child, frames } = launch((frame, proc) => {
-    if (frame.type === 'ready') send(proc, { ...start, tools: [hostTool, clarification] })
+    if (frame.type === 'ready') send(proc, { ...start, tools: [hostTool, structuredAskUserTool] })
     if (frame.type === 'checkpoint') {
       through = frame.through_seq
       send(proc, { type: 'checkpoint_ack', id: frame.id, ok: true, through_seq: through, sha256: frame.sha256 })
@@ -5327,7 +5387,10 @@ test('rejects ask_user mixed with a Host tool before dispatching either tool', a
       modelCalls += 1
       const chunks = [
         { type: 'tool-call-delta', index: 0, id: 'call_read_1', name: hostTool.name, argumentsDelta: '{}' },
-        { type: 'tool-call-delta', index: 1, id: 'call_ask_1', name: clarification.name, argumentsDelta: '{"question":"Which environment?"}' },
+        { type: 'tool-call-delta', index: 1, id: 'call_ask_1', name: structuredAskUserTool.name,
+          argumentsDelta: JSON.stringify({ question: null, questions: [{ id: 'environment', prompt: 'Which environment?',
+            type: 'single_choice', required: true, allow_skip: false,
+            options: [{ id: 'staging', label: 'Staging' }, { id: 'production', label: 'Production' }] }] }) },
         { type: 'usage', usage: { inputTokens: 3, outputTokens: 2 } },
         { type: 'finish', reason: { kind: 'tool-calls' } },
       ]
@@ -5395,6 +5458,61 @@ test('resumes a standalone ask_user call with the exact user answer as its tool 
   assert.equal(resumed.modelCalls, 1)
   const answer = resumed.modelRequests[0].messages.find(message => message.role === 'tool' && message.toolCallId === 'call_ask_1')
   assert.equal(answer?.content[0].text, 'Use staging.')
+  assert.equal(resumed.frames.filter(frame => frame.type === 'tool_call').length, 1)
+})
+
+test('resumes a structured ask_user call once under its original Task and call ID', async () => {
+  const pages = []
+  const answer = JSON.stringify({
+    question_group_id: 'r1234567', version: 2,
+    answers: [
+      { question_id: 'environment', option_ids: ['staging'], text: '', skipped: false },
+      { question_id: 'notes', option_ids: [], text: 'Keep the current defaults.', skipped: false },
+    ],
+  })
+  const { child, frames } = launch((frame, proc) => {
+    if (frame.type === 'ready') send(proc, { ...start, tools: [structuredAskUserTool] })
+    if (frame.type === 'checkpoint') {
+      pages.push({ from_seq: frame.from_seq, through_seq: frame.through_seq, payload: frame.payload, sha256: frame.sha256 })
+      send(proc, { type: 'checkpoint_ack', id: frame.id, ok: true, through_seq: frame.through_seq, sha256: frame.sha256 })
+    }
+    if (frame.type === 'model') {
+      const chunks = [
+        { type: 'tool-call-delta', index: 0, id: 'call_ask_group_1', name: structuredAskUserTool.name,
+          argumentsDelta: JSON.stringify({ question: null, questions: [
+            { id: 'environment', prompt: 'Which environment?', type: 'single_choice', required: true,
+              allow_skip: false, options: [{ id: 'staging', label: 'Staging' }, { id: 'production', label: 'Production' }] },
+            { id: 'notes', prompt: 'Any other constraints?', type: 'free_text', required: false, allow_skip: true, options: [] },
+          ] }) },
+        { type: 'usage', usage: { inputTokens: 3, outputTokens: 2 } },
+        { type: 'finish', reason: { kind: 'tool-calls' } },
+      ]
+      chunks.forEach((chunk, index) => send(proc, { type: 'model_chunk', id: frame.id, index, chunk }))
+      send(proc, { type: 'model_end', id: frame.id, ok: true })
+    }
+    if (frame.type === 'tool_call') {
+      assert.equal(frame.task_id, start.task_id)
+      assert.equal(frame.call_id, 'call_ask_group_1')
+      proc.stdin.end()
+    }
+  })
+  const [code] = await once(child, 'close')
+  assert.notEqual(code, 0)
+  assert.ok(pages.length > 0)
+
+  const resumed = await resumeSession(pages, {
+    tools: [structuredAskUserTool],
+    onToolCall(frame) {
+      assert.equal(frame.task_id, start.task_id)
+      assert.equal(frame.call_id, 'call_ask_group_1')
+      return { status: 'succeeded', output: answer }
+    },
+  })
+  assert.equal(resumed.code, 0, `frames: ${resumed.frames.map(frame => frame.type).join(', ')}`)
+  assert.equal(resumed.sentToolResults.length, 1)
+  assert.deepEqual(resumed.sentToolResults[0], { call_id: 'call_ask_group_1', status: 'succeeded', output: answer })
+  const result = resumed.modelRequests[0].messages.find(message => message.role === 'tool' && message.toolCallId === 'call_ask_group_1')
+  assert.equal(result?.content[0].text, answer)
   assert.equal(resumed.frames.filter(frame => frame.type === 'tool_call').length, 1)
 })
 

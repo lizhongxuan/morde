@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"morde-runtime/contract"
 	mordesync "morde-sync"
 )
 
@@ -311,10 +312,12 @@ func validOperationID(value string) bool {
 }
 
 type boundedBuffer struct {
-	limit     int
-	budget    *outputBudget
-	buffer    bytes.Buffer
-	truncated bool
+	limit        int
+	budget       *outputBudget
+	buffer       bytes.Buffer
+	truncated    bool
+	supplemental contract.SupplementalOutputSink
+	stream       contract.SupplementalOutputCaptureStream
 }
 
 // outputBudget applies one combined retention limit to stdout and stderr.
@@ -329,7 +332,6 @@ type outputBudget struct {
 func (b *boundedBuffer) Write(value []byte) (int, error) {
 	if b.budget != nil {
 		b.budget.mu.Lock()
-		defer b.budget.mu.Unlock()
 	}
 	remaining := b.limit - b.buffer.Len()
 	if b.budget != nil && b.budget.limit-b.budget.used < remaining {
@@ -350,6 +352,20 @@ func (b *boundedBuffer) Write(value []byte) (int, error) {
 		}
 	} else if len(value) > 0 {
 		b.truncated = true
+	}
+	retained := len(value)
+	if remaining <= 0 {
+		retained = 0
+	} else if retained > remaining {
+		retained = remaining
+	}
+	if b.budget != nil {
+		b.budget.mu.Unlock()
+	}
+	if retained < len(value) && b.supplemental != nil {
+		// This callback is a bounded in-memory sideband. A failed append is
+		// evidence loss only; the child pipe must keep draining unchanged.
+		b.supplemental.WriteSupplementalOutput(b.stream, value[retained:])
 	}
 	// Keep draining the child's pipe after the retained output reaches its cap.
 	return len(value), nil

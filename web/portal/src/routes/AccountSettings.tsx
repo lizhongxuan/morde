@@ -13,6 +13,88 @@ import {
 } from './personal-data-store';
 import './AccountSettings.css';
 
+type DesktopNotificationBridge = {
+  desktopNotificationSettings?: () => Promise<unknown>;
+  setDesktopNotificationsEnabled?: (enabled: boolean) => Promise<unknown>;
+};
+
+function desktopNotificationBridge(): DesktopNotificationBridge | undefined {
+  if (typeof window === 'undefined') return undefined;
+  return (window as Window & { morde?: DesktopNotificationBridge }).morde;
+}
+
+function DesktopNotificationSettings() {
+  const bridge = desktopNotificationBridge();
+  const loadPreference = bridge?.desktopNotificationSettings;
+  const savePreference = bridge?.setDesktopNotificationsEnabled;
+  const [enabled, setEnabled] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let current = true;
+    if (!loadPreference || !savePreference) {
+      setLoading(false);
+      return () => { current = false; };
+    }
+    setLoading(true);
+    setError(null);
+    void loadPreference().then((value) => {
+      const state = value && typeof value === 'object' ? value as { enabled?: unknown } : null;
+      if (!state || typeof state.enabled !== 'boolean') throw new Error('Invalid desktop notification setting');
+      if (current) setEnabled(state.enabled);
+    }).catch(() => {
+      if (current) setError('无法读取本机桌面提醒设置。');
+    }).finally(() => {
+      if (current) setLoading(false);
+    });
+    return () => { current = false; };
+  }, [loadPreference, savePreference]);
+
+  if (!loadPreference || !savePreference) return null;
+
+  const toggle = async () => {
+    if (saving || loading || error) return;
+    setSaving(true);
+    setError(null);
+    try {
+      const result = await savePreference(!enabled);
+      const state = result && typeof result === 'object' ? result as { enabled?: unknown } : null;
+      if (!state || typeof state.enabled !== 'boolean') throw new Error('Invalid desktop notification setting');
+      setEnabled(state.enabled);
+    } catch {
+      setError('无法保存本机桌面提醒设置，请重试。');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return <section className="account-settings-info-block" aria-labelledby="desktop-notification-title">
+    <div className="account-settings-toggle-row">
+      <div>
+        <h3 id="desktop-notification-title">任务完成桌面提醒</h3>
+        <p>仅在 Morde 窗口未聚焦时尝试系统通知。通知不含任务标题或内容；点击后只打开 Assistant。系统通知不可用时，可在站内通知查看。</p>
+      </div>
+      <button type="button" role="switch" aria-label="任务完成桌面提醒" aria-checked={enabled} disabled={loading || saving || Boolean(error)}
+        className="account-settings-switch" onClick={() => void toggle()}>
+        <span aria-hidden="true" />
+      </button>
+    </div>
+    {loading && <p role="status" className="notice notice-info">正在读取本机设置…</p>}
+    {saving && <p role="status" className="notice notice-info">正在保存本机设置…</p>}
+    {error && <p role="alert" className="notice notice-warning">{error}<button type="button" className="button button-secondary" onClick={() => {
+      setError(null);
+      setLoading(true);
+      void loadPreference().then((value) => {
+        const state = value && typeof value === 'object' ? value as { enabled?: unknown } : null;
+        if (!state || typeof state.enabled !== 'boolean') throw new Error('Invalid desktop notification setting');
+        setEnabled(state.enabled);
+      }).catch(() => setError('无法读取本机桌面提醒设置。')).finally(() => setLoading(false));
+    }}>重试</button></p>}
+  </section>;
+}
+
 function PersonalSyncSettings() {
   const { user } = useAuth();
   const userID = user?.id ?? null;
@@ -113,6 +195,7 @@ export function AccountSettings() {
             <div><h3>已登录设备</h3><p>查看或撤销已登录的电脑和手机。</p></div>
             <Link className="button button-secondary" to="/clients">管理客户端</Link>
           </div>
+          <DesktopNotificationSettings />
         </div>
       </section>}
     </section>

@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AssistantVoiceInput } from './AssistantVoiceInput';
 
@@ -11,9 +11,11 @@ class FakeRecognition {
   interimResults = true;
   onresult: ((event: { resultIndex?: number; results: ArrayLike<{ isFinal?: boolean; 0?: { transcript?: string } }> }) => void) | null = null;
   onerror: ((event: { error?: string }) => void) | null = null;
+  onstart: (() => void) | null = null;
   onend: (() => void) | null = null;
   start = vi.fn(() => {
     if (FakeRecognition.startThrows) throw new Error('start failed');
+    this.onstart?.();
   });
   stop = vi.fn();
   abort = vi.fn();
@@ -31,17 +33,57 @@ class FakeRecognition {
   }
 }
 
+class FakeAudioContext {
+  static latest: FakeAudioContext | null = null;
+  state: 'running' | 'closed' = 'running';
+  analyser = {
+    fftSize: 256,
+    getByteTimeDomainData: vi.fn((data: Uint8Array) => data.fill(160)),
+    disconnect: vi.fn(),
+  };
+  source = { connect: vi.fn(), disconnect: vi.fn() };
+  resume = vi.fn(async () => undefined);
+  close = vi.fn(async () => { this.state = 'closed'; });
+  createMediaStreamSource = vi.fn(() => this.source);
+  createAnalyser = vi.fn(() => this.analyser);
+
+  constructor() {
+    FakeAudioContext.latest = this;
+  }
+}
+
 type SpeechRecognitionWindow = Window & {
   SpeechRecognition?: typeof FakeRecognition;
   webkitSpeechRecognition?: typeof FakeRecognition;
+  morde?: {
+    voiceWaveformEnabled?: boolean;
+    beginVoiceRecording?: () => Promise<unknown>;
+    endVoiceRecording?: (token: string) => Promise<unknown>;
+  };
 };
 
-const supportedWindow = window as SpeechRecognitionWindow;
+const supportedWindow = window as unknown as SpeechRecognitionWindow;
+const audioContextWindow = window as unknown as { AudioContext?: typeof AudioContext };
+const navigatorWithOptionalMediaDevices = navigator as unknown as { mediaDevices?: MediaDevices };
+let previousMediaDevices: PropertyDescriptor | undefined;
+
+function fakeStream() {
+  const track = { stop: vi.fn() };
+  const stream = { getTracks: () => [track] } as unknown as MediaStream;
+  return { stream, track };
+}
+
+function setMediaDevices(getUserMedia: (constraints: MediaStreamConstraints) => Promise<MediaStream>) {
+  Object.defineProperty(navigator, 'mediaDevices', { configurable: true, value: { getUserMedia } });
+}
 
 describe('AssistantVoiceInput', () => {
   beforeEach(() => {
     FakeRecognition.latest = null;
     FakeRecognition.startThrows = false;
+    FakeAudioContext.latest = null;
+    previousMediaDevices = Object.getOwnPropertyDescriptor(navigator, 'mediaDevices');
+    window.history.replaceState({}, '', '/assistant');
     supportedWindow.SpeechRecognition = FakeRecognition;
   });
 
@@ -49,7 +91,13 @@ describe('AssistantVoiceInput', () => {
     cleanup();
     delete supportedWindow.SpeechRecognition;
     delete supportedWindow.webkitSpeechRecognition;
+    delete audioContextWindow.AudioContext;
+    delete supportedWindow.morde;
+    window.history.replaceState({}, '', '/');
+    if (previousMediaDevices) Object.defineProperty(navigator, 'mediaDevices', previousMediaDevices);
+    else delete navigatorWithOptionalMediaDevices.mediaDevices;
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
   });
 
   it('starts only after an explicit click and sends final text to the caller', () => {
@@ -175,6 +223,137 @@ describe('AssistantVoiceInput', () => {
 
     expect(screen.getByRole('button', { name: '开始语音输入' })).toBeDisabled();
     expect(FakeRecognition.latest).toBeNull();
+  });
+
+  it('keeps the real microphone meter off when the local setting is absent', async () => {
+    const getUserMedia = vi.fn(async () => fakeStream().stream);
+    const beginVoiceRecording = vi.fn(async () => 'recognition-token');
+    setMediaDevices(getUserMedia);
+    audioContextWindow.AudioContext = FakeAudioContext as unknown as typeof AudioContext;
+    supportedWindow.morde = { voiceWaveformEnabled: false, beginVoiceRecording, endVoiceRecording: vi.fn(async () => ({})) };
+    render(<AssistantVoiceInput onTranscript={vi.fn()} />);
+
+    fireEvent.click(screen.getByRole('button', { name: '开始语音输入' }));
+    await waitFor(() => expect(FakeRecognition.latest?.start).toHaveBeenCalledOnce());
+
+    expect(FakeRecognition.latest?.start).toHaveBeenCalledOnce();
+    expect(beginVoiceRecording).toHaveBeenCalledOnce();
+    expect(getUserMedia).not.toHaveBeenCalled();
+    expect(document.querySelector('.assistant-voice-waveform')).toBeNull();
+  });
+
+  it('does not request the desktop microphone lease outside the Assistant route', () => {
+    window.history.replaceState({}, '', '/projects');
+    const beginVoiceRecording = vi.fn(async () => 'project-token');
+    supportedWindow.morde = {
+      voiceWaveformEnabled: true,
+      beginVoiceRecording,
+      endVoiceRecording: vi.fn(async () => ({ released: true })),
+    };
+    render(<AssistantVoiceInput onTranscript={vi.fn()} />);
+
+    fireEvent.click(screen.getByRole('button', { name: '开始语音输入' }));
+
+    expect(beginVoiceRecording).not.toHaveBeenCalled();
+    expect(FakeRecognition.latest?.start).toHaveBeenCalledOnce();
+    expect(document.querySelector('.assistant-voice-waveform')).toBeNull();
+  });
+
+  it('renders audio-derived levels and releases the microphone when stopped', async () => {
+    const { stream, track } = fakeStream();
+    const getUserMedia = vi.fn(async () => stream);
+    const beginVoiceRecording = vi.fn(async () => 'audio-token');
+    const endVoiceRecording = vi.fn(async () => ({ released: true }));
+    setMediaDevices(getUserMedia);
+    audioContextWindow.AudioContext = FakeAudioContext as unknown as typeof AudioContext;
+    supportedWindow.morde = { voiceWaveformEnabled: true, beginVoiceRecording, endVoiceRecording };
+    const callbacks: FrameRequestCallback[] = [];
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => { callbacks.push(callback); return callbacks.length; });
+    vi.stubGlobal('cancelAnimationFrame', vi.fn());
+    render(<AssistantVoiceInput onTranscript={vi.fn()} />);
+
+    fireEvent.click(screen.getByRole('button', { name: '开始语音输入' }));
+    const waveform = await waitFor(() => {
+      const element = document.querySelector('.assistant-voice-waveform');
+      expect(element).not.toBeNull();
+      return element as HTMLElement;
+    });
+
+    expect(getUserMedia).toHaveBeenCalledWith({ audio: true, video: false });
+    expect(beginVoiceRecording).toHaveBeenCalledOnce();
+    expect(FakeAudioContext.latest?.analyser.getByteTimeDomainData).toHaveBeenCalled();
+    expect(waveform.firstElementChild).toHaveStyle({ height: '3.8px' });
+
+    fireEvent.click(screen.getByRole('button', { name: '停止语音输入' }));
+
+    expect(track.stop).toHaveBeenCalledOnce();
+    expect(FakeAudioContext.latest?.close).toHaveBeenCalledOnce();
+    expect(endVoiceRecording).toHaveBeenCalledWith('audio-token');
+    expect(document.querySelector('.assistant-voice-waveform')).toBeNull();
+  });
+
+  it('keeps speech recognition running and hides the meter when microphone capture fails', async () => {
+    const getUserMedia = vi.fn(async () => { throw new Error('microphone busy'); });
+    const endVoiceRecording = vi.fn(async () => ({ released: true }));
+    setMediaDevices(getUserMedia);
+    audioContextWindow.AudioContext = FakeAudioContext as unknown as typeof AudioContext;
+    supportedWindow.morde = {
+      voiceWaveformEnabled: true,
+      beginVoiceRecording: vi.fn(async () => 'busy-token'),
+      endVoiceRecording,
+    };
+    render(<AssistantVoiceInput onTranscript={vi.fn()} />);
+
+    fireEvent.click(screen.getByRole('button', { name: '开始语音输入' }));
+    await waitFor(() => expect(endVoiceRecording).toHaveBeenCalledWith('busy-token'));
+
+    expect(FakeRecognition.latest?.start).toHaveBeenCalledOnce();
+    expect(screen.getByRole('button', { name: '停止语音输入' })).toHaveAttribute('aria-pressed', 'true');
+    expect(document.querySelector('.assistant-voice-waveform')).toBeNull();
+  });
+
+  it('releases the waveform lease when local audio metering is unavailable', async () => {
+    const endVoiceRecording = vi.fn(async () => ({ released: true }));
+    const getUserMedia = vi.fn(async () => fakeStream().stream);
+    setMediaDevices(getUserMedia);
+    supportedWindow.morde = {
+      voiceWaveformEnabled: true,
+      beginVoiceRecording: vi.fn(async () => 'unavailable-token'),
+      endVoiceRecording,
+    };
+    render(<AssistantVoiceInput onTranscript={vi.fn()} />);
+
+    fireEvent.click(screen.getByRole('button', { name: '开始语音输入' }));
+    await waitFor(() => expect(endVoiceRecording).toHaveBeenCalledWith('unavailable-token'));
+
+    expect(FakeRecognition.latest?.start).toHaveBeenCalledOnce();
+    expect(screen.getByRole('button', { name: '停止语音输入' })).toHaveAttribute('aria-pressed', 'true');
+    expect(getUserMedia).not.toHaveBeenCalled();
+    expect(document.querySelector('.assistant-voice-waveform')).toBeNull();
+  });
+
+  it('stops a getUserMedia stream that resolves after voice input was cancelled', async () => {
+    const { stream, track } = fakeStream();
+    let resolveMedia: ((value: MediaStream) => void) | undefined;
+    const getUserMedia = vi.fn(() => new Promise<MediaStream>((resolve) => { resolveMedia = resolve; }));
+    const endVoiceRecording = vi.fn(async () => ({ released: true }));
+    setMediaDevices(getUserMedia);
+    audioContextWindow.AudioContext = FakeAudioContext as unknown as typeof AudioContext;
+    supportedWindow.morde = {
+      voiceWaveformEnabled: true,
+      beginVoiceRecording: vi.fn(async () => 'late-token'),
+      endVoiceRecording,
+    };
+    render(<AssistantVoiceInput onTranscript={vi.fn()} />);
+
+    fireEvent.click(screen.getByRole('button', { name: '开始语音输入' }));
+    await waitFor(() => expect(getUserMedia).toHaveBeenCalledOnce());
+    fireEvent.click(screen.getByRole('button', { name: '取消语音输入' }));
+    resolveMedia?.(stream);
+    await waitFor(() => expect(track.stop).toHaveBeenCalledOnce());
+
+    expect(endVoiceRecording).toHaveBeenCalledWith('late-token');
+    expect(document.querySelector('.assistant-voice-waveform')).toBeNull();
   });
 
   it('returns to idle when the browser ends recognition unexpectedly', () => {

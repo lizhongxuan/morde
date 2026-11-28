@@ -47,6 +47,79 @@ func TestNewRequiresVerifiedHTTPSURLAnd256BitCredential(t *testing.T) {
 	}
 }
 
+func TestSupplementalOutputCaptureClientValidatesEveryPageFence(t *testing.T) {
+	fence := HostFence{HostID: hostID, RuntimeGeneration: 2, RuntimeInstanceID: "ri_current", ControlVersion: 9}
+	identity := SupplementalOutputCaptureIdentity{
+		OwnerID: "u1234567", TaskID: taskID, AuthorizationVersion: 3, TaskRevision: 4,
+		WorkspaceID: "w1234567", WorkspaceAuthorizationVersion: 5, WorkspaceBindingVersion: 6,
+		WorkspaceViewID: "v" + strings.Repeat("a", 64), WorkspaceCheckpointRevision: 7,
+		StepID: "s1234567", CallID: "call-123",
+	}
+	request := SupplementalOutputCapturePageRequest{HostFence: fence, TaskID: taskID, LeaseVersion: 8,
+		OperationID: operationID, Identity: identity, Stream: SupplementalOutputCaptureStdout, Offset: 0}
+	var corrupt atomic.Bool
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/runtime/v1/operations/"+operationID+"/output-capture/page" ||
+			r.Header.Get(ProtocolHeader) != ProtocolVersion || r.URL.Query().Get("call_id") != identity.CallID ||
+			r.URL.Query().Get("workspace_binding_version") != "6" {
+			t.Errorf("supplemental page request=%s %s query=%v", r.Method, r.URL.Path, r.URL.Query())
+		}
+		page := SupplementalOutputCapturePage{ProtocolVersion: ProtocolVersion, HostFence: fence, TaskID: taskID,
+			LeaseVersion: request.LeaseVersion, OperationID: operationID, Identity: identity, State: SupplementalOutputCaptureComplete,
+			Stream: request.Stream, Offset: request.Offset, NextOffset: 8, TotalBytes: 8, Data: []byte("secret!!"), EOF: true}
+		if corrupt.Load() {
+			page.Identity.CallID = "other-call"
+		}
+		writeJSON(t, w, page)
+	}))
+	defer server.Close()
+	client, err := New(server.URL, runtimeCredential, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, err := client.SupplementalOutputCapturePage(context.Background(), request)
+	if err != nil || string(page.Data) != "secret!!" || !page.EOF {
+		t.Fatalf("SupplementalOutputCapturePage()=%#v,%v", page, err)
+	}
+	corrupt.Store(true)
+	if _, err := client.SupplementalOutputCapturePage(context.Background(), request); err == nil {
+		t.Fatal("SupplementalOutputCapturePage accepted a different capture identity")
+	}
+	request.Offset = SupplementalOutputCaptureMaxBytes + 1
+	if _, err := client.SupplementalOutputCapturePage(context.Background(), request); err == nil {
+		t.Fatal("SupplementalOutputCapturePage accepted an offset over the stream limit")
+	}
+}
+
+func TestSupplementalOutputCaptureClientReleaseEchoesFenceAndIdentity(t *testing.T) {
+	fence := HostFence{HostID: hostID, RuntimeGeneration: 2, RuntimeInstanceID: "ri_current", ControlVersion: 9}
+	identity := SupplementalOutputCaptureIdentity{OwnerID: "u1234567", TaskID: taskID, AuthorizationVersion: 1,
+		TaskRevision: 0, WorkspaceID: "w1234567", WorkspaceAuthorizationVersion: 0, WorkspaceBindingVersion: 1,
+		WorkspaceViewID: "v" + strings.Repeat("a", 64), WorkspaceCheckpointRevision: 0, StepID: "s1234567", CallID: "call-123"}
+	request := SupplementalOutputCaptureReleaseRequest{HostFence: fence, TaskID: taskID, LeaseVersion: 1, Identity: identity}
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/runtime/v1/operations/"+operationID+"/output-capture/release" {
+			t.Errorf("release request=%s %s", r.Method, r.URL.Path)
+		}
+		var body SupplementalOutputCaptureReleaseRequest
+		readJSON(t, r, &body)
+		if body.Identity != identity || body.TaskID != taskID {
+			t.Errorf("release identity=%#v", body.Identity)
+		}
+		writeJSON(t, w, SupplementalOutputCaptureReleaseResponse{ProtocolVersion: ProtocolVersion, HostFence: fence,
+			TaskID: taskID, LeaseVersion: 1, OperationID: operationID, Released: true})
+	}))
+	defer server.Close()
+	client, err := New(server.URL, runtimeCredential, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := client.ReleaseSupplementalOutputCapture(context.Background(), operationID, request)
+	if err != nil || !response.Released {
+		t.Fatalf("ReleaseSupplementalOutputCapture()=%#v,%v", response, err)
+	}
+}
+
 func TestTaskWorkspaceExportClientChecksExactViewAndBlockBytes(t *testing.T) {
 	fence := HostFence{HostID: hostID, RuntimeGeneration: 2, RuntimeInstanceID: "ri_current", ControlVersion: 9}
 	viewID := "v" + strings.Repeat("a", 64)

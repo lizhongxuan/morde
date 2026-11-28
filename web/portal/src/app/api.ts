@@ -394,6 +394,9 @@ export const portalApi = {
   answerTaskInput: async (id: string, body: components['schemas']['TaskInputRequest'], idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.POST('/api/tasks/{id}/inputs', {
     params: { path: { id }, header: { 'Idempotency-Key': idempotencyKey } }, body,
   })),
+  answerStructuredTaskClarification: async (id: string, clarificationID: string, body: components['schemas']['TaskStructuredInputRequest'], idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.POST('/api/v2/tasks/{id}/clarifications/{clarification_id}/responses', {
+    params: { path: { id, clarification_id: clarificationID }, header: { 'Idempotency-Key': idempotencyKey } }, body,
+  })),
   respondToTaskApproval: async (id: string, approvalID: string, body: components['schemas']['TaskApprovalResponseRequest'], idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.POST('/api/tasks/{id}/approvals/{approval_id}/responses', {
     params: { path: { id, approval_id: approvalID }, header: { 'Idempotency-Key': idempotencyKey } }, body,
   })),

@@ -669,12 +669,13 @@ type ExecuteRequest struct {
 	WorkspaceCheckpointRevision int64  `json:"workspace_checkpoint_revision,omitempty"`
 	// WorkspaceDirectory is injected by runtimecore after validating the
 	// Task, Workspace, binding, view, and checkpoint. It is never accepted on wire.
-	WorkspaceDirectory string          `json:"-"`
-	OperationID        string          `json:"operation_id"`
-	LeaseVersion       int64           `json:"lease_version"`
-	Capability         string          `json:"capability"`
-	Action             string          `json:"action"`
-	Arguments          json.RawMessage `json:"arguments"`
+	WorkspaceDirectory string                             `json:"-"`
+	OperationID        string                             `json:"operation_id"`
+	LeaseVersion       int64                              `json:"lease_version"`
+	Capability         string                             `json:"capability"`
+	Action             string                             `json:"action"`
+	Arguments          json.RawMessage                    `json:"arguments"`
+	OutputCapture      *SupplementalOutputCaptureIdentity `json:"output_capture,omitempty"`
 }
 
 type Operation struct {

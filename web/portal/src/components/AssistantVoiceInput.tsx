@@ -12,6 +12,7 @@ interface SpeechRecognitionLike {
   interimResults: boolean;
   onresult: ((event: SpeechResultEventLike) => void) | null;
   onerror: ((event: SpeechErrorEventLike) => void) | null;
+  onstart: (() => void) | null;
   onend: (() => void) | null;
   start(): void;
   stop(): void;
@@ -20,9 +21,33 @@ interface SpeechRecognitionLike {
 
 type SpeechRecognitionConstructor = new () => SpeechRecognitionLike;
 
+type VoiceWaveformBridge = {
+  voiceWaveformEnabled?: boolean;
+  beginVoiceRecording?: () => Promise<unknown>;
+  endVoiceRecording?: (token: string) => Promise<unknown>;
+};
+
 type SpeechRecognitionWindow = Window & {
   SpeechRecognition?: SpeechRecognitionConstructor;
   webkitSpeechRecognition?: SpeechRecognitionConstructor;
+  AudioContext?: typeof AudioContext;
+  webkitAudioContext?: typeof AudioContext;
+  morde?: VoiceWaveformBridge;
+};
+
+type WaveformCapture = {
+  generation: number;
+  bridge: VoiceWaveformBridge;
+  token: string | null;
+  tokenReleased: boolean;
+  stream: MediaStream | null;
+  context: AudioContext | null;
+  source: MediaStreamAudioSourceNode | null;
+  analyser: AnalyserNode | null;
+  data: Uint8Array<ArrayBuffer> | null;
+  frame: number | null;
+  contextResume: Promise<void> | null;
+  disposed: boolean;
 };
 
 export type AssistantVoiceInputProps = {
@@ -56,26 +81,205 @@ function speechErrorMessage(error: string | undefined): string {
   }
 }
 
+function localVoiceWaveformBridge(): VoiceWaveformBridge | undefined {
+  if (typeof window === 'undefined' || window.location.pathname !== '/assistant') return undefined;
+  return (window as SpeechRecognitionWindow).morde;
+}
+
+function releaseVoiceRecordingLease(capture: WaveformCapture): void {
+  if (!capture.token || capture.tokenReleased || !capture.bridge.endVoiceRecording) return;
+  capture.tokenReleased = true;
+  void capture.bridge.endVoiceRecording(capture.token).catch(() => undefined);
+}
+
+function disposeWaveformCapture(capture: WaveformCapture | null): void {
+  if (!capture || capture.disposed) return;
+  capture.disposed = true;
+  if (capture.frame !== null) cancelAnimationFrame(capture.frame);
+  try { capture.source?.disconnect(); } catch { /* The source may already have been disconnected. */ }
+  try { capture.analyser?.disconnect(); } catch { /* The analyser may already have been disconnected. */ }
+  capture.stream?.getTracks().forEach((track) => track.stop());
+  if (capture.context && capture.context.state !== 'closed') void capture.context.close().catch(() => undefined);
+  releaseVoiceRecordingLease(capture);
+}
+
 /**
  * Browser-native speech-to-text control. Morde does not read or upload raw
- * audio; recognition is delegated to the browser implementation, whose
- * processing location depends on the browser and its settings.
+ * samples for the visual meter; Web Audio derives only a live level. Speech
+ * recognition is delegated to the browser implementation, whose processing
+ * location depends on the browser and its settings.
  */
 export function AssistantVoiceInput({ onTranscript, disabled = false, language = 'zh-CN', compact = false }: AssistantVoiceInputProps) {
   const disclosureID = useId();
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
+  const waveformCaptureRef = useRef<WaveformCapture | null>(null);
+  const waveformGenerationRef = useRef(0);
+  const recognitionStartedRef = useRef(false);
   const [listening, setListening] = useState(false);
+  const [waveformLevel, setWaveformLevel] = useState(0);
+  const [waveformVisible, setWaveformVisible] = useState(false);
   const [status, setStatus] = useState('');
 
   useEffect(() => () => {
     const recognition = recognitionRef.current;
     recognitionRef.current = null;
-    recognition?.abort();
+    try { recognition?.abort(); } catch { /* The recognizer may still be preparing to start. */ }
+    recognitionStartedRef.current = false;
+    waveformGenerationRef.current += 1;
+    const capture = waveformCaptureRef.current;
+    waveformCaptureRef.current = null;
+    disposeWaveformCapture(capture);
   }, []);
+
+  useEffect(() => {
+    if (!disabled) return;
+    const recognition = recognitionRef.current;
+    recognitionRef.current = null;
+    try { recognition?.abort(); } catch { /* The recognizer may still be preparing to start. */ }
+    recognitionStartedRef.current = false;
+    waveformGenerationRef.current += 1;
+    const capture = waveformCaptureRef.current;
+    waveformCaptureRef.current = null;
+    disposeWaveformCapture(capture);
+    setListening(false);
+    setWaveformVisible(false);
+    setWaveformLevel(0);
+  }, [disabled]);
+
+  const stopWaveform = (expected?: WaveformCapture) => {
+    if (expected && waveformCaptureRef.current !== expected) {
+      disposeWaveformCapture(expected);
+      return;
+    }
+    waveformGenerationRef.current += 1;
+    const capture = waveformCaptureRef.current;
+    waveformCaptureRef.current = null;
+    disposeWaveformCapture(capture);
+    setWaveformVisible(false);
+    setWaveformLevel(0);
+  };
+
+  const startWaveform = (recognition: SpeechRecognitionLike, capture: WaveformCapture) => {
+    const bridge = capture.bridge;
+    if (!bridge.voiceWaveformEnabled || !capture.token) return;
+    if (!capture.context || !navigator.mediaDevices?.getUserMedia) {
+      stopWaveform(capture);
+      return;
+    }
+    const isCurrent = () => waveformCaptureRef.current === capture &&
+      waveformGenerationRef.current === capture.generation && recognitionRef.current === recognition && !capture.disposed;
+
+    void (async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+        if (!isCurrent()) {
+          stream.getTracks().forEach((track) => track.stop());
+          return;
+        }
+        capture.stream = stream;
+        const context = capture.context;
+        if (!context) throw new Error('Audio context is unavailable');
+        const source = context.createMediaStreamSource(stream);
+        const analyser = context.createAnalyser();
+        analyser.fftSize = 256;
+        source.connect(analyser);
+        capture.source = source;
+        capture.analyser = analyser;
+        capture.data = new Uint8Array(new ArrayBuffer(analyser.fftSize));
+        await capture.contextResume;
+        if (context.state === 'suspended') await context.resume();
+        if (!isCurrent() || context.state !== 'running') throw new Error('Audio level meter is unavailable');
+
+        setWaveformVisible(true);
+        const updateLevel = () => {
+          if (!isCurrent() || !capture.analyser || !capture.data) return;
+          capture.analyser.getByteTimeDomainData(capture.data);
+          let sumSquares = 0;
+          for (const sample of capture.data) {
+            const amplitude = (sample - 128) / 128;
+            sumSquares += amplitude * amplitude;
+          }
+          setWaveformLevel(Math.min(1, Math.sqrt(sumSquares / capture.data.length) * 2.5));
+          capture.frame = requestAnimationFrame(updateLevel);
+        };
+        updateLevel();
+      } catch {
+        if (!isCurrent()) {
+          disposeWaveformCapture(capture);
+          return;
+        }
+        stopWaveform(capture);
+      }
+    })();
+  };
+
+  const prepareVoiceRecording = (recognition: SpeechRecognitionLike, bridge: VoiceWaveformBridge) => {
+    if (!bridge.beginVoiceRecording || !bridge.endVoiceRecording) return false;
+    waveformGenerationRef.current += 1;
+    const capture: WaveformCapture = {
+      generation: waveformGenerationRef.current, bridge, token: null, tokenReleased: false,
+      stream: null, context: null, source: null, analyser: null, data: null, frame: null,
+      contextResume: null, disposed: false,
+    };
+    waveformCaptureRef.current = capture;
+    const isCurrent = () => waveformCaptureRef.current === capture &&
+      waveformGenerationRef.current === capture.generation && recognitionRef.current === recognition && !capture.disposed;
+    recognition.onstart = () => {
+      if (!isCurrent()) return;
+      if (bridge.voiceWaveformEnabled) startWaveform(recognition, capture);
+    };
+    const supportedWindow = typeof window === 'undefined' ? undefined : window as SpeechRecognitionWindow;
+    const AudioContextConstructor = supportedWindow?.AudioContext ?? supportedWindow?.webkitAudioContext;
+    if (bridge.voiceWaveformEnabled && AudioContextConstructor) {
+      try {
+        capture.context = new AudioContextConstructor();
+        // Start the audio context in the click call stack to satisfy autoplay rules.
+        capture.contextResume = capture.context.resume().catch(() => undefined);
+      } catch { /* Speech recognition can still run without a visual meter. */ }
+    }
+
+    setListening(true);
+    setStatus('正在准备麦克风…');
+    void (async () => {
+      try {
+        const token = await bridge.beginVoiceRecording!();
+        if (typeof token !== 'string' || token.length < 1) throw new Error('Invalid voice recording lease');
+        capture.token = token;
+        if (!isCurrent()) {
+          releaseVoiceRecordingLease(capture);
+          disposeWaveformCapture(capture);
+          return;
+        }
+        recognition.start();
+        recognitionStartedRef.current = true;
+        setStatus('正在聆听…');
+      } catch {
+        if (!isCurrent()) {
+          releaseVoiceRecordingLease(capture);
+          disposeWaveformCapture(capture);
+          return;
+        }
+        recognitionRef.current = null;
+        recognitionStartedRef.current = false;
+        stopWaveform(capture);
+        setListening(false);
+        setStatus('无法启动语音输入，请检查麦克风权限后重试。');
+      }
+    })();
+    return true;
+  };
 
   const toggleRecognition = () => {
     if (listening) {
-      recognitionRef.current?.stop();
+      const recognition = recognitionRef.current;
+      const recognitionStarted = recognitionStartedRef.current;
+      stopWaveform();
+      if (recognitionStarted) recognition?.stop();
+      else {
+        recognitionRef.current = null;
+        try { recognition?.abort(); } catch { /* The recognizer may still be preparing to start. */ }
+      }
+      recognitionStartedRef.current = false;
       setListening(false);
       setStatus('');
       return;
@@ -108,22 +312,31 @@ export function AssistantVoiceInput({ onTranscript, disabled = false, language =
         if (recognitionRef.current !== recognition) return;
         const message = speechErrorMessage(event.error);
         if (message) setStatus(message);
+        stopWaveform();
         setListening(false);
         recognitionRef.current = null;
+        recognitionStartedRef.current = false;
       };
       recognition.onend = () => {
         if (recognitionRef.current !== recognition) return;
+        stopWaveform();
         setListening(false);
         recognitionRef.current = null;
+        recognitionStartedRef.current = false;
       };
       recognitionRef.current = recognition;
+      const bridge = localVoiceWaveformBridge();
+      if (bridge && prepareVoiceRecording(recognition, bridge)) return;
       recognition.start();
       if (recognitionRef.current === recognition) {
+        recognitionStartedRef.current = true;
         setListening(true);
         setStatus('正在聆听…');
       }
     } catch {
       if (activeRecognition && recognitionRef.current === activeRecognition) recognitionRef.current = null;
+      recognitionStartedRef.current = false;
+      stopWaveform();
       setListening(false);
       setStatus('无法启动语音输入，请检查麦克风权限后重试。');
     }
@@ -134,7 +347,9 @@ export function AssistantVoiceInput({ onTranscript, disabled = false, language =
     // Invalidate the active generation before abort can synchronously emit
     // result/error/end callbacks. Results already delivered stay in the draft.
     recognitionRef.current = null;
-    recognition?.abort();
+    try { recognition?.abort(); } catch { /* The recognizer may still be preparing to start. */ }
+    recognitionStartedRef.current = false;
+    stopWaveform();
     setListening(false);
     setStatus('语音输入已取消。');
   };
@@ -160,6 +375,9 @@ export function AssistantVoiceInput({ onTranscript, disabled = false, language =
         aria-label="取消语音输入"
         onClick={cancelRecognition}
       >取消</button>}
+      {waveformVisible && <span className="assistant-voice-waveform" aria-hidden="true" style={{ display: 'inline-flex', alignItems: 'center', gap: 2, height: 18 }}>
+        {[0.38, 0.64, 0.9, 0.64, 0.38].map((weight, index) => <span key={index} style={{ display: 'block', width: 2, height: `${Math.max(2, waveformLevel * 16 * weight)}px`, borderRadius: 2, background: 'currentColor' }} />)}
+      </span>}
       <span
         className={`assistant-voice-status${compact && !status ? ' assistant-voice-status-idle' : ''}`}
         aria-label="语音输入状态"
@@ -171,7 +389,7 @@ export function AssistantVoiceInput({ onTranscript, disabled = false, language =
       >
         {status || '\u00a0'}
       </span>
-      <span id={disclosureID} className="sr-only">语音识别由浏览器提供，处理位置取决于浏览器和设置，可能使用在线服务。仅在点击按钮后开始。</span>
+      <span id={disclosureID} className="sr-only">语音识别由浏览器提供，处理位置取决于浏览器和设置，可能使用在线服务。仅在点击按钮后开始。波形功能仅在本机启用时读取实时音量，不保存或上传麦克风采样。</span>
     </div>
   );
 }

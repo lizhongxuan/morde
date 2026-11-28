@@ -545,14 +545,25 @@ func cloudDSHDefinitionsFromCheckpointToolPayload(current []app.AgentToolDefinit
 		if !exists {
 			return nil, cloudDSHCheckpointToolDefinitionUnavailable{toolName: named.Name, source: "base"}
 		}
-		base = append(base, definition)
-		encoded, err := json.Marshal(cloudDSHToolPayload([]app.AgentToolDefinition{definition})[0])
-		if err != nil {
-			return nil, errors.New("dsh checkpoint tool definition is invalid")
+		candidates := []app.AgentToolDefinition{definition}
+		if named.Name == "ask_user" {
+			candidates = append(candidates, app.CloudDSHLegacyAskUserToolDefinition())
 		}
-		actualCanonical, actualOK := canonicalCloudDSHJSON(raw)
-		expectedCanonical, expectedOK := canonicalCloudDSHJSON(encoded)
-		if !actualOK || !expectedOK || !bytes.Equal(actualCanonical, expectedCanonical) {
+		matched := false
+		for _, candidate := range candidates {
+			encoded, err := json.Marshal(cloudDSHToolPayload([]app.AgentToolDefinition{candidate})[0])
+			if err != nil {
+				return nil, errors.New("dsh checkpoint tool definition is invalid")
+			}
+			actualCanonical, actualOK := canonicalCloudDSHJSON(raw)
+			expectedCanonical, expectedOK := canonicalCloudDSHJSON(encoded)
+			if actualOK && expectedOK && bytes.Equal(actualCanonical, expectedCanonical) {
+				base = append(base, candidate)
+				matched = true
+				break
+			}
+		}
+		if !matched {
 			return nil, errors.New("dsh checkpoint tool definition changed")
 		}
 	}
@@ -571,7 +582,7 @@ func cloudDSHDefinitionsFromCheckpointToolPayload(current []app.AgentToolDefinit
 		}
 		hasDelegableTools := false
 		for _, definition := range base {
-			if definition.Name != "ask_user" {
+			if !app.IsCloudDSHClarificationToolName(definition.Name) {
 				hasDelegableTools = true
 				break
 			}
@@ -2128,7 +2139,7 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 		rootDefinitions = append(rootDefinitions, cloudDSHJobTools()...)
 		hasDelegableTools := false
 		for _, definition := range baseDefinitions {
-			if definition.Name != cloudDSHDelegateToolName && definition.Name != "ask_user" {
+			if definition.Name != cloudDSHDelegateToolName && !app.IsCloudDSHClarificationToolName(definition.Name) {
 				hasDelegableTools = true
 				break
 			}

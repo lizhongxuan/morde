@@ -435,7 +435,7 @@ type taskClarificationQuestionGroupResponse struct {
 type taskClarificationQuestionResponse struct {
 	ID        string                                    `json:"id"`
 	Prompt    string                                    `json:"prompt"`
-	Type      task.ClarificationQuestionType            `json:"type"`
+	Type      string                                    `json:"type"`
 	Required  bool                                      `json:"required"`
 	AllowSkip bool                                      `json:"allow_skip"`
 	Options   []taskClarificationQuestionOptionResponse `json:"options"`
@@ -652,8 +652,8 @@ type taskStructuredInputRequest struct {
 type taskStructuredAnswerRequest struct {
 	QuestionID string   `json:"question_id"`
 	OptionIDs  []string `json:"option_ids"`
-	Text       string   `json:"text"`
-	Skipped    bool     `json:"skipped"`
+	Text       *string  `json:"text"`
+	Skipped    *bool    `json:"skipped"`
 }
 
 func parseFileDeliveryIntentRequest(raw json.RawMessage, allowUnclear bool) (task.FileDeliveryIntent, bool) {
@@ -1214,7 +1214,8 @@ func (h *api) addStructuredTaskInput(service StructuredTaskClarificationService)
 		answers := make([]task.ClarificationAnswer, 0, len(request.Answers))
 		for _, answer := range request.Answers {
 			if !validTaskText(answer.QuestionID, 64) || strings.ContainsRune(answer.QuestionID, '\x00') ||
-				len(answer.OptionIDs) > 12 || len(answer.Text) > 16384 || !utf8.ValidString(answer.Text) || strings.ContainsRune(answer.Text, '\x00') {
+				answer.OptionIDs == nil || answer.Text == nil || answer.Skipped == nil || len(answer.OptionIDs) > 12 ||
+				len(*answer.Text) > 16384 || !utf8.ValidString(*answer.Text) || strings.ContainsRune(*answer.Text, '\x00') {
 				writeError(c, domain.InvalidArgument("answers", "structured clarification answer fields are invalid"))
 				return
 			}
@@ -1225,7 +1226,7 @@ func (h *api) addStructuredTaskInput(service StructuredTaskClarificationService)
 				}
 			}
 			answers = append(answers, task.ClarificationAnswer{
-				QuestionID: answer.QuestionID, OptionIDs: append([]string(nil), answer.OptionIDs...), Text: answer.Text, Skipped: answer.Skipped,
+				QuestionID: answer.QuestionID, OptionIDs: append([]string(nil), answer.OptionIDs...), Text: *answer.Text, Skipped: *answer.Skipped,
 			})
 		}
 		if err := service.AnswerStructuredClarificationRequest(c.Request.Context(), principal, taskID, clarificationID,
@@ -1796,7 +1797,7 @@ func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 					options = append(options, taskClarificationQuestionOptionResponse{ID: option.ID, Label: option.Label})
 				}
 				group.Questions = append(group.Questions, taskClarificationQuestionResponse{
-					ID: question.ID, Prompt: question.Prompt, Type: question.Type, Required: question.Required,
+					ID: question.ID, Prompt: question.Prompt, Type: string(question.Type), Required: question.Required,
 					AllowSkip: question.AllowSkip, Options: options,
 				})
 			}

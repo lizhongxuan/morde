@@ -17,6 +17,15 @@ export type HostEmbedTarget = "browser" | "terminal" | "workspace" | "files" | "
 export type HostEmbedTicket = { exchangeURL: string; ticket: string; embedNonce: string; targets: HostEmbedTarget[] };
 export type ClientLoginAttempt = { clientInstanceID: string; attemptGeneration: string; idempotencyKey: string };
 export type ProjectSyncFolder = { folderID: string; workspaceID: string; folderKind: "workspace_root" | "project"; projectName?: string; relativePath: string; state: "pending_node" | "active" | "revoked"; syncAvailable: boolean };
+export type NotificationUpdateItem = { id: string; kind: string };
+export type NotificationUpdatePage = { items: NotificationUpdateItem[]; cursor: string; hasMore: boolean };
+export type NotificationListPage = { items: NotificationUpdateItem[]; nextCursor: string | null };
+export class NotificationCursorExpiredError extends Error {
+  constructor() {
+    super("Morde notification cursor expired");
+    this.name = "NotificationCursorExpiredError";
+  }
+}
 export type CodexScope = "read" | "live" | "send" | "interrupt" | "approval";
 export type CodexDiscoverInput = {
   profile_key: string;
@@ -408,6 +417,63 @@ export class MordeAPI {
     });
     if (!response.ok) throw requestFailure(response, method, path, "Authorization expired or revoked");
     return response.status === 204 ? null : response.json();
+  }
+
+  private async notificationRequest(path: string, signal?: AbortSignal): Promise<unknown> {
+    const auth = this.credentials();
+    if (!auth || credentialExpired(auth.clientExpiresAt)) throw new Error("Log in to Morde again");
+    const response = await tracedFetch(this.fetcher, `${auth.origin}${path}`, {
+      headers: { authorization: `Bearer ${auth.clientCredential}`, accept: "application/json" },
+      cache: "no-store", redirect: "error",
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(20_000)]) : AbortSignal.timeout(20_000),
+    });
+    if (!response.ok) {
+      if (response.status === 409) {
+        const value = await response.json().catch(() => null) as { error?: { code?: unknown } } | null;
+        if (value?.error?.code === "event_cursor_expired") throw new NotificationCursorExpiredError();
+      }
+      throw requestFailure(response, "GET", path.split("?", 1)[0]!, "Authorization expired or revoked");
+    }
+    return response.json();
+  }
+
+  private parseNotificationItems(value: unknown): NotificationUpdateItem[] {
+    const page = value as { items?: unknown } | null;
+    if (!page || !Array.isArray(page.items) || page.items.length > 100) throw new Error("Invalid Morde notification response");
+    return page.items.map((item) => {
+      const row = item as { id?: unknown; kind?: unknown } | null;
+      if (!row || typeof row.id !== "string" || !/^n[a-z0-9]{7}$/.test(row.id) ||
+        typeof row.kind !== "string" || !/^[a-z][a-z0-9_]{0,63}$/.test(row.kind)) {
+        throw new Error("Invalid Morde notification response");
+      }
+      return { id: row.id, kind: row.kind };
+    });
+  }
+
+  async notificationUpdates(cursor?: string, signal?: AbortSignal): Promise<NotificationUpdatePage> {
+    if (cursor !== undefined && (typeof cursor !== "string" || !cursor || cursor.length > 1024)) {
+      throw new Error("Invalid Morde notification cursor");
+    }
+    const query = new URLSearchParams({ limit: "100" });
+    if (cursor !== undefined) query.set("cursor", cursor);
+    const value = await this.notificationRequest(`/api/notifications/incremental?${query}`, signal) as Record<string, unknown> | null;
+    if (!value || typeof value.cursor !== "string" || !value.cursor || value.cursor.length > 1024 || typeof value.has_more !== "boolean") {
+      throw new Error("Invalid Morde notification response");
+    }
+    return { items: this.parseNotificationItems(value), cursor: value.cursor, hasMore: value.has_more };
+  }
+
+  async notificationListPage(cursor?: string, signal?: AbortSignal): Promise<NotificationListPage> {
+    if (cursor !== undefined && (typeof cursor !== "string" || !cursor || cursor.length > 1024)) {
+      throw new Error("Invalid Morde notification cursor");
+    }
+    const query = new URLSearchParams({ limit: "100" });
+    if (cursor !== undefined) query.set("cursor", cursor);
+    const value = await this.notificationRequest(`/api/notifications?${query}`, signal) as Record<string, unknown> | null;
+    if (!value || !(value.next_cursor === null || typeof value.next_cursor === "string" && value.next_cursor.length > 0 && value.next_cursor.length <= 1024)) {
+      throw new Error("Invalid Morde notification response");
+    }
+    return { items: this.parseNotificationItems(value), nextCursor: value.next_cursor as string | null };
   }
 
   private async codexRequest(path: string, method = "GET", body?: unknown): Promise<unknown> {

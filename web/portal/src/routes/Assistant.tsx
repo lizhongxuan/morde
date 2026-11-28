@@ -1,5 +1,5 @@
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import type { CSSProperties, DragEvent as ReactDragEvent, FormEvent, KeyboardEvent as ReactKeyboardEvent } from 'react';
+import type { CSSProperties, DragEvent as ReactDragEvent, FormEvent, KeyboardEvent as ReactKeyboardEvent, ReactNode } from 'react';
 import { Link, useLocation, useNavigate, useOutletContext } from 'react-router';
 import { useInfiniteQuery, useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
 import { errorDetails, newIdempotencyKey, portalApi } from '../app/api';
@@ -96,11 +96,13 @@ type TaskStepDetailWithExecution = Omit<TaskStepDetail, 'execution'> & { executi
 type TaskStepSourceLocation = NonNullable<TaskStepDetail['source_locations']>[number];
 type TaskValidationClaim = NonNullable<Task['validation_detail']>['claims'][number];
 type TaskArtifact = Task['artifacts'][number];
+type ClarificationQuestionGroup = components['schemas']['TaskClarificationQuestionGroup'];
+type ClarificationAnswerDraft = { optionIDs?: string[]; text?: string; skipped?: boolean };
 type ClarificationInteraction = {
   clarificationID: string;
   version: number;
   question: string;
-  status: 'sending' | 'submitted' | 'failed' | 'unknown' | 'revoked';
+  status: 'sending' | 'submitted' | 'expired' | 'failed' | 'unknown' | 'revoked';
   message?: string;
 };
 type AssistantPanelTab = 'tasks' | 'files' | 'computer';
@@ -169,6 +171,34 @@ function isPlaceholderConversationTitle(title?: string): boolean {
 
 function clarificationDraftKey(taskID: string, clarificationID: string, version: number): string {
   return `${taskID}:${clarificationID}:${version}`;
+}
+
+function clarificationStructuredDraftIsValid(group: ClarificationQuestionGroup, draft: Record<string, ClarificationAnswerDraft>): boolean {
+  return group.questions.every((question) => {
+    const answer = draft[question.id] ?? {};
+    if (answer.skipped) return !question.required && question.allow_skip;
+    if (question.type === 'free_text') return Boolean(answer.text?.trim());
+    const optionIDs = answer.optionIDs ?? [];
+    const validIDs = new Set(question.options.map((option) => option.id));
+    return optionIDs.length > 0 && optionIDs.every((id) => validIDs.has(id)) &&
+      (question.type !== 'single_choice' || optionIDs.length === 1);
+  });
+}
+
+function clarificationStructuredRequestBody(group: ClarificationQuestionGroup,
+  draft: Record<string, ClarificationAnswerDraft>): components['schemas']['TaskStructuredInputRequest'] {
+  return {
+    version: group.version,
+    answers: group.questions.map((question) => {
+      const answer = draft[question.id] ?? {};
+      return {
+        question_id: question.id,
+        option_ids: answer.skipped ? [] : answer.optionIDs ?? [],
+        text: answer.skipped ? '' : answer.text ?? '',
+        skipped: Boolean(answer.skipped),
+      };
+    }),
+  };
 }
 
 function conversationMessageActorID(message: RoutingFailureMessage): string | undefined {
@@ -691,11 +721,13 @@ function safeTaskStepOutput(value: unknown): { value: string; truncated: boolean
   return { value: bounded, truncated: redacted.truncated || byteTruncated };
 }
 
-function TaskStepOutput({ label, value, clientTruncated, truncated, omittedBytes }: {
+function TaskStepOutput({ label, value, clientTruncated, truncated, runtimeTruncated, detailTruncated, omittedBytes }: {
   label: string;
   value: string;
   clientTruncated: boolean;
   truncated: boolean;
+  runtimeTruncated: boolean;
+  detailTruncated: boolean;
   omittedBytes: number | null;
 }) {
   let preview = '';
@@ -712,7 +744,9 @@ function TaskStepOutput({ label, value, clientTruncated, truncated, omittedBytes
   return <div className="task-step-output">
     <p><strong>{label}</strong> {value ? preview : '（无输出）'}{hasMore ? '…' : ''}</p>
     {clientTruncated && <p role="status">已记录的{label}超过客户端 64 KiB 显示上限，本页内容已截断。</p>}
-    {truncated && <p role="status">已记录的{label}有截断标记{omittedBytes === null ? '。' : `，省略 ${omittedBytes} 字节。`}</p>}
+    {runtimeTruncated && <p role="status">执行源头的{label}已截断，后续输出没有进入任务结果。</p>}
+    {detailTruncated && <p role="status">已记录的{label}详情受服务端保存上限限制，无法查看更长记录{omittedBytes === null ? '。' : `，省略 ${omittedBytes} 字节。`}</p>}
+    {truncated && !runtimeTruncated && !detailTruncated && <p role="status">旧版记录标记了{label}截断，但没有说明发生在执行源头还是详情保存阶段。</p>}
     {hasMore && <details>
       <summary>查看完整已记录输出</summary>
       <pre>{value}</pre>
@@ -913,11 +947,15 @@ function TaskStepDetails({ task, step, conversationID, actorID, serviceInstanceI
         {(exitCode !== null || isShell) && <p><strong>退出码</strong> {exitCode ?? '未记录'}</p>}
         {(typeof execution.timed_out === 'boolean' || isShell) && <p><strong>是否超时</strong> {typeof execution.timed_out === 'boolean' ? (execution.timed_out ? '是' : '否') : '未记录'}</p>}
         {safeStdout && <TaskStepOutput label="标准输出" value={safeStdout.value} clientTruncated={safeStdout.truncated}
-          truncated={execution.stdout_truncated === true} omittedBytes={stdoutOmitted} />}
+          truncated={execution.stdout_truncated === true}
+          runtimeTruncated={execution.stdout_runtime_truncated === true} detailTruncated={execution.stdout_detail_truncated === true}
+          omittedBytes={stdoutOmitted} />}
         {!safeStdout && (hasStdout || isShell) && <p><strong>标准输出</strong> 未记录</p>}
         {stdoutBytes !== null && <p><strong>标准输出字节数</strong> {stdoutBytes} 字节</p>}
         {safeStderr && <TaskStepOutput label="错误输出" value={safeStderr.value} clientTruncated={safeStderr.truncated}
-          truncated={execution.stderr_truncated === true} omittedBytes={stderrOmitted} />}
+          truncated={execution.stderr_truncated === true}
+          runtimeTruncated={execution.stderr_runtime_truncated === true} detailTruncated={execution.stderr_detail_truncated === true}
+          omittedBytes={stderrOmitted} />}
         {!safeStderr && (hasStderr || isShell) && <p><strong>错误输出</strong> 未记录</p>}
         {stderrBytes !== null && <p><strong>错误输出字节数</strong> {stderrBytes} 字节</p>}
         {[location, command, parameters, cwd].some((field) => field?.truncated) && <p>执行信息在界面显示时截断。</p>}
@@ -1358,6 +1396,15 @@ function taskAgentActivityItems(steps: TaskStep[]): TaskAgentActivityItem[] {
   return items;
 }
 
+function TaskAgentToolBatch({ steps, renderStep }: { steps: TaskStep[]; renderStep: (step: TaskStep) => ReactNode }) {
+  const [open, setOpen] = useState(false);
+  return <details className="task-detail-more" aria-label={`${steps.length} 项工具操作`}
+    onToggle={(event) => setOpen(event.currentTarget.open)}>
+    <summary>{steps.length} 项工具操作 · 已完成</summary>
+    {open && steps.map(renderStep)}
+  </details>;
+}
+
 type TaskFeedState = 'connected' | 'disconnected' | 'resyncing';
 
 function TaskStream({ task, conversationID, onState }: {
@@ -1562,6 +1609,7 @@ export function Assistant() {
   const modelRecoveryRetriesInFlight = useRef(new Set<string>());
   const [clarificationAnswers, setClarificationAnswers] = useState<Record<string, string>>({});
   const [clarificationFileDeliveryIntents, setClarificationFileDeliveryIntents] = useState<Record<string, 'none' | 'required'>>({});
+  const [clarificationStructuredDrafts, setClarificationStructuredDrafts] = useState<Record<string, Record<string, ClarificationAnswerDraft>>>({});
   const [clarificationInteractions, setClarificationInteractions] = useState<Record<string, ClarificationInteraction>>({});
   const clarificationSubmissionsInFlight = useRef(new Set<string>());
   const [taskEventFeeds, setTaskEventFeeds] = useState<Record<string, TaskFeedState>>({});
@@ -3017,31 +3065,48 @@ export function Assistant() {
       return;
     }
     const draftKey = clarificationDraftKey(task.id, request.id, request.version);
+    const questionGroup = request.question_group ?? null;
+    const structuredDraft = clarificationStructuredDrafts[draftKey] ?? {};
+    const structuredBody = questionGroup ? clarificationStructuredRequestBody(questionGroup, structuredDraft) : null;
+    if (questionGroup && (questionGroup.id !== request.id || questionGroup.version !== request.version ||
+        !clarificationStructuredDraftIsValid(questionGroup, structuredDraft))) return;
     const answer = (clarificationAnswers[draftKey] ?? '').trim();
-    if (!answer) return;
+    if (!questionGroup && !answer) return;
     const isFileDeliveryClarification = isFileDeliveryIntentClarification(request.call_id);
     const fileDeliveryIntent = isFileDeliveryClarification ? clarificationFileDeliveryIntents[draftKey] : undefined;
-    if (isFileDeliveryClarification && (!fileDeliveryIntent ||
+    if (!questionGroup && isFileDeliveryClarification && (!fileDeliveryIntent ||
       (fileDeliveryIntent === 'required' && !task.workspace_id))) return;
     if (clarificationSubmissionsInFlight.current.has(task.id)) return;
     clarificationSubmissionsInFlight.current.add(task.id);
     const actionScope = `clarification:${task.id}:${request.id}`;
-    const fingerprint = JSON.stringify({ call_id: request.call_id, version: request.version, answer,
-      ...(fileDeliveryIntent ? { file_delivery_intent: fileDeliveryIntent } : {}) });
+    const fingerprint = JSON.stringify(structuredBody
+      ? { call_id: request.call_id, clarification_id: request.id, version: structuredBody.version, answers: structuredBody.answers }
+      : { call_id: request.call_id, clarification_id: request.id, version: request.version, answer,
+        ...(fileDeliveryIntent ? { file_delivery_intent: fileDeliveryIntent } : {}) });
     const key = taskActionKey(actionScope, fingerprint);
     setClarificationInteractions((current) => ({ ...current, [task.id]: {
       clarificationID: request.id, version: request.version, question: request.question, status: 'sending',
     } }));
     try {
-      await portalApi.answerTaskInput(task.id, {
-        clarification_id: request.id,
-        clarification_version: request.version,
-        answer,
-        ...(fileDeliveryIntent ? { file_delivery_intent: fileDeliveryIntent } : {}),
-      }, key);
+      if (structuredBody) {
+        await portalApi.answerStructuredTaskClarification(task.id, request.id, structuredBody, key);
+      } else {
+        await portalApi.answerTaskInput(task.id, {
+          clarification_id: request.id,
+          clarification_version: request.version,
+          answer,
+          ...(fileDeliveryIntent ? { file_delivery_intent: fileDeliveryIntent } : {}),
+        }, key);
+      }
       clearTaskActionKey(actionScope, key);
       setClarificationAnswers((current) => ({ ...current, [draftKey]: '' }));
       setClarificationFileDeliveryIntents((current) => {
+        if (!(draftKey in current)) return current;
+        const next = { ...current };
+        delete next[draftKey];
+        return next;
+      });
+      setClarificationStructuredDrafts((current) => {
         if (!(draftKey in current)) return current;
         const next = { ...current };
         delete next[draftKey];
@@ -3072,6 +3137,18 @@ export function Assistant() {
           client.invalidateQueries({ queryKey: ['conversation-tasks'] }),
         ]);
         notify(details.message, 'error');
+      } else if (details.code === 'conflict') {
+        clearTaskActionKey(actionScope, key);
+        setClarificationInteractions((current) => ({ ...current, [task.id]: {
+          clarificationID: request.id, version: request.version, question: request.question,
+          status: 'expired', message: '此澄清已过期或版本已变化，正在刷新任务状态。请核对最新问题后再回答。',
+        } }));
+        await Promise.all([
+          client.invalidateQueries({ queryKey: ['task', task.id] }),
+          client.invalidateQueries({ queryKey: ['assistant-account-tasks'] }),
+          client.invalidateQueries({ queryKey: ['conversation-tasks', conversationID] }),
+        ]);
+        notify('澄清请求状态已变化，已刷新最新任务状态。请核对后再操作。', 'error');
       } else {
         const uncertain = !(error instanceof ApiError) || error.status >= 500 || [408, 425, 429].includes(error.status);
         setClarificationInteractions((current) => ({ ...current, [task.id]: {
@@ -3079,10 +3156,7 @@ export function Assistant() {
           status: uncertain ? 'unknown' : 'failed',
           message: uncertain ? '提交结果待确认；重试相同回答会复用原请求编号。' : details.message,
         } }));
-        if (details.code === 'conflict') {
-          await client.invalidateQueries({ queryKey: ['task', task.id] });
-          notify('澄清请求状态已变化，已刷新最新任务状态。请核对后再操作。', 'error');
-        } else if (uncertain) notify('补充信息提交结果待确认；重试相同回答会复用原请求编号。', 'error');
+        if (uncertain) notify('补充信息提交结果待确认；重试相同回答会复用原请求编号。', 'error');
         else notify(details.message, 'error');
       }
     } finally {
@@ -3762,10 +3836,12 @@ export function Assistant() {
   const composerDraftReady = !composerDraftIdentity || hydratedComposerDraftKey === composerDraftIdentity;
   const visibleComposerContent = composerDraftReady ? content : '';
   useEffect(() => {
+    let cancelled = false;
     const urls = composerDraftPreviewURLRegistry.sync(composerDraftReady ? composerDraftIdentity : null,
       composerDraftReady ? composerAttachments.map((item) => ({ id: item.id, blob: item.file,
         mediaType: assistantFileMediaType(item.file), needsPreparation: item.needsPreparation })) : []);
-    setComposerAttachmentPreviewURLs(urls);
+    queueMicrotask(() => { if (!cancelled) setComposerAttachmentPreviewURLs(urls); });
+    return () => { cancelled = true; };
   }, [composerAttachments, composerDraftIdentity, composerDraftPreviewURLRegistry, composerDraftReady]);
   useEffect(() => () => composerDraftPreviewURLRegistry.clear(), [composerDraftPreviewURLRegistry]);
   const resizeComposer = useCallback(() => {
@@ -3918,10 +3994,7 @@ export function Assistant() {
           <h4><strong>{group.title}</strong><span aria-hidden="true" /></h4>
           {group.currentActivity && <p className="muted task-agent-current-activity" role="status">{group.currentActivity}</p>}
           {taskAgentActivityItems(group.steps).map((item) => item.kind === 'step' ? renderActivityStep(item.step) :
-            <details className="task-detail-more" key={item.id} aria-label={`${item.steps.length} 项工具操作`}>
-              <summary>{item.steps.length} 项工具操作 · 已完成</summary>
-              {item.steps.map(renderActivityStep)}
-            </details>)}
+            <TaskAgentToolBatch key={item.id} steps={item.steps} renderStep={renderActivityStep} />)}
         </section>) : <p className="muted task-work-empty">暂无已记录的工作项。</p>}
       </section>
     </section>;
@@ -4267,9 +4340,27 @@ export function Assistant() {
                   const clarificationDraftID = activeClarification
                     ? clarificationDraftKey(messageTaskID, activeClarification.id, activeClarification.version) : '';
                   const clarificationAnswer = clarificationDraftID ? clarificationAnswers[clarificationDraftID] ?? '' : '';
-                  const fileDeliveryClarification = isFileDeliveryIntentClarification(activeClarification?.call_id);
+                  const clarificationQuestionGroup = activeClarification?.question_group ?? null;
+                  const clarificationStructuredDraft = clarificationDraftID ? clarificationStructuredDrafts[clarificationDraftID] ?? {} : {};
+                  const clarificationStructuredDraftIsSubmittable = clarificationQuestionGroup
+                    ? clarificationStructuredDraftIsValid(clarificationQuestionGroup, clarificationStructuredDraft) : false;
+                  const fileDeliveryClarification = !clarificationQuestionGroup && isFileDeliveryIntentClarification(activeClarification?.call_id);
                   const clarificationFileDeliveryIntent = fileDeliveryClarification
                     ? clarificationFileDeliveryIntents[clarificationDraftID] : undefined;
+                  const updateStructuredClarificationAnswer = (questionID: string, changes: Partial<ClarificationAnswerDraft>) => {
+                    setClarificationStructuredDrafts((current) => {
+                      const draft = current[clarificationDraftID] ?? {};
+                      return { ...current, [clarificationDraftID]: {
+                        ...draft, [questionID]: { ...draft[questionID], ...changes },
+                      } };
+                    });
+                  };
+                  const clarificationInteractionLabel = clarificationInteraction?.status === 'submitted' ? '已提交'
+                    : clarificationInteraction?.status === 'sending' ? '正在提交'
+                      : clarificationInteraction?.status === 'expired' ? '已过期'
+                        : clarificationInteraction?.status === 'failed' ? '提交失败'
+                          : clarificationInteraction?.status === 'unknown' ? '结果待确认'
+                            : clarificationInteraction?.status === 'revoked' ? '权限已变化' : '等待回复';
                   const showRoutingFailure = isUnlinkedRoutingFailure(message);
                   const routingRetryActorMatches = conversationMessageActorID(message) === user?.id;
                   const retryEligibilityQuery = routingRetryEligibilityByMessageID.get(message.id);
@@ -4410,25 +4501,64 @@ export function Assistant() {
                         <section className="chat-approval task-approval-card conversation-clarification-card" role="region" aria-label="对话中的澄清请求">
                           <header className="task-approval-card-heading">
                             <h3>需要补充信息</h3>
-                            <span>{clarificationInteraction?.status === 'submitted' ? '已提交' : clarificationInteraction?.status === 'sending' ? '正在提交' : '等待回复'}</span>
+                            <span>{clarificationInteractionLabel}</span>
                           </header>
                           <p>{safeTaskActivityText(clarificationDisplay.question, 1_000).value}</p>
                           {clarificationInteraction?.status === 'submitted' && <p role="status">{clarificationInteraction.message}</p>}
                           {clarificationInteraction?.status === 'sending' && <p role="status">正在提交补充信息…</p>}
                           {clarificationInteraction?.status === 'unknown' && <p role="status">{clarificationInteraction.message}</p>}
-                          {(clarificationInteraction?.status === 'failed' || clarificationInteraction?.status === 'revoked') &&
+                          {(clarificationInteraction?.status === 'expired' || clarificationInteraction?.status === 'failed' || clarificationInteraction?.status === 'revoked') &&
                             <p role="alert">{clarificationInteraction.message}</p>}
                           {activeClarification && clarificationInteraction?.status !== 'submitted' &&
-                            clarificationInteraction?.status !== 'sending' && clarificationInteraction?.status !== 'revoked' &&
+                            clarificationInteraction?.status !== 'sending' && clarificationInteraction?.status !== 'expired' &&
+                            clarificationInteraction?.status !== 'revoked' &&
                             <form aria-label="提交澄清回复" onSubmit={(event) => {
                               event.preventDefault();
                               void submitClarificationAnswer(messageTask!);
                             }}>
-                              <label className="sr-only" htmlFor={`clarification-answer-${encodeURIComponent(messageTaskID)}`}>澄清问题答复</label>
-                              <textarea id={`clarification-answer-${encodeURIComponent(messageTaskID)}`} aria-label="澄清问题答复"
-                                value={clarificationAnswer} maxLength={16_384}
-                                onChange={(event) => setClarificationAnswers((current) => ({ ...current, [clarificationDraftID]: event.target.value }))}
-                                placeholder="在这里补充信息…" disabled={clarificationInteraction?.status === 'unknown'} />
+                              {clarificationQuestionGroup ? clarificationQuestionGroup.questions.map((question) => {
+                                const answerDraft = clarificationStructuredDraft[question.id] ?? {};
+                                const selectedOptionIDs = answerDraft.optionIDs ?? [];
+                                const skipped = Boolean(answerDraft.skipped);
+                                const controlsDisabled = clarificationInteraction?.status === 'unknown' || skipped;
+                                const inputName = `clarification-${encodeURIComponent(messageTaskID)}-${encodeURIComponent(clarificationQuestionGroup.id)}-${question.id}`;
+                                return <fieldset className="fieldset task-clarification-question" key={question.id}>
+                                  <legend>{safeTaskActivityText(question.prompt, 1_024).value}{question.required ? '（必填）' : '（可选）'}</legend>
+                                  {question.type === 'free_text' ? <textarea aria-label={`${question.prompt}答复`}
+                                    value={answerDraft.text ?? ''} maxLength={4_096} disabled={controlsDisabled}
+                                    placeholder="在这里填写…"
+                                    onChange={(event) => updateStructuredClarificationAnswer(question.id, {
+                                      optionIDs: [], text: event.target.value, skipped: false,
+                                    })} /> : question.options.map((option) => <label key={option.id}>
+                                    <input type={question.type === 'single_choice' ? 'radio' : 'checkbox'} name={inputName}
+                                      checked={selectedOptionIDs.includes(option.id)} disabled={controlsDisabled}
+                                      onChange={(event) => {
+                                        if (question.type === 'single_choice') {
+                                          updateStructuredClarificationAnswer(question.id, { optionIDs: [option.id], text: '', skipped: false });
+                                          return;
+                                        }
+                                        const nextSelected = new Set(selectedOptionIDs);
+                                        if (event.currentTarget.checked) nextSelected.add(option.id);
+                                        else nextSelected.delete(option.id);
+                                        updateStructuredClarificationAnswer(question.id, {
+                                          optionIDs: question.options.filter((item) => nextSelected.has(item.id)).map((item) => item.id),
+                                          text: '', skipped: false,
+                                        });
+                                      }} />{option.label}
+                                  </label>)}
+                                  {question.allow_skip && <label><input type="checkbox" checked={skipped}
+                                    disabled={clarificationInteraction?.status === 'unknown'}
+                                    onChange={(event) => updateStructuredClarificationAnswer(question.id, {
+                                      optionIDs: [], text: '', skipped: event.currentTarget.checked,
+                                    })} />跳过此问题</label>}
+                                </fieldset>;
+                              }) : <>
+                                <label className="sr-only" htmlFor={`clarification-answer-${encodeURIComponent(messageTaskID)}`}>澄清问题答复</label>
+                                <textarea id={`clarification-answer-${encodeURIComponent(messageTaskID)}`} aria-label="澄清问题答复"
+                                  value={clarificationAnswer} maxLength={16_384}
+                                  onChange={(event) => setClarificationAnswers((current) => ({ ...current, [clarificationDraftID]: event.target.value }))}
+                                  placeholder="在这里补充信息…" disabled={clarificationInteraction?.status === 'unknown'} />
+                              </>}
                               {fileDeliveryClarification && <fieldset aria-label="文件交付方式">
                                 <legend>文件交付方式</legend>
                                 <label><input type="radio" name={`file-delivery-intent-${encodeURIComponent(messageTaskID)}`}
@@ -4444,8 +4574,9 @@ export function Assistant() {
                               </fieldset>}
                               <div className="chat-approval-actions">
                                 <button type="submit" className="button button-primary"
-                                  disabled={!clarificationAnswer.trim() || (fileDeliveryClarification && (!clarificationFileDeliveryIntent ||
-                                    (clarificationFileDeliveryIntent === 'required' && !messageTask?.workspace_id)))}>
+                                  disabled={clarificationQuestionGroup ? !clarificationStructuredDraftIsSubmittable
+                                    : !clarificationAnswer.trim() || (fileDeliveryClarification && (!clarificationFileDeliveryIntent ||
+                                      (clarificationFileDeliveryIntent === 'required' && !messageTask?.workspace_id)))}>
                                   {clarificationInteraction?.status === 'unknown' ? '使用相同回答重试' : '提交并继续'}
                                 </button>
                               </div>
@@ -4596,7 +4727,7 @@ export function Assistant() {
                 {mcpConnectors.isError && <FloatingError className="error-inline assistant-connector-error" role="alert">工具连接暂不可用<button type="button" className="button button-small button-secondary" onClick={() => void mcpConnectors.refetch()}>重试</button></FloatingError>}
               </div>
               <div className="assistant-task-actions" role="group" aria-label="发送操作">
-                <AssistantVoiceInput compact onTranscript={(transcript) => {
+                <AssistantVoiceInput key={composerDraftIdentity ?? 'composer'} compact onTranscript={(transcript) => {
                   composerEditRevision.current += 1;
                   if (!conversationID) ensureLocalConversationKey();
                   const snapshot = latestComposerDraft.current;

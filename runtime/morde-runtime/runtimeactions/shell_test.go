@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"morde-runtime/contract"
 	mordesync "morde-sync"
 )
 
@@ -240,6 +241,45 @@ func TestBoundedBufferRetainsPrefixAndDrainsInput(t *testing.T) {
 		t.Fatal("buffer did not report truncated output")
 	}
 }
+
+func TestBoundedBufferSupplementalOutputStartsAfterLegacyCombinedLimit(t *testing.T) {
+	sink := &recordingSupplementalOutputSink{}
+	budget := &outputBudget{limit: 5}
+	stdout := &boundedBuffer{limit: 5, budget: budget, supplemental: sink, stream: contract.SupplementalOutputCaptureStdout}
+	stderr := &boundedBuffer{limit: 5, budget: budget, supplemental: sink, stream: contract.SupplementalOutputCaptureStderr}
+	_, _ = stdout.Write([]byte("abcde"))
+	_, _ = stderr.Write([]byte("f"))
+	_, _ = stdout.Write([]byte("sec"))
+	_, _ = stdout.Write([]byte("ret"))
+	if stdout.String() != "abcde" || stderr.String() != "" || budget.used != 5 {
+		t.Fatalf("legacy output changed: stdout=%q stderr=%q budget=%d", stdout.String(), stderr.String(), budget.used)
+	}
+	if got := string(sink.stdout); got != "secret" {
+		t.Fatalf("supplemental stdout=%q, want exact overflow bytes %q", got, "secret")
+	}
+	if got := string(sink.stderr); got != "f" {
+		t.Fatalf("supplemental stderr=%q, want exact overflow bytes %q", got, "f")
+	}
+}
+
+type recordingSupplementalOutputSink struct {
+	stdout []byte
+	stderr []byte
+}
+
+func (s *recordingSupplementalOutputSink) WriteSupplementalOutput(stream contract.SupplementalOutputCaptureStream, value []byte) bool {
+	if stream == contract.SupplementalOutputCaptureStdout {
+		s.stdout = append(s.stdout, value...)
+	} else if stream == contract.SupplementalOutputCaptureStderr {
+		s.stderr = append(s.stderr, value...)
+	} else {
+		return false
+	}
+	return true
+}
+
+func (*recordingSupplementalOutputSink) MarkSupplementalOutputIncomplete(string)  {}
+func (*recordingSupplementalOutputSink) MarkSupplementalOutputUnsupported(string) {}
 
 func TestStdoutAndStderrShareOneOutputLimit(t *testing.T) {
 	budget := &outputBudget{limit: 5}

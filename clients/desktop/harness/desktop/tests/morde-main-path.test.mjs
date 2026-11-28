@@ -142,7 +142,7 @@ test('authenticated WebView restores Assistant and workspace folder selection en
     },
     BrowserWindow: FakeWindow, WebContentsView: FakeView,
     session: { fromPartition: () => ({
-      cookies: { async set() {} }, webRequest: { onCompleted() {}, onHeadersReceived() {} }, on() {}, setPermissionRequestHandler() {},
+      cookies: { async set() {} }, webRequest: { onCompleted() {}, onHeadersReceived() {} }, on() {}, setPermissionCheckHandler() {}, setPermissionRequestHandler() {},
       async clearStorageData() {},
     }) },
     ipcMain: { handle: (channel, fn) => handlers.set(channel, fn) },

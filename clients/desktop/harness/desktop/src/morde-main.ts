@@ -1,10 +1,10 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, net, safeStorage, session, shell, Tray, WebContentsView, type MessageBoxOptions, type Session, type WebContents } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Menu, net, Notification, safeStorage, session, shell, Tray, WebContentsView, type MessageBoxOptions, type Session, type WebContents } from "electron";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync, rmSync } from "node:fs";
 import { access, lstat, realpath } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { basename, dirname, isAbsolute, join, posix, resolve, win32 } from "node:path";
-import { MordeAPI, checkedId, credentialExpired, credentialExpiresSoon, gatewayURL, localGatewayOrigin, mordeUserDataDirectory, portalOrigin, tracedFetch, withTimeout, type ClientLoginAttempt, type Credentials, type HostEmbedTarget, type ProjectSyncFolder, type WebSession } from "./morde-core";
+import { MordeAPI, NotificationCursorExpiredError, checkedId, credentialExpired, credentialExpiresSoon, gatewayURL, localGatewayOrigin, mordeUserDataDirectory, portalOrigin, tracedFetch, withTimeout, type ClientLoginAttempt, type Credentials, type HostEmbedTarget, type NotificationUpdatePage, type ProjectSyncFolder, type WebSession } from "./morde-core";
 import { checkedDirectory, MordeSync, pathsOverlap, SyncRunError, validateSyncScope, type HandoffRecord, type HandoffTarget, type Mapping, type PreservedFile, type ProjectHostApplicationStatus, type SyncCheckpoint } from "./morde-sync";
 import { MordeSyncthingNode, type ManagedWorkspaceFolder } from "./morde-node";
 import { MordeCodexRuntime, type CodexPersistentState } from "./morde-codex";
@@ -193,6 +193,25 @@ type ProjectTarget = {
   folders: { folderID: string; projectName: string; relativePath: string; state: string }[];
   blockedMessage?: string;
 };
+type DesktopNotificationProfile = {
+  version: 1;
+  serviceInstanceID: string;
+  accountName: string;
+  enabled: boolean;
+  cursor: string | null;
+  receiptHashes: string[];
+};
+type DesktopNotificationLoop = {
+  auth: Credentials;
+  profile: DesktopNotificationProfile;
+  generation: number;
+  timer: NodeJS.Timeout | null;
+  controller: AbortController | null;
+  polling: boolean;
+};
+const desktopNotificationIntervalMs = 30_000;
+const desktopNotificationReceiptLimit = 4_096;
+const desktopNotificationPageLimit = 10;
 let clientLoginAttempts: Record<string, ClientLoginFence> = {};
 let clientLoginAttemptsError = false;
 let activeProfile: string | null = null;
@@ -215,8 +234,14 @@ const liveSyncStartWaiters = new Map<string, { resolve: () => void; reject: (err
 const liveSyncStopping = new Set<string>();
 let workspaceSyncOperationInProgress = false;
 let syncChildPid: number | undefined;
+let desktopNotificationLoop: DesktopNotificationLoop | null = null;
+let desktopNotificationGeneration = 0;
 let webView: WebContentsView | null = null;
 let webPartition: Session | null = null;
+// Local opt-in: launch with MORDE_ENABLE_VOICE_WAVEFORM=1 make pc. Default stays off.
+const voiceWaveformEnabled = process.env.MORDE_ENABLE_VOICE_WAVEFORM === "1";
+const voiceWaveformPermissionWindowMs = 5_000;
+let voiceWaveformLease: { token: string; owner: WebContents; auth: Credentials; partition: Session; expiresAt: number; remainingAudioRequests: number } | null = null;
 type NativeWorkbenchEmbed = {
   auth: Credentials;
   hostID: string;
@@ -833,6 +858,247 @@ function readOptional(name: string): string | null {
 function readOptionalBuffer(name: string): Buffer | null {
   try { return readFileSync(settingsPath(name)); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return null; throw error; }
+}
+
+function desktopNotificationProfileFile(auth: Credentials): string {
+  const accountProfile = createHash("sha256").update(`${auth.serviceInstanceID}\0${auth.accountName}`).digest("hex");
+  return `desktop-notifications-${accountProfile}.bin`;
+}
+
+function emptyDesktopNotificationProfile(auth: Credentials): DesktopNotificationProfile {
+  return { version: 1, serviceInstanceID: auth.serviceInstanceID, accountName: auth.accountName, enabled: false, cursor: null, receiptHashes: [] };
+}
+
+function validDesktopNotificationProfile(value: unknown, auth: Credentials): value is DesktopNotificationProfile {
+  if (!value || typeof value !== "object") return false;
+  const profile = value as Partial<DesktopNotificationProfile>;
+  return profile.version === 1 && profile.serviceInstanceID === auth.serviceInstanceID && profile.accountName === auth.accountName &&
+    typeof profile.enabled === "boolean" && (profile.cursor === null || typeof profile.cursor === "string" && profile.cursor.length > 0 && profile.cursor.length <= 1024) &&
+    Array.isArray(profile.receiptHashes) && profile.receiptHashes.length <= desktopNotificationReceiptLimit &&
+    profile.receiptHashes.every((receipt) => typeof receipt === "string" && /^[a-f0-9]{64}$/.test(receipt)) &&
+    new Set(profile.receiptHashes).size === profile.receiptHashes.length;
+}
+
+function readDesktopNotificationProfile(auth: Credentials): DesktopNotificationProfile {
+  if (!safeStorageReady()) throw new Error("Secure operating system storage is unavailable");
+  const raw = readOptionalBuffer(desktopNotificationProfileFile(auth));
+  if (raw === null) return emptyDesktopNotificationProfile(auth);
+  if (raw.byteLength > 1024 * 1024) throw new Error("Desktop notification settings are unavailable");
+  const saved = JSON.parse(safeStorage.decryptString(raw)) as unknown;
+  if (!validDesktopNotificationProfile(saved, auth)) throw new Error("Desktop notification settings are unavailable");
+  return saved;
+}
+
+function saveDesktopNotificationProfile(auth: Credentials, profile: DesktopNotificationProfile): void {
+  if (!safeStorageReady() || !validDesktopNotificationProfile(profile, auth)) throw new Error("Could not safely save desktop notification settings");
+  savePrivate(desktopNotificationProfileFile(auth), safeStorage.encryptString(JSON.stringify(profile)));
+}
+
+function desktopNotificationReceiptHash(auth: Credentials, id: string): string {
+  return createHash("sha256").update(`${auth.serviceInstanceID}\0${auth.accountName}\0${id}`).digest("hex");
+}
+
+function desktopNotificationLoopIsCurrent(loop: DesktopNotificationLoop): boolean {
+  return desktopNotificationLoop === loop && loop.generation === desktopNotificationGeneration && credentials === loop.auth &&
+    activeProfile === profileID(loop.auth) && !logoutInProgress && loop.profile.enabled;
+}
+
+function stopDesktopNotificationPolling(): void {
+  desktopNotificationGeneration += 1;
+  const loop = desktopNotificationLoop;
+  desktopNotificationLoop = null;
+  if (!loop) return;
+  if (loop.timer) clearInterval(loop.timer);
+  loop.controller?.abort();
+}
+
+function desktopNotificationNativeAvailable(): boolean {
+  try { return app.isPackaged && Notification.isSupported(); }
+  catch { return false; }
+}
+
+function desktopNotificationWindowIsFocused(): boolean {
+  return Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.isFocused());
+}
+
+function showDesktopCompletionNotification(loop: DesktopNotificationLoop): void {
+  if (!desktopNotificationNativeAvailable() || desktopNotificationWindowIsFocused() || !desktopNotificationLoopIsCurrent(loop)) return;
+  try {
+    const notice = new Notification({ title: "Morde", body: zh ? "有一项任务已完成" : "A task has completed" });
+    notice.on("failed", () => console.warn("Morde desktop notification delivery failed; in-app notifications remain available"));
+    notice.on("click", () => {
+      const auth = loop.auth;
+      if (credentials !== auth || activeProfile !== profileID(auth) || logoutInProgress) return;
+      void openAssistant().then(() => {
+        if (credentials !== auth || activeProfile !== profileID(auth) || logoutInProgress) return;
+        mainWindow?.show();
+        mainWindow?.focus();
+      }).catch(() => undefined);
+    });
+    notice.show();
+  } catch { /* The existing in-app notification list remains available when OS delivery fails. */ }
+}
+
+function persistDesktopNotificationCursor(loop: DesktopNotificationLoop, cursor: string): void {
+  const next = { ...loop.profile, cursor };
+  saveDesktopNotificationProfile(loop.auth, next);
+  loop.profile = next;
+}
+
+function scheduleDesktopNotificationPoll(loop: DesktopNotificationLoop, delay = desktopNotificationIntervalMs): void {
+  if (!desktopNotificationLoopIsCurrent(loop) || loop.timer) return;
+  loop.timer = setInterval(() => { void pollDesktopNotifications(loop); }, Math.max(delay, 1_000));
+  loop.timer.unref();
+}
+
+async function rebaselineExpiredDesktopNotificationCursor(loop: DesktopNotificationLoop, signal: AbortSignal): Promise<void> {
+  // Move the persisted cursor first. A completion committed after this baseline
+  // must be read incrementally even if it also appears in the list snapshot.
+  const baseline = await api.notificationUpdates(undefined, signal);
+  if (!desktopNotificationLoopIsCurrent(loop)) return;
+  persistDesktopNotificationCursor(loop, baseline.cursor);
+
+  let cursor: string | undefined;
+  const visited = new Set<string>();
+  const listedCompletionIDs = new Set<string>();
+  for (let pageNumber = 0; pageNumber < 50; pageNumber++) {
+    if (!desktopNotificationLoopIsCurrent(loop)) return;
+    const page = await api.notificationListPage(cursor, signal);
+    if (!desktopNotificationLoopIsCurrent(loop)) return;
+    for (const item of page.items) if (item.kind === "completed") listedCompletionIDs.add(item.id);
+    if (!page.nextCursor) break;
+    if (visited.has(page.nextCursor)) throw new Error("Morde notification list cursor did not advance");
+    visited.add(page.nextCursor);
+    cursor = page.nextCursor;
+  }
+
+  // Drain completions committed between the baseline and the list scan before
+  // recording list IDs as already seen. This keeps the list reconciliation
+  // from suppressing a new completion that must still produce a desktop notice.
+  let pages = 0;
+  while (desktopNotificationLoopIsCurrent(loop) && pages < desktopNotificationPageLimit) {
+    const previousCursor = loop.profile.cursor;
+    const page = await api.notificationUpdates(previousCursor ?? undefined, signal);
+    if (!desktopNotificationLoopIsCurrent(loop)) return;
+    if (page.hasMore && page.cursor === previousCursor) throw new Error("Morde notification cursor did not advance");
+    await processDesktopNotificationPage(loop, page);
+    if (!desktopNotificationLoopIsCurrent(loop)) return;
+    pages += 1;
+    if (!page.hasMore) {
+      let receipts = loop.profile.receiptHashes;
+      for (const id of listedCompletionIDs) {
+        const receipt = desktopNotificationReceiptHash(loop.auth, id);
+        if (!receipts.includes(receipt)) receipts = [...receipts, receipt].slice(-desktopNotificationReceiptLimit);
+      }
+      if (receipts !== loop.profile.receiptHashes) {
+        const reconciled = { ...loop.profile, receiptHashes: receipts };
+        saveDesktopNotificationProfile(loop.auth, reconciled);
+        loop.profile = reconciled;
+      }
+      scheduleDesktopNotificationPoll(loop);
+      return;
+    }
+  }
+  // Leave list IDs unreconciled while the incremental stream still has pages;
+  // the next poll will continue from the durably saved cursor.
+  if (desktopNotificationLoopIsCurrent(loop)) scheduleDesktopNotificationPoll(loop, 0);
+}
+
+async function processDesktopNotificationPage(loop: DesktopNotificationLoop, page: NotificationUpdatePage): Promise<void> {
+  if (!desktopNotificationLoopIsCurrent(loop)) return;
+  const canNotify = desktopNotificationNativeAvailable() && !desktopNotificationWindowIsFocused();
+  for (const item of page.items) {
+    if (item.kind !== "completed" || !canNotify || !desktopNotificationLoopIsCurrent(loop)) continue;
+    const receipt = desktopNotificationReceiptHash(loop.auth, item.id);
+    if (loop.profile.receiptHashes.includes(receipt)) continue;
+    const next = { ...loop.profile, receiptHashes: [...loop.profile.receiptHashes, receipt].slice(-desktopNotificationReceiptLimit) };
+    saveDesktopNotificationProfile(loop.auth, next);
+    loop.profile = next;
+    if (desktopNotificationLoopIsCurrent(loop)) showDesktopCompletionNotification(loop);
+  }
+  if (desktopNotificationLoopIsCurrent(loop)) persistDesktopNotificationCursor(loop, page.cursor);
+}
+
+async function pollDesktopNotifications(loop: DesktopNotificationLoop): Promise<void> {
+  if (!desktopNotificationLoopIsCurrent(loop) || loop.polling) return;
+  loop.polling = true;
+  const controller = new AbortController();
+  loop.controller = controller;
+  try {
+    if (loop.profile.cursor === null) {
+      const baseline = await api.notificationUpdates(undefined, controller.signal);
+      if (!desktopNotificationLoopIsCurrent(loop)) return;
+      // A cursorless response establishes the opt-in baseline; its items are never delivered.
+      persistDesktopNotificationCursor(loop, baseline.cursor);
+      scheduleDesktopNotificationPoll(loop, baseline.hasMore ? 0 : desktopNotificationIntervalMs);
+      return;
+    }
+    let pages = 0;
+    while (desktopNotificationLoopIsCurrent(loop) && pages < desktopNotificationPageLimit) {
+      const previousCursor = loop.profile.cursor;
+      let page: NotificationUpdatePage;
+      try { page = await api.notificationUpdates(previousCursor ?? undefined, controller.signal); }
+      catch (error) {
+        if (!(error instanceof NotificationCursorExpiredError)) throw error;
+        await rebaselineExpiredDesktopNotificationCursor(loop, controller.signal);
+        return;
+      }
+      if (!desktopNotificationLoopIsCurrent(loop)) return;
+      if (page.hasMore && page.cursor === previousCursor) throw new Error("Morde notification cursor did not advance");
+      await processDesktopNotificationPage(loop, page);
+      if (!desktopNotificationLoopIsCurrent(loop)) return;
+      pages += 1;
+      if (!page.hasMore) {
+        scheduleDesktopNotificationPoll(loop);
+        return;
+      }
+    }
+    scheduleDesktopNotificationPoll(loop, 0);
+  } catch (error) {
+    if (desktopNotificationLoopIsCurrent(loop)) {
+      if (String(error).includes("Authorization expired or revoked")) clearAuthorization();
+      else scheduleDesktopNotificationPoll(loop);
+    }
+  } finally {
+    if (loop.controller === controller) loop.controller = null;
+    loop.polling = false;
+  }
+}
+
+function startDesktopNotificationPolling(auth: Credentials, profile: DesktopNotificationProfile): void {
+  stopDesktopNotificationPolling();
+  if (!profile.enabled || credentials !== auth || activeProfile !== profileID(auth) || logoutInProgress) return;
+  const loop: DesktopNotificationLoop = {
+    auth, profile, generation: desktopNotificationGeneration, timer: null, controller: null, polling: false,
+  };
+  desktopNotificationLoop = loop;
+  void pollDesktopNotifications(loop);
+}
+
+function resumeDesktopNotificationPolling(auth: Credentials): void {
+  if (credentials !== auth || activeProfile !== profileID(auth) || credentialExpired(auth.clientExpiresAt)) return;
+  try {
+    const profile = readDesktopNotificationProfile(auth);
+    if (profile.enabled) startDesktopNotificationPolling(auth, profile);
+  } catch { /* Corrupt or unavailable local settings keep desktop delivery off; in-app notifications remain available. */ }
+}
+
+function desktopNotificationSettings(): { enabled: boolean } {
+  const auth = credentials;
+  if (!auth || !activeProfile || activeProfile !== profileID(auth) || logoutInProgress) throw new Error("请先登录 Morde");
+  return { enabled: readDesktopNotificationProfile(auth).enabled };
+}
+
+function setDesktopNotificationsEnabled(enabled: unknown): { enabled: boolean } {
+  if (typeof enabled !== "boolean") throw new Error("Desktop notification setting must be on or off");
+  const auth = credentials;
+  if (!auth || !activeProfile || activeProfile !== profileID(auth) || logoutInProgress) throw new Error("请先登录 Morde");
+  const previous = readDesktopNotificationProfile(auth);
+  const next = { ...previous, enabled, ...(enabled ? { cursor: null } : {}) };
+  saveDesktopNotificationProfile(auth, next);
+  if (enabled) startDesktopNotificationPolling(auth, next);
+  else stopDesktopNotificationPolling();
+  return { enabled: next.enabled };
 }
 
 type PendingRevocation = { origin: string; serviceInstanceID: string; installationID: string; clientInstanceID: string | null; createdAt: string };
@@ -2129,6 +2395,7 @@ async function performProjectUpload(selectionIDInput: unknown, projectNameInput:
 }
 
 function detachWeb(): void {
+  voiceWaveformLease = null;
   closeHostWindows();
   if (webView) {
     if (mainWindow && !mainWindow.isDestroyed() && webAttached) mainWindow.contentView.removeChildView(webView);
@@ -2142,6 +2409,7 @@ function detachWeb(): void {
 }
 
 function clearAuthorization(stopRuntime = true): void {
+  stopDesktopNotificationPolling();
   if (!credentials) return;
   void codex.stop();
   if (stopRuntime) {
@@ -2204,6 +2472,10 @@ function scheduleAuthorizationCheck(): void {
 
 function sameOriginURL(value: string, origin: string): URL | null {
   try { const url = new URL(value); return url.origin === origin && !url.username && !url.password ? url : null; } catch { return null; }
+}
+
+function isTrustedAssistantPage(value: string, origin: string): boolean {
+  return sameOriginURL(value, origin)?.pathname === "/assistant";
 }
 
 function portalOriginFor(auth: Credentials): string {
@@ -2286,6 +2558,34 @@ function trustedPortalBridgeEvent(event: { sender: WebContents; senderFrame: { u
   const contents = webView?.webContents;
   return Boolean(contents && !contents.isDestroyed() && credentials === auth && event.sender === contents &&
     event.senderFrame === event.sender.mainFrame && isTrustedPortalBridgePage(event.sender.getURL(), portalOriginFor(auth)));
+}
+
+function trustedAccountSettingsBridgeEvent(event: { sender: WebContents; senderFrame: { url: string } | null }, auth: Credentials): boolean {
+  const contents = webView?.webContents;
+  const url = contents && sameOriginURL(contents.getURL(), portalOriginFor(auth));
+  return Boolean(contents && !contents.isDestroyed() && credentials === auth && event.sender === contents &&
+    event.senderFrame === event.sender.mainFrame && url?.pathname === "/settings" && !url.search && !url.hash);
+}
+
+function trustedAssistantVoiceEvent(event: { sender: WebContents; senderFrame: { url: string } | null }, auth: Credentials): boolean {
+  const contents = webView?.webContents;
+  return Boolean(contents && !contents.isDestroyed() && credentials === auth && event.sender === contents &&
+    event.senderFrame === event.sender.mainFrame && isTrustedAssistantPage(event.sender.getURL(), portalOriginFor(auth)));
+}
+
+function voiceRecordingPermissionAllowed(
+  contents: WebContents | null,
+  requestingUrl: string | undefined,
+  isMainFrame: boolean | undefined,
+  mediaType: string | undefined,
+): boolean {
+  const auth = credentials;
+  const lease = voiceWaveformLease;
+  const origin = auth ? portalOriginFor(auth) : "";
+  return Boolean(auth && lease && lease.expiresAt >= Date.now() && lease.remainingAudioRequests > 0 && lease.auth === auth &&
+    lease.partition === webPartition && contents && !contents.isDestroyed() && contents === lease.owner &&
+    contents === webView?.webContents && isMainFrame === true && mediaType === "audio" &&
+    isTrustedAssistantPage(contents.getURL(), origin) && typeof requestingUrl === "string" && isTrustedAssistantPage(requestingUrl, origin));
 }
 
 const documentLoadOptions = { extraHeaders: "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" };
@@ -2696,8 +2996,35 @@ function installDownloadAndClipboard(partition: Session, portalOrigin: string): 
     if (!sameOriginURL(source, portalOrigin) && ![...hostWindows].some((win) => win.webContents === contents) && nativeWorkbenchEmbed?.view.webContents !== contents) { item.cancel(); return; }
     item.setSaveDialogOptions({ title: "保存 Morde 文件" });
   });
-  partition.setPermissionRequestHandler((contents, permission, callback) => {
+  partition.setPermissionCheckHandler((contents, permission, requestingOrigin, details) => {
+    if (permission === "clipboard-sanitized-write") {
+      return Boolean(contents && !contents.isDestroyed() &&
+        (sameOriginURL(contents.getURL(), portalOrigin) || [...hostWindows].some((win) => win.webContents === contents) || nativeWorkbenchEmbed?.view.webContents === contents));
+    }
+    if (permission !== "media" || !sameOriginURL(requestingOrigin, portalOrigin)) return false;
+    const requestingUrl = details && "requestingUrl" in details ? details.requestingUrl : undefined;
+    const isMainFrame = details && "isMainFrame" in details ? details.isMainFrame : undefined;
+    const mediaType = details && "mediaType" in details ? details.mediaType : undefined;
+    return voiceRecordingPermissionAllowed(contents, requestingUrl, isMainFrame, mediaType);
+  });
+  partition.setPermissionRequestHandler((contents, permission, callback, details) => {
     const trusted = Boolean(sameOriginURL(contents.getURL(), portalOrigin)) || [...hostWindows].some((win) => win.webContents === contents) || nativeWorkbenchEmbed?.view.webContents === contents;
+    if (permission === "media") {
+      const lease = voiceWaveformLease;
+      const requestingUrl = details && "requestingUrl" in details ? details.requestingUrl : undefined;
+      const isMainFrame = details && "isMainFrame" in details ? details.isMainFrame : undefined;
+      const mediaTypes = details && "mediaTypes" in details ? details.mediaTypes : undefined;
+      const allowed = Boolean(mediaTypes?.length === 1 && mediaTypes[0] === "audio" &&
+        voiceRecordingPermissionAllowed(contents, requestingUrl, isMainFrame, "audio"));
+      if (lease?.owner === contents) {
+        if (allowed) {
+          lease.remainingAudioRequests -= 1;
+          if (lease.remainingAudioRequests < 1) voiceWaveformLease = null;
+        } else voiceWaveformLease = null;
+      }
+      callback(allowed);
+      return;
+    }
     callback(trusted && permission === "clipboard-sanitized-write");
   });
 }
@@ -2877,10 +3204,14 @@ async function openWeb(initial: WebSession | undefined, owner: BrowserWindow): P
         else if (target?.pathname === "/login") restoreFromLogin(target);
       }
     };
+    content.webContents.on("did-start-navigation", (_event, _value, _isInPlace, isMainFrame) => {
+      if (isMainFrame) voiceWaveformLease = null;
+    });
     content.webContents.on("will-navigate", guardNavigation);
     content.webContents.on("will-redirect", guardNavigation);
     content.webContents.on("did-navigate-in-page", (_event, value) => {
       const target = sameOriginURL(value, appOrigin);
+      if (!isTrustedAssistantPage(value, appOrigin)) voiceWaveformLease = null;
       if (credentials !== auth) return;
       const embed = nativeWorkbenchEmbed;
       if (embed?.parent === content.webContents && target?.pathname !== "/assistant") void closeNativeWorkbenchEmbed(embed.nonce).catch(() => undefined);
@@ -2955,6 +3286,7 @@ async function login(origin: unknown, name: unknown, password: unknown): Promise
     lastInstallation = { origin: credentials.origin, serviceInstanceID: credentials.serviceInstanceID, name: normalizedName, id: credentials.installationId };
     scheduleCredentialExpiry();
     scheduleAuthorizationCheck();
+    resumeDesktopNotificationPolling(result.credentials);
     void codex.start().catch(() => notifyState());
     void refreshLiveSyncCapability(result.credentials);
     showConnecting();
@@ -3137,6 +3469,16 @@ function portalBridgeHandler(channel: string, fn: (...args: unknown[]) => Promis
   });
 }
 
+function accountSettingsBridgeHandler(channel: string, fn: (...args: unknown[]) => Promise<unknown> | unknown): void {
+  ipcMain.handle(channel, async (event, ...args: unknown[]) => {
+    const auth = credentials;
+    if (!auth || !trustedAccountSettingsBridgeEvent(event, auth)) throw new Error("Invalid Morde account settings window");
+    if (logoutInProgress) throw new Error("Sign-out is in progress");
+    if (credentialExpired(auth.clientExpiresAt)) { clearAuthorization(); throw new Error("Authorization expired or revoked"); }
+    try { return await fn(...args); } catch (error) { return sendError(error); }
+  });
+}
+
 function workbenchPortalBridgeHandler(channel: string, fn: (...args: unknown[]) => Promise<unknown> | unknown): void {
   ipcMain.handle(channel, async (event, ...args: unknown[]) => {
     const auth = credentials;
@@ -3166,6 +3508,25 @@ function register(): void {
   });
   ipcMain.handle("morde:host-workbench-ready", (event, nonce) => notifyNativeWorkbenchReady(event, nonce));
   ipcMain.handle("morde:host-workbench-state", (event, state) => notifyNativeWorkbenchState(event, state));
+  ipcMain.handle("morde:voice-recording-begin", async (event) => {
+    const auth = credentials;
+    if (!auth || !trustedAssistantVoiceEvent(event, auth) || !webPartition || logoutInProgress) throw new Error("Invalid Morde Assistant recording context");
+    if (credentialExpired(auth.clientExpiresAt)) { clearAuthorization(); throw new Error("Authorization expired or revoked"); }
+    const token = randomUUID();
+    voiceWaveformLease = {
+      token, owner: event.sender, auth, partition: webPartition, expiresAt: Date.now() + voiceWaveformPermissionWindowMs,
+      remainingAudioRequests: voiceWaveformEnabled ? 2 : 1,
+    };
+    return token;
+  });
+  ipcMain.handle("morde:voice-recording-end", async (event, token) => {
+    const lease = voiceWaveformLease;
+    if (typeof token !== "string" || !lease || lease.token !== token || lease.owner !== event.sender || event.senderFrame !== event.sender.mainFrame) {
+      return { released: false };
+    }
+    voiceWaveformLease = null;
+    return { released: true };
+  });
   handler("morde:state", () => publicState());
   handler("morde:open-assistant", async () => {
     try { await openAssistant(); return { opened: true }; }
@@ -3281,6 +3642,8 @@ function register(): void {
   handler("morde:project-upload", uploadProject);
   handler("morde:project-local-status", projectLocalStatus);
   portalBridgeHandler("morde:portal-state", () => publicPortalProjectState(), true);
+  accountSettingsBridgeHandler("morde:desktop-notification-settings", desktopNotificationSettings);
+  accountSettingsBridgeHandler("morde:desktop-notification-toggle", setDesktopNotificationsEnabled);
   portalBridgeHandler("morde:portal-project-upload-targets", listProjectUploadTargets, true);
   portalBridgeHandler("morde:portal-project-select-directory", selectProjectDirectory, true);
   portalBridgeHandler("morde:portal-project-upload", uploadProject, true);
@@ -3826,7 +4189,10 @@ else {
   app.on("second-instance", () => showWindow());
   app.whenReady().then(() => {
     loadState();
-    if (credentials) void codex.start().catch(() => notifyState());
+    if (credentials) {
+      resumeDesktopNotificationPolling(credentials);
+      void codex.start().catch(() => notifyState());
+    }
     scheduleCredentialExpiry();
     scheduleAuthorizationCheck();
     register();
@@ -3857,6 +4223,7 @@ else {
     event.preventDefault();
     if (quitInProgress) return;
     quitInProgress = true;
+    stopDesktopNotificationPolling();
     void (async () => {
       try {
         await codex.stop();

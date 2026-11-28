@@ -19,7 +19,7 @@ vi.mock('./personal-data-store', () => ({
 }));
 
 describe('AccountSettings', () => {
-  afterEach(() => { cleanup(); vi.restoreAllMocks(); });
+  afterEach(() => { cleanup(); delete (window as Window & { morde?: unknown }).morde; vi.restoreAllMocks(); });
 
   function renderSettings() {
     const capabilities = vi.spyOn(portalApi, 'capabilities').mockResolvedValue({ service_instance_id: 'service-account-test' } as Awaited<ReturnType<typeof portalApi.capabilities>>);
@@ -60,5 +60,22 @@ describe('AccountSettings', () => {
     expect(await screen.findByText('待提交 2 项 · 冲突 1 项')).toBeInTheDocument();
     expect(await screen.findByText(/已用 10 B/)).toBeInTheDocument();
     expect(personalSyncStore.subscribeStatus).toHaveBeenCalledWith('u1', expect.any(Function), window.location.origin, 'service-account-test');
+  });
+
+  it('shows the PC-only task completion switch and persists it through the native bridge', async () => {
+    const desktopNotificationSettings = vi.fn().mockResolvedValue({ enabled: false });
+    const setDesktopNotificationsEnabled = vi.fn().mockResolvedValue({ enabled: true });
+    (window as Window & { morde?: unknown }).morde = { desktopNotificationSettings, setDesktopNotificationsEnabled };
+    renderSettings();
+
+    const toggle = await screen.findByRole('switch', { name: '任务完成桌面提醒' });
+    expect(toggle).toHaveAttribute('aria-checked', 'false');
+    expect(screen.getByText(/通知不含任务标题或内容/)).toBeInTheDocument();
+    expect(localStorage.length).toBe(0);
+
+    await userEvent.setup().click(toggle);
+    await waitFor(() => expect(setDesktopNotificationsEnabled).toHaveBeenCalledWith(true));
+    await waitFor(() => expect(toggle).toHaveAttribute('aria-checked', 'true'));
+    expect(localStorage.length).toBe(0);
   });
 });

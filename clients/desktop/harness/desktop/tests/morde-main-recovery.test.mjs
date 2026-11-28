@@ -107,6 +107,7 @@ function harness(initialAuth = null, existingRoot = null) {
         onHeadersReceived(filter, fn) { this.headersFilter = filter; this.headersReceived = fn; },
       },
       events: new Map(), on(event, fn) { this.events.set(event, fn); },
+      setPermissionCheckHandler(fn) { this.permissionCheck = fn; },
       setPermissionRequestHandler(fn) { this.permissionRequest = fn; },
       async clearStorageData(options) { this.cleared = options; },
     };

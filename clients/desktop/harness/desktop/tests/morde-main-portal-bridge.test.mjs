@@ -27,6 +27,7 @@ const host = {
 const json = (value, status = 200) => new Response(JSON.stringify(value && typeof value === 'object' && 'web_session_credential' in value && !('web_session_host_frame_source' in value) ? { ...value, web_session_host_frame_source: 'https://*.hosts.example.test' } : value), { status, headers: { 'content-type': 'application/json' } });
 const portalStateKeys = ['projectMappings', 'syncCheckpoint', 'syncRecovery', 'syncState'];
 const appURL = (h, path) => `${new URL(h.views[0].webContents.url).origin}${path}`;
+const flushMain = async () => { for (let index = 0; index < 5; index++) await new Promise((resolve) => setImmediate(resolve)); };
 function assertPortalProjectState(state) {
   assert.deepEqual(Object.keys(state).sort(), portalStateKeys);
   for (const key of ['accountName', 'origin', 'installationId', 'expiresAt', 'mappings', 'workspaceSync', 'liveSyncs', 'handoff', 'profileError', 'storageReady', 'view']) {
@@ -38,7 +39,7 @@ function assertPortalProjectState(state) {
   }
 }
 
-function mockFetch(calls) {
+function mockFetch(calls, notificationHandlers = {}) {
   globalThis.fetch = async (input, options = {}) => {
     const url = new URL(String(input));
     calls.push({ url: url.href, method: options.method ?? 'GET', body: options.body });
@@ -46,6 +47,8 @@ function mockFetch(calls) {
     if (url.pathname === '/api/auth/client-web-session') return json({ web_session_credential: 'local-web-session', web_session_expires_at: future });
     if (url.pathname === '/api/auth/client-logout') return new Response(null, { status: 204 });
     if (url.pathname === '/api/me') return json({ id: 'u1234567' });
+    if (url.pathname === '/api/notifications/incremental') return notificationHandlers.incremental?.(url) ?? json({ items: [], cursor: 'baseline-cursor', has_more: false });
+    if (url.pathname === '/api/notifications') return notificationHandlers.list?.(url) ?? json({ items: [], next_cursor: null });
     if (url.pathname === '/api/me/preferences') return json({ default_host_id: 'h1234567' });
     if (url.pathname === '/api/hosts') return json({ items: [host] });
     if (url.pathname === '/api/hosts/h1234567') return json(host);
@@ -54,13 +57,15 @@ function mockFetch(calls) {
   };
 }
 
-function harness({ checkpoint, portalLoadError } = {}) {
+function harness({ checkpoint, portalLoadError, voiceWaveformEnabled = false, packaged = false, notificationSupported = true } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'morde-p11-portal-'));
   const intervals = new Set();
+  const intervalCallbacks = [];
   const originalSetInterval = globalThis.setInterval;
   globalThis.setInterval = (...args) => {
     const interval = originalSetInterval(...args);
     intervals.add(interval);
+    intervalCallbacks.push(args[0]);
     return interval;
   };
   const userData = join(root, 'Morde Client');
@@ -110,6 +115,7 @@ function harness({ checkpoint, portalLoadError } = {}) {
     async loadFile(path) { this.path = path; }
     async loadURL(url) { this.webContents.url = url; }
     show() { this.shown = true; }
+    isFocused() { return Boolean(this.focused); }
     isMinimized() { return this.minimized; }
     restore() { this.minimized = false; this.restored = true; }
     getContentBounds() { return this.contentBounds; }
@@ -135,6 +141,7 @@ function harness({ checkpoint, portalLoadError } = {}) {
       },
       events: new Map(), on(event, fn) { this.events.set(event, fn); },
       setPermissionRequestHandler(fn) { this.permissionRequest = fn; },
+      setPermissionCheckHandler(fn) { this.permissionCheck = fn; },
       async clearStorageData() { this.cleared = true; this.clearCount = (this.clearCount ?? 0) + 1; this.cookies.values = []; },
     };
     partitions.push(partition);
@@ -144,12 +151,24 @@ function harness({ checkpoint, portalLoadError } = {}) {
     showOpenDialog: async () => ({ canceled: true, filePaths: [] }),
     showMessageBox: async () => ({ response: 1 }),
   };
+  const notifications = [];
+  class FakeNotification {
+    static isSupported() { return notificationSupported; }
+    constructor(options) { this.options = options; this.events = new Map(); this.showCalls = 0; notifications.push(this); }
+    on(name, listener) { this.events.set(name, listener); return this; }
+    show() { this.showCalls++; }
+    click() { this.events.get('click')?.(); }
+    fail() { this.events.get('failed')?.(); }
+  }
   const paths = { appData: root };
+  const previousVoiceWaveformSetting = process.env.MORDE_ENABLE_VOICE_WAVEFORM;
+  if (voiceWaveformEnabled) process.env.MORDE_ENABLE_VOICE_WAVEFORM = '1';
+  else delete process.env.MORDE_ENABLE_VOICE_WAVEFORM;
   const electron = {
     app: {
       setName() {}, getPath: (key) => paths[key] ?? root, setPath: (key, path) => { paths[key] = path; },
       getLocale: () => 'en', getVersion: () => '0.1.0', requestSingleInstanceLock: () => true,
-      isPackaged: false, whenReady: () => Promise.resolve(), on: (name, fn) => appEvents.set(name, fn), quit() {},
+      isPackaged: packaged, whenReady: () => Promise.resolve(), on: (name, fn) => appEvents.set(name, fn), quit() {},
     },
     BrowserWindow: FakeWindow, WebContentsView: FakeView, net: {
       fetch: (...args) => globalThis.fetch(...args),
@@ -174,7 +193,7 @@ function harness({ checkpoint, portalLoadError } = {}) {
         };
       },
     }, session: fakeSession,
-    ipcMain: { handle: (channel, fn) => handlers.set(channel, fn) }, dialog,
+    ipcMain: { handle: (channel, fn) => handlers.set(channel, fn) }, dialog, Notification: FakeNotification,
     Menu: { buildFromTemplate: (template) => ({ template, popup: (options) => menus.push({ template, options }) }), setApplicationMenu() {} },
     safeStorage: {
       isEncryptionAvailable: () => true, getSelectedStorageBackend: () => 'test',
@@ -192,10 +211,14 @@ function harness({ checkpoint, portalLoadError } = {}) {
   };
   delete require.cache[entry];
   try { require(entry); }
-  finally { Module._load = originalLoad; }
+  finally {
+    Module._load = originalLoad;
+    if (previousVoiceWaveformSetting === undefined) delete process.env.MORDE_ENABLE_VOICE_WAVEFORM;
+    else process.env.MORDE_ENABLE_VOICE_WAVEFORM = previousVoiceWaveformSetting;
+  }
 
   return {
-    root, userData, handlers, windows, views, partitions, appEvents, dialog, menus,
+    root, userData, handlers, windows, views, partitions, appEvents, dialog, menus, notifications,
     async ready() {
       let timeout;
       try {
@@ -204,7 +227,6 @@ function harness({ checkpoint, portalLoadError } = {}) {
         })]);
       } finally { clearTimeout(timeout); }
       await new Promise((resolve) => setImmediate(resolve));
-      globalThis.setInterval = originalSetInterval;
     },
     invoke(channel, sender, args = [], senderFrame = sender.mainFrame) {
       return handlers.get(channel)({ sender, senderFrame }, ...args);
@@ -215,6 +237,7 @@ function harness({ checkpoint, portalLoadError } = {}) {
       delete require.cache[entry];
       rmSync(root, { recursive: true, force: true });
     },
+    fireIntervals() { for (const callback of intervalCallbacks) callback(); },
   };
 }
 
@@ -254,6 +277,90 @@ test('assistant page load failure leaves the authenticated client on its offline
     assert.equal(state.authenticated, true);
     assert.equal(state.view, 'offline');
     assert.equal(h.windows[0].contentView.attached.length, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    h.cleanup();
+  }
+});
+
+test('speech microphone permission requires an explicit recording and keeps the clipboard gate', async () => {
+  const originalFetch = globalThis.fetch;
+  mockFetch([]);
+  const h = harness();
+  try {
+    await h.ready();
+    const portal = h.views[0].webContents;
+    const partition = h.partitions.find((item) => item.name.startsWith('persist:morde-user-'));
+    const origin = new URL(portal.url).origin;
+    const audio = { requestingUrl: portal.url, isMainFrame: true, mediaType: 'audio', mediaTypes: ['audio'] };
+    assert.equal(partition.permissionCheck(portal, 'media', origin, audio), false);
+    assert.equal(partition.permissionCheck(portal, 'media', origin), false);
+    let missingDetailsAllowed;
+    partition.permissionRequest(portal, 'media', (allowed) => { missingDetailsAllowed = allowed; });
+    assert.equal(missingDetailsAllowed, false);
+    const token = await h.invoke('morde:voice-recording-begin', portal);
+    assert.match(token, /^[0-9a-f-]{36}$/i);
+    assert.equal(partition.permissionCheck(portal, 'media', origin, audio), true);
+    let microphoneAllowed;
+    partition.permissionRequest(portal, 'media', (allowed) => { microphoneAllowed = allowed; }, audio);
+    assert.equal(microphoneAllowed, true);
+    assert.equal(partition.permissionCheck(portal, 'media', origin, audio), false, 'the default recording lease only covers speech recognition');
+
+    assert.equal(partition.permissionCheck(portal, 'clipboard-sanitized-write', origin, { requestingUrl: portal.url, isMainFrame: true }), true);
+    let clipboardAllowed;
+    partition.permissionRequest(portal, 'clipboard-sanitized-write', (allowed) => { clipboardAllowed = allowed; }, {});
+    assert.equal(clipboardAllowed, true);
+  } finally {
+    globalThis.fetch = originalFetch;
+    h.cleanup();
+  }
+});
+
+test('voice waveform grants one audio-only request to the trusted Assistant main frame', async () => {
+  const originalFetch = globalThis.fetch;
+  mockFetch([]);
+  const h = harness({ voiceWaveformEnabled: true });
+  try {
+    await h.ready();
+    const portal = h.views[0].webContents;
+    const partition = h.partitions.find((item) => item.name.startsWith('persist:morde-user-'));
+    const origin = new URL(portal.url).origin;
+    const frame = { requestingUrl: portal.url, isMainFrame: true, mediaType: 'audio', mediaTypes: ['audio'] };
+    const token = await h.invoke('morde:voice-recording-begin', portal);
+    assert.match(token, /^[0-9a-f-]{36}$/i);
+    assert.equal(partition.permissionCheck(portal, 'media', origin, frame), true);
+    let microphoneAllowed;
+    partition.permissionRequest(portal, 'media', (allowed) => { microphoneAllowed = allowed; }, frame);
+    assert.equal(microphoneAllowed, true);
+    assert.equal(partition.permissionCheck(portal, 'media', origin, frame), true, 'the enabled waveform gets a second audio-only permission');
+    let waveformAllowed;
+    partition.permissionRequest(portal, 'media', (allowed) => { waveformAllowed = allowed; }, frame);
+    assert.equal(waveformAllowed, true);
+    assert.equal(partition.permissionCheck(portal, 'media', origin, frame), false);
+    assert.deepEqual(await h.invoke('morde:voice-recording-end', portal, [token]), { released: false });
+
+    const secondToken = await h.invoke('morde:voice-recording-begin', portal);
+    const camera = { ...frame, mediaType: 'video', mediaTypes: ['video'] };
+    assert.equal(partition.permissionCheck(portal, 'media', origin, camera), false);
+    let cameraAllowed;
+    partition.permissionRequest(portal, 'media', (allowed) => { cameraAllowed = allowed; }, camera);
+    assert.equal(cameraAllowed, false);
+
+    await h.invoke('morde:voice-recording-begin', portal);
+    const mixedMedia = { ...frame, mediaTypes: ['audio', 'video'] };
+    let mixedMediaAllowed;
+    partition.permissionRequest(portal, 'media', (allowed) => { mixedMediaAllowed = allowed; }, mixedMedia);
+    assert.equal(mixedMediaAllowed, false);
+    assert.equal(partition.permissionCheck(portal, 'display-capture', origin, frame), false);
+    let displayCaptureAllowed;
+    partition.permissionRequest(portal, 'display-capture', (allowed) => { displayCaptureAllowed = allowed; }, frame);
+    assert.equal(displayCaptureAllowed, false);
+
+    assert.deepEqual(await h.invoke('morde:voice-recording-end', portal, [secondToken], {}), { released: false });
+    await assert.rejects(h.invoke('morde:voice-recording-begin', portal, [], {}), /Invalid Morde Assistant recording context/);
+    portal.url = `${origin}/projects`;
+    await assert.rejects(h.invoke('morde:voice-recording-begin', portal), /Invalid Morde Assistant recording context/);
+    assert.equal(partition.permissionCheck(portal, 'media', origin, frame), false);
   } finally {
     globalThis.fetch = originalFetch;
     h.cleanup();
@@ -379,6 +486,210 @@ test('Portal bridge requires the current trusted top-level route and returns onl
     globalThis.fetch = originalFetch;
     h.cleanup();
     rmSync(selectedRoot, { recursive: true, force: true });
+  }
+});
+
+test('desktop completion reminders baseline, filter, deduplicate, suppress foreground delivery, and persist opt-out', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  mockFetch(calls, {
+    incremental: (url) => {
+      const cursor = url.searchParams.get('cursor');
+      if (!cursor) return json({ items: [{ id: 'n0000001', kind: 'completed', summary: 'historic task detail' }], cursor: 'baseline-cursor', has_more: false });
+      if (cursor === 'baseline-cursor') return json({ items: [
+        { id: 'n0000002', kind: 'failed' }, { id: 'n0000003', kind: 'completed', summary: 'private task title' },
+      ], cursor: 'cursor-one', has_more: false });
+      if (cursor === 'cursor-one') return json({ items: [{ id: 'n0000003', kind: 'completed', summary: 'duplicate detail' }], cursor: 'cursor-two', has_more: false });
+      if (cursor === 'cursor-two') return json({ items: [{ id: 'n0000004', kind: 'completed' }], cursor: 'cursor-three', has_more: false });
+      return json({ items: [], cursor: 'cursor-four', has_more: false });
+    },
+  });
+  const h = harness({ packaged: true });
+  try {
+    await h.ready();
+    const portal = h.views[0].webContents;
+    portal.url = appURL(h, '/settings');
+    assert.deepEqual(await h.invoke('morde:desktop-notification-settings', portal), { enabled: false });
+    assert.equal(calls.some((call) => new URL(call.url).pathname === '/api/notifications/incremental'), false,
+      'default off must not start an incremental poll');
+    await assert.rejects(h.invoke('morde:desktop-notification-settings', h.windows[0].webContents), /Invalid Morde account settings window/);
+
+    assert.deepEqual(await h.invoke('morde:desktop-notification-toggle', portal, [true]), { enabled: true });
+    await flushMain();
+    const incrementalCalls = () => calls.filter((call) => new URL(call.url).pathname === '/api/notifications/incremental');
+    assert.equal(incrementalCalls().length, 1);
+    assert.equal(new URL(incrementalCalls()[0].url).searchParams.has('cursor'), false, 'first enable must establish an empty-history baseline');
+    assert.equal(h.notifications.length, 0, 'baseline response items must never trigger historical popups');
+
+    h.windows[0].focused = false;
+    h.fireIntervals();
+    await flushMain();
+    assert.equal(h.notifications.length, 1, 'only the completion item should be delivered');
+    assert.deepEqual(h.notifications[0].options, { title: 'Morde', body: 'A task has completed' });
+    h.notifications[0].fail();
+    assert.equal(h.notifications[0].showCalls, 1, 'an OS failure must not retry or trigger another Electron delivery');
+
+    h.fireIntervals();
+    await flushMain();
+    assert.equal(h.notifications.length, 1, 'a repeated notification ID must be deduplicated');
+
+    h.windows[0].focused = true;
+    h.fireIntervals();
+    await flushMain();
+    assert.equal(h.notifications.length, 1, 'a completion received while the client is foregrounded must not pop');
+
+    assert.deepEqual(await h.invoke('morde:desktop-notification-toggle', portal, [false]), { enabled: false });
+    const callsAfterOptOut = incrementalCalls().length;
+    h.fireIntervals();
+    await flushMain();
+    assert.equal(incrementalCalls().length, callsAfterOptOut, 'opt-out must stop polling');
+    assert.deepEqual(await h.invoke('morde:desktop-notification-settings', portal), { enabled: false });
+    h.windows[0].focused = false;
+    h.notifications[0].click();
+    await flushMain();
+    assert.equal(h.windows[0].focused, true, 'clicking a notice should only bring the authenticated Assistant window forward');
+  } finally {
+    globalThis.fetch = originalFetch;
+    h.cleanup();
+  }
+});
+
+test('an expired cursor baselines before reconciliation and still delivers a completion arriving in between', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  let baselineCount = 0;
+  let cursorCount = 0;
+  let listCount = 0;
+  mockFetch(calls, {
+    incremental: (url) => {
+      if (!url.searchParams.has('cursor')) {
+        baselineCount++;
+        return json({ items: [], cursor: `baseline-${baselineCount}`, has_more: false });
+      }
+      cursorCount++;
+      if (url.searchParams.get('cursor') === 'baseline-1') return json({ error: { code: 'event_cursor_expired' } }, 409);
+      assert.equal(url.searchParams.get('cursor'), 'baseline-2', 'recovery polling must start from the newly saved cursor');
+      return json({ items: [{ id: 'n0000007', kind: 'completed' }], cursor: 'after-recovery-completion', has_more: false });
+    },
+    list: () => {
+      listCount++;
+      return json({ items: [{ id: 'n0000007', kind: 'completed', summary: 'completion committed after baseline' }], next_cursor: null });
+    },
+  });
+  const h = harness({ packaged: true });
+  try {
+    await h.ready();
+    const portal = h.views[0].webContents;
+    portal.url = appURL(h, '/settings');
+    await h.invoke('morde:desktop-notification-toggle', portal, [true]);
+    await flushMain();
+    h.windows[0].focused = false;
+    h.fireIntervals();
+    await flushMain();
+
+    const requestPath = (call) => new URL(call.url).pathname;
+    const listIndex = calls.findIndex((call) => requestPath(call) === '/api/notifications');
+    const freshBaselineIndex = calls.findIndex((call) => requestPath(call) === '/api/notifications/incremental' &&
+      !new URL(call.url).searchParams.has('cursor') && calls.indexOf(call) > 0);
+    const recoveryDrainIndex = calls.findIndex((call) => requestPath(call) === '/api/notifications/incremental' &&
+      new URL(call.url).searchParams.get('cursor') === 'baseline-2');
+    assert.ok(freshBaselineIndex >= 0 && freshBaselineIndex < listIndex,
+      'the replacement cursorless baseline must be saved before scanning the existing list');
+    assert.ok(listIndex >= 0 && listIndex < recoveryDrainIndex,
+      `list IDs must be collected before incremental reconciliation (${calls.map((call) => `${requestPath(call)}?${new URL(call.url).searchParams}`).join(' | ')})`);
+    assert.equal(listCount, 1);
+    assert.equal(calls.some((call) => requestPath(call) === '/api/notifications'), true,
+      'expired cursors must reconcile through the existing notification list');
+    assert.equal(cursorCount, 2);
+    assert.equal(baselineCount, 2, 'an expired cursor must be replaced with a new cursorless baseline');
+    assert.equal(h.notifications.length, 1,
+      'a completion present in the list after baseline must still be delivered from the incremental stream');
+    assert.deepEqual(h.notifications[0].options, { title: 'Morde', body: 'A task has completed' });
+  } finally {
+    globalThis.fetch = originalFetch;
+    h.cleanup();
+  }
+});
+
+test('a late old-account completion is discarded after sign-out', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  let resolvePending;
+  mockFetch(calls, {
+    incremental: (url) => {
+      if (!url.searchParams.has('cursor')) return json({ items: [], cursor: 'baseline-cursor', has_more: false });
+      return new Promise((resolve) => { resolvePending = resolve; });
+    },
+  });
+  const h = harness({ packaged: true });
+  try {
+    await h.ready();
+    const portal = h.views[0].webContents;
+    portal.url = appURL(h, '/settings');
+    await h.invoke('morde:desktop-notification-toggle', portal, [true]);
+    await flushMain();
+    h.windows[0].focused = false;
+    h.fireIntervals();
+    await flushMain();
+    assert.equal(typeof resolvePending, 'function', 'the incremental response should be in flight');
+
+    await h.invoke('morde:logout', h.windows[0].webContents);
+    resolvePending(json({ items: [{ id: 'n0000005', kind: 'completed' }], cursor: 'late-cursor', has_more: false }));
+    await flushMain();
+    assert.equal(h.notifications.length, 0, 'a response from a revoked account must never reach Electron Notification');
+  } finally {
+    globalThis.fetch = originalFetch;
+    h.cleanup();
+  }
+});
+
+test('unsupported native notifications remain an in-app-only fallback', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  mockFetch(calls, {
+    incremental: (url) => url.searchParams.has('cursor')
+      ? json({ items: [{ id: 'n0000006', kind: 'completed' }], cursor: 'after-completion', has_more: false })
+      : json({ items: [], cursor: 'baseline-cursor', has_more: false }),
+  });
+  const h = harness({ packaged: true, notificationSupported: false });
+  try {
+    await h.ready();
+    const portal = h.views[0].webContents;
+    portal.url = appURL(h, '/settings');
+    await h.invoke('morde:desktop-notification-toggle', portal, [true]);
+    await flushMain();
+    h.fireIntervals();
+    await flushMain();
+    assert.equal(h.notifications.length, 0);
+    assert.equal(calls.some((call) => new URL(call.url).searchParams.get('cursor') === 'baseline-cursor'), true,
+      'the opted-in cursor advances while the existing in-app notification list remains the fallback');
+  } finally {
+    globalThis.fetch = originalFetch;
+    h.cleanup();
+  }
+});
+
+test('an unpackaged development build does not invoke Electron Notification', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  mockFetch(calls, {
+    incremental: (url) => url.searchParams.has('cursor')
+      ? json({ items: [{ id: 'n0000008', kind: 'completed' }], cursor: 'after-completion', has_more: false })
+      : json({ items: [], cursor: 'baseline-cursor', has_more: false }),
+  });
+  const h = harness({ packaged: false, notificationSupported: true });
+  try {
+    await h.ready();
+    const portal = h.views[0].webContents;
+    portal.url = appURL(h, '/settings');
+    await h.invoke('morde:desktop-notification-toggle', portal, [true]);
+    await flushMain();
+    h.fireIntervals();
+    await flushMain();
+    assert.equal(h.notifications.length, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    h.cleanup();
   }
 });
 

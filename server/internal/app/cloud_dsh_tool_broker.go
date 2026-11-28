@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -42,6 +43,69 @@ type CloudDSHToolBroker struct {
 	projectContext           *ProjectService
 	stepDetailSealer         *Sealer
 	taskModelRecoveryAuto    bool
+}
+
+const agentAskUserQuestionToolName = "ask_user_question"
+
+const cloudDSHAskUserToolParameters = `{
+	"type":"object",
+	"properties":{
+		"question":{"type":["string","null"],"minLength":1,"maxLength":4096},
+		"questions":{
+			"type":["array","null"],"minItems":1,"maxItems":8,
+			"items":{
+				"type":"object",
+				"properties":{
+					"id":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[a-z][a-z0-9_-]*$"},
+					"prompt":{"type":"string","minLength":1,"maxLength":1024},
+					"type":{"type":"string","enum":["single_choice","multi_choice","free_text"]},
+					"required":{"type":"boolean"},
+					"allow_skip":{"type":"boolean"},
+					"options":{
+						"type":"array","maxItems":12,
+						"items":{
+							"type":"object",
+							"properties":{
+								"id":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[a-z][a-z0-9_-]*$"},
+								"label":{"type":"string","minLength":1,"maxLength":256}
+							},
+							"required":["id","label"],
+							"additionalProperties":false
+						}
+					}
+				},
+				"required":["id","prompt","type","required","allow_skip","options"],
+				"additionalProperties":false
+			}
+		}
+	},
+	"required":["question","questions"],
+	"additionalProperties":false
+}`
+
+// CloudDSHAskUserToolDefinition is the locked Morde clarification tool schema.
+// Its result is persisted on the Task and later reconciled under the original DSH call ID.
+func CloudDSHAskUserToolDefinition() AgentToolDefinition {
+	return AgentToolDefinition{ModelTool: ModelTool{
+		Name:        agentAskUserToolName,
+		Description: "Ask the user for missing information that blocks safe progress. Use this tool alone; the Task pauses until the user answers.",
+		Parameters:  json.RawMessage(cloudDSHAskUserToolParameters),
+		Strict:      true,
+	}, RequiredScope: identity.ScopeComputerObserve}
+}
+
+// CloudDSHLegacyAskUserToolDefinition returns the exact ask_user schema pinned
+// by checkpoints written before structured clarification was introduced.
+func CloudDSHLegacyAskUserToolDefinition() AgentToolDefinition {
+	legacy := agentAskUserTool
+	legacy.Parameters = append(json.RawMessage(nil), legacy.Parameters...)
+	return legacy
+}
+
+// IsCloudDSHClarificationToolName identifies both Morde's persisted clarification
+// tool and the upstream plugin name that must not bypass Morde's Task broker.
+func IsCloudDSHClarificationToolName(name string) bool {
+	return name == agentAskUserToolName || name == agentAskUserQuestionToolName
 }
 
 // AgentMessageSourceReader exposes only fenced metadata and bounded page
@@ -442,7 +506,7 @@ func (b *CloudDSHToolBroker) Definitions(ctx context.Context, claimed task.Task)
 	}
 	seen := make(map[string]struct{}, len(definitions)+1)
 	for _, definition := range definitions {
-		if definition.Name == agentAskUserToolName {
+		if IsCloudDSHClarificationToolName(definition.Name) {
 			return nil, errors.New("host tool conflicts with the Agent clarification tool")
 		}
 		if _, exists := seen[definition.Name]; exists {
@@ -453,7 +517,7 @@ func (b *CloudDSHToolBroker) Definitions(ctx context.Context, claimed task.Task)
 	if goalFollowupReadOnly {
 		return definitions, nil
 	}
-	return append(definitions, agentAskUserTool), nil
+	return append(definitions, CloudDSHAskUserToolDefinition()), nil
 }
 
 func cloudDSHGoalFollowupReadOnlyTask(value task.Task) bool {
@@ -1395,6 +1459,9 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 	if ctx == nil || call.CallID == "" || len(call.CallID) > 256 || len(call.Name) == 0 || len(call.Name) > 128 {
 		return AgentToolResult{}, domain.InvalidArgument("tool_call", "dsh tool call identity is invalid")
 	}
+	if call.Name == agentAskUserQuestionToolName {
+		return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "upstream clarification tools are not available through Morde tasks")
+	}
 	originalCall := call
 	var planStepMetadata cloudDSHPlanStepArguments
 	mapping, hostRuntimeTool := runtimeToolMappingByName(call.Name)
@@ -2236,8 +2303,87 @@ func validCloudDSHToolImages(name string, result AgentToolResult) bool {
 		len(result.Images[0].Data) >= 4 && len(result.Images[0].Data) <= 512<<10
 }
 
+type agentClarificationInput struct {
+	Question  string
+	Questions []task.ClarificationQuestion
+}
+
+func parseAgentClarificationInput(raw string) (agentClarificationInput, error) {
+	arguments, err := validateAgentToolArguments(raw)
+	if err != nil {
+		return agentClarificationInput{}, err
+	}
+	var request struct {
+		Question  json.RawMessage `json:"question"`
+		Questions json.RawMessage `json:"questions"`
+	}
+	decoder := json.NewDecoder(bytes.NewReader(arguments))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		return agentClarificationInput{}, errors.New("clarification request is invalid")
+	}
+	var question *string
+	if len(request.Question) > 0 && !bytes.Equal(bytes.TrimSpace(request.Question), []byte("null")) {
+		var value string
+		if err := json.Unmarshal(request.Question, &value); err != nil || !validAgentClarificationQuestion(value) {
+			return agentClarificationInput{}, errors.New("clarification question is invalid")
+		}
+		value = strings.TrimSpace(value)
+		question = &value
+	}
+	var questions []task.ClarificationQuestion
+	if len(request.Questions) > 0 && !bytes.Equal(bytes.TrimSpace(request.Questions), []byte("null")) {
+		questionDecoder := json.NewDecoder(bytes.NewReader(request.Questions))
+		questionDecoder.DisallowUnknownFields()
+		if err := questionDecoder.Decode(&questions); err != nil || task.ValidateClarificationQuestions(questions) != nil {
+			return agentClarificationInput{}, errors.New("clarification question group is invalid")
+		}
+		for index := range questions {
+			if questions[index].Options == nil {
+				questions[index].Options = []task.ClarificationQuestionOption{}
+			}
+		}
+	}
+	if question != nil && len(questions) > 0 || question == nil && len(questions) == 0 {
+		return agentClarificationInput{}, errors.New("clarification must contain either one legacy question or one structured question group")
+	}
+	if question != nil {
+		return agentClarificationInput{Question: *question}, nil
+	}
+	return agentClarificationInput{Question: questions[0].Prompt, Questions: questions}, nil
+}
+
+func sameAgentClarificationInput(request task.ClarificationRequest, input agentClarificationInput) bool {
+	if len(input.Questions) == 0 {
+		return len(request.Questions) == 0 && request.Question == input.Question
+	}
+	return len(request.Questions) > 0 && reflect.DeepEqual(request.Questions, input.Questions)
+}
+
+func agentClarificationAnswerResult(request task.ClarificationRequest) (string, bool) {
+	if len(request.Questions) == 0 {
+		return request.Answer, (request.AnswerFormat == "" || request.AnswerFormat == task.ClarificationAnswerFreeText) &&
+			request.Answer != "" && utf8.ValidString(request.Answer) && utf8.RuneCountInString(request.Answer) <= 16384
+	}
+	if request.AnswerFormat != task.ClarificationAnswerStructured || !validAgentJSONObject([]byte(request.Answer), maxAgentToolOutputBytes) {
+		return "", false
+	}
+	var answer struct {
+		QuestionGroupID string                     `json:"question_group_id"`
+		Version         int64                      `json:"version"`
+		Answers         []task.ClarificationAnswer `json:"answers"`
+	}
+	decoder := json.NewDecoder(strings.NewReader(request.Answer))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&answer) != nil || answer.QuestionGroupID != request.ID || answer.Version != request.Version ||
+		task.ValidateClarificationAnswers(request.Questions, answer.Answers) != nil {
+		return "", false
+	}
+	return request.Answer, true
+}
+
 func (b *CloudDSHToolBroker) clarify(ctx context.Context, claimed task.Task, call ModelToolCall, recovering bool) (AgentToolResult, error) {
-	question, err := parseAgentClarificationQuestion(call.Arguments)
+	input, err := parseAgentClarificationInput(call.Arguments)
 	if err != nil || !utf8.ValidString(call.CallID) {
 		return AgentToolResult{}, domain.InvalidArgument("clarification_request", "dsh clarification call is invalid")
 	}
@@ -2249,6 +2395,10 @@ func (b *CloudDSHToolBroker) clarify(ctx context.Context, claimed task.Task, cal
 	if current.ID != claimed.ID || current.OwnerID != claimed.OwnerID || current.HostID != claimed.HostID {
 		return AgentToolResult{Status: AgentToolUnknown}, nil
 	}
+	if call.TaskFence != nil && call.TaskFence.AgentSessionID != "" && call.TaskFence.AgentRootSessionID != "" &&
+		call.TaskFence.AgentSessionID != call.TaskFence.AgentRootSessionID {
+		return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "child agents cannot ask users for clarification")
+	}
 	var matched *task.ClarificationRequest
 	var hasPending bool
 	for i := range details.ClarificationRequests {
@@ -2257,7 +2407,7 @@ func (b *CloudDSHToolBroker) clarify(ctx context.Context, claimed task.Task, cal
 		if request.TaskID != current.ID || request.CallID != call.CallID {
 			continue
 		}
-		if matched != nil || request.Question != question {
+		if matched != nil || !sameAgentClarificationInput(*request, input) {
 			return AgentToolResult{Status: AgentToolUnknown}, nil
 		}
 		matched = request
@@ -2270,12 +2420,13 @@ func (b *CloudDSHToolBroker) clarify(ctx context.Context, claimed task.Task, cal
 			}
 			return AgentToolResult{Status: AgentToolNeedsUser}, nil
 		case task.ClarificationAnswered:
-			if matched.Answer == "" || matched.RespondedAt == nil || !utf8.ValidString(matched.Answer) || utf8.RuneCountInString(matched.Answer) > 16384 ||
+			answer, valid := agentClarificationAnswerResult(*matched)
+			if !valid || matched.RespondedAt == nil ||
 				current.Status != task.StatusRunning || current.Lease.Owner != claimed.Lease.Owner ||
 				current.Lease.Version != claimed.Lease.Version || current.Lease.ExpiresAt == nil || !current.Lease.ExpiresAt.After(time.Now()) {
 				return AgentToolResult{Status: AgentToolUnknown}, nil
 			}
-			return AgentToolResult{Status: AgentToolSucceeded, Output: matched.Answer}, nil
+			return AgentToolResult{Status: AgentToolSucceeded, Output: answer}, nil
 		default:
 			return AgentToolResult{Status: AgentToolUnknown}, nil
 		}
@@ -2319,13 +2470,17 @@ func (b *CloudDSHToolBroker) clarify(ctx context.Context, claimed task.Task, cal
 		return AgentToolResult{}, err
 	}
 	step, err := newAgentStep(current.ID, sequence+2, "clarification", task.StepWaitingUser,
-		"The Agent needs one detail", question)
+		"The Agent needs clarification", input.Question)
 	if err != nil {
 		return AgentToolResult{}, err
 	}
 	request := &task.ClarificationRequest{
 		ID: id, TaskID: current.ID, Version: version, ModelStepID: modelStep.ID,
-		CallID: call.CallID, Question: question, Status: task.ClarificationPending,
+		CallID: call.CallID, Question: input.Question, Questions: input.Questions,
+		AnswerFormat: task.ClarificationAnswerStructured, Status: task.ClarificationPending,
+	}
+	if len(input.Questions) == 0 {
+		request.AnswerFormat = task.ClarificationAnswerFreeText
 	}
 	usage := cloneTaskUsage(current.Usage)
 	usage.ToolCalls++

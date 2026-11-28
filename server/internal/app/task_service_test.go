@@ -53,12 +53,12 @@ type taskStoreStub struct {
 	clarificationIntent    task.FileDeliveryIntent
 	clarificationObjective string
 	clarificationCalls     int
-	answerRecord             IdempotencyRecord
-	answerTaskID             string
-	answerID                 string
-	answerVersion            int64
-	answers                  []task.ClarificationAnswer
-	answerCalls              int
+	answerRecord           IdempotencyRecord
+	answerTaskID           string
+	answerID               string
+	answerVersion          int64
+	answers                []task.ClarificationAnswer
+	answerCalls            int
 	actionResult           TaskActionResult
 	actionRecord           IdempotencyRecord
 	actionTaskID           string

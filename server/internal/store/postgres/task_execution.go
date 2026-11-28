@@ -1798,9 +1798,24 @@ func (s *Store) CommitTaskProgress(ctx context.Context, progress app.TaskProgres
 			if clarification.CallID == task.RouteFileDeliveryIntentClarificationCallID || clarification.CallID == app.FileDeliveryIntentClarificationCallID {
 				return task.Event{}, domain.InvalidArgument("clarification_request", "file delivery clarifications cannot use a structured question group")
 			}
+			if clarification.BatchItemID != "" || clarification.BatchAttempt != 0 {
+				return task.Event{}, domain.InvalidArgument("clarification_request", "batch and file-target clarifications cannot use a structured question group")
+			}
 			if err := task.ValidateClarificationQuestions(clarification.Questions); err != nil {
 				return task.Event{}, domain.InvalidArgument("clarification_request", "structured clarification question group is invalid")
 			}
+		}
+		answerFormat := clarification.AnswerFormat
+		if answerFormat == "" {
+			if len(clarification.Questions) > 0 {
+				answerFormat = task.ClarificationAnswerStructured
+			} else {
+				answerFormat = task.ClarificationAnswerFreeText
+			}
+		}
+		if (len(clarification.Questions) > 0 && answerFormat != task.ClarificationAnswerStructured) ||
+			(len(clarification.Questions) == 0 && answerFormat != task.ClarificationAnswerFreeText) {
+			return task.Event{}, domain.InvalidArgument("clarification_request", "clarification answer format does not match its question group")
 		}
 	}
 	eventPayload, err := validateInitialTaskEvent(progress.Event.Type, progress.Event.Payload)
@@ -2502,10 +2517,18 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'pending',$17,$18
 			if marshalErr != nil {
 				return fmt.Errorf("encode task clarification questions: %w", marshalErr)
 			}
+			answerFormat := clarification.AnswerFormat
+			if answerFormat == "" {
+				if len(questions) > 0 {
+					answerFormat = task.ClarificationAnswerStructured
+				} else {
+					answerFormat = task.ClarificationAnswerFreeText
+				}
+			}
 			_, err = tx.Exec(ctx, `INSERT INTO task_clarification_requests
-(id, task_id, version, model_step_id, call_id, question, questions, status)
-VALUES ($1,$2,$3,$4,$5,$6,$7,'pending')`, clarification.ID, clarification.TaskID, clarification.Version,
-				clarification.ModelStepID, clarification.CallID, clarification.Question, questionsJSON)
+(id, task_id, version, model_step_id, call_id, question, questions, answer_format, status)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending')`, clarification.ID, clarification.TaskID, clarification.Version,
+				clarification.ModelStepID, clarification.CallID, clarification.Question, questionsJSON, answerFormat)
 			if err != nil {
 				return fmt.Errorf("persist task clarification request: %w", err)
 			}

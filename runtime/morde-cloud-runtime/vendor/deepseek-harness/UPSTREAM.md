@@ -8,7 +8,7 @@
 - Pinned source commit: `fcc0ad462172522aaf5c93a7b2e01f6b9f0b0159`
 - Release tag commit: `dsh-v0.2.2-rc.1` / `66491b05e3f05ad35bcdd4f6cd7ed26041d9e3db`
 - Morde copy: `vendor/deepseek-harness/packages/compaction/compaction-basic/`
-- Local changes to copied upstream source: none. Source and manifest SHA-256 values are in that directory's `source.sha256`; `dist/index.js` is generated and ignored.
+- Morde's local source patch is [`morde-output-budget-compaction-selection.patch`](packages/compaction/compaction-basic/patches/morde-output-budget-compaction-selection.patch). It adds an overridable range-selection seam and passes the resolved context window and reserved output tokens into that seam for normal compaction and overflow recovery. The default implementation delegates to DSH's original selector; Morde's runtime override uses the values to keep signed output capacity available when choosing a safe compactable range. The local source hashes, including this patch, are recorded in `source.sha256`; `dist/index.js` is generated and ignored.
 
 The pinned commit is the checkout in `project/deepseek-harness`. The source path and package manifest match the release tag. Run `scripts/verify-dsh-upstream.sh` from this Runtime directory to compare the local vendored source against the pinned Git objects and to verify the release path. Set `DSH_CHECKOUT` only if the checkout is elsewhere.
 
@@ -41,15 +41,15 @@ Runtime builds the vendored TypeScript entry point with the already locked `esbu
 
 Relevant verification:
 
-- Source and release comparison: `sh scripts/verify-dsh-upstream.sh`
-- Source checksums: `(cd vendor/deepseek-harness/packages/compaction/compaction-basic && shasum -a 256 -c source.sha256)`
+- Upstream source, release, and exact Morde patch comparison: `sh scripts/verify-dsh-upstream.sh`
+- Local source checksums: `(cd vendor/deepseek-harness/packages/compaction/compaction-basic && shasum -a 256 -c source.sha256)`
 - Runtime integration: `npm test`
 - Morde persistence, authorization, and recovery: `go test ./internal/worker -run 'TestConversationRouteWorker|TestCloudDSHInitialPrompt'` and targeted PostgreSQL summary/Task recovery tests under `server/`
 - Upstream behavior tests live at `project/deepseek-harness/packages/compaction/compaction-basic/tests/` and should be rerun from the DSH checkout when its dependencies are available.
 
 ## Upstream update procedure
 
-1. Select and record an upstream commit and release tag. Compare the compaction package source, manifest, tests, runtime dependencies, and event/checkpoint format with this snapshot. Check whether any Morde patch was absorbed; currently there is no source patch.
+1. Select and record an upstream commit and release tag. Compare the compaction package source, manifest, tests, runtime dependencies, and event/checkpoint format with this snapshot. Check whether the Morde range-selection patch was absorbed; remove it only after the upstream API provides equivalent signed-output-aware selection and its behavior is verified.
 2. Update the source commit, release commit, package version, checksum file, and verifier together. Rebuild the vendored entry point and pin all DSH runtime dependencies in `package.json` and `package-lock.json`; keep the MCP override only if the compatibility check still requires it.
 3. Run the upstream compaction behavior tests, `npm test`, and Morde's session isolation, gateway accounting, checkpoint, cancellation, restart, and old-checkpoint recovery tests. Review lockfile integrity and license metadata.
 4. Review the DSH event and checkpoint format before changing Morde's `ENGINE_VERSION`. DSH package version changes do not establish checkpoint compatibility. If an older checkpoint cannot be proven safe, stop the new runtime before rollout and use the prior runtime or the documented bounded-history recovery path; do not replay unknown model calls.

@@ -17,16 +17,19 @@ type notificationStoreFake struct {
 	events           []notification.TaskEvent
 	sourceEvents     []notification.SourceEvent
 	page             NotificationPage
+	updates          NotificationUpdatePage
 	marked           notification.Notification
 	listEventsErr    error
 	consumeErr       error
 	sourceEventsErr  error
 	sourceConsumeErr error
 	listErr          error
+	updatesErr       error
 	markErr          error
 	limit            int32
 	ownerID          string
 	pageRequest      PageRequest
+	updateRequest    PageRequest
 	unreadOnly       bool
 	markedOwner      string
 	markedID         string
@@ -68,6 +71,11 @@ func (s *notificationStoreFake) ListNotifications(_ context.Context, ownerID str
 	return s.page, s.listErr
 }
 
+func (s *notificationStoreFake) ListNotificationUpdates(_ context.Context, ownerID string, page PageRequest) (NotificationUpdatePage, error) {
+	s.ownerID, s.updateRequest = ownerID, page
+	return s.updates, s.updatesErr
+}
+
 func (s *notificationStoreFake) MarkNotificationRead(_ context.Context, ownerID, id string) (notification.Notification, error) {
 	s.markedOwner, s.markedID = ownerID, id
 	return s.marked, s.markErr
@@ -99,6 +107,25 @@ func TestNotificationServiceProcessesTaskEventsWithoutCopyingPayload(t *testing.
 	}
 	if got := store.effects[1].Notification.Summary; got == "" || got == "private content" || got == "private result" {
 		t.Fatalf("unsafe summary = %q", got)
+	}
+}
+
+func TestNotificationServiceIncrementalUsesBoundedAccountScopedPage(t *testing.T) {
+	store := &notificationStoreFake{updates: NotificationUpdatePage{Cursor: "next"}}
+	service, err := NewNotificationService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, err := service.Incremental(context.Background(), notificationPrincipal(identity.KindSession), PageRequest{Cursor: "resume"})
+	if err != nil || page.Cursor != "next" || page.Items == nil || store.ownerID != "u1234567" ||
+		store.updateRequest.Limit != defaultNotificationPageSize || store.updateRequest.Cursor != "resume" {
+		t.Fatalf("incremental notification page=%#v err=%v request=%#v owner=%q", page, err, store.updateRequest, store.ownerID)
+	}
+	if _, err := service.Incremental(context.Background(), notificationPrincipal(identity.KindAPIKey), PageRequest{}); domain.CodeOf(err) != domain.CodeForbidden {
+		t.Fatalf("API key incremental notification access = %v; want forbidden", err)
+	}
+	if _, err := service.Incremental(context.Background(), notificationPrincipal(identity.KindSession), PageRequest{Limit: maxNotificationPageSize + 1}); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("oversized incremental notification page = %v; want invalid argument", err)
 	}
 }
 

@@ -107,6 +107,29 @@ func (s *NotificationService) List(ctx context.Context, principal identity.Princ
 	return result, nil
 }
 
+func (s *NotificationService) Incremental(ctx context.Context, principal identity.Principal, page PageRequest) (NotificationUpdatePage, error) {
+	if err := validateNotificationPrincipal(principal); err != nil {
+		return NotificationUpdatePage{}, err
+	}
+	if page.Limit == 0 {
+		page.Limit = defaultNotificationPageSize
+	}
+	if page.Limit < 1 || page.Limit > maxNotificationPageSize || len(page.Cursor) > 1024 || !utf8.ValidString(page.Cursor) {
+		return NotificationUpdatePage{}, domain.InvalidArgument("page", "notification update request is out of range")
+	}
+	result, err := s.store.ListNotificationUpdates(ctx, principal.UserID, page)
+	if err != nil {
+		return NotificationUpdatePage{}, err
+	}
+	if result.Items == nil {
+		result.Items = []notification.Notification{}
+	}
+	if result.Cursor == "" {
+		return NotificationUpdatePage{}, domain.NewError(domain.CodeInternal, "notification update cursor is missing")
+	}
+	return result, nil
+}
+
 func (s *NotificationService) MarkRead(ctx context.Context, principal identity.Principal, id string) (notification.Notification, error) {
 	if err := validateNotificationPrincipal(principal); err != nil {
 		return notification.Notification{}, err
