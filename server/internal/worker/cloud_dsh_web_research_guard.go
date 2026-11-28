@@ -16,12 +16,12 @@ import (
 const (
 	cloudDSHWebResearchMaxSearchCalls        = 2
 	cloudDSHWebResearchMaxSuccessfulSearches = 1
-	cloudDSHWebResearchMaxReadCalls          = 4
+	cloudDSHWebResearchMaxReadCalls          = 3
 	cloudDSHWebResearchMaxReadURLs           = 2
 	cloudDSHWebResearchMaxReadWindowsPerURL  = 2
 )
 
-const cloudDSHWebResearchBudgetFeedback = "The bounded web research allowance is exhausted or this exact request was already attempted. Stop repeating search/read calls, synthesize the available evidence, and state any gaps in the user's language."
+const cloudDSHWebResearchBudgetFeedback = "The web research profile allows at most two search attempts with one successful search, three page reads across two source URLs, and two read windows per URL. This exact request may also already be settled. Do not retry denied or repeated calls; synthesize from recorded evidence and state any gaps in the user's language."
 
 func cloudDSHWebResearchProfileActive(value task.Task) bool {
 	return value.ConversationContext != nil && initialCloudDSHTaskRevision(value) &&
