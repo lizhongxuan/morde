@@ -19,6 +19,34 @@ import (
 	"morde/server/internal/domain/project"
 )
 
+func TestAttachTaskBudgetReservationProjectionAddsOnlySafeEnvelopeCounts(t *testing.T) {
+	request := ModelRequest{Instructions: "internal prompt fixture", MaxOutputTokens: 256,
+		Input: []ModelInput{{Type: "message", Role: "user", Text: "private user fixture"}},
+		Tools: []ModelTool{{Name: "morde_read", Description: "private tool description", Parameters: json.RawMessage(`{"type":"object"}`)}}}
+	inputReserved := modelRequestInputTokenReservation(request)
+	totalReserved := inputReserved + int64(request.MaxOutputTokens)
+	err := domain.NewError(domain.CodeQuotaExceeded, "task model token budget exceeded")
+	err.Details["reason"] = "task_model_budget_exhausted"
+	attachTaskBudgetReservationProjection(err, request, totalReserved)
+	if err.Details["request_input_reserved_tokens"] != inputReserved ||
+		err.Details["request_output_cap_tokens"] != int64(request.MaxOutputTokens) ||
+		err.Details["request_total_reserved_tokens"] != totalReserved {
+		t.Fatalf("task budget projection = %#v", err.Details)
+	}
+	for _, privateValue := range []string{"internal prompt fixture", "private user fixture", "private tool description"} {
+		if fmt.Sprint(err.Details) == privateValue || strings.Contains(fmt.Sprint(err.Details), privateValue) {
+			t.Fatalf("task budget projection leaked request content %q", privateValue)
+		}
+	}
+
+	unrelated := domain.NewError(domain.CodeQuotaExceeded, "account model token budget exceeded")
+	unrelated.Details["reason"] = "account_budget_exhausted"
+	attachTaskBudgetReservationProjection(unrelated, request, totalReserved)
+	if _, exists := unrelated.Details["request_input_reserved_tokens"]; exists {
+		t.Fatalf("unrelated budget rejection received Task-only details: %#v", unrelated.Details)
+	}
+}
+
 type modelGatewayStoreTest struct {
 	reservation     ModelCallReservation
 	settlement      ModelCallSettlement

@@ -84,6 +84,15 @@ func TestCloudDSHModelFailureCategoryUsesOnlySafeAllowlistedReason(t *testing.T)
 	if got := cloudDSHModelErrorCategory(taskBudgetFailure); got != "task_budget_exhausted" {
 		t.Fatalf("cloudDSHModelErrorCategory() = %q, want task_budget_exhausted", got)
 	}
+	budgetFailure := cloudDSHModelResultErrorFor(taskBudgetFailure)
+	var budgetDiagnostic cloudDSHModelFailureDiagnosticSource
+	if !errors.As(budgetFailure, &budgetDiagnostic) {
+		t.Fatalf("task budget failure has no safe model diagnostic: %T", budgetFailure)
+	}
+	if diagnostic := budgetDiagnostic.ModelFailureDiagnostic(); diagnostic.Stage != "model_call_reservation" ||
+		diagnostic.Category != "task_budget_exhausted" || diagnostic.ReasonCode != "task_budget_reservation_exceeded" {
+		t.Fatalf("task budget failure diagnostic = %+v", diagnostic)
+	}
 	if got := cloudDSHModelErrorCategory(domain.NewError(domain.CodeResultTooLarge, "input exceeds limit")); got != "context_length_exceeded" {
 		t.Fatalf("cloudDSHModelErrorCategory() = %q, want context_length_exceeded", got)
 	}

@@ -187,3 +187,12 @@
 - 服务器只读核对：`morde-portal.service` active、healthz 返回 `ok`，但 `/opt/morde-src` 当前仍是 `release@8c46fee0`，尚未包含本轮改动。未向旧会话重放失败任务；本地分支 HEAD 为 `release@ca897b29`。
 - 待验收：合并并部署本轮路由修复后，用实际 `morde-pc` 新建旁聊执行一个真实只读搜索和一个普通快答，观察收到状态、正常 DSH Task、MCP operation 恰好一次、AI 综合答复回到原会话，并记录阶段时间。目前没有真实 PC 证据，也没有实现 Taskless 持久 token 流；因此不宣称搜索回复已修复或延迟已满足。
 - T07/T08 继续进行中；错误气泡/真实 AI 失败解释、PC 快答与搜索端到端、延迟样本、Worker 全量失败项、安全恢复反例及灰度 cohort/基线仍需分别验收。自动恢复保持关闭。
+
+### 2026-11-28 续验（PC 重复失败说明与 Task 预算拒绝）
+
+- 设计方向：继续使用唯一的 DSH Agent Runtime。普通问答仍走 DSH 对话；搜索/网页读取由 DSH Task Agent 实际调用已授权工具、核实来源并生成答复；失败回告由 DSH 根据安全事实组织自然语言。PC 收到终态后有界补读原会话消息，避免 Worker 晚于 Task 状态事件写入的 AI 回告一直不可见。
+- 实际 PC 证据：上一条新旁聊短答由真实模型针对问题生成，用户提交后观察到的可见延迟低于 1 秒。重复的失败气泡关联两条分别提交的同文请求，不是同一助手消息被复制。另一次新的只读搜索创建了 DSH Task，但任务进入 `waiting_user`，未产生 Task 模型调用账本或预算预案，Task 用量为 0、上限为 50,000；相关模型账本只包含成功的终态说明调用（输入 386、输出 116），该助手消息已写回原会话。旧 PC 会话未及时补读该消息。
+- 根因定位：`task_budget_exhausted` 唯一对应 PostgreSQL Task 模型调用预留检查，在 provider 派发前拒绝 `request.ReservedTokens > Task 剩余额度`。请求预留由输入估算与输出上限组成；旧账本没有记录被拒绝请求的输入/输出拆分，因此尚不能确定哪部分超限，也不能据此调高 50,000 上限或降低估算系数。
+- 本地修复：只对白名单 `task_budget_exhausted` 保留阶段 `model_call_reservation` 与原因码 `task_budget_reservation_exceeded`，交给终态 DSH 解释模型；不把失败伪装成搜索结果。增加仅含整数的预算 envelope 诊断日志（Task 上限、已用、在途预留、输入估算、输出上限、总预留）；PC 在未见关联助手消息时最多退避刷新 8 次，消息到达后立即停止。审批或澄清待处理时不轮询。未关闭 fence、账本或硬预算限制。
+- 本地验证：App/Worker 预算拒绝与终态解释定向用例、隔离 PostgreSQL Task 预算预留用例、Portal `Assistant.test.tsx`（334 项）和 `npm run typecheck` 通过；`git diff --check` 通过。部署 smoke 和真实 PC 搜索尚未执行本轮版本。
+- 下一步：提交并推送 `release` 后部署安全诊断；在真实 `morde-pc` 发起一条全新的只读搜索，读取整数 envelope，按证据最小化过大的上下文/schema 或调整可安全配置的输出 cap，再核验一次工具派发、来源综合与原会话回告。PC 端改动需本地 `make pc` 构建并从实际客户端验收。若输入上下文本身超过剩余额度，应给出 DSH 生成的真实预算说明，不报告未执行的搜索。`T07`/`T08` 保持进行中；Taskless 持久增量流、完整 Worker 回归失败项及灰度基线仍未验收，自动恢复继续关闭。

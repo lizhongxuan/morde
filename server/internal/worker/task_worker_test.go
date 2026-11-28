@@ -42,6 +42,35 @@ func TestTaskExecutionStoppedLogUsesSafeDiagnosticFields(t *testing.T) {
 	}
 }
 
+func TestTaskExecutionStoppedLogAddsOnlyModelBudgetEnvelopeCounts(t *testing.T) {
+	err := domain.NewError(domain.CodeQuotaExceeded, "task model token budget exceeded")
+	err.Details["reason"] = "task_model_budget_exhausted"
+	err.Details["task_budget_tokens"] = int64(50_000)
+	err.Details["task_usage_tokens"] = int64(0)
+	err.Details["task_pending_reserved_tokens"] = int64(0)
+	err.Details["request_input_reserved_tokens"] = int64(49_500)
+	err.Details["request_output_cap_tokens"] = int64(2_048)
+	err.Details["request_total_reserved_tokens"] = int64(51_548)
+	err.Details["private_prompt"] = "must not be logged"
+	categorized := cloudDSHModelResultErrorFor(err)
+	core, logs := observer.New(zap.ErrorLevel)
+	zap.New(core).Error("task execution stopped", taskExecutionStoppedFields("q1234567", categorized)...)
+	if entries := logs.All(); len(entries) != 1 {
+		t.Fatalf("logged task execution failures = %d, want 1", len(entries))
+	} else {
+		fields := entries[0].ContextMap()
+		if fields["failure_stage"] != "model_call_reservation" || fields["failure_category"] != "task_budget_exhausted" ||
+			fields["failure_reason"] != "task_budget_reservation_exceeded" || fields["task_budget_tokens"] != int64(50_000) ||
+			fields["request_input_reserved_tokens"] != int64(49_500) || fields["request_output_cap_tokens"] != int64(2_048) ||
+			fields["request_total_reserved_tokens"] != int64(51_548) {
+			t.Fatalf("safe model budget diagnostics = %#v", fields)
+		}
+		if _, exists := fields["private_prompt"]; exists || containsTaskLogMarker(fields, "must not be logged") {
+			t.Fatalf("private request content leaked to logs: %#v", fields)
+		}
+	}
+}
+
 func containsTaskLogMarker(fields map[string]interface{}, marker string) bool {
 	for _, value := range fields {
 		if fmt.Sprint(value) == marker {

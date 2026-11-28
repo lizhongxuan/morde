@@ -822,6 +822,9 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 	budgetShadowPlan := s.planTaskModelBudgetShadow(ctx, call, call.Request, endpoint, projectID)
 	if call.BudgetPlanID == "" {
 		if err := s.reserveModelCall(ctx, call.Source, projectCall, projectID, reservation, projectUsageReservation(call.Request, reserve)); err != nil {
+			if call.Source == ModelCallTask {
+				attachTaskBudgetReservationProjection(err, call.Request, reserve)
+			}
 			return ModelResponse{}, err
 		}
 	}
@@ -1432,6 +1435,20 @@ func modelRequestInputTokenReservation(request ModelRequest) int64 {
 		reserve += int64(len(tool.Name)+len(tool.Description)+len(tool.Parameters)) + modelRequestItemTokenReserve
 	}
 	return reserve
+}
+
+// attachTaskBudgetReservationProjection adds only integer envelope sizes to a
+// hard Task-budget rejection. The values help operators distinguish input
+// pressure from an output cap without logging the request, prompt, tools, or
+// provider response.
+func attachTaskBudgetReservationProjection(err error, request ModelRequest, totalReserved int64) {
+	var modelErr *domain.Error
+	if !errors.As(err, &modelErr) || modelErr.Details["reason"] != "task_model_budget_exhausted" {
+		return
+	}
+	modelErr.Details["request_input_reserved_tokens"] = modelRequestInputTokenReservation(request)
+	modelErr.Details["request_output_cap_tokens"] = int64(request.MaxOutputTokens)
+	modelErr.Details["request_total_reserved_tokens"] = totalReserved
 }
 
 func validateGatewayModelInput(inputs []ModelInput, tools []ModelTool) error {

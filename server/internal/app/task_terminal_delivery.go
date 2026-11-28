@@ -458,6 +458,12 @@ func terminalDeliveryModelFailureDiagnosis(diagnostic AgentModelFailureDiagnosti
 	if ladderExhausted || diagnostic.Category == "model_retry_ladder_exhausted" {
 		return "模型服务经过有限次恢复尝试后仍未能完成回复。"
 	}
+	if diagnostic.Category == "task_budget_exhausted" {
+		if diagnostic.Stage == "model_call_reservation" && diagnostic.ReasonCode == "task_budget_reservation_exceeded" {
+			return "模型调用前的任务预算检查未通过：本次请求所需的保守预算预留超过任务剩余额度，因此模型没有收到这次请求。"
+		}
+		return "任务的模型预算不足，本次请求未能发送。"
+	}
 	switch diagnostic.Category {
 	case "timeout", "provider_timeout":
 		return "模型服务在本次时限内没有返回完整回复。"
@@ -500,6 +506,8 @@ func validTerminalDeliveryRecoveryDiagnosis(value string) bool {
 	case "模型提出了当前任务未授权的工具操作，系统在派发前已拦截。",
 		"模型提出了当前任务不允许的工具操作，系统已拦截。",
 		"模型服务经过有限次恢复尝试后仍未能完成回复。",
+		"模型调用前的任务预算检查未通过：本次请求所需的保守预算预留超过任务剩余额度，因此模型没有收到这次请求。",
+		"任务的模型预算不足，本次请求未能发送。",
 		"模型服务在本次时限内没有返回完整回复。",
 		"连接模型服务时发生网络错误。",
 		"模型服务暂时不可用。",

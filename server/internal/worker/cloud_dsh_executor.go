@@ -127,6 +127,7 @@ type cloudDSHModelResultError struct {
 	reasonCode         string
 	toolName           string
 	toolCallID         string
+	cause              error
 	noDispatch         *app.TaskModelNoDispatchEvidence
 	recoveryFailure    *app.TaskModelRecoveryFailureEvidence
 	recoveryFailureErr app.TaskModelRecoveryFailure
@@ -134,6 +135,8 @@ type cloudDSHModelResultError struct {
 }
 
 func (e cloudDSHModelResultError) Error() string { return errCloudDSHModelResultUnavailable.Error() }
+
+func (e cloudDSHModelResultError) Unwrap() error { return e.cause }
 
 func (e cloudDSHModelResultError) Is(target error) bool {
 	return target == errCloudDSHModelResultUnavailable
@@ -243,7 +246,7 @@ func cloudDSHModelErrorCategory(err error) string {
 }
 
 func cloudDSHModelResultErrorFor(err error) error {
-	return cloudDSHModelResultError{category: cloudDSHModelErrorCategory(err)}
+	return cloudDSHModelResultErrorForCall(err, app.ModelCall{})
 }
 
 type cloudDSHModelRecoveryFailureSource interface {
@@ -255,7 +258,14 @@ func cloudDSHModelResultErrorForCall(err error, call app.ModelCall, checkpoints 
 	if errors.As(err, &preclassified) && preclassified.stage != "" {
 		return preclassified
 	}
-	failure := cloudDSHModelResultError{category: cloudDSHModelErrorCategory(err)}
+	failure := cloudDSHModelResultError{category: cloudDSHModelErrorCategory(err), cause: err}
+	if failure.category == "task_budget_exhausted" {
+		// The PostgreSQL reservation guard rejected this call before the
+		// provider was dispatched. Preserve that allowlisted fact so the
+		// terminal explanation model can tell the user what actually happened.
+		failure.stage = "model_call_reservation"
+		failure.reasonCode = "task_budget_reservation_exceeded"
+	}
 	var source cloudDSHModelRecoveryFailureSource
 	if !errors.As(err, &source) || call.Source != app.ModelCallTask || call.Task == nil ||
 		call.Task.RecoveryCallID != "" || call.Task.RecoveryDSHCallID != "" {

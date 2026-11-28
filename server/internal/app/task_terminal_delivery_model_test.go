@@ -261,3 +261,21 @@ func TestTaskTerminalDeliveryRecoveryDiagnosisUsesPlainFallbackForUnknownCause(t
 		t.Fatalf("unknown recovery diagnosis is not a safe plain fallback: %q", diagnosis)
 	}
 }
+
+func TestTaskTerminalDeliveryExplainsTaskBudgetReservationFailure(t *testing.T) {
+	event := []byte(`{"reason":"dsh_recovery_unresolved","detail":{"phase":"recovery","failure_stage":"model_call_reservation","failure_category":"task_budget_exhausted","failure_reason":"task_budget_reservation_exceeded"}}`)
+	diagnosis := TaskTerminalDeliveryRecoveryDiagnosisFromEvent(event)
+	const expected = "模型调用前的任务预算检查未通过：本次请求所需的保守预算预留超过任务剩余额度，因此模型没有收到这次请求。"
+	if diagnosis != expected {
+		t.Fatalf("task budget diagnosis = %q, want %q", diagnosis, expected)
+	}
+	if !validTerminalDeliveryRecoveryDiagnosis(diagnosis) || strings.Contains(diagnosis, "task_budget_exhausted") ||
+		strings.Contains(diagnosis, "task_budget_reservation_exceeded") {
+		t.Fatalf("task budget diagnosis is not a safe model fact: %q", diagnosis)
+	}
+
+	unknown := TaskTerminalDeliveryRecoveryDiagnosisFromEvent([]byte(`{"reason":"dsh_recovery_unresolved","detail":{"phase":"recovery","failure_stage":"private_stage","failure_category":"task_budget_exhausted","failure_reason":"private_reason"}}`))
+	if unknown != "任务的模型预算不足，本次请求未能发送。" {
+		t.Fatalf("unrecognized budget details did not use the bounded fallback: %q", unknown)
+	}
+}

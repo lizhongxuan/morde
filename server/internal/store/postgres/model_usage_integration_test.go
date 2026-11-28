@@ -818,7 +818,9 @@ VALUES ('q1234567',$1,'agent-1',2,$2,'session-1',0,0,$3,decode('01','hex'),'engi
 		t.Fatalf("child exceeded the Task budget remaining after the root call: %v", err)
 	} else {
 		var domainErr *domain.Error
-		if !errors.As(err, &domainErr) || domainErr.Details["reason"] != "task_model_budget_exhausted" {
+		if !errors.As(err, &domainErr) || domainErr.Details["reason"] != "task_model_budget_exhausted" ||
+			domainErr.Details["task_budget_tokens"] != int64(125) || domainErr.Details["task_usage_tokens"] != int64(18) ||
+			domainErr.Details["task_pending_reserved_tokens"] != int64(0) || domainErr.Details["request_total_reserved_tokens"] != int64(108) {
 			t.Fatalf("task budget failure reason = %#v, want task_model_budget_exhausted", domainErr)
 		}
 	}

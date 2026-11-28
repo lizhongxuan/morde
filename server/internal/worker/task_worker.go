@@ -307,6 +307,23 @@ func taskExecutionStoppedFields(taskID string, err error) []zap.Field {
 			diagnostic.ReasonCode == "tool_call_metadata_invalid" {
 			fields = append(fields, zap.Bool("tool_dispatched", false))
 		}
+		if diagnostic.Category == "task_budget_exhausted" {
+			var modelErr *domain.Error
+			if errors.As(err, &modelErr) && modelErr.Details["reason"] == "task_model_budget_exhausted" {
+				for _, value := range []struct{ detail, field string }{
+					{"task_budget_tokens", "task_budget_tokens"},
+					{"task_usage_tokens", "task_usage_tokens"},
+					{"task_pending_reserved_tokens", "task_pending_reserved_tokens"},
+					{"request_input_reserved_tokens", "request_input_reserved_tokens"},
+					{"request_output_cap_tokens", "request_output_cap_tokens"},
+					{"request_total_reserved_tokens", "request_total_reserved_tokens"},
+				} {
+					if tokens, ok := modelErr.Details[value.detail].(int64); ok && tokens >= 0 {
+						fields = append(fields, zap.Int64(value.field, tokens))
+					}
+				}
+			}
+		}
 	}
 	var toolFailure interface {
 		ToolExecutionDiagnostic() cloudDSHToolExecutionDiagnostic

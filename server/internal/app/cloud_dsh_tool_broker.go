@@ -2772,7 +2772,7 @@ func safeAgentRecoveryDiagnostic(value AgentRecoveryDiagnostic) AgentRecoveryDia
 }
 
 func safeAgentModelFailureDiagnostic(value AgentModelFailureDiagnostic) AgentModelFailureDiagnostic {
-	if value.Stage != "model_response_validation" {
+	if value.Stage != "model_response_validation" && value.Stage != "model_call_reservation" {
 		value.Stage = ""
 	}
 	switch value.Category {
@@ -2781,7 +2781,7 @@ func safeAgentModelFailureDiagnostic(value AgentModelFailureDiagnostic) AgentMod
 		"client_request_invalid", "context_length_exceeded", "provider_invalid_request", "provider_unsupported_parameter", "provider_context_length_exceeded",
 		"provider_model_not_found", "provider_permission_denied", "provider_invalid_api_key", "provider_rate_limited",
 		"provider_quota_exhausted", "provider_server_error", "provider_request_rejected", "attachment_reader_unavailable", "stream_result_mismatch", "unauthorized_tool",
-		"model_retry_ladder_exhausted":
+		"model_retry_ladder_exhausted", "task_budget_exhausted":
 	default:
 		value.Category = "unknown"
 	}
@@ -2792,7 +2792,8 @@ func safeAgentModelFailureDiagnostic(value AgentModelFailureDiagnostic) AgentMod
 		value.Attempts = 0
 	}
 	switch value.ReasonCode {
-	case "response_shape_invalid", "tool_call_metadata_invalid", "task_has_no_authorized_tools", "tool_not_in_task_allowlist", "tool_arguments_not_object":
+	case "response_shape_invalid", "tool_call_metadata_invalid", "task_has_no_authorized_tools", "tool_not_in_task_allowlist", "tool_arguments_not_object",
+		"task_budget_reservation_exceeded":
 	default:
 		value.ReasonCode = ""
 	}

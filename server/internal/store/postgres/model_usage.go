@@ -229,6 +229,10 @@ WHERE project_id=$1 AND source='terminal_delivery' AND call_id=$2 FOR UPDATE`,
 		if taskUsed > taskLimit || pending > taskLimit-taskUsed || request.ReservedTokens > taskLimit-taskUsed-pending {
 			budgetErr := domain.NewError(domain.CodeQuotaExceeded, "task model token budget exceeded")
 			budgetErr.Details["reason"] = "task_model_budget_exhausted"
+			budgetErr.Details["task_budget_tokens"] = taskLimit
+			budgetErr.Details["task_usage_tokens"] = taskUsed
+			budgetErr.Details["task_pending_reserved_tokens"] = pending
+			budgetErr.Details["request_total_reserved_tokens"] = request.ReservedTokens
 			return budgetErr
 		}
 		taskID = request.Task.TaskID

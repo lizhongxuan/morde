@@ -83,3 +83,12 @@
 - 验收边界：对象参数解析、无效输出安全分类、慢消息回告轮询均有本地自动化测试。服务端实际模型输出与真实工具派发须在部署后的 `morde-pc` 中核验。当前架构仍没有 Taskless 直接回复的持久增量事件协议；在 owner/conversation/message/revision 围栏、重连游标和 PC 续读完成前，不承诺真实 token 流式回复。
 - 实机搜索揭示第二个接线缺陷：路由已经选中 `morde_web_search` 并创建隐藏 Broker Task，但内置 MCP 执行要求读取 Task revision。直接路由 Task 没有用户可编辑的 revision，数据库 fence 合法值为 `current_revision=desired_revision=0`；应用读模型将它们投影为 nil，Broker 因此在操作账本/派发之前拒绝，用户看到兜底气泡且工具派发数为 0。仅对带可信 `InternalTool` 标记的这种隐藏单次 Task，将 nil/nil 解释为 revision 0；普通 Task 仍要求已有一致 revision。新增 Broker 路径回归用例已复现修复，但需要部署后用真实 PC 再确认 operation ledger 恰好一次、搜索结果进入原会话。
 - DSH Runtime 已在 compaction 的模型预算请求中传 `purpose=compaction`，但 Portal adapter 之前丢弃该字段，导致 compaction 被按短答 stage 预算。现在只接受空值或明确的 `compaction`，将后者透传并映射到 summary stage；集成验证确认用 summary 配置创建并结算同一个输出上限。这是长会话摘要预算修正，不等同于首 token 流式回复，也不替代 PC 长任务验收。
+
+### 2026-11-28 PC 复现：重复失败说明与任务回复延迟
+
+- 实际 `morde-pc` 的无工具短问答由 DSH 返回了与问题相符的真实答案，观察到的可见延迟低于 1 秒。两条相同的失败气泡分别对应用户提交的两条重复请求；并非同一条助手消息被复制。短答样本通过不代表后台任务链路已通过。
+- 新建的只读搜索 Task 在首个 DSH 模型调用前因任务预算预留被拒绝。线上 Task 显示 50,000 模型 token 预算、已用 0；没有该 Task 的模型调用账本或预算预案。唯一相关的模型账本行为终态说明调用（输入 386、输出 116），并已写入原会话。等待事件的失败类别却被安全过滤成 `unknown`，所以 DSH 终态说明只知道中断状态，无法给用户具体原因。源码中 `task_budget_exhausted` 唯一映射来自 Task reservation guard；它在 Provider dispatch 前拒绝 `request.ReservedTokens > Task 剩余额度`，预留由估算输入与输出上限相加组成。
+- 处理：终态失败事实现在保留白名单类别 `task_budget_exhausted`、阶段 `model_call_reservation` 和原因码，并由 DSH 解释模型基于这些事实用自然语言说明“模型请求没有发出”；不把固定兜底文本伪装成模型答复。日志只新增整数预算 envelope（输入估算、输出上限、总预留、任务上限/已用/在途预留），不写提示词、工具定义或供应商文本。
+- PC 端对尚未出现在当前会话的终态回告采用最多 8 次退避刷新；每次等当前消息读取完成再启动，收到与该 Task 关联的助手消息即停止。审批与澄清卡存在时不启动回告刷新。这样处理 terminal-delivery Worker 晚于 Task SSE 的窗口，同时保持刷新次数有界。
+- 尚未降低保守预留系数、抬高任务预算或绕过 hard budget。需先部署整数诊断并在一条新的只读 PC 搜索请求上取得输入/输出预留拆分；若输入本身超过剩余预算，应修剪可安全去重的上下文/schema 或明确说明预算约束，不能把未派发的搜索报告成已执行。
+- 本地验证：App/Worker 定向诊断测试、隔离 PostgreSQL Task reservation 用例、PC Assistant 测试（334 项）及 Portal typecheck 均通过。新诊断尚未部署；预算问题是否能在现有 50,000 硬额度内完成搜索与最终综合，必须由部署后真实 `morde-pc` 验收确认。Taskless 持久增量流仍未实现。
