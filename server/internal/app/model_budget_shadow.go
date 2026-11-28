@@ -125,9 +125,20 @@ func modelBudgetShadowStage(fence *ModelTaskFence, request ModelRequest) string 
 			return string(modelOutputBudgetStageToolStep)
 		}
 	}
+	for _, input := range request.Input {
+		if input.Type == "image" || len(input.Images) > 0 {
+			return modelBudgetShadowStageUnknown
+		}
+		for _, part := range input.Parts {
+			if part.Type == "image" || part.Image != nil {
+				return modelBudgetShadowStageUnknown
+			}
+		}
+	}
 	// The root/no-tool shape is trustworthy, but it does not say whether the
-	// requested answer is short or long. Keep that distinction out of prompt
-	// heuristics and let the exact-route policy define a neutral root-text goal.
+	// requested answer is short or long. It is only a text stage; multimodal
+	// requests remain unknown. Keep semantic length out of prompt heuristics and
+	// let the exact-route policy define a neutral root-text goal.
 	return string(modelOutputBudgetStageRootTextOnly)
 }
 

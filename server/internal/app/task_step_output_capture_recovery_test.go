@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/task"
@@ -122,5 +125,123 @@ func TestRuntimeToolExecutorReconcileTerminalShellCollectsCaptureWithoutReplay(t
 		!persistedShell.StdoutTruncated || !persistedShell.StderrTruncated ||
 		persistedShell.Stdout != prefix || strings.Contains(persisted.Result, string(secret)) {
 		t.Fatalf("recovered legacy Operation result lost structure or retained credentials: %s", persisted.Result)
+	}
+}
+
+func TestRuntimeToolExecutorSlowOutputPageCancellationReleasesCaptureWithoutShellReplay(t *testing.T) {
+	const prefixBytes = 8 << 10
+	secret := []byte("slow-output-page-private-canary")
+	prefix := strings.Repeat("x", prefixBytes-len("api_key=")) + "api_key="
+	handler := &runtimeToolOutputCaptureHandler{stdoutPrefix: prefix, stdoutSpill: append(secret, '\n')}
+	fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{{runtimeAction: handler}})
+	fixture.store.details.Task.Authorization.Version = 1
+	request, preparation := fixture.prepared(runtimeToolShellExec, `{"command":"printf output"}`, identity.ScopeComputerOperate)
+	request.Task = fixture.store.details.Task
+	request.StepID = "s1234567"
+
+	ctx := context.Background()
+	session, err := fixture.executor.connect(ctx, request.Task, preparation.Fence)
+	if err != nil {
+		t.Fatalf("connect Runtime for slow output-page test: %v", err)
+	}
+	defer session.Close()
+	_, viewID, err := session.SetTaskWorkspaceView(ctx, request.Task, preparation.WorkspaceID, preparation.BindingVersion)
+	if err != nil {
+		t.Fatalf("set Shell Workspace view: %v", err)
+	}
+	checkpointRevision := *request.Task.WorkspaceCheckpointRevision
+	if err := session.SetTaskLease(ctx, request.Task.ID, request.Task.Lease.Version, *request.Task.Lease.ExpiresAt, true); err != nil {
+		t.Fatalf("set task lease before Shell dispatch: %v", err)
+	}
+	mapping, ok := runtimeToolMappingByName(runtimeToolShellExec)
+	if !ok {
+		t.Fatal("Shell runtime mapping is missing")
+	}
+	runtimeIdentity, _, err := fixture.executor.taskStepOutputCaptureIdentity(ctx, request.Task, request,
+		preparation.WorkspaceID, preparation.BindingVersion, viewID, checkpointRevision)
+	if err != nil {
+		t.Fatalf("build output capture identity: %v", err)
+	}
+	runtimeArguments, err := runtimeToolExecutionArguments(mapping, request.Arguments)
+	if err != nil {
+		t.Fatalf("build Shell runtime arguments: %v", err)
+	}
+	operation, err := fixture.executor.operations.ExecuteWithSupplementalOutputCapture(ctx, session,
+		request.Task.ID, request.OperationID, request.Task.Lease.Version, mapping.capability, mapping.action,
+		runtimeArguments, preparation.WorkspaceID, preparation.BindingVersion, viewID, checkpointRevision,
+		request.Task.InputRevision, runtimeIdentity)
+	if err == nil {
+		operation, err = fixture.executor.operations.Poll(ctx, session, request.Task.ID, request.OperationID,
+			request.Task.Lease.Version, operation)
+	}
+	if err != nil || operation.Status != runtimeclient.OperationSucceeded || handler.calls.Load() != 1 || handler.captureCalls.Load() != 1 {
+		t.Fatalf("captured Shell operation=%+v err=%v calls=%d capture requests=%d", operation, err,
+			handler.calls.Load(), handler.captureCalls.Load())
+	}
+
+	pageStarted := make(chan struct{}, 1)
+	releaseSeen := make(chan struct{}, 1)
+	var pageRequests atomic.Int32
+	fixture.wrap = func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			switch {
+			case strings.HasSuffix(request.URL.Path, "/output-capture/page"):
+				if pageRequests.Add(1) == 1 {
+					pageStarted <- struct{}{}
+					<-request.Context().Done()
+					return
+				}
+			case strings.HasSuffix(request.URL.Path, "/output-capture/release"):
+				releaseSeen <- struct{}{}
+			}
+			next.ServeHTTP(writer, request)
+		})
+	}
+
+	drainCtx, cancel := context.WithCancel(ctx)
+	type drainResult struct {
+		state          TaskStepOutputCaptureState
+		stdout, stderr []byte
+	}
+	done := make(chan drainResult, 1)
+	go func() {
+		state, stdout, stderr := fixture.executor.collectTaskStepOutputCapture(drainCtx, session, request.Task,
+			request, request.Task.Lease.Version, runtimeIdentity)
+		done <- drainResult{state: state, stdout: stdout, stderr: stderr}
+	}()
+	select {
+	case <-pageStarted:
+		cancel()
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("output-page request did not reach the deliberately slow Runtime response")
+	}
+
+	var drained drainResult
+	select {
+	case drained = <-done:
+	case <-time.After(time.Second):
+		t.Fatal("cancelled output-page drain did not return promptly")
+	}
+	defer clear(drained.stdout)
+	defer clear(drained.stderr)
+	if drained.state != TaskStepOutputCaptureStateFailed || len(drained.stdout) != 0 || len(drained.stderr) != 0 {
+		t.Fatalf("cancelled output-page drain=%q stdout=%d stderr=%d; want failed metadata only",
+			drained.state, len(drained.stdout), len(drained.stderr))
+	}
+	select {
+	case <-releaseSeen:
+	default:
+		t.Fatal("output capture was not released after the cancelled drain")
+	}
+
+	page, err := session.SupplementalOutputCapturePage(context.Background(), request.Task.ID, request.OperationID,
+		request.Task.Lease.Version, runtimeIdentity, runtimeclient.SupplementalOutputCaptureStdout, 0)
+	if err != nil || page.State != runtimeclient.SupplementalOutputCaptureFailed || page.Reason != "capture_unavailable" {
+		t.Fatalf("released output capture page=%+v err=%v; want unavailable metadata", page, err)
+	}
+	if handler.calls.Load() != 1 || handler.captureCalls.Load() != 1 || operation.Status != runtimeclient.OperationSucceeded {
+		t.Fatalf("slow reader replayed or changed the terminal Shell operation: status=%q calls=%d capture requests=%d",
+			operation.Status, handler.calls.Load(), handler.captureCalls.Load())
 	}
 }

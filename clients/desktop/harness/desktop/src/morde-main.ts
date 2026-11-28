@@ -918,7 +918,8 @@ function desktopNotificationNativeAvailable(): boolean {
 }
 
 function desktopNotificationWindowIsFocused(): boolean {
-  return Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.isFocused());
+  const focusedWindow = BrowserWindow.getFocusedWindow();
+  return Boolean(focusedWindow && !focusedWindow.isDestroyed());
 }
 
 function showDesktopCompletionNotification(loop: DesktopNotificationLoop): void {

@@ -2817,10 +2817,7 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			if frame.Type != "ready" || frame.Version != 1 || frame.Engine != "dsh" || frame.EngineVer != cloudDSHEngineVersion {
 				return errors.New("dsh startup handshake is invalid")
 			}
-			maxTokens := value.Budget.ModelTokens
-			if maxTokens > 2048 {
-				maxTokens = 2048
-			}
+			maxTokens := cloudDSHTaskLegacyModelOutputTokens(value)
 			start := map[string]any{"type": "start", "version": 1, "task_id": rootIdentity.TaskID, "owner_id": rootIdentity.OwnerID,
 				"agent_id": rootIdentity.AgentID, "session_id": rootIdentity.SessionID, "generation": rootIdentity.Generation,
 				"authorization_version": rootIdentity.AuthorizationVersion, "task_revision": cloudDSHTaskRevision(value), "model": value.ModelID,
