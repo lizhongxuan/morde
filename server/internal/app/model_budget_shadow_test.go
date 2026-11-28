@@ -230,6 +230,27 @@ func TestTaskModelBudgetShadowUsesNeutralRootTextOnlyStage(t *testing.T) {
 	}
 }
 
+func TestModelBudgetShadowDoesNotClassifyRootImageRequestsAsTextOnly(t *testing.T) {
+	fence := &ModelTaskFence{AgentRootSessionID: "session-root", AgentSessionID: "session-root"}
+	image := ModelImage{MediaType: "image/png", Data: []byte("image")}
+	tests := []struct {
+		name  string
+		input ModelInput
+	}{
+		{name: "image input", input: ModelInput{Type: "image"}},
+		{name: "images field", input: ModelInput{Type: "message", Images: []ModelImage{image}}},
+		{name: "image part type", input: ModelInput{Type: "message", Parts: []ModelContentPart{{Type: "image"}}}},
+		{name: "image part value", input: ModelInput{Type: "message", Parts: []ModelContentPart{{Image: &image}}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := modelBudgetShadowStage(fence, ModelRequest{Input: []ModelInput{test.input}}); got != modelBudgetShadowStageUnknown {
+				t.Fatalf("root image request stage = %q, want %q", got, modelBudgetShadowStageUnknown)
+			}
+		})
+	}
+}
+
 func TestTaskModelBudgetShadowObserverPanicDoesNotAffectComplete(t *testing.T) {
 	run := newModelBudgetShadowTestRun(t, "session-root", modelBudgetShadowTestPreview(900), nil, 1,
 		func(ModelOutputBudgetShadowObservation) { panic("observer failure") })
