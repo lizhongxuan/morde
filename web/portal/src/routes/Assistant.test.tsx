@@ -6080,8 +6080,55 @@ describe('Assistant durable tasks', () => {
     expect(messageFetches).toBe(2);
 
     await act(async () => { finishReload({ items: [source, terminalReply], next_cursor: null }); });
-    expect(await screen.findByText('这次搜索请求没有执行。')).toBeInTheDocument();
+    expect(await screen.findByText('这次搜索请求没有执行。', {}, { timeout: 5_000 })).toBeInTheDocument();
     expect(screen.queryByRole('status', { name: '任务状态：结果待核对' })).not.toBeInTheDocument();
+  });
+
+  it('refreshes the open conversation when terminal delivery publishes after the Task event stream ends', async () => {
+    const source = { ...message, actor_id: authUser.id, task_id: task.id } as ConversationMessage;
+    const terminalTask = { ...task, status: 'failed' as const, result: null, waiting_reason: 'model_call_failed',
+      finished_at: timestamp, event_sequence: 9, assistant_message: null,
+      result_message_pending: false, result_message_published: false } as unknown as Task;
+    const terminalReply: ConversationMessage = { ...reply, id: 'm7654335', sequence: 3,
+      content: '任务失败原因已整理并送达。', task_id: task.id, delivery_status: 'applied' };
+    mockCommon({ conversations: [conversation], messages: [source] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(terminalTask);
+    let messageFetches = 0;
+    vi.spyOn(portalApi, 'conversationMessages').mockImplementation(async () => {
+      messageFetches++;
+      return messageFetches < 3
+        ? { items: [source], next_cursor: null }
+        : { items: [source, terminalReply], next_cursor: null };
+    });
+    renderPage();
+
+    expect(await screen.findByRole('article', { name: '你的消息' })).toBeInTheDocument();
+    expect(await screen.findByText('任务失败原因已整理并送达。', {}, { timeout: 5_000 })).toBeInTheDocument();
+    expect(messageFetches).toBe(3);
+  });
+
+  it('refreshes a terminal-delivery reply for another public unresolved waiting reason', async () => {
+    const source = { ...message, actor_id: authUser.id, task_id: task.id } as ConversationMessage;
+    const waitingTask = { ...task, status: 'waiting_user' as const, result: null, waiting_reason: 'tool_result_unknown',
+      finished_at: null, event_sequence: 9, assistant_message: null,
+      pending_request: null, clarification_request: null,
+      result_message_pending: false, result_message_published: false } as unknown as Task;
+    const terminalReply: ConversationMessage = { ...reply, id: 'm7654336', sequence: 3,
+      content: '工具操作结果仍未确认，原因已整理。', task_id: task.id, delivery_status: 'applied' };
+    mockCommon({ conversations: [conversation], messages: [source] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(waitingTask);
+    let messageFetches = 0;
+    vi.spyOn(portalApi, 'conversationMessages').mockImplementation(async () => {
+      messageFetches++;
+      return messageFetches === 1
+        ? { items: [source], next_cursor: null }
+        : { items: [source, terminalReply], next_cursor: null };
+    });
+    renderPage();
+
+    expect(await screen.findByRole('article', { name: '你的消息' })).toBeInTheDocument();
+    expect(await screen.findByText('工具操作结果仍未确认，原因已整理。', {}, { timeout: 5_000 })).toBeInTheDocument();
+    expect(messageFetches).toBe(2);
   });
 
   it('does not let a stale assistant reply from before the source message hide the recovery explanation', async () => {

@@ -659,6 +659,10 @@ function mergeTaskAssistantMessages(items: ConversationMessage[], tasks: Task[])
 }
 
 const terminalTaskStatuses = new Set<Task['status']>(['completed', 'failed', 'cancelled']);
+const terminalDeliveryWaitingReasons = new Set([
+  'mcp_result_unknown', 'hub_action_unknown', 'tool_result_unknown', 'target_result_unknown', 'dsh_recovery_unresolved',
+]);
+const conversationReplyRefreshDelaysMs = [1_000, 1_000, 2_000, 4_000, 8_000, 15_000, 30_000, 60_000] as const;
 
 type ConversationFileItem =
   | { kind: 'attachment'; key: string; attachmentID: string; messageID: string; index: number; createdAt: string }
@@ -2573,19 +2577,51 @@ export function Assistant() {
     ...tasks.flatMap((item) => item.artifacts.filter(hasCompleteVerifiedArtifactProof).map((artifact) => ({ kind: 'artifact' as const,
       key: `artifact:${item.id}:${artifact.id}`, taskID: item.id, taskTitle: item.objective || '未命名任务', artifact }))),
   ];
-  const resultsAwaitingMessages = tasks.some((task) => task.result_message_pending || (task.result_message_published &&
-    !conversationMessageItems.some((message) => message.sources?.some((source) => source.task_id === task.id &&
-      source.task_revision === task.assistant_message?.task_revision && source.event_sequence === task.assistant_message?.result_event_sequence))));
+  const tasksAwaitingConversationReply = tasks.filter((task) => {
+    const publishedResultVisible = task.result_message_published && conversationMessageItems.some((message) =>
+      message.sources?.some((source) => source.task_id === task.id &&
+        source.task_revision === task.assistant_message?.task_revision && source.event_sequence === task.assistant_message?.result_event_sequence));
+    if (task.result_message_pending || (task.result_message_published && !publishedResultVisible)) return true;
+
+    // Task terminal-delivery runs after the Task status event and does not
+    // publish another Task event. Keep a bounded message refresh alive for
+    // terminal Tasks whose applied assistant bubble has not reached this page.
+    const terminalDeliveryCanReply = terminalTaskStatuses.has(task.status) ||
+      (task.status === 'waiting_user' && terminalDeliveryWaitingReasons.has(task.waiting_reason ?? '') &&
+        task.pending_request?.status !== 'pending' && !task.clarification_request);
+    if (!terminalDeliveryCanReply) return false;
+    const sourceSequence = conversationMessageItems.reduce((latest, message) =>
+      message.role === 'user' && (message.task_id === task.id || message.related_task_id === task.id)
+        ? Math.max(latest, message.sequence) : latest, -1);
+    return !conversationMessageItems.some((message) => message.role === 'assistant' && message.delivery_status === 'applied' &&
+      message.sequence > sourceSequence && (message.task_id === task.id || message.sources?.some((source) => source.task_id === task.id)));
+  });
+  const conversationReplyRefreshKey = tasksAwaitingConversationReply.map((task) =>
+    `${task.id}:${task.status}:${task.current_revision ?? ''}:${task.event_sequence ?? ''}:${task.waiting_reason ?? ''}:` +
+    `${task.result_message_pending ? 'pending' : ''}:` +
+    `${task.result_message_published ? 'published' : ''}:${task.assistant_message?.result_event_sequence ?? ''}`)
+    .sort().join('|');
+  const conversationReplyRefreshAttempts = useRef<{ key: string; count: number } | null>(null);
   useEffect(() => {
-    // Do not invalidate while a message fetch is in flight. Repeating
-    // invalidateQueries on a fixed interval can cancel a slow request every
-    // second, preventing the durable assistant reply from ever arriving in
-    // the open conversation until the user switches away and back.
-    if (!conversationID || !resultsAwaitingMessages || messages.isFetching) return;
+    if (!conversationID || !conversationReplyRefreshKey) {
+      conversationReplyRefreshAttempts.current = null;
+      return;
+    }
+    if (conversationReplyRefreshAttempts.current?.key !== conversationReplyRefreshKey) {
+      conversationReplyRefreshAttempts.current = { key: conversationReplyRefreshKey, count: 0 };
+    }
+    const attempts = conversationReplyRefreshAttempts.current;
+    if (!attempts || attempts.count >= conversationReplyRefreshDelaysMs.length || messages.isFetching) return;
     const queryKey = ['conversation-messages', conversationID] as const;
-    const timer = window.setTimeout(() => { void client.invalidateQueries({ queryKey, exact: true }); }, 1000);
+    const delay = conversationReplyRefreshDelaysMs[attempts.count];
+    const timer = window.setTimeout(() => {
+      if (conversationReplyRefreshAttempts.current?.key !== conversationReplyRefreshKey ||
+        client.getQueryState(queryKey)?.fetchStatus === 'fetching') return;
+      conversationReplyRefreshAttempts.current.count += 1;
+      void client.invalidateQueries({ queryKey, exact: true });
+    }, delay);
     return () => window.clearTimeout(timer);
-  }, [client, conversationID, messages.isFetching, resultsAwaitingMessages]);
+  }, [client, conversationID, conversationReplyRefreshKey, messages.isFetching]);
   const tasksByID = new Map(tasks.map((task) => [task.id, task]));
   const activePanelTasks = tasks.filter((task) => !terminalTaskStatuses.has(task.status));
   const selectedActiveTask = activePanelTasks.find((task) => task.id === taskDetailTaskID);
