@@ -101,6 +101,8 @@ type taskModelRecoveryRetryStoreStub struct {
 	retryCalls   int
 	beginCalls   int
 	beginFence   AgentInstanceFence
+	deferCalls   int
+	deferFence   AgentInstanceFence
 }
 
 func (s *taskModelRecoveryRetryStoreStub) GetTaskModelRecovery(_ context.Context, taskID, ownerID string, revision int64) (task.ModelRecoveryIntent, bool, error) {
@@ -127,6 +129,17 @@ func (*taskModelRecoveryRetryStoreStub) ScheduleTaskModelRecovery(context.Contex
 func (s *taskModelRecoveryRetryStoreStub) BeginTaskModelRecoveryAttempt(_ context.Context, _ task.ModelRecoveryIntent, fence AgentInstanceFence) error {
 	s.beginCalls++
 	s.beginFence = fence
+	return nil
+}
+
+func (s *taskModelRecoveryRetryStoreStub) DeferAutomaticTaskModelRecovery(_ context.Context, intent task.ModelRecoveryIntent, fence AgentInstanceFence) error {
+	s.deferCalls++
+	s.deferFence = fence
+	s.intent = intent
+	s.intent.State = task.ModelRecoveryRetryAvailable
+	s.intent.Automatic = false
+	s.details.Task.Status = task.StatusWaitingUser
+	s.details.Task.WaitingReason = "task_model_recovery_retry_available"
 	return nil
 }
 
@@ -164,5 +177,43 @@ func TestBeginTaskModelRecoveryAttemptAllowsNewAgentGeneration(t *testing.T) {
 	staleFence.AgentInstanceID = intent.AgentInstanceID
 	if err := broker.BeginTaskModelRecoveryAttempt(context.Background(), intent, staleFence); err == nil || store.beginCalls != 1 {
 		t.Fatalf("failed Agent generation was allowed to consume recovery: calls=%d err=%v", store.beginCalls, err)
+	}
+}
+
+func TestBeginTaskModelRecoveryAttemptDefersQueuedAutomaticPlanWhenGateIsClosed(t *testing.T) {
+	value := attentionTask(4, task.StatusQueued, "")
+	value.Authorization.Version = 3
+	intent := attentionRecoveryIntent(value, task.ModelRecoveryScheduled)
+	intent.EventSequence = 21
+	intent.Automatic = true
+	if !ValidTaskModelRecoveryIntent(intent) {
+		t.Fatalf("automatic recovery intent is invalid: %+v", intent)
+	}
+	store := &taskModelRecoveryRetryStoreStub{taskStoreStub: &taskStoreStub{details: TaskDetails{Task: value}}, intent: intent, found: true}
+	broker := &CloudDSHToolBroker{store: store} // default is fail-closed
+	fence := AgentInstanceFence{TaskID: intent.TaskID, OwnerID: intent.OwnerID, InitiatorID: intent.InitiatorID,
+		AgentInstanceID: "agent_456", AgentGeneration: intent.AgentGeneration + 1, AgentSessionID: intent.AgentSessionID,
+		SupervisorID: "supervisor_1", LeaseOwner: "worker-next", LeaseVersion: intent.FailedLeaseVersion + 1,
+		AuthorizationVersion: intent.AuthorizationVersion, EngineVersion: intent.EngineVersion, ProfileVersion: intent.ProfileVersion}
+
+	if err := broker.BeginTaskModelRecoveryAttempt(context.Background(), intent, fence); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("closed gate should defer automatic recovery, got %v", err)
+	}
+	if store.deferCalls != 1 || store.deferFence != fence || store.beginCalls != 0 ||
+		store.intent.State != task.ModelRecoveryRetryAvailable || store.intent.Automatic ||
+		store.details.Task.Status != task.StatusWaitingUser || store.details.Task.WaitingReason != "task_model_recovery_retry_available" {
+		t.Fatalf("closed gate did not preserve the manual-safe path: store=%+v task=%+v", store, store.details.Task)
+	}
+
+	// An explicit user retry retains Automatic=false and remains usable while
+	// automatic recovery is disabled.
+	manual := store.intent
+	manual.State = task.ModelRecoveryScheduled
+	store.intent = manual
+	if err := broker.BeginTaskModelRecoveryAttempt(context.Background(), manual, fence); err != nil {
+		t.Fatalf("manual retry was blocked by the automatic recovery gate: %v", err)
+	}
+	if store.beginCalls != 1 || store.deferCalls != 1 {
+		t.Fatalf("manual retry did not use the ordinary one-attempt gate: store=%+v", store)
 	}
 }

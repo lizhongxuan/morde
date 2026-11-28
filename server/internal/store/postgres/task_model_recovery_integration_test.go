@@ -241,6 +241,69 @@ func TestPostgresTaskModelRecoveryPersistsAndConsumesOneStableAttempt(t *testing
 	}
 }
 
+func TestPostgresTaskModelRecoveryClosedGateDefersUnstartedAttemptToManualState(t *testing.T) {
+	f, failure, _, fence := createTaskModelRecoveryNoDispatch(t)
+	ctx := context.Background()
+	details, err := f.store.GetTask(ctx, fence.TaskID, f.ownerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	toolsetDigest := sha256.Sum256([]byte("verified read-only toolset"))
+	intent, accepted, err := f.store.ScheduleTaskModelRecovery(ctx, app.TaskModelRecoveryCommand{Task: details.Task, Failure: failure,
+		CheckpointThroughSequence: details.Task.CheckpointThroughSequence, CheckpointDigest: append([]byte(nil), details.Task.CheckpointDigest...),
+		ToolsetDigest: toolsetDigest[:], Auto: true})
+	if err != nil || !accepted || intent.State != task.ModelRecoveryScheduled || !intent.Automatic {
+		t.Fatalf("schedule automatic recovery before closing gate: intent=%+v accepted=%t err=%v", intent, accepted, err)
+	}
+	claimed, found, err := f.store.ClaimNextTask(ctx, "recovery-closed-gate-worker", time.Minute)
+	if err != nil || !found || claimed.ID != intent.TaskID || claimed.ModelRecovery == nil || claimed.ModelRecovery.State != task.ModelRecoveryScheduled {
+		t.Fatalf("claim scheduled recovery before gate close: task=%+v found=%t err=%v", claimed, found, err)
+	}
+	key := make([]byte, 32)
+	key[0] = 51
+	authenticator, err := app.NewAgentStopAuthenticator("revision-supervisor", key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instances, err := app.NewAgentInstanceService(f.store, authenticator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonce := make([]byte, 32)
+	nonce[0] = 52
+	lease, replayed, err := instances.Start(ctx, app.AgentInstanceStart{Fence: app.AgentInstanceFence{
+		TaskID: claimed.ID, OwnerID: claimed.OwnerID, InitiatorID: claimed.InitiatorID, AgentInstanceID: "agent-closed-gate",
+		AgentSessionID: claimed.AgentSessionID, SupervisorID: "revision-supervisor", LeaseOwner: claimed.Lease.Owner,
+		LeaseVersion: claimed.Lease.Version, AuthorizationVersion: claimed.Authorization.Version,
+		EngineVersion: claimed.AgentEngineVersion, ProfileVersion: claimed.AgentProfileVersion},
+		SupervisorNonce: nonce, LeaseDuration: 20 * time.Second})
+	if err != nil || replayed || lease.Fence.AgentGeneration != intent.AgentGeneration+1 {
+		t.Fatalf("start fenced Agent before gate close: lease=%+v replayed=%t err=%v", lease, replayed, err)
+	}
+	if err := f.store.DeferAutomaticTaskModelRecovery(ctx, *claimed.ModelRecovery, lease.Fence); err != nil {
+		t.Fatalf("close gate and defer scheduled recovery: %v", err)
+	}
+	deferred, found, err := f.store.GetTaskModelRecovery(ctx, intent.TaskID, f.ownerID, intent.TaskRevision)
+	if err != nil || !found || deferred.State != task.ModelRecoveryRetryAvailable || deferred.Automatic || deferred.AttemptStartedAt != nil ||
+		deferred.EventSequence <= intent.EventSequence {
+		t.Fatalf("closed gate did not preserve an unconsumed manual recovery: intent=%+v found=%t err=%v", deferred, found, err)
+	}
+	paused, err := f.store.GetTask(ctx, intent.TaskID, f.ownerID)
+	if err != nil || paused.Task.Status != task.StatusWaitingUser || paused.Task.WaitingReason != taskModelRecoveryAvailableReason ||
+		paused.Task.Lease.Owner != "" || paused.Task.EventSequence != deferred.EventSequence {
+		t.Fatalf("closed gate did not pause Task with the manual retry action: task=%+v err=%v", paused.Task, err)
+	}
+	var eventCount, recoveryLedgerCount int
+	if err := f.store.pool.QueryRow(ctx, `SELECT count(*) FROM task_events WHERE task_id=$1 AND sequence=$2 AND event_type='task.waiting_user'`,
+		intent.TaskID, deferred.EventSequence).Scan(&eventCount); err != nil || eventCount != 1 {
+		t.Fatalf("closed gate event count=%d err=%v", eventCount, err)
+	}
+	if err := f.store.pool.QueryRow(ctx, `SELECT count(*) FROM model_call_ledger WHERE owner_id=$1 AND source='task' AND call_id=$2`,
+		intent.OwnerID, intent.RecoveryCallID).Scan(&recoveryLedgerCount); err != nil || recoveryLedgerCount != 0 {
+		t.Fatalf("closed gate recovery model ledger rows=%d err=%v", recoveryLedgerCount, err)
+	}
+}
+
 func TestPostgresTaskModelRecoveryUsesDistinctLedgerIDAndReplaysSettledResponse(t *testing.T) {
 	f, gateway, failedProvider, fence, failedCall := revisionGatewayFixture(t)
 	ctx := context.Background()

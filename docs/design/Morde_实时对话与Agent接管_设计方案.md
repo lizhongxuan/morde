@@ -92,3 +92,11 @@
 - PC 端对尚未出现在当前会话的终态回告采用最多 8 次退避刷新；每次等当前消息读取完成再启动，收到与该 Task 关联的助手消息即停止。审批与澄清卡存在时不启动回告刷新。这样处理 terminal-delivery Worker 晚于 Task SSE 的窗口，同时保持刷新次数有界。
 - 尚未降低保守预留系数、抬高任务预算或绕过 hard budget。需先部署整数诊断并在一条新的只读 PC 搜索请求上取得输入/输出预留拆分；若输入本身超过剩余预算，应修剪可安全去重的上下文/schema 或明确说明预算约束，不能把未派发的搜索报告成已执行。
 - 本地验证：App/Worker 定向诊断测试、隔离 PostgreSQL Task reservation 用例、PC Assistant 测试（334 项）及 Portal typecheck 均通过。新诊断尚未部署；预算问题是否能在现有 50,000 硬额度内完成搜索与最终综合，必须由部署后真实 `morde-pc` 验收确认。Taskless 持久增量流仍未实现。
+
+## 自动恢复的灰度与停止策略
+
+- 自动恢复保持默认关闭。当前 `MORDE_TASK_MODEL_RECOVERY_AUTO` 在 Portal 启动时读取并作用于整组 Portal/Task Worker；线上是单一 `portal serve`，没有独立 Worker cohort、用户分组或恢复专属指标，因此不能安全地把它作为线上灰度开关。
+- 关闭后，尚未启动的自动恢复计划必须原子退回 `waiting_user / task_model_recovery_retry_available`，将恢复记录降为 `retry_available`，保留一次明确的手动入口；不得消费自动尝试额度或派发模型请求。用户主动点击后的计划标记 `automatic=false`，仍走原权限、修订、账本和 checkpoint fence。
+- 已开始的模型调用、结果或用量未知的调用不因开关变化而重新派发。必须先按已存在账本与 checkpoint 事实恢复；无法证明未产生副作用时只暂停并说明。
+- 未来灰度启用前，必须有独立 cohort 与可单独关停的门控，并用低基数指标比较「无有效入口却提示等待用户」、原会话终态回告覆盖率、自动恢复成功率及额外模型调用。指标不得包含 owner、Task、conversation 或 call ID。发生重复副作用或跨权限展示时立即关闭 cohort 并保留任务记录。
+- 这轮新增了关闭门时将排队自动计划原子退回手动入口的实现及测试。独立 cohort 和灰度指标仍未实现，所以线上继续关闭自动恢复，不能把默认关闭或隔离测试写成灰度通过。

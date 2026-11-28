@@ -69,5 +69,14 @@ func (b *CloudDSHToolBroker) BeginTaskModelRecoveryAttempt(ctx context.Context, 
 	if !ok {
 		return domain.NewError(domain.CodeUnsupported, "task model recovery storage is unavailable")
 	}
+	if intent.Automatic && !b.taskModelRecoveryAuto {
+		// A process-level kill switch must also stop durable automatic plans
+		// created by an earlier process. Convert the unstarted attempt into the
+		// existing manual-safe state before the DSH loop can dispatch a model call.
+		if err := store.DeferAutomaticTaskModelRecovery(ctx, intent, fence); err != nil {
+			return err
+		}
+		return domain.NewError(domain.CodeConflict, "automatic Task model recovery is disabled")
+	}
 	return store.BeginTaskModelRecoveryAttempt(ctx, intent, fence)
 }

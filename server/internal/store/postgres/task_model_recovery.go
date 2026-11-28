@@ -279,6 +279,99 @@ WHERE task_id=$1 AND task_revision=$2 AND state='retry_available'`, intent.TaskI
 	return result, err
 }
 
+// DeferAutomaticTaskModelRecovery closes an unstarted automatic attempt when
+// the process-level recovery gate is disabled. It atomically moves both the
+// Task and its recovery record to the existing manual-safe state, so a stale
+// scheduled row cannot be claimed or shown as actively recovering.
+func (s *Store) DeferAutomaticTaskModelRecovery(ctx context.Context, intent task.ModelRecoveryIntent, fence app.AgentInstanceFence) error {
+	if ctx == nil || !app.ValidTaskModelRecoveryIntent(intent) || intent.State != task.ModelRecoveryScheduled || !intent.Automatic {
+		return domain.InvalidArgument("task_model_recovery", "automatic recovery intent is invalid")
+	}
+	if fence.Validate() != nil || fence.TaskID != intent.TaskID || fence.OwnerID != intent.OwnerID ||
+		fence.InitiatorID != intent.InitiatorID || fence.AgentSessionID != intent.AgentSessionID ||
+		fence.AuthorizationVersion != intent.AuthorizationVersion || fence.EngineVersion != intent.EngineVersion ||
+		fence.ProfileVersion != intent.ProfileVersion || fence.AgentGeneration <= intent.AgentGeneration ||
+		fence.AgentInstanceID == intent.AgentInstanceID {
+		return domain.InvalidArgument("task_model_recovery", "attempt fence is invalid")
+	}
+	return s.WithTx(ctx, func(tx pgx.Tx) error {
+		projectFence, err := lockProjectTaskWorkspaceFence(ctx, tx, intent.TaskID, false)
+		if err != nil {
+			return err
+		}
+		ownerID, err := taskOwnerIDForActor(ctx, tx, intent.TaskID, intent.InitiatorID, true, false)
+		if err != nil {
+			return err
+		}
+		if ownerID != intent.OwnerID {
+			return domain.NewError(domain.CodeUnauthenticated, "task owner changed before recovery was deferred")
+		}
+		current, err := lockAuthorizedAgentTask(ctx, tx, fence)
+		if err != nil {
+			return err
+		}
+		if current.InitiatorID != intent.InitiatorID || current.ProjectID != projectFence.projectID ||
+			current.InstanceID != fence.AgentInstanceID || current.Generation != fence.AgentGeneration || current.SessionID != intent.AgentSessionID ||
+			current.EngineVersion != intent.EngineVersion || current.ProfileVersion != intent.ProfileVersion ||
+			current.CheckpointThrough < intent.CheckpointThroughSequence ||
+			current.CheckpointThrough == intent.CheckpointThroughSequence && !bytes.Equal(current.CheckpointDigest, intent.CheckpointDigest) {
+			return domain.NewError(domain.CodeConflict, "Task recovery checkpoint or authorization changed")
+		}
+		currentTask, err := sqlcgen.New(tx).GetTask(ctx, sqlcgen.GetTaskParams{ID: intent.TaskID, OwnerID: ownerID})
+		if err != nil {
+			return storeError("read current Task model recovery gate", "task", err)
+		}
+		if currentTask.CurrentRevision != intent.TaskRevision || currentTask.DesiredRevision != intent.TaskRevision ||
+			currentTask.AuthVersion != intent.AuthorizationVersion || currentTask.CheckpointThroughSeq != current.CheckpointThrough ||
+			!bytes.Equal(currentTask.CheckpointDigest, current.CheckpointDigest) {
+			return domain.NewError(domain.CodeConflict, "Task revision, authorization, or checkpoint changed before recovery was deferred")
+		}
+		if err := verifyProjectTaskWorkspaceFence(ctx, tx, intent.TaskID, projectFence); err != nil {
+			return err
+		}
+		currentAgent, err := lockAgentInstance(ctx, tx, intent.TaskID, ownerID, fence.AgentGeneration)
+		if err != nil {
+			return err
+		}
+		if currentAgent.State != "active" || currentAgent.Fence.AgentInstanceID != fence.AgentInstanceID ||
+			currentAgent.Fence.AgentSessionID != fence.AgentSessionID || currentAgent.Fence.LeaseOwner != fence.LeaseOwner ||
+			currentAgent.Fence.LeaseVersion != fence.LeaseVersion || currentAgent.Fence.AuthorizationVersion != fence.AuthorizationVersion ||
+			!currentAgent.ExpiresAt.After(time.Now()) {
+			return domain.NewError(domain.CodeConflict, "Task recovery Agent lease is no longer current")
+		}
+		stored, found, err := loadTaskModelRecoveryIntent(ctx, tx, intent.TaskID, ownerID, intent.TaskRevision, true)
+		if err != nil {
+			return err
+		}
+		if !found || !sameTaskModelRecoveryIntent(stored, intent) || stored.State != task.ModelRecoveryScheduled || !stored.Automatic {
+			return domain.NewError(domain.CodeConflict, "Task automatic recovery is no longer scheduled")
+		}
+		sequence, err := transitionTaskToModelRecoveryState(ctx, tx, intent.TaskID, ownerID, fence,
+			task.StatusWaitingUser, taskModelRecoveryAvailableReason)
+		if err != nil {
+			return err
+		}
+		updated, err := tx.Exec(ctx, `UPDATE task_model_recovery_schedules SET state='retry_available',automatic=false,
+event_sequence=$3,updated_at=clock_timestamp() WHERE task_id=$1 AND task_revision=$2 AND state='scheduled' AND automatic=true`,
+			intent.TaskID, intent.TaskRevision, sequence)
+		if err != nil {
+			return fmt.Errorf("defer automatic Task model recovery: %w", err)
+		}
+		if updated.RowsAffected() != 1 {
+			return domain.NewError(domain.CodeConflict, "Task automatic recovery was already consumed")
+		}
+		payload, err := json.Marshal(map[string]any{"status": string(task.StatusWaitingUser), "reason": taskModelRecoveryAvailableReason,
+			"revision": intent.TaskRevision, "recovery_state": string(task.ModelRecoveryRetryAvailable)})
+		if err != nil {
+			return fmt.Errorf("encode deferred Task model recovery event: %w", err)
+		}
+		if err := insertTaskEvent(ctx, tx, task.Event{TaskID: intent.TaskID, Sequence: sequence, Type: "task.waiting_user", Payload: payload}); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
 func (s *Store) BeginTaskModelRecoveryAttempt(ctx context.Context, intent task.ModelRecoveryIntent, fence app.AgentInstanceFence) error {
 	if ctx == nil || !app.ValidTaskModelRecoveryIntent(intent) {
 		return domain.InvalidArgument("task_model_recovery", "recovery intent is invalid")

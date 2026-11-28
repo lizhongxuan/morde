@@ -68,12 +68,15 @@
 - [ ] 待验证：已补齐 `dsh_recovery_unresolved` 的原对话安全中文兜底；待服务器恢复可访问后，用实际 `morde-pc` 验证截图对应任务的失败分类、终态回告与气泡可见性。服务端历史终态回告已因会话凭据过期被作废，无法由客户端重放。
 - [x] 隔离工作树回归：`go test ./internal/api ./internal/app ./cmd/portal -count=1`；恢复专属 Worker 测试（含完整搜索恢复 E2E）；本机 PostgreSQL `go test ./internal/store/postgres -run 'Test(DurableRecoveredToolAdmission|PostgresTaskModelRecovery)' -count=1`；DSH Runtime 恢复启动协议测试；PC `npm test -- src/routes/Assistant.test.tsx`（289/289）。2026-11-28 当前结果与命令见下方记录。
 - [ ] 用打包 PC 完成端到端回归，保存目标 commit、任务/事件关联、三种页面状态与实际派发次数；全量 Worker 包仍未通过，2026-11-28 的具体失败见下方记录，修复/补齐对应测试环境后重跑。
+- [x] PostgreSQL + 两个独立 Go Worker 进程的恢复正例：首进程完成只读搜索、确认零用量失败并持久化计划后被强制终止；新进程从 PostgreSQL 恢复同一 Task，校验 lease/generation 与恢复 call ID 更新、搜索只派发一次、模型读到已结算结果、原会话只交付一条助手答案及一个 `task.result`。
 - [ ] 真实 `morde-pc` 交互尚未稳定通过：本轮 `make pc` 构建并启动客户端后，隔离旁聊的无工具快答一直停留在连接状态，未收到助手回复；早先一次快速问答通过不代表当前连接稳定。仍需确认未知结果只保留在任务详情、原对话只显示自然语言说明，且终态回告模型未知时仍能收到确定性说明。
 - [ ] 正例：快答无 👌🏻；耗时任务一次 👌🏻；可重试故障自动恢复后出结果；耗尽后原对话收到说明；真实审批能继续。
 - [x] 双 Worker 同时竞争同一恢复尝试：PostgreSQL 用例断言恰好一个成功、另一个得到冲突；租约重启后不会再消费同一尝试额度。
-- [ ] 其余反例：结果或用量未知、工具不在授权范围、权限撤销、用户取消、checkpoint 不匹配、写入结果不明。断言不发生不安全派发、跨账号展示或重复交付。
+- [x] PostgreSQL 负例：已排队恢复后撤销授权版本、取消 Task 或破坏绑定的 checkpoint 历史，均拒绝 Begin；计划不进入 `attempting`，不写恢复模型调用账本/响应。
+- [ ] 其余反例：未知结果/用量禁止自动计划的完整 PostgreSQL/Worker 派发断言仍缺（目前是分类/资格单测）；工具 allowlist 已有闭合集测试，写入结果未知已有独立进程恢复 E2E，但尚未与模型自动恢复资格合成在同一个 E2E。
 - [x] 恢复诊断输入：服务端从等待事件提取白名单失败事实，终态解释模型请求只收到自然语言诊断、不包含工具名/调用 ID/内部分类；应用与 PostgreSQL 集成测试覆盖。
-- [ ] 自动恢复独立灰度并可关闭；关闭后仍保留状态修复与原对话回告。比较「无入口却提示等待用户」次数、任务回告覆盖率、恢复成功率及额外模型调用。任何重复副作用或跨权限展示立即停用自动恢复。
+- [x] 关闭门保护：旧进程已排队但未启动的自动恢复在新进程关闭开关时，原子转为 `waiting_user / retry_available`，不消耗尝试、不派发模型调用，并保留手动 retry；应用与 PostgreSQL 回归覆盖。
+- [ ] 独立灰度 cohort 与可比较指标仍未实现；当前只有 Portal 进程级开关，没有独立 Worker/用户分组或专属低基数指标。生产自动恢复保持关闭，不因隔离 E2E 打开线上恢复。
 
 ## T08 · P0/P1：实时对话、真实失败说明与 Agent 接管（进行中）
 
@@ -205,3 +208,13 @@
 - 线上诊断：部署后只读读取了白名单预算失败日志，未出现新的 `task_budget_exhausted` 样本；这是因为本轮无法从 PC 登录创建新请求，不能据此判断预算问题已消失。旧 `unknown` 事件不可追溯补出输入/输出拆分。未调整 Task 预算、估算器、授权、重放或任何现存任务。
 - 已通过的代码验证仍为上一节所列 App/Worker/PostgreSQL 定向用例、Portal Assistant 测试 334 项、Portal typecheck、`git diff --check`；`make pc` 本轮构建通过。真实 PC 登录后的普通快答、搜索、失败解释与阶段耗时样本尚未验收。
 - 后续门槛：恢复 PC 界面输入能力或由用户在当前 PC 登录页完成登录后，继续在全新对话提交一条快答和一条只读搜索；读取拒绝请求的整数预留拆分，再提交针对性修复并验证来源、单次派发和原会话助手消息。Taskless 持久增量流仍未实现，`T07`/`T08` 保持进行中，自动恢复继续关闭。
+
+### 2026-11-28 续验（Worker 进程重启与自动恢复关停门）
+
+- 实际 Worker 进程重启 E2E：新增 `TestCloudDSHModelRecoverySurvivesWorkerProcessRestart`。首个独立 Go Worker/DSH Node 进程完成合成只读搜索、收到确认零用量的模型限流并持久化恢复计划后，被父进程 SIGKILL；新 Worker 进程从同一隔离 PostgreSQL 恢复。断言 lease/generation 和 recovery call ID 更新、模型读到已结算搜索、搜索 operation 恰好一次、结果与 `task.result` 只交付一次到原会话。PostgreSQL 17 下 `go test ./internal/worker -run '^TestCloudDSHModelRecoverySurvivesWorkerProcessRestart$' -count=1` 通过（3.947 秒）。
+- 关停设计与实现：关闭进程级自动恢复开关后，旧进程留下的未启动 `scheduled` 计划不会继续请求模型；新 Worker 使用当前 Task/Agent/checkpoint fence，在同一 PostgreSQL 事务中把 Task 转为 `waiting_user / task_model_recovery_retry_available`、计划转为 `retry_available / automatic=false` 并写状态事件。用户手动 retry 仍可走原入口。不会撤销已开始的调用或把结果未知的调用改成可自动重试。
+- 自动恢复安全验证：`go test ./internal/app -run 'Test.*TaskModelRecovery|TestBeginTaskModelRecoveryAttempt' -count=1`、`go test ./internal/api ./internal/app ./cmd/portal -count=1`、PostgreSQL `go test ./internal/store/postgres -run '^TestPostgresTaskModelRecovery' -count=1` 全通过。PostgreSQL 负例覆盖撤销授权版本、取消 Task、恢复绑定的 checkpoint 历史失配；均拒绝进入 `attempting`，没有恢复调用账本或响应。`git diff --check` 通过。
+- 灰度审查：生产开关未设置，代码默认关闭。它仍是单一 Portal 进程的全局开关，没有独立 Worker/用户 cohort 或恢复专属指标；本轮只补安全关停，不开启线上灰度。灰度 cohort、低基数指标与可比较基线仍未通过。
+- 服务器基线只读核验：`morde-portal.service` active，`/healthz` 和 `/readyz` 返回 200；`/opt/morde/.deployed-head` 指向 `38f610ce`，smoke 记录为 5 pass、0 fail、5 exception（无 `CH_TEST_DATABASE_URL` 的 PostgreSQL 门槛及真实 PC/DSH 门槛）。当前二进制 `vcs.revision=38f610ce` 且 `vcs.modified=true`；源码 checkout 无 tracked diff，但有一个既存未跟踪文件，本轮没有清理。此服务器基线还未包含本节新增代码。
+- 实际 PC 阻塞：`morde-pc` 窗口仍在登录页。CUA 能观察界面，但点击和输入返回 `noWindowsAvailable`；本轮未提交登录或测试消息，因此真实快答/搜索/失败气泡、阶段延迟与审批入口仍未验收。未通过后台 Web/API 代测。
+- 合并状态：GitHub `release@2120d0bb` 与此前本地 `release@d559c01a` 的 tree 相同（`10316138`）；已将该远端 release 合并到当前本地 `release`，避免从陈旧远端跟踪点发布。新增代码与本节 TODO 尚待提交、推送及部署；不得据以上本地隔离测试把 T07 标为完成。

@@ -44,6 +44,7 @@ type TaskModelRecoveryRetryResult struct {
 type TaskModelRecoveryStore interface {
 	ScheduleTaskModelRecovery(context.Context, TaskModelRecoveryCommand) (task.ModelRecoveryIntent, bool, error)
 	RequestTaskModelRecoveryRetry(context.Context, IdempotencyRecord, TaskModelRecoveryRetryCommand) (TaskModelRecoveryRetryResult, error)
+	DeferAutomaticTaskModelRecovery(context.Context, task.ModelRecoveryIntent, AgentInstanceFence) error
 	BeginTaskModelRecoveryAttempt(context.Context, task.ModelRecoveryIntent, AgentInstanceFence) error
 	GetTaskModelRecovery(context.Context, string, string, int64) (task.ModelRecoveryIntent, bool, error)
 }
