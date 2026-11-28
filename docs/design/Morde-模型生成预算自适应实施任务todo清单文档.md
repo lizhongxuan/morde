@@ -1,6 +1,6 @@
 # Morde 模型生成预算自适应实施任务 TODO
 
-**状态：实现基线为 `release@e689a8e8`，本地 `release` 已集成候选提交 `663d9250`（merge commit `0c906232`）；预算功能已合入分支，测试机部署与真实 PC 验收仍待完成。B01–B04 的本地协议、预算计算、账本、影子、失败恢复与核对子门禁已有部分通过；Portal 的 Task planner admission 与 shadow 仍默认关闭，生产配置未启用，真实 PC 服务端目录读写、线上影子数据和真实 provider 账单仍未验收。B01 同一 Task 内真实 DSH child Agent 的并行预算计划/调用身份/DSH settle 协议测试通过，PG ledger compaction 及 child 并发结算仍待验；B04 跨 owner 共享项目并发预留与超额归属 PG 子门禁通过。B03 shadow 已同步到自适应协议上限，并补测 >32,768 的候选计划；可信阶段信号仍缺。B05 已有高于 32,768 的本地签约 cap 整链证据；B06 的有限长回复传输与持久化实现及定向本地验证已通过；B07 的加密部分结果保存、签约纯文本有限续写和新输入优先已完成本地实现与测试。B08 现已按 exact `long_form` 阶段策略计算 `O_send=min(O_goal,O_safe)`；默认未配置 `long_form` 数值，所以默认部署不开放此路径。B05–B08 真实 PC/生产门禁尚未验收，B01–B04 生产门禁也未满足。旧候选 `194ba92e` 的 P0 smoke 曾通过（8 pass/0 fail/2 预期例外），但测试机上次只读确认的迁移基线为 `277/277`，该候选无法直接更新。新候选 `663d9250` 基于 `8c87122f`，本地 P0 smoke 8 pass/0 fail/2 预期例外、DSH 构建、runtime 299/299、T22 Worker 与预算等待 PG 回归通过；测试机当前 health/SSH 超时，候选未上传，远端 dry-run 没有完整记录，未执行部署。B09 未完成，B10 尚未开始；无真实 provider 调用或 PC 端长回复验收。**
+**状态：预算实现已集成并同步到 `release@ee618bed`（`origin/release` 同一提交）；候选 `663d9250` 由 merge commit `0c906232` 纳入历史。截图所示 7 个 Codex worktree 已核对并删除，分支引用保留；另有未提交的任务中断/输出捕获等工作区改动，未纳入本次预算修改。当前 release 复验：DSH runtime 302/302、Worker→PostgreSQL→fake HTTP 整链及 PostgreSQL 容量恢复测试通过，DSH 来源补丁和 vendor checksum 校验通过。测试 Portal health 请求超时，旧 dry-run 仍无最终输出；没有部署、真实 provider 调用、远端写入或 PC 真实长回复验收。B01–B09 的生产/PC 门禁仍未完成，B10 尚未开始。**
 评审依据：《Morde_个人Agent_模型预算与可靠交付实施方案.md》、固定提交的 Morde 源码，以及锁定版本 DSH 的本地包契约和离线实跑。保留原 B01–B10 编号；已实现 DSH opt-in IPC/Worker 协议探针、Task compaction prepare、假 HTTP 集成测试、模型输出能力元数据、阶段策略快照及 PostgreSQL 预算准备账本。Portal 可单独加载显式路由阶段策略，但不会因此启用 Task admission 或 shadow sampling；默认配置没有任何阶段预算值。第25–27节记录旧候选 smoke、00270 迁移失败与本地 schema 修复；第28节记录当前候选本地验证、冲突核查及测试机不可达状态。
 
 **方案复核决策（2026-11-27）：** 采纳方案的 P0–P4 门禁、等待/暂停语义、周期止损与试点质量验收；保留“未知能力不猜、短答不多一次模型往返、历史 Task/Schedule 合同不迁移、未知派发结果继续占用”的边界。B03 影子原型不再作为开始 B04 账本工作的硬依赖；预算策略与 `O_send` 计算仍须在 B04/P1 试点启用前通过影子核验。方案中的 `4,000` 仅是反例数值，拟议 API 字段不代表现有接口；均不写成默认额度或既有合同。
@@ -403,3 +403,11 @@ P0 协议子门禁通过后可开始 P1 的 B02、B04；B03 影子计算可与 B
 - **代码树核对：** 合并前 `git merge-tree --write-tree` 结果与 `release` 第一父提交 tree 一致；实际合并后 `HEAD^{tree}` 与 `HEAD^1^{tree}` 仍相同。候选五个文件在合并前已与 `7acb032c` 内容完全一致，所以本次合并记录了候选提交历史，没有重复改写代码。
 - **范围与发布：** 预算基础实现提交 `4ed9f1c9` 已是 `release` 祖先。本次只在本地合入候选分支，没有 push。`release` 相对 `origin/release` ahead 2（候选提交与 merge commit）；`origin/release` 原先已有相同代码树内容。
 - **验证与状态：** 合并前后候选文件树一致，`git diff --check HEAD^1 HEAD` 通过；既有 P0 smoke 8/0/2、DSH/runtime 299/299、T22 Worker 与 PostgreSQL 定向验证仍对应候选代码。本次没有因 tree 未变而重跑测试。B09 仍未完成：测试机 health/SSH 超时，未部署或执行真实 PC/provider 验收。
+
+
+## 30. 当前 release 集成与本地复验（2026-11-28）
+
+- **release 与 worktree：** 本次 TODO 更新提交前最终核对时，HEAD 为 `release@ee618bed`，`origin/release` 指向相同提交；该基线之后的提交 `ee618bed` 只增加终态诊断投递回归等非预算变更；对比 `0f83fab0..ee618bed`，预算 runtime/服务端实现文件无差异。候选 `663d9250` 经 `0c906232` 合入且是 `release` 祖先。截图所示 7 个 Codex worktree 均已核对后删除：预算候选已合入；其余分支内容已在 release、被后续逻辑取代，或与 release tree 相同。分支引用保留。隐藏 detached worktree 未在本次清理范围内；release 工作区的任务中断/输出捕获等其他未提交改动均保留，未纳入预算改动。
+- **当前源码验证：** `runtime/morde-cloud-runtime` 执行 `npm test`，自动重建 DSH compaction 后 **302/302 通过**（102.6 秒）；`sh scripts/verify-dsh-upstream.sh` 确认锁定 DSH 来源 `fcc0ad462172522aaf5c93a7b2e01f6b9f0b0159` 及 release 输出预算补丁，compaction 的 6 个文件 SHA-256 全部通过；`server` 定向 Worker 整链 `TestCloudDSHModelBudgetPostgresHTTPUsesOneSignedCapAndSettlesOnce` 通过；`TestPostgresModelBudgetCapacity` 组在本机隔离 PostgreSQL 通过（18.478 秒）；`git diff --check` 与 staged diff check 通过；这些自动化结果覆盖当前 release 的预算实现文件，执行工作区另含未提交的任务中断/输出捕获改动。
+- **测试环境校正：** 首次重跑时旧 Unix socket 路径已不存在，PG 用例无法连接；Worker 命令未设置 `CH_TEST_DATABASE_URL` 时相应用例被跳过。改用当前本机 PostgreSQL TCP 连接后重跑，两项均通过。首次失败/跳过不计入成功证据。
+- **远端边界：** 测试 Portal `/healthz` 请求仍超时；之前启动的只读 dry-run 进程句柄仍无输出，不能确认其最终状态。没有登录或改远端数据库、上传文件、部署、迁移或重启服务，也没有调用真实 DeepSeek/provider。因服务端不可达，B09 的远端 smoke/dry-run、真实 PC 长回复超过 2,048 模型输出 token、刷新/重连、取消/结算及质量/延迟基线仍待验收；B01–B09 生产/客户端门禁不得勾选，B10 仍未开始。
