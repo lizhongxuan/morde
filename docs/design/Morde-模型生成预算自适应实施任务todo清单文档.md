@@ -452,6 +452,6 @@ P0 协议子门禁通过后可开始 P1 的 B02、B04；B03 影子计算可与 B
 ## 36. 测试机存储和 v4 备份前置条件复核（2026-11-28）
 
 - **只读主机核查：** Portal `/healthz` 返回 HTTP 200。SSH 只读 `lsblk` 显示只有 100 GiB `/dev/vda` 系统盘；`/` 在 `/dev/vda3`，约 33 GiB 可用。Workspace 现挂载为 20 GiB `/dev/loop0`，backing file `/var/lib/morde/workspace-sync.img` 位于 `/dev/vda3`，文件 apparent size 20 GiB、实际分配约 135 MiB。它仍是系统盘上的稀疏 loop 文件，不满足 Workspace 独立固定容量文件系统要求。
-- **数据与环境现状：** PGDATA 约 589 MiB、Docker named-volume 目录约 3.9 GiB、Site 约 12 KiB，均在系统盘；Workspace loop 内容约 2.3 MiB。`/etc/cloudhost/cloudhost.env` 缺少 `CH_POSTGRES_WAL_ARCHIVE_DIR`、`CH_WORKSPACE_SYNC_CURRENT_FILES_DIR` 和新 Workspace data-root 配置。`/var/backups/morde` 约 75 MiB，现有条目是旧 dump/Portal 归档，没有 v4 bundle 目录；不能作为 v4 备份证据。
+- **数据与环境现状：** 最新只读复核显示 PGDATA 约 593 MiB、Docker named-volume 目录约 3.9 GiB、Site 约 12 KiB，均在系统盘；Workspace loop 内容约 2.3 MiB。`/etc/cloudhost/cloudhost.env` 缺少 `CH_POSTGRES_WAL_ARCHIVE_DIR`、`CH_WORKSPACE_SYNC_CURRENT_FILES_DIR` 和新 Workspace data-root 配置。`/var/backups/morde` 约 75 MiB，现有条目是旧 dump/Portal 归档，没有 v4 bundle 目录；不能作为 v4 备份证据。
 - **存储布局决策：** 部署安装脚本会校验 Workspace mount 的文件系统设备与 `/`、Docker、Site、PGDATA 均不同；WAL 归档还必须与 Workspace mount 不同。根分区仅有 33 GiB 可用且承载 PGDATA，按 README 不能把其中另一个目录视作磁盘隔离或离线备份。当前最低建议是 Workspace 20 GiB 独立盘 + WAL/v4 备份 20 GiB 独立盘；两盘参考总价约 ¥20/月或按量 ¥1.008/天，实际价格需控制台确认。系统盘现有空闲量可承载当前 `verify` 临时解包，但不替代独立 v4 bundle 目标。
 - **未执行项：** 本轮仅作 HTTP、SSH、磁盘、环境变量名及目录大小的只读核查；没有创建/挂载云盘、改环境变量或数据库、停止服务、上传候选、执行迁移、替换二进制或重启服务。早前仅询问 20 GiB Workspace 盘；由于发现 v4 备份/WAL 还需独立存储，该单盘方案尚未获批且不足以继续部署，需先确认更新后的资源方案。
