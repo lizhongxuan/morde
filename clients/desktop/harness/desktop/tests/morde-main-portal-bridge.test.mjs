@@ -98,6 +98,7 @@ function harness({ checkpoint, portalLoadError, voiceWaveformEnabled = false, pa
   }
 
   class FakeWindow {
+    static getFocusedWindow() { return windows.find((window) => window.focused && !window.isDestroyed()) ?? null; }
     constructor(options) {
       this.options = options;
       this.events = new Map();
@@ -218,7 +219,7 @@ function harness({ checkpoint, portalLoadError, voiceWaveformEnabled = false, pa
   }
 
   return {
-    root, userData, handlers, windows, views, partitions, appEvents, dialog, menus, notifications,
+    root, userData, handlers, windows, views, partitions, appEvents, dialog, menus, notifications, BrowserWindow: FakeWindow,
     async ready() {
       let timeout;
       try {
@@ -501,6 +502,7 @@ test('desktop completion reminders baseline, filter, deduplicate, suppress foreg
       ], cursor: 'cursor-one', has_more: false });
       if (cursor === 'cursor-one') return json({ items: [{ id: 'n0000003', kind: 'completed', summary: 'duplicate detail' }], cursor: 'cursor-two', has_more: false });
       if (cursor === 'cursor-two') return json({ items: [{ id: 'n0000004', kind: 'completed' }], cursor: 'cursor-three', has_more: false });
+      if (cursor === 'cursor-three') return json({ items: [{ id: 'n0000005', kind: 'completed' }], cursor: 'cursor-four', has_more: false });
       return json({ items: [], cursor: 'cursor-four', has_more: false });
     },
   });
@@ -538,12 +540,21 @@ test('desktop completion reminders baseline, filter, deduplicate, suppress foreg
     await flushMain();
     assert.equal(h.notifications.length, 1, 'a completion received while the client is foregrounded must not pop');
 
+    h.windows[0].focused = false;
+    const auxiliaryWindow = new h.BrowserWindow({ title: 'morde-pc · Host' });
+    auxiliaryWindow.focused = true;
+    h.fireIntervals();
+    await flushMain();
+    assert.equal(h.notifications.length, 1, 'a focused Morde auxiliary window must suppress a system popup too');
+
     assert.deepEqual(await h.invoke('morde:desktop-notification-toggle', portal, [false]), { enabled: false });
     const callsAfterOptOut = incrementalCalls().length;
     h.fireIntervals();
     await flushMain();
     assert.equal(incrementalCalls().length, callsAfterOptOut, 'opt-out must stop polling');
     assert.deepEqual(await h.invoke('morde:desktop-notification-settings', portal), { enabled: false });
+    auxiliaryWindow.focused = false;
+    auxiliaryWindow.close();
     h.windows[0].focused = false;
     h.notifications[0].click();
     await flushMain();

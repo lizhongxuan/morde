@@ -27,7 +27,7 @@
 ## PR C · 桌面通知
 
 - [x] **M10 增量合同。** `notification.go`、`notification_source_store.go`、API/OpenAPI：保留现有站内列表/已读协议，新增按账号可持久提交顺序消费的完成增量合约。定义首次基线、最大页长、续页游标、游标过期恢复、授权过滤以及所有写入路径或等价的专用索引。**验收：**迁移与真实双连接 PostgreSQL 集成测试包含反向提交、翻页、断线和撤权；先后顺序不依赖时间。将 E4 的合成漏读案例变成测试；不能只用 `MAX(created_at)`、最新一页或未锁定的预分配序列。**验证：**`go test ./internal/api ./internal/app -count=1`、`go test ./internal/api ./internal/app ./internal/worker` 通过；隔离工作树 PG16 下 `go test ./internal/store/postgres -run 'TestPostgres(NotificationUpdates|TaskCompletionNotification)' -count=1` 3 项通过；变更行 golangci-lint 0 issue；M10 完整列表接口保持原样，增量响应仅含 `id`/`kind`。全仓 `make lint` 仍有 10 项超出本项文件边界的问题。
-- [ ] **代码与 mock 验证完成，签名包系统提醒待验 · M11 Electron 提醒。** `morde-main.ts`、受信 preload、设置：只交付已完成事件，灰度默认关闭，开启起算；前台在会话看结果，后台通过 Electron 提醒。按服务实例/账号/通知 ID 去重；默认文案不含标题或内容。账号注销、切换、权限拒绝、未签名或系统不可用走站内兜底。**验证：**桌面逻辑定向测试 51/51、Portal 账户设置 3/3、两端类型检查及 desktop build 通过；过期游标恢复并发回归通过。签名 macOS 包和真实系统弹窗/点击尚未验收。`make pc` 构建后，CUA 绑定到已有默认用户目录的 Electron 进程；新隔离实例无法与同路径进程区分，因此未把可见设置页计为本轮候选验收。该项保持未勾选。
+- [ ] **代码与 mock 回归完成，签名包系统提醒待验 · M11 Electron 提醒。** `morde-main.ts`、受信 preload、设置：只交付已完成事件，灰度默认关闭，开启起算；前台在会话看结果，后台通过 Electron 提醒。按服务实例/账号/通知 ID 去重；默认文案不含标题或内容。账号注销、切换、权限拒绝、未签名或系统不可用走站内兜底。**验证：**桌面通知定向测试 5/5、完整 desktop Node 测试 308/308、Portal 账户设置 3/3、两端类型检查及 desktop build 通过；过期游标恢复并发回归通过。前台判定现使用 Electron 当前聚焦窗口，回归覆盖 Host 等辅助窗口聚焦时抑制提醒。签名 macOS 包和真实系统弹窗/点击尚未验收。`make pc` 构建后，CUA 绑定到已有默认用户目录的 Electron 进程；新隔离实例无法与同路径进程区分，因此未把可见设置页计为本轮候选验收。该项保持未勾选。
 
 ## PR D · 两项风险较高的可选增强
 
