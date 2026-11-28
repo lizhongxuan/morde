@@ -354,6 +354,13 @@ func (b *CloudDSHToolBroker) pauseForExistingMCPApproval(ctx context.Context, de
 }
 
 func currentMCPTaskRevision(current task.Task) (*int64, error) {
+	// A hidden direct-route tool Task has no user-editable revisions or plan.
+	// Its persisted creation fence is revision 0, which is still a valid value
+	// for the MCP operation ledger and must not block the one Broker call.
+	if current.InternalTool && current.CurrentRevision == nil && current.DesiredRevision == nil {
+		revision := int64(0)
+		return &revision, nil
+	}
 	if current.CurrentRevision == nil || current.DesiredRevision == nil || *current.CurrentRevision < 0 ||
 		*current.CurrentRevision != *current.DesiredRevision {
 		return nil, domain.NewError(domain.CodeConflict, "MCP Task revision is unavailable or changing")

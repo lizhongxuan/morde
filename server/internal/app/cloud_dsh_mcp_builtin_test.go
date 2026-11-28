@@ -119,6 +119,35 @@ func newBuiltinSearchFixture(t *testing.T, client MCPConnectorToolClient) (*Clou
 	return broker, store, fixture.store.details.Task
 }
 
+func TestInternalConversationRouteSearchDoesNotRequireTaskPlanMetadata(t *testing.T) {
+	client := &cloudDSHMCPClientStub{result: MCPConnectorToolResult{Text: []string{"Title: DeepSeek documentation\nURL: https://api-docs.deepseek.com"}}}
+	broker, store, claimed := newBuiltinSearchFixture(t, client)
+	claimed.InternalTool = true
+	claimed.CurrentRevision, claimed.DesiredRevision = nil, nil
+	store.details.Task.InternalTool = true
+	store.details.Task.CurrentRevision, store.details.Task.DesiredRevision = nil, nil
+	call := ModelToolCall{CallID: "morde_route_tool_m1234567", Name: cloudDSHWebSearchToolName,
+		Arguments: `{"query":"DeepSeek official website"}`}
+
+	result, err := broker.Execute(context.Background(), claimed, call)
+	if err != nil || result.Status != AgentToolSucceeded || client.callCalls != 1 || client.lastTool != "searxng_web_search" {
+		t.Fatalf("internal route search = status %q, calls=%d, remote tool %q, err=%v; want one authorized search without Task-plan fields",
+			result.Status, client.callCalls, client.lastTool, err)
+	}
+	operation, found := store.operations[agentOperationKey(call.CallID)]
+	if !found || len(store.operations) != 1 || operation.Status != task.OperationSucceeded || operation.TaskRevision == nil ||
+		*operation.TaskRevision != 0 || store.lastDispatched.TaskRevision == nil || *store.lastDispatched.TaskRevision != 0 {
+		t.Fatalf("internal route operation was not durably fenced at revision zero exactly once: found=%t operations=%d status=%q revision=%v",
+			found, len(store.operations), operation.Status, operation.TaskRevision)
+	}
+}
+
+func TestOrdinaryMCPTaskStillRequiresTaskPlanRevision(t *testing.T) {
+	if _, err := currentMCPTaskRevision(task.Task{}); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("ordinary task without revision metadata error = %v; want conflict", err)
+	}
+}
+
 type builtinSearchIntegrationClient struct {
 	client *mcpconnector.BuiltinSearchClient
 }
