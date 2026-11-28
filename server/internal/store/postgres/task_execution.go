@@ -2500,7 +2500,7 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'pending',$17,$18
 			}
 			questionsJSON, marshalErr := json.Marshal(questions)
 			if marshalErr != nil {
-				return task.Event{}, fmt.Errorf("encode task clarification questions: %w", marshalErr)
+				return fmt.Errorf("encode task clarification questions: %w", marshalErr)
 			}
 			_, err = tx.Exec(ctx, `INSERT INTO task_clarification_requests
 (id, task_id, version, model_step_id, call_id, question, questions, status)
