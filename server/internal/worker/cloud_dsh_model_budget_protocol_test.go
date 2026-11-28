@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"morde/server/internal/app"
+	"morde/server/internal/domain"
 	"morde/server/internal/domain/task"
 )
 
@@ -23,6 +24,24 @@ func TestCloudDSHCapacityWaitSurvivesBudgetDenialPipeFailure(t *testing.T) {
 	got = cloudDSHModelBudgetPlanDenialError(otherErr, writeErr)
 	if !errors.Is(got, writeErr) || errors.Is(got, errCloudDSHModelBudgetCapacityWaiting) {
 		t.Fatalf("non-capacity denial with failed write = %v; want original pipe error and no wait sentinel", got)
+	}
+}
+
+func TestCloudDSHContextPressureDenialKeepsRuntimeLoopOpen(t *testing.T) {
+	planErr := domain.NewError(domain.CodeQuotaExceeded, "context window is below the stage minimum")
+	planErr.Details["reason"] = "context_window_below_stage_minimum"
+	if got := cloudDSHModelBudgetPlanDenialError(planErr, nil); got != nil {
+		t.Fatalf("typed context pressure denial = %v; want recoverable runtime response", got)
+	}
+
+	writeErr := errors.New("runtime pipe closed")
+	if got := cloudDSHModelBudgetPlanDenialError(planErr, writeErr); !errors.Is(got, writeErr) {
+		t.Fatalf("typed context pressure with failed response write = %v; want pipe error", got)
+	}
+
+	otherErr := domain.NewError(domain.CodeQuotaExceeded, "account budget exhausted")
+	if got := cloudDSHModelBudgetPlanDenialError(otherErr, nil); got == nil || got.Error() != "dsh model budget plan was denied" {
+		t.Fatalf("generic budget denial = %v; want terminal denial", got)
 	}
 }
 

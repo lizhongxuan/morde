@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -86,6 +87,31 @@ func TestGPT6LunaAdaptiveBudgetFailsClosedBelowReasoningMinimum(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAdaptiveBudgetMarksOnlyContextWindowMinimumDenialForCompaction(t *testing.T) {
+	t.Run("context window exhausted by projected input", func(t *testing.T) {
+		store, service, _, _, request := modelBudgetLunaFixture(t, 40_000, 8_192, 32_000)
+		request.ProviderRequest = json.RawMessage(fmt.Sprintf(`{"provider":"morde","model":"p1234567","messages":[{"role":"user","content":[{"type":"text","text":%q}]}],"tools":[]}`, strings.Repeat("x", 10_000)))
+		_, err := service.PrepareTaskModelBudget(context.Background(), request)
+		var modelErr *domain.Error
+		if !errors.As(err, &modelErr) || modelErr.Code != domain.CodeQuotaExceeded ||
+			modelErr.Details["reason"] != "context_window_below_stage_minimum" || store.prepareCalls != 0 {
+			t.Fatalf("context-bound request did not expose a pre-ledger compaction signal: err=%v details=%#v prepare_calls=%d",
+				err, modelErr, store.prepareCalls)
+		}
+	})
+
+	t.Run("verified model output cap exhausted", func(t *testing.T) {
+		store, service, _, _, request := modelBudgetLunaFixture(t, 24_999, 128_000, 32_000)
+		_, err := service.PrepareTaskModelBudget(context.Background(), request)
+		var modelErr *domain.Error
+		if !errors.As(err, &modelErr) || modelErr.Code != domain.CodeQuotaExceeded ||
+			modelErr.Details["reason"] == "context_window_below_stage_minimum" || store.prepareCalls != 0 {
+			t.Fatalf("model output ceiling was misclassified as context pressure: err=%v details=%#v prepare_calls=%d",
+				err, modelErr, store.prepareCalls)
+		}
+	})
 }
 
 func modelBudgetLunaFixture(t *testing.T, modelMax, contextWindow int, goal int64) (

@@ -5,7 +5,7 @@ import AgentRegistry from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { BasicCompactionEngine } from '../vendor/deepseek-harness/packages/compaction/compaction-basic/dist/index.js'
 import LlmRuntime, { AssistantStreamAccumulator, BlockAssembler, CONTEXT_WINDOW_EXCEEDED_CODE, LlmAdapter, LlmError, MessageId, createToolResultMessage, createUserMessage, freezeMessage, lastAssistantStreamChunk, projectFilesToText, projectToolUpdates } from '@deepseek-ai/dsh-llm'
-import SessionStore, { SessionId, SessionLogOffset } from '@deepseek-ai/dsh-session'
+import SessionStore, { canonicalHeader, SessionId, SessionLogOffset } from '@deepseek-ai/dsh-session'
 import * as checkpointPolicy from '@deepseek-ai/dsh-session-checkpoint-policy'
 import SessionPersistence, { assertContiguous, assertStoredId, assertVersion, materializeAppendBatch, materializeCreateHeader, validateStoredEvents } from '@deepseek-ai/dsh-session-persistence'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
@@ -16,7 +16,7 @@ import { estimateMessage } from '@deepseek-ai/dsh-token-meter/estimate'
 import ToolResultPruner from '@deepseek-ai/dsh-compaction-tool-result-pruner'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import { apply as nativeToolExecutorApply, inject as nativeToolExecutorInject, name as nativeToolExecutorName } from '@deepseek-ai/dsh-tool-executor-native'
-import { hermesCompactionBudget, hermesCompactionMadeProgress, originalToolResultsForRange, selectHermesCompactionRange } from './hermes-compaction-window.mjs'
+import { hermesCompactionBudget, hermesCompactionMadeProgress, originalToolResultsForRange, selectHermesCompactionRange, taskBudgetHermesCompactionBudget } from './hermes-compaction-window.mjs'
 
 const MAX_CHECKPOINT_PAYLOAD_BYTES = 1024 * 1024
 const MAX_RESTORE_BYTES = 8 * 1024 * 1024
@@ -48,6 +48,7 @@ export const MODEL_FAILURE_SUMMARIES = Object.freeze({
   MODEL_TASK_BUDGET_EXHAUSTED: 'The task model budget was exhausted.',
   MODEL_OUTPUT_LIMIT: 'The answer remained partial after the bounded model-output continuations.',
 })
+export const MODEL_BUDGET_CONTEXT_PRESSURE_CODE = 'MODEL_BUDGET_CONTEXT_PRESSURE'
 export const TASK_VALIDATION_REVIEW_IDENTITY_FIELDS = Object.freeze([
   'context_role', 'owner_id', 'actor_id', 'task_id', 'task_revision', 'result_event_sequence', 'result_sha256',
   'claim_generation', 'lease_owner', 'session_id', 'purpose',
@@ -1768,22 +1769,26 @@ export async function runAgent(ipc, frame) {
   const compactionBudget = Number.isSafeInteger(frame.context_window_tokens)
     ? hermesCompactionBudget(frame.context_window_tokens, frame.max_tokens ?? 0)
     : undefined
+  const taskCompactionBudget = frame.model_budget_admission === true && compactionBudget
+    ? taskBudgetHermesCompactionBudget(frame.context_window_tokens, frame.max_tokens ?? 0)
+    : undefined
+  const effectiveCompactionBudget = taskCompactionBudget ?? compactionBudget
   const compactionMaxTokens = frame.purpose === 'compaction' && Number.isSafeInteger(frame.max_tokens)
     ? frame.max_tokens
     : Math.min(2048, Math.max(256, Math.floor((frame.context_window_tokens ?? 4096) * 0.0625)))
   const compactionConfig = frame.purpose === 'compaction' ? {
     auto: false,
-    thresholdRatio: compactionBudget.thresholdTokens / frame.context_window_tokens,
+    thresholdRatio: effectiveCompactionBudget.thresholdTokens / frame.context_window_tokens,
     headroomTokens: 0,
-    retainTokens: compactionBudget.tailTokens,
+    retainTokens: effectiveCompactionBudget.tailTokens,
     maxTokens: compactionMaxTokens,
     compactionRetries: 0,
     maxOverflowRetries: 0,
   } : Number.isSafeInteger(frame.context_window_tokens) ? {
     auto: true,
-    thresholdRatio: compactionBudget.thresholdTokens / frame.context_window_tokens,
+    thresholdRatio: effectiveCompactionBudget.thresholdTokens / frame.context_window_tokens,
     headroomTokens: 0,
-    retainTokens: compactionBudget.tailTokens,
+    retainTokens: effectiveCompactionBudget.tailTokens,
     maxTokens: Math.min(2048, Math.max(256, Math.floor(frame.context_window_tokens * 0.0625))),
     maxOverflowRetries: 1,
   } : !coordinator ? {
@@ -1810,13 +1815,23 @@ export async function runAgent(ipc, frame) {
       return this.compactWithHermes(agent, header, signal, false, requireBelowThreshold)
     }
 
+    async compactForBudgetPressure(agent, header, signal) {
+      return this.compactWithHermes(agent, header, signal, true, false)
+    }
+
     selectRange(session, measurement, retainTokens, contextWindow, outputTokens = 0) {
       // The isolated coordinator summary uses source messages as user records and keeps DSH's forced compactNow behavior.
       if (coordinator && identity.purpose === 'compaction') return super.selectRange(session, measurement, retainTokens)
       const target = session.requestHeader()?.config
+      const selectedContextWindow = contextWindow ?? frame.context_window_tokens
+      const selectedOutputTokens = outputTokens || target?.maxTokens || frame.max_tokens || this.config.maxTokens
+      const selectionBudget = frame.model_budget_admission === true && Number.isSafeInteger(selectedContextWindow)
+        ? taskBudgetHermesCompactionBudget(selectedContextWindow, selectedOutputTokens)
+        : undefined
       return selectHermesCompactionRange(session, measurement, {
-        contextWindow: contextWindow ?? frame.context_window_tokens,
-        outputTokens: outputTokens || target?.maxTokens || frame.max_tokens || this.config.maxTokens,
+        contextWindow: selectedContextWindow,
+        outputTokens: selectionBudget?.rangeOutputTokens ?? selectedOutputTokens,
+        tailTokens: selectionBudget?.tailTokens,
         pinTask: !coordinator,
       })
     }
@@ -1830,7 +1845,11 @@ export async function runAgent(ipc, frame) {
         throw new LlmError('model context capacity is unavailable', 'MODEL_CONTEXT_UNAVAILABLE')
       }
       const outputTokens = header.config.maxTokens ?? resolved.defaultMaxTokens ?? frame.max_tokens ?? 0
-      const { thresholdTokens } = hermesCompactionBudget(contextWindow, outputTokens)
+      const taskBudgeted = frame.model_budget_admission === true && !coordinator
+      const pressureBudget = taskBudgeted
+        ? taskBudgetHermesCompactionBudget(contextWindow, outputTokens)
+        : hermesCompactionBudget(contextWindow, outputTokens)
+      const { thresholdTokens } = pressureBudget
       let measurement = ctx.tokenMeter.measure(agent.session, header)
       if (!force && measurement.totalTokens < thresholdTokens) return null
 
@@ -1847,11 +1866,28 @@ export async function runAgent(ipc, frame) {
       const coveredSeqs = new Set()
       for (let attempt = 0; attempt < attempts; attempt++) {
         const range = selectHermesCompactionRange(agent.session, measurement, {
-          contextWindow, outputTokens, pinTask: !coordinator,
+          contextWindow, outputTokens: pressureBudget.rangeOutputTokens ?? outputTokens, pinTask: !coordinator,
+          tailTokens: pressureBudget.tailTokens,
         })
         if (!range) {
-          if (requireBelowThreshold) throw new Error('no safe DSH compaction range is available')
+          if (requireBelowThreshold || force) throw new Error('no safe DSH compaction range is available')
           return result
+        }
+        if (taskBudgeted) {
+          const sourceTokens = measurement.nodes.reduce((total, node) =>
+            node.seq >= range.start && node.seq <= range.end ? total + node.tokens : total, 0)
+          const summaryPromptTokens = estimateMessage(compactionMessage(COMPACTION_SUMMARY_PROMPT))
+          if (sourceTokens <= summaryPromptTokens) {
+            if (force) {
+              const sourceRows = measurement.nodes.filter(node => node.seq >= range.start && node.seq <= range.end)
+                .map(node => {
+                  const message = agent.session.deriveEventMessage(agent.session.eventAt(node.seq))
+                  return `${node.seq}:${message?.role ?? 'unknown'}:${node.tokens}`
+                })
+              throw new Error(`DSH context pressure source span is too small for a safe summary (${sourceTokens} <= ${summaryPromptTokens} tokens; ${sourceRows.join(',')})`)
+            }
+            return result
+          }
         }
         const originals = originalToolResultsForRange(agent.session, range.start, range.end)
         this.summarySources.set(agent.session, originals)
@@ -2077,23 +2113,51 @@ export async function runAgent(ipc, frame) {
           }
           const budgetContinuation = currentMordeBudgetContinuation(payload.messages)
           if (budgetContinuation && agent.inbox.hasPending) return
-          await sessionDurable.flush(agent.session)
-          payload.signal.throwIfAborted()
-          const through = sessionDurable.through
-          if (!Number.isSafeInteger(through) || through < 0) throw new Error('model budget baseline checkpoint is unavailable')
-          sessionDurable.modelBudgetPlans.clearSession(sessionDurable.identity.session_id)
-          const callID = randomUUID()
-          const recovery = sessionDurable.start.model_recovery
-          const dshCallID = recovery && through === recovery.checkpoint_through_seq
-            ? recovery.recovery_dsh_call_id
-            : modelCallID(sessionDurable.identity.task_id, sessionDurable.identity.session_id, through)
-          const providerDraft = projectModelBudgetDraft(payload.messages, payload.tools, payload.toolHistory, ctx.llm)
-          const plan = await ipc.prepareModelBudget(sessionDurable.identity, through, callID, dshCallID, { ...payload, ...providerDraft })
-          payload.signal.throwIfAborted()
-          if (plan.call_id !== callID || plan.through_seq !== through ||
-              !MODEL_BUDGET_IDENTITY_FIELDS.every(key => plan.identity?.[key] === sessionDurable.identity[key])) {
-            throw new Error('model budget plan does not match the durable request')
+          const preparePlan = async messages => {
+            await sessionDurable.flush(agent.session)
+            payload.signal.throwIfAborted()
+            const through = sessionDurable.through
+            if (!Number.isSafeInteger(through) || through < 0) throw new Error('model budget baseline checkpoint is unavailable')
+            sessionDurable.modelBudgetPlans.clearSession(sessionDurable.identity.session_id)
+            const callID = randomUUID()
+            const recovery = sessionDurable.start.model_recovery
+            const dshCallID = recovery && through === recovery.checkpoint_through_seq
+              ? recovery.recovery_dsh_call_id
+              : modelCallID(sessionDurable.identity.task_id, sessionDurable.identity.session_id, through)
+            const providerDraft = projectModelBudgetDraft(messages, payload.tools, payload.toolHistory, ctx.llm)
+            const plan = await ipc.prepareModelBudget(sessionDurable.identity, through, callID, dshCallID,
+              { ...payload, ...providerDraft })
+            payload.signal.throwIfAborted()
+            if (plan.call_id !== callID || plan.through_seq !== through ||
+                !MODEL_BUDGET_IDENTITY_FIELDS.every(key => plan.identity?.[key] === sessionDurable.identity[key])) {
+              throw new Error('model budget plan does not match the durable request')
+            }
+            return plan
           }
+          let plan
+          try {
+            plan = await preparePlan(payload.messages)
+          } catch (error) {
+            if (error?.code !== MODEL_BUDGET_CONTEXT_PRESSURE_CODE || sessionDurable.start.model_recovery ||
+                payload.config.purpose === 'compaction') throw error
+            payload.signal.throwIfAborted()
+            const header = canonicalHeader({ config: payload.config,
+              ...(payload.tools?.length ? { tools: payload.tools } : {}) })
+            const compaction = ctx.get('compaction')
+            if (!compaction || typeof compaction.compactForBudgetPressure !== 'function') throw error
+            const compacted = await compaction.compactForBudgetPressure(agent, header, payload.signal)
+            if (compacted === null) throw error
+            const messages = [...agent.session.deriveMessages()]
+            const currentIDs = new Set(messages.map(message => message.id).filter(Boolean))
+            for (const message of payload.messages) {
+              if (message?.source?.kind === 'tool-registry' && message.id && !currentIDs.has(message.id)) {
+                messages.push(message)
+                currentIDs.add(message.id)
+              }
+            }
+            plan = await preparePlan(messages)
+          }
+          payload.signal.throwIfAborted()
           sessionDurable.modelBudgetPlans.save(plan, payload.signal)
           return { maxTokens: plan.max_tokens }
         })

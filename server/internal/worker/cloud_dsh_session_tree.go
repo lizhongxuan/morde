@@ -2717,11 +2717,43 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 					pending.modelCall.Task.RecoveryCallID != "" && pending.state.hasRecoverySteer() {
 					steerPending = true
 				}
-				if steerPending {
+				recoveryModelCall := value.ModelRecovery != nil && pending.modelCall.Task != nil &&
+					pending.modelCall.Task.RecoveryCallID == value.ModelRecovery.RecoveryCallID &&
+					pending.modelCall.Task.RecoveryDSHCallID == value.ModelRecovery.RecoveryDSHCallID &&
+					pending.modelCall.CallID == value.ModelRecovery.RecoveryDSHCallID
+				staleCheckpointRejection := cloudDSHModelRootCheckpointAdvanced(result.err)
+				if staleCheckpointRejection {
+					callThrough := int64(-1)
+					if pending.modelCall.Task != nil {
+						callThrough = pending.modelCall.Task.ThroughSequence
+					}
+					e.options.Logger.Info("discarding stale DSH model call after Task checkpoint advanced",
+						zap.String("task_id", value.ID), zap.String("session_id", pending.identity.SessionID),
+						zap.Int64("model_call_through_sequence", callThrough), zap.Int64("current_session_through_sequence", pending.state.through),
+						zap.Bool("recovery_call", recoveryModelCall))
+				}
+				staleRootCheckpoint := pending.identity.SessionID == rootIdentity.SessionID && !recoveryModelCall &&
+					staleCheckpointRejection
+				staleInputDuringCall := !steerPending && pending.modelCall.Task != nil &&
+					pending.modelCall.Task.ThroughSequence < pending.state.through && !recoveryModelCall
+				if steerPending || staleRootCheckpoint {
 					if err := deliverPendingMessagesOnce(ctx); err != nil {
 						return errors.New("pending conversation messages are unavailable")
 					}
+				}
+				if staleRootCheckpoint {
+					// The checkpoint fence rejects this root call before provider
+					// dispatch, so its usage is known to be zero. Mark that fact on
+					// the synthetic response so it passes the DSH response contract.
 					result.err = nil
+					result.response = app.ModelResponse{Text: "A new task input arrived during this model call. Re-evaluate the current task before taking action.",
+						StopReason: "stop", Usage: app.ModelUsage{Known: true}}
+				} else if (steerPending || staleInputDuringCall) && result.err == nil {
+					// A newly delivered task input can advance the durable checkpoint
+					// while a model call is running. Discard a successful stale result
+					// and return a bounded re-evaluation signal so DSH continues from
+					// the committed input. Failed calls remain failures unless the
+					// exact pre-dispatch checkpoint rejection above proves zero usage.
 					result.response = app.ModelResponse{Text: "A new task input arrived during this model call. Re-evaluate the current task before taking action.",
 						StopReason: "stop", Usage: result.response.Usage, ProviderReportedModel: result.response.ProviderReportedModel}
 				}
@@ -2761,14 +2793,7 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 					pending.modelCall.CallID == intent.RecoveryDSHCallID {
 					recoveryCallSucceeded = true
 				}
-				recoveryModelCall := value.ModelRecovery != nil && pending.modelCall.Task != nil &&
-					pending.modelCall.Task.RecoveryCallID == value.ModelRecovery.RecoveryCallID &&
-					pending.modelCall.Task.RecoveryDSHCallID == value.ModelRecovery.RecoveryDSHCallID &&
-					pending.modelCall.CallID == value.ModelRecovery.RecoveryDSHCallID
-				if !steerPending && pending.modelCall.Task != nil && pending.modelCall.Task.ThroughSequence < pending.state.through && !recoveryModelCall {
-					result.response = app.ModelResponse{Text: "A new task input arrived during this model call. Re-evaluate the current task before taking action.",
-						StopReason: "stop", Usage: result.response.Usage, ProviderReportedModel: result.response.ProviderReportedModel}
-				} else if !steerPending && pending.stream.hasVisibleText() {
+				if !steerPending && !staleInputDuringCall && pending.stream.hasVisibleText() {
 					pending.state.lastStream = pending.stream
 				}
 				if protectsMemory && memoryValidator.ValidatePersonalMemoryProof(ctx, value, memoryProof, pending.memoryVersions) != nil {
@@ -3340,11 +3365,17 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				if ok {
 					response["budget_plan_id"] = result.PlanID
 					response["max_tokens"] = result.MaxTokens
+				} else if reason := cloudDSHModelBudgetPlanDenialReason(planErr); reason != "" {
+					response["denial_reason"] = reason
 				}
 				return writeCloudDSHFrame(ctx, input, response)
 			}
 			if planErr != nil || !cloudDSHID.MatchString(result.PlanID) || result.MaxTokens <= 0 || result.MaxTokens > cloudDSHModelBudgetProtocolMaxTokens {
-				return cloudDSHModelBudgetPlanDenialError(planErr, writeBudgetResponse(false))
+				denialErr := cloudDSHModelBudgetPlanDenialError(planErr, writeBudgetResponse(false))
+				if denialErr != nil {
+					return denialErr
+				}
+				continue
 			}
 			binding := cloudDSHModelBudgetPlanBinding{Identity: state.identity, ThroughSeq: *frame.Through,
 				CallID: frame.CallID, DSHCallID: frame.DSHCallID, LedgerCallID: ledgerCallID,

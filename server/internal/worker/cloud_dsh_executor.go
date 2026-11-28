@@ -64,7 +64,21 @@ func cloudDSHModelBudgetPlanDenialError(planErr, denialWriteErr error) error {
 	if denialWriteErr != nil {
 		return denialWriteErr
 	}
+	if cloudDSHModelBudgetPlanDenialReason(planErr) == "context_window_below_stage_minimum" {
+		// The runtime can reduce its DSH context and prepare a fresh request. Keep
+		// the session loop alive so it can consume the typed denial frame.
+		return nil
+	}
 	return errors.New("dsh model budget plan was denied")
+}
+
+func cloudDSHModelBudgetPlanDenialReason(planErr error) string {
+	var modelErr *domain.Error
+	if errors.As(planErr, &modelErr) && modelErr != nil &&
+		modelErr.Details["reason"] == "context_window_below_stage_minimum" {
+		return "context_window_below_stage_minimum"
+	}
+	return ""
 }
 
 var errCloudDSHTerminalToolAttempt = errors.New("dsh tool attempt was durably terminated")
@@ -243,6 +257,12 @@ func cloudDSHModelErrorCategory(err error) string {
 		}
 	}
 	return "unknown"
+}
+
+func cloudDSHModelRootCheckpointAdvanced(err error) bool {
+	var modelErr *domain.Error
+	return errors.As(err, &modelErr) && modelErr.Code == domain.CodeInvalidState &&
+		modelErr.Details["reason"] == "task_checkpoint_advanced"
 }
 
 func cloudDSHModelResultErrorFor(err error) error {

@@ -104,6 +104,7 @@ func TestCloudDSHCheckpointHistoryAcceptsVerifiedCompactionReplacement(t *testin
 		{Sequence: 4, Type: "compaction/start", Data: map[string]any{"compactionId": compactionID, "turn": 1}},
 		{Sequence: 5, Type: "compaction/summary", Data: map[string]any{
 			"compactionId": compactionID, "summary": []any{map[string]any{"type": "text", "text": "verified summary"}},
+			"rawOutput": []any{map[string]any{"type": "text", "text": "verified summary"}}, "llmStreamCall": true,
 			"shadowedRange": map[string]any{"start": 2, "end": 3}, "shadowedSeqs": []int64{2, 3}, "shadowedTokenCount": 100,
 			"provider": "morde", "model": "test-model", "maxTokens": 256,
 		}},
@@ -119,6 +120,60 @@ func TestCloudDSHCheckpointHistoryAcceptsVerifiedCompactionReplacement(t *testin
 	}
 	if _, active := history.surfaceNodes[6]; !active || !history.compactions[compactionID].ended {
 		t.Fatal("verified replacement or compaction end was not recorded")
+	}
+}
+
+func TestCloudDSHCheckpointHistoryAcceptsRepeatedCompactionWithNonMonotonicSurfaceRange(t *testing.T) {
+	compactionEvent := func(sequence int64, compactionID string, start, end int64, shadowed []int64) cloudDSHCheckpointEvent {
+		return cloudDSHCheckpointEvent{Sequence: sequence, Type: "compaction/summary", Data: map[string]any{
+			"compactionId": compactionID, "summary": []any{map[string]any{"type": "text", "text": "verified summary " + compactionID}},
+			"rawOutput": []any{map[string]any{"type": "text", "text": "verified summary " + compactionID}}, "llmStreamCall": true,
+			"shadowedRange": map[string]any{"start": start, "end": end}, "shadowedSeqs": shadowed, "shadowedTokenCount": 100,
+			"provider": "morde", "model": "test-model", "maxTokens": 256,
+		}}
+	}
+	replacement := func(sequence, start, end int64, compactionID, summary string, sources []int64) cloudDSHCheckpointEvent {
+		return cloudDSHCheckpointEvent{Sequence: sequence, Type: "user/message", SurfaceOp: map[string]any{
+			"op": "replace", "startSeq": start, "endSeq": end}, SourceEventSeqs: sources, Data: map[string]any{
+			"role": "user", "source": map[string]any{"kind": "compact-checkpoint", "compactionId": compactionID},
+			"content": []any{
+				map[string]any{"type": "text", "text": cloudDSHCompactionPreamble + "\n\n<compacted-summary>"},
+				map[string]any{"type": "text", "text": summary},
+				map[string]any{"type": "text", "text": "</compacted-summary>"},
+			},
+		}}
+	}
+	firstSummary := "verified summary compact_1"
+	secondSummary := "verified summary compact_2"
+	events := []cloudDSHCheckpointEvent{
+		{Sequence: 0, Type: "system/message", SurfaceOp: "append", Data: map[string]any{"message": map[string]any{"role": "system"}}},
+		checkpointTurnStart(1, "turn/start", map[string]any{"turn": 1}),
+		{Sequence: 2, Type: "user/message", SurfaceOp: "append", Data: map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": "older request"}}}},
+		checkpointAssistantText(3, "older answer"),
+		{Sequence: 4, Type: "user/message", SurfaceOp: "append", Data: map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": "recent request"}}}},
+		{Sequence: 5, Type: "compaction/start", Data: map[string]any{"compactionId": "compact_1", "turn": 1}},
+		compactionEvent(6, "compact_1", 2, 3, []int64{2, 3}),
+		replacement(7, 2, 3, "compact_1", firstSummary, []int64{5, 6, 2, 3}),
+		{Sequence: 8, Type: "compaction/end", Data: map[string]any{"compactionId": "compact_1", "turn": 1}},
+		{Sequence: 9, Type: "user/message", SurfaceOp: "append", Data: map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": "follow-up request"}}}},
+		checkpointAssistantText(10, "follow-up answer"),
+		{Sequence: 11, Type: "compaction/start", Data: map[string]any{"compactionId": "compact_2", "turn": 1}},
+		compactionEvent(12, "compact_2", 7, 4, []int64{7, 4}),
+		replacement(13, 7, 4, "compact_2", secondSummary, []int64{11, 12, 7, 4}),
+		{Sequence: 14, Type: "compaction/end", Data: map[string]any{"compactionId": "compact_2", "turn": 1}},
+	}
+	history := newCloudDSHCheckpointHistory("session_1")
+	if err := history.append(cloudDSHCheckpointPayload("session_1", 0, events...), 0, 14); err != nil {
+		t.Fatalf("repeated compaction with a reversed numeric endpoint pair was rejected: %v", err)
+	}
+	if got := history.surfaceOrder; len(got) != 4 || got[0] != 0 || got[1] != 13 || got[2] != 9 || got[3] != 10 {
+		t.Fatalf("active DSH surface after repeated compaction = %v; want [0 13 9 10]", got)
+	}
+	if _, active := history.surfaceNodes[7]; active {
+		t.Fatal("first compacted replacement remained active after the second compaction")
+	}
+	if proof := history.compactions["compact_2"]; proof == nil || !proof.ended || proof.start != 7 || proof.end != 4 {
+		t.Fatalf("second compaction proof = %+v; want verified range 7..4", proof)
 	}
 }
 

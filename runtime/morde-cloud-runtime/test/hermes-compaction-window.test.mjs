@@ -7,12 +7,28 @@ import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import ToolResultPruner from '@deepseek-ai/dsh-compaction-tool-result-pruner'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
 import { validStart } from '../src/engine.mjs'
-import { hermesCompactionBudget, hermesCompactionMadeProgress, originalToolResultsForRange, planHermesCompaction, selectHermesCompactionRange } from '../src/hermes-compaction-window.mjs'
+import { hermesCompactionBudget, hermesCompactionMadeProgress, originalToolResultsForRange, planHermesCompaction, selectHermesCompactionRange, taskBudgetHermesCompactionBudget } from '../src/hermes-compaction-window.mjs'
 
 test('Hermes trigger and lean-tail budgets use output-reserved capacity at both context scales', () => {
   assert.deepEqual(hermesCompactionBudget(64_000, 8_000), { thresholdTokens: 47_600, tailTokens: 10_000 })
   assert.deepEqual(hermesCompactionBudget(1_000_000, 100_000), { thresholdTokens: 450_000, tailTokens: 25_000 })
   assert.throws(() => hermesCompactionBudget(4096, 4096), /output reservation/)
+})
+
+test('adaptive Task compaction stays inside conservative byte-based context holds', () => {
+  const large = taskBudgetHermesCompactionBudget(65_536, 40_000)
+  assert.equal(large.thresholdTokens, 8_192)
+  assert.equal(large.rangeOutputTokens, 49_152)
+  assert.equal(large.tailTokens, 1_638)
+  assert.ok(large.thresholdTokens * 4 < 65_536,
+    'the DSH pressure threshold leaves at least half the model window for byte-reserved input')
+  assert.ok(large.tailTokens * 2 < 65_536,
+    'the compacted tail leaves room for framing and summary instructions under byte reservations')
+
+  const small = taskBudgetHermesCompactionBudget(16_384, 10_756)
+  assert.equal(small.thresholdTokens, 2_048)
+  assert.equal(small.rangeOutputTokens, 12_288)
+  assert.equal(small.tailTokens, 409)
 })
 
 test('compaction progress is measured by token reduction or new covered source events', () => {
@@ -55,6 +71,31 @@ test('Hermes windows keep the system/head, last user and assistant, and whole to
     ...rows.slice(2),
   ], { contextWindow: 4096, pinTask: true })
   assert.equal(withContext.start, 3, 'pin the actual task input after trusted context')
+})
+
+test('adaptive Task compaction keeps a bounded recent message tail', () => {
+  const rows = [
+    { role: 'system', tokens: 20, balancedBefore: true },
+    { role: 'user', tokens: 300, balancedBefore: true, isUserInput: true },
+    { role: 'assistant', tokens: 200, balancedBefore: true, hasText: true },
+    ...Array.from({ length: 10 }, (_, index) => [
+      { role: 'user', tokens: 550, balancedBefore: true, isUserInput: true, index },
+      { role: 'assistant', tokens: 100, balancedBefore: true, hasText: true, index },
+    ]).flat(),
+    { role: 'user', tokens: 550, balancedBefore: true, isUserInput: true, index: 10 },
+  ]
+  const defaultRange = planHermesCompaction(rows, {
+    contextWindow: 16_384, outputTokens: 12_288, pinTask: true,
+  })
+  const adaptiveRange = planHermesCompaction(rows, {
+    contextWindow: 16_384, outputTokens: 12_288, pinTask: true, tailTokens: 409,
+  })
+  assert.ok(defaultRange)
+  assert.ok(adaptiveRange)
+  assert.ok(adaptiveRange.end - adaptiveRange.start > defaultRange.end - defaultRange.start,
+    `the adaptive Task range should cover more history; default=${JSON.stringify(defaultRange)} adaptive=${JSON.stringify(adaptiveRange)}`)
+  assert.equal(rows.at(-1).isUserInput, true, 'keep the latest user request')
+  assert.ok(adaptiveRange.end < rows.length - 1, 'the adaptive range must stop before the latest user request')
 })
 
 test('DSH frame validation rejects an output cap that consumes the known context window', () => {
