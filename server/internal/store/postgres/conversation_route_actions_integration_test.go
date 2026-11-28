@@ -21,6 +21,7 @@ import (
 type routeActionsTestFixture struct {
 	store         *Store
 	ownerID       string
+	projectID     string
 	conversation  conversation.Conversation
 	instanceID    string
 	authorization task.Authorization
@@ -186,6 +187,9 @@ func (f routeActionsTestFixture) receiveInConversation(t *testing.T, conversatio
 	input app.ConversationRoutingInput) app.ConversationRouteClaim {
 	t.Helper()
 	ctx := context.Background()
+	if f.projectID != "" {
+		input.ProjectID = f.projectID
+	}
 	input.ModelID = "p1234567"
 	input.Budget = task.Budget{ActiveSeconds: 120, ToolCalls: 5, ModelTokens: 1000}
 	hash := sha256.Sum256([]byte(clientID))

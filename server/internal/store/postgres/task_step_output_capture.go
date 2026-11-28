@@ -186,7 +186,7 @@ func verifyTaskStepOutputCaptureFence(ctx context.Context, tx pgx.Tx, identity a
 	var workspaceOwner, workspaceState pgtype.Text
 	var workspaceDeleted pgtype.Timestamptz
 	err := tx.QueryRow(ctx, `SELECT t.owner_id,t.initiator_id,t.auth_version,t.current_revision,t.desired_revision,t.workspace_id,
-	 t.workspace_owner_id,t.workspace_checkpoint_revision,COALESCE(t.project_id,''),t.workspace_project_resource_version,p.version,
+	 t.workspace_owner_id,t.workspace_checkpoint_revision,COALESCE(t.project_id,''),t.workspace_project_resource_version,pr.version,
  pm.version,pm.role,st.task_revision,st.tool_call_key,st.tool_name,st.phase,st.status,
  op.task_revision,op.call_id,op.tool_name,op.workspace_id,op.binding_version,op.workspace_checkpoint_revision,op.status,
  w.owner_id,w.state,w.deleted_at
@@ -195,7 +195,8 @@ JOIN task_steps st ON st.task_id=t.id AND st.id=$3
 JOIN task_operations op ON op.task_id=t.id AND op.id=$4
 LEFT JOIN project_members pm ON pm.project_id=t.project_id AND pm.user_id=t.initiator_id
   AND EXISTS (SELECT 1 FROM users u WHERE u.id=pm.user_id AND u.status='approved')
-LEFT JOIN projects p ON p.id=t.project_id
+LEFT JOIN project_resources pr ON pr.project_id=t.project_id AND pr.kind='workspace'
+  AND pr.resource_id=t.workspace_id AND pr.workspace_id=t.workspace_id AND pr.active
 LEFT JOIN workspaces w ON w.id=t.workspace_id
 WHERE t.id=$1 AND t.owner_id=$2`, identity.TaskID, identity.OwnerID, identity.StepID, identity.OperationID).Scan(
 		&ownerID, &initiatorID, &authVersion, &currentRevision, &desired, &currentWorkspace, &currentWorkspaceOwner, &currentCheckpoint, &projectID,

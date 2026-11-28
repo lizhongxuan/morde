@@ -9,7 +9,10 @@ import (
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/conversation"
+	"morde/server/internal/domain/host"
 	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/project"
 	"morde/server/internal/domain/task"
 	"morde/server/internal/domain/workspace"
 )
@@ -184,6 +187,164 @@ FROM stamp WHERE task_id=$1 AND step_id=$2`, current.ID, truncatedStepID); err !
 		remainingReceipts != 0 || remainingPages != 0 || remainingStatuses != 0 {
 		t.Fatalf("expired output rows remain: receipts=%d pages=%d statuses=%d err=%v", remainingReceipts,
 			remainingPages, remainingStatuses, err)
+	}
+}
+
+func TestPostgresTaskStepOutputCaptureRechecksProjectMemberRevocation(t *testing.T) {
+	ctx := context.Background()
+	route := newRouteActionsTestFixture(t)
+	projectValue := createProjectStoreFixture(t, ctx, route.store, route.ownerID,
+		"Output capture access", "Project member revocation fences", "output-capture-project-create")
+	member := createPreRetirementTestUser(t, route.store, 1, 2000, 4096)
+	if _, err := inviteAndAcceptProjectStoreMember(t, ctx, route.store, route.ownerID, member.ID,
+		projectValue, project.RoleMember, projectValue.Version, "output-capture-project-invite", "output-capture-project-accept"); err != nil {
+		t.Fatalf("add Project member: %v", err)
+	}
+	projectValue, err := route.store.GetProject(ctx, route.ownerID, projectValue.ID)
+	if err != nil {
+		t.Fatalf("reload Project after adding member: %v", err)
+	}
+	projectConversationID := mustID(t, domain.NewConversationID)
+	projectConversation, _, err := route.store.CreateProjectConversation(ctx, route.ownerID, conversation.Conversation{
+		ID: projectConversationID, OwnerID: route.ownerID, ProjectID: projectValue.ID, Title: "Output capture access",
+	}, testIdempotency(route.ownerID, "project_conversation.create", "output-capture-project-conversation"))
+	if err != nil {
+		t.Fatalf("create Project conversation fixture: %v", err)
+	}
+	route.projectID = projectValue.ID
+	route.conversation = projectConversation
+	fixture := createS03RunningAgentTask(t, route, "output-capture-project-revocation", true)
+
+	var workspaceID string
+	var bindingVersion int64
+	if err := fixture.route.store.pool.QueryRow(ctx, `SELECT workspace_id,binding_version FROM workspace_bindings
+WHERE host_id=$1 AND owner_id=$2 ORDER BY created_at DESC LIMIT 1`, fixture.host.ID, fixture.task.OwnerID).
+		Scan(&workspaceID, &bindingVersion); err != nil {
+		t.Fatalf("read Host Workspace binding: %v", err)
+	}
+	workspaceValue, err := fixture.route.store.GetWorkspace(ctx, workspaceID)
+	if err != nil {
+		t.Fatalf("read Host Workspace: %v", err)
+	}
+	binding, err := fixture.route.store.GetWorkspaceBinding(ctx, fixture.host.ID, workspaceID)
+	if err != nil {
+		t.Fatalf("read Host Workspace binding: %v", err)
+	}
+	if binding.State == workspace.BindingPreparing {
+		binding, err = fixture.route.store.TransitionWorkspaceBinding(ctx, fixture.host.ID, workspaceID, binding.BindingVersion,
+			workspace.BindingPreparing, workspace.BindingActive, workspaceValue.Revision, 0)
+		if err != nil {
+			t.Fatalf("activate Host Workspace binding: %v", err)
+		}
+	}
+	bindingVersion = binding.BindingVersion
+	checkpointRevision := workspaceValue.Revision
+	if _, err := fixture.route.store.UpsertHostMember(ctx, host.Member{HostID: fixture.host.ID,
+		OwnerID: fixture.task.OwnerID, UserID: member.ID, Permissions: []host.Permission{host.PermissionWorkspaceFileRead}}); err != nil {
+		t.Fatalf("grant Project member Workspace read access: %v", err)
+	}
+	projectValue, err = fixture.route.store.GetProject(ctx, fixture.task.OwnerID, projectValue.ID)
+	if err != nil {
+		t.Fatalf("reload Project before adding Workspace resource: %v", err)
+	}
+	projectResource, replay, err := fixture.route.store.AddProjectResource(ctx, fixture.task.OwnerID, project.Resource{
+		ProjectID: projectValue.ID, Kind: project.ResourceWorkspace, ResourceID: workspaceID, Version: 1,
+	}, projectValue.Version, "output-capture-project-workspace")
+	if err != nil || replay || projectResource.Version != 1 {
+		t.Fatalf("add Project Workspace resource = %#v replay=%t err=%v", projectResource, replay, err)
+	}
+	if _, err := fixture.route.store.pool.Exec(ctx, `UPDATE tasks SET workspace_id=$2,workspace_owner_id=$3,
+	workspace_project_resource_version=$4,input_revision=$5,workspace_checkpoint_revision=$5,context_digest=$6 WHERE id=$1`,
+		fixture.task.ID, workspaceID, fixture.task.OwnerID, projectResource.Version, checkpointRevision,
+		hashBytes("output-capture project input manifest")); err != nil {
+		t.Fatalf("bind Task to Project Workspace: %v", err)
+	}
+	loaded, err := fixture.route.store.GetTask(ctx, fixture.task.ID, fixture.task.OwnerID)
+	if err != nil || loaded.Task.ProjectID != projectValue.ID || loaded.Task.WorkspaceProjectResourceVersion == nil ||
+		*loaded.Task.WorkspaceProjectResourceVersion != projectResource.Version {
+		t.Fatalf("load Project-bound Task: task=%+v err=%v", loaded.Task, err)
+	}
+	current := loaded.Task
+	viewID := "v" + strings.Repeat("b", 64)
+	sealer, err := app.NewSealer(bytesOf(32, 0x32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	projects, err := app.NewProjectService(fixture.route.store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tasks, err := app.NewTaskService(fixture.route.store, k4FixtureAuthorization{}, k4FixtureModelCatalog{}, projects)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tasks.SetTaskStepDetailSealer(sealer); err != nil {
+		t.Fatal(err)
+	}
+	callID := "call_output_capture_project"
+	stepID, operation := createTerminalShellOutputCaptureExecution(t, fixture, current, callID, workspaceID,
+		bindingVersion, checkpointRevision)
+	initiatorMember, err := fixture.route.store.GetProjectMember(ctx, projectValue.ID, current.InitiatorID)
+	if err != nil {
+		t.Fatalf("read Project task initiator membership: %v", err)
+	}
+	identityValue := app.TaskStepOutputCaptureIdentity{
+		OwnerID: current.OwnerID, TaskID: current.ID, AuthorizationVersion: current.Authorization.Version,
+		TaskRevision: *current.CurrentRevision, WorkspaceID: workspaceID, WorkspaceAuthorizationVersion: initiatorMember.Version,
+		WorkspaceBindingVersion: bindingVersion, WorkspaceViewID: viewID, WorkspaceCheckpointRevision: checkpointRevision,
+		StepID: stepID, CallID: callID, OperationID: operation.ID,
+	}
+	record, err := app.SealTaskStepOutputCapture(sealer, identityValue, []byte("project output page"), nil)
+	if err != nil {
+		t.Fatalf("seal Project Task output: %v", err)
+	}
+	if err := fixture.route.store.SaveTaskStepOutputCapture(ctx, record); err != nil {
+		t.Fatalf("save Project Task output: %v", err)
+	}
+	principal := identity.Principal{UserID: member.ID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: testSessionTokenID(member.ID)}
+	page, err := tasks.GetStepOutputCapturePage(ctx, principal, current.ID, stepID, "stdout", 0)
+	if err != nil || string(page.Data) != "project output page" || !page.Complete {
+		t.Fatalf("Project member initial page=%+v err=%v; want complete output", page, err)
+	}
+
+	currentProject, err := fixture.route.store.GetProject(ctx, fixture.task.OwnerID, projectValue.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.route.store.UpdateProjectMemberRole(ctx, fixture.task.OwnerID, projectValue.ID, member.ID,
+		project.RoleViewer, currentProject.Version, "output-capture-project-demote"); err != nil {
+		t.Fatalf("downgrade Project member: %v", err)
+	}
+	if _, err := tasks.GetStepOutputCapturePage(ctx, principal, current.ID, stepID, "stdout", 0); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("Project viewer read captured output: %v; want not found", err)
+	}
+	currentProject, err = fixture.route.store.GetProject(ctx, fixture.task.OwnerID, projectValue.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.route.store.UpdateProjectMemberRole(ctx, fixture.task.OwnerID, projectValue.ID, member.ID,
+		project.RoleMember, currentProject.Version, "output-capture-project-restore"); err != nil {
+		t.Fatalf("restore Project member role: %v", err)
+	}
+	if _, err := tasks.GetStepOutputCapturePage(ctx, principal, current.ID, stepID, "stdout", 0); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("re-authorized Project member read stale captured output: %v; want not found", err)
+	}
+	ownerPrincipal := identity.Principal{UserID: fixture.task.OwnerID, Role: identity.RoleUser, Kind: identity.KindSession,
+		TokenID: testSessionTokenID(fixture.task.OwnerID)}
+	if _, err := tasks.GetStepOutputCapturePage(ctx, ownerPrincipal, current.ID, stepID, "stdout", 0); err != nil {
+		t.Fatalf("Project owner lost access after member role change: %v", err)
+	}
+
+	currentProject, err = fixture.route.store.GetProject(ctx, fixture.task.OwnerID, projectValue.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.route.store.RemoveProjectResource(ctx, fixture.task.OwnerID, projectValue.ID,
+		project.ResourceWorkspace, workspaceID, currentProject.Version, "output-capture-project-remove-workspace"); err != nil {
+		t.Fatalf("remove Project Workspace resource: %v", err)
+	}
+	if _, err := tasks.GetStepOutputCapturePage(ctx, ownerPrincipal, current.ID, stepID, "stdout", 0); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("read captured output after Workspace resource removal: %v; want not found", err)
 	}
 }
 

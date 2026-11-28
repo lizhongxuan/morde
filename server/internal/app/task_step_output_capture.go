@@ -447,20 +447,7 @@ func (s *TaskService) GetStepOutputCapturePage(ctx context.Context, principal id
 			}
 			return TaskStepOutputCapturePage{}, domain.NewError(domain.CodeNotFound, "supplemental output page not found")
 		}
-		projectReader, ok := s.store.(interface {
-			GetProject(context.Context, string, string) (project.Project, error)
-		})
-		if !ok || current.WorkspaceProjectResourceVersion == nil || *current.WorkspaceProjectResourceVersion < 1 {
-			return TaskStepOutputCapturePage{}, domain.NewError(domain.CodeNotFound, "supplemental output page not found")
-		}
-		projectValue, err := projectReader.GetProject(ctx, principal.UserID, current.ProjectID)
-		if err != nil {
-			if domain.CodeOf(err) != domain.CodeForbidden && domain.CodeOf(err) != domain.CodeNotFound {
-				return TaskStepOutputCapturePage{}, err
-			}
-			return TaskStepOutputCapturePage{}, domain.NewError(domain.CodeNotFound, "supplemental output page not found")
-		}
-		if projectValue.ID != current.ProjectID || projectValue.Version != *current.WorkspaceProjectResourceVersion || projectValue.Version < 1 {
+		if current.WorkspaceProjectResourceVersion == nil || *current.WorkspaceProjectResourceVersion < 1 {
 			return TaskStepOutputCapturePage{}, domain.NewError(domain.CodeNotFound, "supplemental output page not found")
 		}
 		workspaceAuthVersion = member.Version
