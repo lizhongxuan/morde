@@ -197,3 +197,11 @@
 - 本地修复：只对白名单 `task_budget_exhausted` 保留阶段 `model_call_reservation` 与原因码 `task_budget_reservation_exceeded`，交给终态 DSH 解释模型；不把失败伪装成搜索结果。增加仅含整数的预算 envelope 诊断日志（Task 上限、已用、在途预留、输入估算、输出上限、总预留）；PC 在未见关联助手消息时最多退避刷新 8 次，消息到达后立即停止。审批或澄清待处理时不轮询。未关闭 fence、账本或硬预算限制。
 - 本地验证：App/Worker 预算拒绝与终态解释定向用例、隔离 PostgreSQL Task 预算预留用例、Portal `Assistant.test.tsx`（334 项）和 `npm run typecheck` 通过；`git diff --check` 通过。部署 smoke 和真实 PC 搜索尚未执行本轮版本。
 - 下一步：提交并推送 `release` 后部署安全诊断；在真实 `morde-pc` 发起一条全新的只读搜索，读取整数 envelope，按证据最小化过大的上下文/schema 或调整可安全配置的输出 cap，再核验一次工具派发、来源综合与原会话回告。PC 端改动需本地 `make pc` 构建并从实际客户端验收。若输入上下文本身超过剩余额度，应给出 DSH 生成的真实预算说明，不报告未执行的搜索。`T07`/`T08` 保持进行中；Taskless 持久增量流、完整 Worker 回归失败项及灰度基线仍未验收，自动恢复继续关闭。
+
+### 2026-11-28 续验（预算诊断部署与 PC 交互阻塞）
+
+- 发布：`release@38f610ce` 已推送并部署。原子更新脚本的 P0 smoke gate 为 5 pass、0 fail、5 exception；例外是无 `CH_TEST_DATABASE_URL` 的 PostgreSQL 项与需要真实 PC/DSH 的项。构建、迁移状态（280）、二进制切换、Portal health/readiness 均通过，`morde-portal.service` 为 active。
+- PC 构建：本地 `make pc` 成功并打开实际 Electron `morde-pc`。CUA 能读取登录页，但键盘/剪贴板输入无法稳定反映到可见表单，按钮及坐标操作分别返回 `elementHasNoFrameWindow` / `noWindowsAvailable`；未提交登录，也未发送测试消息。按 PC 验收约定，不以 API 或后台 Web 代替客户端验收。
+- 线上诊断：部署后只读读取了白名单预算失败日志，未出现新的 `task_budget_exhausted` 样本；这是因为本轮无法从 PC 登录创建新请求，不能据此判断预算问题已消失。旧 `unknown` 事件不可追溯补出输入/输出拆分。未调整 Task 预算、估算器、授权、重放或任何现存任务。
+- 已通过的代码验证仍为上一节所列 App/Worker/PostgreSQL 定向用例、Portal Assistant 测试 334 项、Portal typecheck、`git diff --check`；`make pc` 本轮构建通过。真实 PC 登录后的普通快答、搜索、失败解释与阶段耗时样本尚未验收。
+- 后续门槛：恢复 PC 界面输入能力或由用户在当前 PC 登录页完成登录后，继续在全新对话提交一条快答和一条只读搜索；读取拒绝请求的整数预留拆分，再提交针对性修复并验证来源、单次派发和原会话助手消息。Taskless 持久增量流仍未实现，`T07`/`T08` 保持进行中，自动恢复继续关闭。
