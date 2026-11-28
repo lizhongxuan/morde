@@ -50,9 +50,9 @@ func ConversationLongReplyModelRequest(value ConversationRouteContext, currentMe
 		if message.Truncated {
 			content = "[bounded excerpt of an earlier message]\n" + content
 		}
-		input = append(input, ModelInput{Role: role, Text: content})
+		input = append(input, ModelInput{Type: "message", Role: role, Text: content})
 	}
-	input = append(input, ModelInput{Role: string(conversation.RoleUser), Text: currentMessage})
+	input = append(input, ModelInput{Type: "message", Role: string(conversation.RoleUser), Text: currentMessage})
 	return ModelRequest{Instructions: instructions, Input: input, MaxOutputTokens: maxOutputTokens}, nil
 }
 

@@ -19,7 +19,8 @@ func TestConversationLongReplyOutputTokensUsesVerifiedModelLimit(t *testing.T) {
 	}
 	request, err := ConversationLongReplyModelRequest(context, "Please explain the design choices.", got)
 	if err != nil || request.MaxOutputTokens != modelOutputLimit || len(request.Tools) != 0 || len(request.Input) != 1 ||
-		request.Input[0].Role != string(conversation.RoleUser) || request.Input[0].Text != "Please explain the design choices." ||
+		request.Input[0].Type != "message" || request.Input[0].Role != string(conversation.RoleUser) ||
+		request.Input[0].Text != "Please explain the design choices." ||
 		!ConversationRouteInputFitsContextWindow(request, 32768) {
 		t.Fatalf("long-form request did not preserve the exact text-only budget: %+v err=%v", request, err)
 	}
@@ -35,7 +36,8 @@ func TestConversationLongReplyOutputTokensRespectsInputContext(t *testing.T) {
 		t.Fatal(err)
 	}
 	request, err := ConversationLongReplyModelRequest(context, currentMessage, got)
-	if err != nil || got < 1 || got >= 8192 || !ConversationRouteInputFitsContextWindow(request, 32768) {
+	if err != nil || got < 1 || got >= 8192 || len(request.Input) != 2 || request.Input[0].Type != "message" ||
+		request.Input[1].Type != "message" || !ConversationRouteInputFitsContextWindow(request, 32768) {
 		t.Fatalf("context-aware output budget = %d request=%+v err=%v", got, request, err)
 	}
 }
