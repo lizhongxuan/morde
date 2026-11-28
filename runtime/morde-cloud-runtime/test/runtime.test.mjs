@@ -521,6 +521,7 @@ test('Task start validates persisted message modes while defaulting old frames t
   const initialStart = { ...start, initial_message: { message_id: 'm1234567', content: 'initial request', attachment_ids: [] } }
   delete initialStart.prompt
   assert.equal(validStart(initialStart), true)
+  assert.equal(validStart({ ...initialStart, prompt: initialStart.initial_message.content }), false)
   assert.equal(validStart({ ...initialStart, initial_message: { ...initialStart.initial_message, mode: 'followup' } }), true)
   assert.equal(validStart({ ...initialStart, initial_message: { ...initialStart.initial_message, mode: 'steer' } }), true)
   assert.equal(validStart({ ...initialStart, initial_message: { ...initialStart.initial_message, mode: 'unknown' } }), false)
