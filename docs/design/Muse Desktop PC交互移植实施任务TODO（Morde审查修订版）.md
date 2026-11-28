@@ -96,3 +96,5 @@
 - 2026-11-28 M11 前台窗口判定补强（本地 `release@785c2ab1`，macOS 27.0.1 arm64）：`desktopNotificationWindowIsFocused()` 改用 Electron 当前聚焦窗口；用 synthetic completion 验证主窗及 Host 辅助窗聚焦时不弹系统通知。`npm run build:test` 通过，通知定向测试 5/5，`npm test` 全套 308/308，`git diff --check` 通过。这里是 mock 通知与桌面 Node 回归，不是签名包系统弹窗验收；旧 `io.morde.client` 包已被识别为非本轮源码候选。签名构建因 SecurityAgent 不可由 CUA 操作而取消；没有输入钥匙串密码、修改服务端或部署。
 
 - 2026-11-28 M09a 语音取消自动化补验（提交 `74909509`）：`web/portal` 执行 `npm test -- src/components/AssistantVoiceInput.test.tsx`，22/22 通过；新增用例覆盖取消后重开时旧 recognizer 的 result/error/end 迟到回调、取消或卸载时待返回的麦克风 lease、卸载后迟到回调。`git diff --check` 通过。真实 `morde-pc` 中 Web Speech Recognition 不可用，无法形成可取消的识别会话；故该结果仅验证 Portal 组件竞态，不替代 PC 实测，M09a 保持未勾选。
+
+- 2026-11-28 M08 Finder 拖放再验：在已运行的 `io.morde.client` PC 窗口中，Finder 选中 `/tmp/morde-muse-drop-XXXXXX.txt` 合成文件后尝试拖至输入框；PC 草稿无变化、没有附件预览，AX 状态也未见 drop 结果。没有发送消息或附件、没有打开 Office 预览；临时文件已删除，Finder 关闭临时目录并回到原桌面。当前 CUA 拖动仍未证明产生了真实系统 drop，M08 保持未勾选。
