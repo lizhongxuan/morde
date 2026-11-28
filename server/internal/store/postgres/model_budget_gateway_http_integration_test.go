@@ -209,6 +209,7 @@ max_output_catalog_version=NULL,max_output_source_url=NULL,updated_at=clock_time
 		TaskRevision: fence.TaskRevision, SessionID: fence.AgentSessionID, ModelID: call.ModelID,
 		ThroughSeq: fence.ThroughSequence, Turn: 1, Step: 0, CallID: budgetCallID, DSHCallID: dshCallID,
 		RequestDigest: requestDigest, Request: providerProjection,
+		Config: json.RawMessage(`{"provider":"morde","model":"p1234567"}`),
 	})
 	if err != nil {
 		t.Fatalf("prepare through the Worker planner adapter and PostgreSQL ledger: %v", err)

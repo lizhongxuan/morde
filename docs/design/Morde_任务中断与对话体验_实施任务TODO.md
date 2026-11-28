@@ -168,3 +168,12 @@
 - 本地通过：`go test ./internal/app -count=1`；Worker route 无效输出安全日志和一次修复后兜底定向用例；`go test ./internal/store/postgres -run 'TestValidStoredRouteDecision|TestConversationRouteModelDecisionSemantic' -count=1`；PC 会话页 `npm test -- --run src/routes/Assistant.test.tsx`（331/331）；`npm run typecheck`；`git diff --check`。
 - 服务器当前 SSH 可用且 `morde-portal.service` active，运行源仍是 `release@1d65dba8`，尚未包含本轮改动。实际 `morde-pc` 窗口仍显示旧测试会话状态；本轮代码尚未发布，不能据此判定真实路由、搜索、Agent 执行或延迟已修复。
 - 待部署后验收：实际 PC 新建对话分别执行无工具快答、直接只读搜索和一个 DSH 后台只读任务；记录 receipt、route claim、分类、工具派发和第一条持久助手消息的耗时；检查消息在原会话自动显现。失败时依据新增安全错误类别继续定位，不重试旧的不确定任务。持久增量回复、Worker 全量包、旧任务安全反例与灰度基线仍未验收；T07/T08 保持进行中。
+
+### 2026-11-28 续验（真实 PC 路由与内置搜索）
+
+- 已部署基线：`release@30695113`，服务迁移到 280，`/healthz=ok`、`/readyz=200`；部署 smoke gate 5 pass、0 fail、5 exception。例外是服务器缺少 `CH_TEST_DATABASE_URL` 的集成场景及必须在真实 PC/DSH 验收的场景。
+- 实际 `morde-pc` 新旁聊快答成功：真实模型在用户提交后直接回复指定短句；接收与下一次客户端读取之间已出现完整答案，观察到的可见延迟低于 1 秒。该样本只证明快答链路本次成功，不能代表延迟分布或持续 token 流。
+- 实际 PC 只读搜索先失败。模型路由成功，创建一个隐藏 `morde_web_search` Task；只读 metadata 显示其只有一个 `tool:failed` 步骤、工具调用数为 0，且没有 MCP operation 记录。根因是可信内部 Task 的持久 revision 为 0/0，但 claim 投影为 nil/nil，Broker 错误地按普通任务拒绝。
+- 本地修复：只有 `InternalTool` 且 revision 两侧都缺失时使用其持久 fence revision 0；普通 Task 仍要求 revision 已存在且一致。实际 Task 存储集成用例验证隐藏 Task 从路由写入、队列 claim、单次 Broker 调用到原会话助手消息完成；本地 PostgreSQL 通过 `TestConversationRouteDirectToolPersistsHiddenBrokerTask`。还通过 `go test ./internal/app -count=1`、`go test ./internal/worker -run 'Test(CloudDSHModelBudget|ConversationRouteInternalTool|CloudDSHCoordinatorRunsMatchingTextOnlyTurn)' -count=1`、`go test ./internal/store/postgres -run '^TestConversationRouteDirectToolPersistsHiddenBrokerTask$|^TestPostgresAdaptiveCompactionBudgetPlannerUsesSummaryStageAndSettlesOneOutputCap$' -count=1`、`git diff --check`。
+- 同轮核对 DSH compaction 模型预算协议：Runtime 会声明 `purpose=compaction`，Portal adapter 丢掉它造成摘要被短答 stage 预算。现改为只允许 `compaction` 枚举并转成 summary stage；PostgreSQL 集成用例通过。此项修正摘要预算，不宣称修复完整长会话质量。
+- 下一步：部署内部工具 revision 修复，再用 `morde-pc` 在全新旁聊重跑只读搜索，并跑一条真实 DSH 长任务；核对工具账本恰好一次、搜索结果由模型综合后回到原对话、任务状态/结果一致、消息在当前会话自动显现。随后记录端到端阶段时间。当前补丁尚未部署，T07/T08 继续进行中；Taskless 持久增量流、Worker 全量包、旧任务安全反例与灰度 cohort/基线仍未验收，自动恢复保持关闭。

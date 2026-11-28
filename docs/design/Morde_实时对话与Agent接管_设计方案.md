@@ -75,3 +75,5 @@
 - 处理方案：让路由提示中的字段合同、按 action 输出规则及 few-shot 示例一致；显式要求工具参数为对象值，并提供直接只读搜索示例。继续由 DSH 决定回复、工具或 Task，服务端解析与授权校验不放宽；失败时保留结构化安全原因，不能伪造工具结果。
 - 延迟处理：PC 结果待消息期间此前每秒重复失效消息查询。若当前请求超过一秒，下一次失效可能取消或替代它，用户切换会话后才看到已持久回告。改为等待现有请求结束后再调度单次刷新，并以延迟响应回归用例锁住行为。
 - 验收边界：对象参数解析、无效输出安全分类、慢消息回告轮询均有本地自动化测试。服务端实际模型输出与真实工具派发须在部署后的 `morde-pc` 中核验。当前架构仍没有 Taskless 直接回复的持久增量事件协议；在 owner/conversation/message/revision 围栏、重连游标和 PC 续读完成前，不承诺真实 token 流式回复。
+- 实机搜索揭示第二个接线缺陷：路由已经选中 `morde_web_search` 并创建隐藏 Broker Task，但内置 MCP 执行要求读取 Task revision。直接路由 Task 没有用户可编辑的 revision，数据库 fence 合法值为 `current_revision=desired_revision=0`；应用读模型将它们投影为 nil，Broker 因此在操作账本/派发之前拒绝，用户看到兜底气泡且工具派发数为 0。仅对带可信 `InternalTool` 标记的这种隐藏单次 Task，将 nil/nil 解释为 revision 0；普通 Task 仍要求已有一致 revision。新增 Broker 路径回归用例已复现修复，但需要部署后用真实 PC 再确认 operation ledger 恰好一次、搜索结果进入原会话。
+- DSH Runtime 已在 compaction 的模型预算请求中传 `purpose=compaction`，但 Portal adapter 之前丢弃该字段，导致 compaction 被按短答 stage 预算。现在只接受空值或明确的 `compaction`，将后者透传并映射到 summary stage；集成验证确认用 summary 配置创建并结算同一个输出上限。这是长会话摘要预算修正，不等同于首 token 流式回复，也不替代 PC 长任务验收。

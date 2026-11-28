@@ -11,10 +11,13 @@ import (
 	"net/http/httptest"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"go.uber.org/zap"
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain/identity"
@@ -550,6 +553,402 @@ FROM model_budget_preparations preparation JOIN model_call_ledger ledger
 	}
 	if providerCalls.Load() != 1 {
 		t.Fatalf("settled replay dispatched to the local HTTP provider again: calls=%d", providerCalls.Load())
+	}
+}
+
+func TestCloudDSHModelBudgetPostgresHTTPUsesTaskHermesCompactionSummaryStage(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+	store, pool := newF01TemporaryStore(t)
+	owner := createF01User(t, ctx, store)
+	if _, err := pool.Exec(ctx, `UPDATE owner_execution_controls SET state='enabled' WHERE owner_id=$1`, owner.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO model_account_budgets(owner_id,token_limit,max_concurrent)
+VALUES ($1,1000000,4) ON CONFLICT (owner_id) DO UPDATE SET token_limit=EXCLUDED.token_limit,max_concurrent=EXCLUDED.max_concurrent`, owner.ID); err != nil {
+		t.Fatalf("configure synthetic account model budget: %v", err)
+	}
+
+	const (
+		providerModel = "synthetic-budget-compaction-e2e-v1"
+		apiKey        = "synthetic-budget-compaction-only"
+		outputCap     = 768
+		contextWindow = 8_192
+		followupCount = 20
+	)
+	var providerCalls atomic.Int32
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		providerCalls.Add(1)
+		if request.Method != http.MethodPost || request.URL.Path != "/responses" ||
+			request.Header.Get("Authorization") != "Bearer "+apiKey ||
+			!bytes.HasPrefix([]byte(request.Header.Get("Content-Type")), []byte("application/json")) {
+			http.Error(writer, "unexpected synthetic provider request", http.StatusBadRequest)
+			return
+		}
+		var body modelBudgetPostgresHTTPProviderRequest
+		if err := json.NewDecoder(io.LimitReader(request.Body, 1<<20)).Decode(&body); err != nil {
+			http.Error(writer, "invalid synthetic provider request", http.StatusBadRequest)
+			return
+		}
+		hasUserText := false
+		for _, input := range body.Input {
+			if input.Role != "user" {
+				continue
+			}
+			for _, content := range input.Content {
+				hasUserText = hasUserText || content.Type == "input_text" && content.Text != ""
+			}
+		}
+		if body.Model != providerModel || body.MaxOutputTokens <= 0 || body.MaxOutputTokens > 8_192 || !hasUserText {
+			http.Error(writer, "synthetic DSH request did not preserve its model cap and user input", http.StatusBadRequest)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(writer, `{"model":"synthetic-budget-compaction-e2e-v1","text":"Synthetic DSH budget path verified.","input_tokens":8,"output_tokens":6}`)
+	}))
+	defer provider.Close()
+	providerClient := &modelBudgetPostgresHTTPClient{endpoint: provider.URL + "/responses", client: provider.Client()}
+
+	audit, err := app.NewAuditService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentials, err := app.NewCredentialService(store, store, store, audit, app.CredentialOptions{
+		SessionTTL: time.Hour, TicketTTL: time.Minute, LoginLimit: 5, LoginWindow: time.Minute,
+	}, f01DefaultHosts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal, err := credentials.VerifySession(ctx, createF01Session(t, ctx, store, owner.ID))
+	if err != nil || principal.Kind != identity.KindSession || principal.UserID != owner.ID {
+		t.Fatalf("verify synthetic owner session: principal=%#v err=%v", principal, err)
+	}
+	serviceInstanceID, err := store.ServiceInstanceID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealer, err := app.NewSealer(bytes.Repeat([]byte{0x35}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	connections, err := app.NewModelConnectionService(store, sealer, providerClient, []string{"api.openai.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	contextWindowTokens := contextWindow
+	modelMaxOutput := 8_192
+	connection, err := connections.Create(ctx, principal, app.ModelConnectionCommand{
+		Name: "Task Hermes compaction synthetic route", BaseURL: "https://api.openai.com/v1", ModelName: providerModel, APIKey: apiKey,
+		ContextWindowOverrideTokens: &contextWindowTokens, ContextWindowOverridePresent: true,
+		MaxOutputOverrideTokens: &modelMaxOutput, MaxOutputOverridePresent: true,
+	})
+	if err != nil {
+		t.Fatalf("create synthetic compaction model route: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE model_connections SET checked_at=clock_timestamp(),capability_text=true,
+capability_tools=false,capability_vision=false WHERE id=$1`, connection.ID); err != nil {
+		t.Fatalf("enable synthetic text-only route: %v", err)
+	}
+	gateway, err := app.NewModelGatewayService(store, connections, providerClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.SetModelResponseSealer(sealer); err != nil {
+		t.Fatal(err)
+	}
+	stages := []app.ModelOutputBudgetStageDefinition{
+		{Stage: "short_answer", GoalTokens: outputCap, MinimumTokens: 64},
+		{Stage: "tool_step", GoalTokens: outputCap, MinimumTokens: 64},
+		{Stage: "subtask", GoalTokens: outputCap, MinimumTokens: 64},
+		{Stage: "summary", GoalTokens: outputCap, MinimumTokens: 64},
+		{Stage: "long_form", GoalTokens: outputCap, MinimumTokens: 64},
+		{Stage: "text_continuation", GoalTokens: outputCap, MinimumTokens: 64},
+	}
+	if err := gateway.SetModelOutputBudgetStrategy(app.ModelOutputBudgetStrategyDefinition{Version: "dsh-task-compaction-e2e-v1",
+		Models: []app.ModelOutputBudgetModelDefinition{{BaseURL: connection.BaseURL, Model: providerModel, Stages: stages}}}); err != nil {
+		t.Fatal(err)
+	}
+
+	tasks, err := app.NewTaskService(store, credentials, f01ConfiguredModels{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversations, err := app.NewConversationService(store, credentials)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialConversation, _, err := conversations.Create(ctx, principal, app.CreateConversationCommand{
+		Title: "Task Hermes compaction E2E", IdempotencyKey: "budget-compaction-conversation",
+		ServiceInstanceID: serviceInstanceID,
+	})
+	if err != nil {
+		t.Fatalf("create synthetic compaction conversation: %v", err)
+	}
+	const initialClientMessageID = "budget-compaction-initial"
+	initialMessage, replayed, err := tasks.AcceptConversationMessage(ctx, principal, initialConversation.ID,
+		app.AcceptConversationMessageCommand{
+			ServiceInstanceID: serviceInstanceID, ClientMessageID: initialClientMessageID,
+			IdempotencyKey: initialClientMessageID, Content: "Preserve the opening requirement, use no external tools, and answer briefly after reading the followups.",
+			ModelID: connection.ID, Budget: task.Budget{ActiveSeconds: 180, ToolCalls: 1, ModelTokens: task.MaxModelTokens},
+		})
+	if err != nil || replayed {
+		t.Fatalf("accept synthetic compaction initial message: replayed=%t err=%v", replayed, err)
+	}
+	routeWorker, err := NewConversationRouteWorker(ConversationRouteWorkerOptions{
+		Queue: store, Actions: store, Models: conversationContextSteerRouteClassifier{},
+		WorkerID: "budget-compaction-route-worker", LeaseDuration: time.Minute, PollInterval: time.Millisecond,
+		MaxConcurrent: 1, Logger: zap.NewNop(),
+	})
+	if err != nil {
+		t.Fatalf("create synthetic compaction conversation route worker: %v", err)
+	}
+	if routed, routeErr := routeWorker.RunOnce(ctx); routeErr != nil || !routed {
+		t.Fatalf("route synthetic compaction initial message: routed=%t err=%v", routed, routeErr)
+	}
+	var taskID string
+	if err := pool.QueryRow(ctx, `SELECT task_id FROM conversation_messages WHERE id=$1`, initialMessage.ID).Scan(&taskID); err != nil || taskID == "" {
+		t.Fatalf("initial conversation route did not create a Task: task=%q err=%v", taskID, err)
+	}
+	claimed, found, err := store.ClaimNextTask(ctx, "budget-compaction-task-worker", 2*time.Minute)
+	if err != nil || !found || claimed.ID != taskID || claimed.ConversationID != initialConversation.ID {
+		t.Fatalf("claim synthetic compaction E2E Task: found=%t task=%q err=%v", found, claimed.ID, err)
+	}
+
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("local Node is unavailable; the actual DSH runtime cannot run")
+	}
+	node, err = filepath.Abs(node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeScript, err := filepath.Abs(filepath.Join("..", "..", "..", "runtime", "morde-cloud-runtime", "bin.mjs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	instances, accountRuntimes, _ := newF01ConversationRuntime(t, store, node, runtimeScript,
+		"budget-compaction-supervisor", bytes.Repeat([]byte{0x36}, 32))
+	checkpoints, err := app.NewAgentCheckpointService(store, sealer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpointObserver := &conversationContextE2ECheckpointObserver{CloudDSHCheckpoints: checkpoints, targetSeen: make(chan struct{})}
+	planner, err := NewCloudDSHModelBudgetPlanner(gateway)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plannerCapture := &modelBudgetPostgresHTTPPlannerCapture{inner: planner}
+	models := &modelBudgetPostgresHTTPModels{ModelGatewayService: gateway}
+	var followupMessageIDs []string
+	models.beforeNextGateway = func(call app.ModelCall) error {
+		if call.Task == nil || call.Task.TaskID != claimed.ID {
+			return errors.New("first synthetic model call did not retain the Task identity")
+		}
+		previousClientMessageID := initialClientMessageID
+		budget := task.Budget{ActiveSeconds: 180, ToolCalls: 1, ModelTokens: task.MaxModelTokens}
+		for index := 1; index <= followupCount; index++ {
+			clientMessageID := fmt.Sprintf("budget-compaction-followup-%02d", index)
+			content := fmt.Sprintf("followup-%02d preserve its detail: %s", index, strings.Repeat("history ", 275))
+			message, replayed, acceptErr := tasks.AcceptConversationMessage(ctx, principal, claimed.ConversationID,
+				app.AcceptConversationMessageCommand{
+					ServiceInstanceID: serviceInstanceID, ClientMessageID: clientMessageID,
+					IdempotencyKey: clientMessageID, PreviousClientMessageID: previousClientMessageID,
+					ReferenceTaskID: claimed.ID, Content: content, ModelID: connection.ID, Budget: budget,
+				})
+			if acceptErr != nil || replayed {
+				return fmt.Errorf("accept running Task followup %d: replayed=%t err=%v", index, replayed, acceptErr)
+			}
+			followupMessageIDs = append(followupMessageIDs, message.ID)
+			checkpointObserver.mu.Lock()
+			checkpointObserver.targetID = message.ID
+			checkpointObserver.mu.Unlock()
+			routeDeadline := time.Now().Add(30 * time.Second)
+			for {
+				found, routeErr := routeWorker.RunOnce(ctx)
+				if routeErr != nil {
+					return fmt.Errorf("route running Task followup %d: %w", index, routeErr)
+				}
+				var linkedTaskID, deliveryStatus, deliveryMode, routeState, failureReason string
+				if err := pool.QueryRow(ctx, `SELECT COALESCE(message.task_id,''),message.delivery_status,message.delivery_mode,route.state,route.failure_reason
+FROM conversation_messages message JOIN conversation_message_routes route ON route.message_id=message.id
+WHERE message.id=$1`, message.ID).
+					Scan(&linkedTaskID, &deliveryStatus, &deliveryMode, &routeState, &failureReason); err != nil {
+					return fmt.Errorf("inspect routed synthetic Task followup %d: %w", index, err)
+				}
+				if linkedTaskID == claimed.ID && deliveryStatus == "pending" && deliveryMode == string(app.AgentMessageDeliverySteer) && routeState == "routed" {
+					break
+				}
+				if routeState == "failed" || routeState == "rejected" {
+					return fmt.Errorf("synthetic Task followup %d route ended state=%q failure=%q", index, routeState, failureReason)
+				}
+				if time.Now().After(routeDeadline) {
+					return fmt.Errorf("synthetic Task followup %d route state task=%q delivery=%q mode=%q route=%q failure=%q; RunOnce found=%t",
+						index, linkedTaskID, deliveryStatus, deliveryMode, routeState, failureReason, found)
+				}
+				if !found {
+					time.Sleep(20 * time.Millisecond)
+				}
+			}
+			previousClientMessageID = clientMessageID
+		}
+		select {
+		case <-checkpointObserver.targetSeen:
+		case <-time.After(30 * time.Second):
+			return errors.New("DSH message-delivery poller did not discover the final synthetic Task followup")
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		time.Sleep(100 * time.Millisecond)
+		return nil
+	}
+	executor, err := NewCloudDSHExecutor(CloudDSHExecutorOptions{
+		SupervisorID: "budget-compaction-supervisor", AccountRuntimes: accountRuntimes, Instances: instances,
+		Checkpoints: checkpointObserver, Models: models, ModelBudgetPlanner: plannerCapture,
+		ToolCapabilities: cloudDSHTestToolCapability{allowed: false},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if executionErr := executor.ExecuteTask(ctx, claimed); !errors.Is(executionErr, ErrCloudDSHCompletionPending) {
+		models.mu.Lock()
+		lastErr, attempts := models.lastErr, len(models.attempts)
+		models.mu.Unlock()
+		plannerCapture.mu.Lock()
+		planCount := len(plannerCapture.plans)
+		plannerCapture.mu.Unlock()
+		t.Fatalf("Task compaction DSH execution = %v gateway_error=%v attempts=%d plans=%d; want successful result awaiting separate Task completion",
+			executionErr, lastErr, attempts, planCount)
+	}
+	var appliedFollowups int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM conversation_messages
+WHERE task_id=$1 AND id=ANY($2::text[]) AND delivery_status='applied'`, claimed.ID, followupMessageIDs).Scan(&appliedFollowups); err != nil || appliedFollowups != followupCount {
+		t.Fatalf("applied running Task followups=%d, want %d; err=%v", appliedFollowups, followupCount, err)
+	}
+
+	plannerCapture.mu.Lock()
+	preparedRequests := append([]CloudDSHModelBudgetPlanRequest(nil), plannerCapture.requests...)
+	preparedPlans := append([]CloudDSHModelBudgetPlan(nil), plannerCapture.plans...)
+	plannerCapture.mu.Unlock()
+	models.mu.Lock()
+	capturedCalls := append([]app.ModelCall(nil), models.calls...)
+	models.mu.Unlock()
+	if len(preparedRequests) < 2 || len(preparedRequests) != len(preparedPlans) || len(preparedRequests) != len(capturedCalls) {
+		t.Fatalf("Task DSH prepare/plan/Gateway call counts = %d/%d/%d; want matching successful calls including compaction",
+			len(preparedRequests), len(preparedPlans), len(capturedCalls))
+	}
+	compactionCount := 0
+	compactionCallIDs := make(map[string]struct{})
+	planByCallID := make(map[string]CloudDSHModelBudgetPlan, len(preparedRequests))
+	for index, request := range preparedRequests {
+		planByCallID[request.CallID] = preparedPlans[index]
+		var config struct {
+			Purpose string `json:"purpose"`
+		}
+		if err := json.Unmarshal(request.Config, &config); err != nil {
+			t.Fatalf("decode prepare config %q: %v", request.CallID, err)
+		}
+		if config.Purpose == "compaction" {
+			compactionCount++
+			compactionCallIDs[request.CallID] = struct{}{}
+		} else if config.Purpose != "" {
+			t.Fatalf("Task DSH prepare %q has unexpected purpose %q", request.CallID, config.Purpose)
+		}
+	}
+	if compactionCount == 0 {
+		t.Fatalf("real Node DSH emitted no Task compaction prepare; prepare purposes were %#v", preparedRequests)
+	}
+
+	callsByBudgetID := make(map[string]app.ModelCall, len(capturedCalls))
+	for _, call := range capturedCalls {
+		if call.Task == nil || call.Task.TaskID != claimed.ID || call.BudgetCallID == "" {
+			t.Fatalf("final DSH Gateway call lost its Task/budget identity: task=%v budget_call=%q", call.Task != nil, call.BudgetCallID)
+		}
+		callsByBudgetID[call.BudgetCallID] = call
+		plan, ok := planByCallID[call.BudgetCallID]
+		if !ok || call.BudgetPlanID != plan.PlanID {
+			t.Fatalf("Gateway call %q is not bound to its prepared plan: plan=%q prepared=%q", call.BudgetCallID, call.BudgetPlanID, plan.PlanID)
+		}
+	}
+
+	type settledPreparation struct {
+		planID, callID, dshCallID, budgetCallID, stage, ledgerState                string
+		sendTokens, inputReservedTokens, reservedTokens, inputTokens, outputTokens int64
+		consumed                                                                   bool
+	}
+	rows, err := pool.Query(ctx, `SELECT preparation.plan_id,preparation.call_id,preparation.dsh_call_id,
+preparation.budget_call_id,preparation.stage,preparation.send_tokens,preparation.input_reserved_tokens,
+ledger.reserved_tokens,ledger.input_tokens,ledger.output_tokens,preparation.consumed_at IS NOT NULL,ledger.state
+FROM model_budget_preparations preparation JOIN model_call_ledger ledger
+ ON ledger.owner_id=preparation.owner_id AND ledger.source=preparation.source AND ledger.call_id=preparation.call_id
+WHERE preparation.owner_id=$1 AND preparation.task_id=$2 AND preparation.source='task'`, owner.ID, claimed.ID)
+	if err != nil {
+		t.Fatalf("query settled Task model budget preparations: %v", err)
+	}
+	preparations := make(map[string]settledPreparation, len(preparedRequests))
+	for rows.Next() {
+		var row settledPreparation
+		if err := rows.Scan(&row.planID, &row.callID, &row.dshCallID, &row.budgetCallID, &row.stage,
+			&row.sendTokens, &row.inputReservedTokens, &row.reservedTokens, &row.inputTokens, &row.outputTokens,
+			&row.consumed, &row.ledgerState); err != nil {
+			rows.Close()
+			t.Fatalf("scan settled Task budget preparation: %v", err)
+		}
+		preparations[row.callID] = row
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		t.Fatalf("iterate settled Task budget preparations: %v", err)
+	}
+	rows.Close()
+	if len(preparations) != len(preparedRequests) {
+		t.Fatalf("PostgreSQL Task preparations=%d, DSH prepares=%d; want one settled ledger row per DSH prepare",
+			len(preparations), len(preparedRequests))
+	}
+	settledCompactions := 0
+	for _, request := range preparedRequests {
+		row, ok := preparations[request.CallID]
+		if !ok {
+			t.Fatalf("PostgreSQL did not persist DSH prepare %q", request.CallID)
+		}
+		call, ok := callsByBudgetID[request.CallID]
+		if !ok || row.planID != planByCallID[request.CallID].PlanID || row.budgetCallID != request.CallID ||
+			row.dshCallID != request.DSHCallID || call.LedgerCallID != request.DSHCallID ||
+			call.BudgetRequestDigest != request.RequestDigest || row.ledgerState != "settled" || !row.consumed ||
+			row.reservedTokens != row.inputReservedTokens+row.sendTokens || row.inputTokens != 8 || row.outputTokens != 6 {
+			t.Fatalf("PostgreSQL/Gateway budget binding or settlement mismatch for %q: row=%+v call={ledger:%q,digest:%q}",
+				request.CallID, row, call.LedgerCallID, call.BudgetRequestDigest)
+		}
+		if _, compaction := compactionCallIDs[request.CallID]; compaction {
+			settledCompactions++
+			if row.stage != "summary" {
+				t.Fatalf("Task compaction prepare %q used PostgreSQL stage %q; want summary", request.CallID, row.stage)
+			}
+			var finalProjection struct {
+				MaxTokens int `json:"max_tokens"`
+			}
+			if err := json.Unmarshal(call.RawRequest, &finalProjection); err != nil || finalProjection.MaxTokens != int(row.sendTokens) {
+				t.Fatalf("compaction Gateway cap=%d err=%v, PostgreSQL signed cap=%d", finalProjection.MaxTokens, err, row.sendTokens)
+			}
+		}
+	}
+	if settledCompactions != compactionCount {
+		t.Fatalf("settled Task compaction ledger rows=%d, compaction prepares=%d", settledCompactions, compactionCount)
+	}
+	providerClient.mu.Lock()
+	providerCaps := append([]int(nil), providerClient.maxCaps...)
+	providerClient.mu.Unlock()
+	if providerCalls.Load() != int32(len(capturedCalls)) || len(providerCaps) != len(capturedCalls) || len(capturedCalls) > followupCount+2 {
+		t.Fatalf("provider/settled model request counts = %d/%d, max caps=%v; want one local provider dispatch per successful DSH Gateway call and a bounded Task run",
+			providerCalls.Load(), len(capturedCalls), providerCaps)
+	}
+	for index, call := range capturedCalls {
+		var projection struct {
+			MaxTokens int `json:"max_tokens"`
+		}
+		plan := planByCallID[call.BudgetCallID]
+		if err := json.Unmarshal(call.RawRequest, &projection); err != nil || projection.MaxTokens != providerCaps[index] || projection.MaxTokens != plan.MaxTokens {
+			t.Fatalf("provider/Gateway/plan cap[%d]=%d/%d/%d err=%v", index, providerCaps[index], projection.MaxTokens, plan.MaxTokens, err)
+		}
 	}
 }
 

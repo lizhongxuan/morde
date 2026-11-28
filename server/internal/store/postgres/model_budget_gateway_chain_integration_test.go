@@ -47,7 +47,7 @@ func (*adaptiveBudgetGatewayClient) Check(context.Context, app.ModelEndpoint) (a
 	return app.ModelCapabilities{}, errors.New("unexpected model capability check")
 }
 
-func TestPostgresAdaptiveBudgetPlannerGatewayAndLedgerUseOneOutputCap(t *testing.T) {
+func TestPostgresAdaptiveCompactionBudgetPlannerUsesSummaryStageAndSettlesOneOutputCap(t *testing.T) {
 	fixture, _, _, fence, call := revisionGatewayFixture(t)
 	ctx := context.Background()
 	store := fixture.store
@@ -84,7 +84,7 @@ max_output_catalog_version=NULL,max_output_source_url=NULL,updated_at=clock_time
 		{Stage: "short_answer", GoalTokens: 3072, MinimumTokens: 64},
 		{Stage: "tool_step", GoalTokens: 3072, MinimumTokens: 64},
 		{Stage: "subtask", GoalTokens: 3072, MinimumTokens: 64},
-		{Stage: "summary", GoalTokens: 3072, MinimumTokens: 64},
+		{Stage: "summary", GoalTokens: 1536, MinimumTokens: 64},
 		{Stage: "long_form", GoalTokens: 3072, MinimumTokens: 64},
 		{Stage: "text_continuation", GoalTokens: 3072, MinimumTokens: 64},
 	}
@@ -111,12 +111,13 @@ max_output_catalog_version=NULL,max_output_source_url=NULL,updated_at=clock_time
 		TaskRevision: fence.TaskRevision, SessionID: fence.AgentSessionID, ModelID: call.ModelID,
 		ThroughSeq: fence.ThroughSequence, Turn: 1, Step: 0, CallID: "budget-call-gateway-0001", DSHCallID: dshCallID,
 		RequestDigest: requestDigest, Request: providerProjection,
+		Config: json.RawMessage(`{"provider":"morde","model":"p1234567","purpose":"compaction"}`),
 	})
 	if err != nil {
 		t.Fatalf("prepare through the Worker planner adapter and PostgreSQL ledger: %v", err)
 	}
-	if plan.PlanID == "" || plan.MaxTokens != 3072 {
-		t.Fatalf("prepared output plan = %#v, want a persisted plan with 3072 tokens", plan)
+	if plan.PlanID == "" || plan.MaxTokens != 1536 {
+		t.Fatalf("prepared compaction output plan = %#v, want the 1536-token summary stage", plan)
 	}
 	var finalRequest map[string]any
 	if err := json.Unmarshal(providerProjection, &finalRequest); err != nil {
@@ -141,19 +142,19 @@ max_output_catalog_version=NULL,max_output_source_url=NULL,updated_at=clock_time
 		t.Fatalf("send and settle the plan through ModelGateway/PostgreSQL: %v", err)
 	}
 	if response.Text != "Adaptive budget PostgreSQL path verified." || client.calls != 1 || client.request.MaxOutputTokens != plan.MaxTokens {
-		t.Fatalf("gateway response/cap/calls = %q/%d/%d, want one 3072-token dispatch", response.Text, client.request.MaxOutputTokens, client.calls)
+		t.Fatalf("gateway response/cap/calls = %q/%d/%d, want one %d-token compaction dispatch", response.Text, client.request.MaxOutputTokens, client.calls, plan.MaxTokens)
 	}
-	var ledgerState string
+	var ledgerState, preparedStage string
 	var reservedTokens, outputTokens, inputTokens int64
-	if err := store.pool.QueryRow(ctx, `SELECT ledger.state,ledger.reserved_tokens,preparation.send_tokens,preparation.input_reserved_tokens
+	if err := store.pool.QueryRow(ctx, `SELECT ledger.state,ledger.reserved_tokens,preparation.send_tokens,preparation.input_reserved_tokens,preparation.stage
 FROM model_call_ledger ledger JOIN model_budget_preparations preparation
  ON preparation.owner_id=ledger.owner_id AND preparation.source=ledger.source AND preparation.call_id=ledger.call_id
 WHERE ledger.owner_id=$1 AND ledger.source='task' AND ledger.call_id=$2`, fence.InitiatorID, call.CallID).
-		Scan(&ledgerState, &reservedTokens, &outputTokens, &inputTokens); err != nil {
+		Scan(&ledgerState, &reservedTokens, &outputTokens, &inputTokens, &preparedStage); err != nil {
 		t.Fatal(err)
 	}
-	if ledgerState != "settled" || outputTokens != int64(plan.MaxTokens) || reservedTokens != inputTokens+outputTokens {
-		t.Fatalf("settled reservation state/tokens = %s/%d (input=%d output=%d)", ledgerState, reservedTokens, inputTokens, outputTokens)
+	if ledgerState != "settled" || preparedStage != "summary" || outputTokens != int64(plan.MaxTokens) || reservedTokens != inputTokens+outputTokens {
+		t.Fatalf("settled reservation state/stage/tokens = %s/%s/%d (input=%d output=%d)", ledgerState, preparedStage, reservedTokens, inputTokens, outputTokens)
 	}
 	replayed, err := gateway.Complete(ctx, call)
 	if err != nil || replayed.Text != response.Text || client.calls != 1 {

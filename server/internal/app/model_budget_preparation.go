@@ -18,6 +18,9 @@ import (
 	"morde/server/internal/domain/task"
 )
 
+// TaskModelBudgetPurposeCompaction selects the separately reviewed summary-stage policy.
+const TaskModelBudgetPurposeCompaction = "compaction"
+
 // TaskModelBudgetPrepareRequest is the provider-bound DSH projection at the
 // prepare boundary. Prompt content is used transiently and is never persisted
 // in the reservation record.
@@ -25,6 +28,7 @@ type TaskModelBudgetPrepareRequest struct {
 	Fence           ModelTaskFence
 	DSHCallID       string
 	ModelID         string
+	Purpose         string
 	ThroughSequence int64
 	Turn            int64
 	Step            int64
@@ -197,6 +201,7 @@ func (s *ModelGatewayService) SupportsTaskModelBudgetAdmission(ctx context.Conte
 // remains unchanged until production acceptance gates are met.
 func (s *ModelGatewayService) PrepareTaskModelBudget(ctx context.Context, input TaskModelBudgetPrepareRequest) (TaskModelBudgetPlan, error) {
 	if ctx == nil || input.ThroughSequence < 0 || input.Turn < 0 || input.Step < 0 ||
+		(input.Purpose != "" && input.Purpose != TaskModelBudgetPurposeCompaction) ||
 		!domain.ValidModelConnectionID(input.ModelID) || !validModelBudgetProtocolID(input.BudgetCallID) ||
 		!modelBudgetDigestPattern.MatchString(input.RequestDigest) || len(input.ProviderRequest) == 0 ||
 		input.Fence.ThroughSequence != input.ThroughSequence || !modelBudgetRequestMatchesProviderProjection(input.ProviderRequest, input.RequestDigest) {
@@ -230,12 +235,7 @@ func (s *ModelGatewayService) PrepareTaskModelBudget(ctx context.Context, input 
 		return TaskModelBudgetPlan{}, domain.NewError(domain.CodeUnsupported, "model output or context capacity is unknown")
 	}
 	s.applyGPT6LunaReasoning(endpoint.Endpoint, &request, true)
-	stage := modelOutputBudgetStageShortAnswer
-	if fence.AgentRootSessionID != fence.AgentSessionID {
-		stage = modelOutputBudgetStageSubtask
-	} else if needsTools {
-		stage = modelOutputBudgetStageToolStep
-	}
+	stage := taskModelOutputBudgetStage(*fence, needsTools, input.Purpose)
 	routeKey := modelMaxOutputCapacityRouteKey(endpoint.Endpoint.BaseURL, endpoint.Endpoint.ModelID)
 	if routeKey == "" {
 		return TaskModelBudgetPlan{}, domain.NewError(domain.CodeUnsupported, "model output budget strategy is unavailable for this route")
@@ -342,6 +342,19 @@ func (s *ModelGatewayService) PrepareTaskModelBudget(ctx context.Context, input 
 		return TaskModelBudgetPlan{}, domain.NewError(domain.CodeInternal, "adaptive model budget store returned an invalid plan")
 	}
 	return TaskModelBudgetPlan{PlanID: result.PlanID, MaxTokens: int(result.MaxOutputTokens)}, nil
+}
+
+func taskModelOutputBudgetStage(fence ModelTaskFence, needsTools bool, purpose string) modelOutputBudgetStage {
+	if purpose == TaskModelBudgetPurposeCompaction {
+		return modelOutputBudgetStageSummary
+	}
+	if fence.AgentRootSessionID != fence.AgentSessionID {
+		return modelOutputBudgetStageSubtask
+	}
+	if needsTools {
+		return modelOutputBudgetStageToolStep
+	}
+	return modelOutputBudgetStageShortAnswer
 }
 
 func (s *ModelGatewayService) waitForTaskModelBudgetCapacity(ctx context.Context, prepareErr error, fence ModelTaskFence,

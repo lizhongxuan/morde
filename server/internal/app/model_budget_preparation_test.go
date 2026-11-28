@@ -14,6 +14,23 @@ import (
 	"morde/server/internal/domain/task"
 )
 
+func TestTaskModelOutputBudgetStageUsesSummaryForCompaction(t *testing.T) {
+	rootFence := ModelTaskFence{AgentSessionID: "root-session", AgentRootSessionID: "root-session"}
+	if got := taskModelOutputBudgetStage(rootFence, false, ""); got != modelOutputBudgetStageShortAnswer {
+		t.Fatalf("ordinary no-tool Task stage = %q, want short_answer", got)
+	}
+	if got := taskModelOutputBudgetStage(rootFence, true, ""); got != modelOutputBudgetStageToolStep {
+		t.Fatalf("ordinary tool Task stage = %q, want tool_step", got)
+	}
+	childFence := ModelTaskFence{AgentSessionID: "child-session", AgentRootSessionID: "root-session"}
+	if got := taskModelOutputBudgetStage(childFence, true, ""); got != modelOutputBudgetStageSubtask {
+		t.Fatalf("ordinary child Agent stage = %q, want subtask", got)
+	}
+	if got := taskModelOutputBudgetStage(childFence, true, "compaction"); got != modelOutputBudgetStageSummary {
+		t.Fatalf("compaction stage = %q, want summary even for a tool-using child Agent", got)
+	}
+}
+
 func TestTaskModelBudgetAdmissionRequiresVerifiedCapacityAndExactStrategyRoute(t *testing.T) {
 	maxOutput, contextWindow := 16_000, 64_000
 	endpoint := ModelGatewayEndpoint{

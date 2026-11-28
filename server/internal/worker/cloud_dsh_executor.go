@@ -428,6 +428,22 @@ type cloudDSHModelBudgetPlannerAdapter struct {
 	service CloudDSHModelBudgetPreparationService
 }
 
+func cloudDSHModelBudgetPreparePurpose(config json.RawMessage) (string, error) {
+	var fields map[string]json.RawMessage
+	if len(config) == 0 || !uniqueCloudDSHJSON(config) || json.Unmarshal(config, &fields) != nil || fields == nil {
+		return "", errors.New("dsh model budget config is invalid")
+	}
+	rawPurpose, exists := fields["purpose"]
+	if !exists {
+		return "", nil
+	}
+	var purpose *string
+	if json.Unmarshal(rawPurpose, &purpose) != nil || purpose == nil || *purpose != app.TaskModelBudgetPurposeCompaction {
+		return "", errors.New("dsh model budget purpose is invalid")
+	}
+	return *purpose, nil
+}
+
 func NewCloudDSHModelBudgetPlanner(service CloudDSHModelBudgetPreparationService) (CloudDSHModelBudgetPlanner, error) {
 	if service == nil {
 		return nil, errors.New("adaptive model budget preparation service is required")
@@ -439,12 +455,16 @@ func (adapter *cloudDSHModelBudgetPlannerAdapter) PrepareModelBudget(ctx context
 	if adapter == nil || adapter.service == nil {
 		return CloudDSHModelBudgetPlan{}, errors.New("adaptive model budget preparation service is unavailable")
 	}
+	purpose, err := cloudDSHModelBudgetPreparePurpose(request.Config)
+	if err != nil {
+		return CloudDSHModelBudgetPlan{}, err
+	}
 	plan, err := adapter.service.PrepareTaskModelBudget(ctx, app.TaskModelBudgetPrepareRequest{
 		Fence: func() app.ModelTaskFence {
 			fence := cloudDSHModelFence(request.Fence, request.SessionID, request.ThroughSeq, request.TaskRevision)
 			fence.RecoveryCallID, fence.RecoveryDSHCallID = request.RecoveryCallID, request.RecoveryDSHCallID
 			return fence
-		}(), DSHCallID: request.DSHCallID, ModelID: request.ModelID, ThroughSequence: request.ThroughSeq,
+		}(), DSHCallID: request.DSHCallID, ModelID: request.ModelID, Purpose: purpose, ThroughSequence: request.ThroughSeq,
 		Turn: request.Turn, Step: request.Step, BudgetCallID: request.CallID,
 		RequestDigest: request.RequestDigest, ProviderRequest: append(json.RawMessage(nil), request.Request...),
 	})

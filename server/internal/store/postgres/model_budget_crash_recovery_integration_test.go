@@ -94,6 +94,7 @@ max_output_catalog_version=NULL,max_output_source_url=NULL,updated_at=clock_time
 		TaskRevision: fence.TaskRevision, SessionID: fence.AgentSessionID, ModelID: call.ModelID,
 		ThroughSeq: fence.ThroughSequence, Turn: 1, Step: 0, CallID: "budget-call-crash-boundary",
 		DSHCallID: dshCallID, RequestDigest: requestDigest, Request: providerProjection,
+		Config: json.RawMessage(`{"provider":"morde","model":"p1234567"}`),
 	})
 	if err != nil {
 		t.Fatalf("prepare through DSH budget planner and PostgreSQL: %v", err)

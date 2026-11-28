@@ -782,6 +782,7 @@ test('opt-in Task compaction prepares its direct LLM stream against the final pr
     assert.ok(prepareFrames.length > 0, `no Task compaction prepare frame among ${frames.map(frame => frame.type).join(', ')}`)
     assert.equal(modelFrames.length, prepareFrames.length)
     for (const prepare of prepareFrames) {
+      assert.equal(prepare.config.purpose, 'compaction')
       const model = modelFrames.find(candidate => candidate.budget_call_id === prepare.call_id)
       assert.ok(model, `no final model frame matched compaction call ${prepare.call_id}`)
       assert.equal(prepare.request_digest, model.request_digest)

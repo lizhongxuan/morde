@@ -38,6 +38,20 @@ func (cloudDSHModelBudgetPlannerStub) SupportsTaskModelBudgetAdmission(context.C
 	return true, nil
 }
 
+type cloudDSHModelBudgetPreparationServiceStub struct {
+	request app.TaskModelBudgetPrepareRequest
+	plan    app.TaskModelBudgetPlan
+}
+
+func (stub *cloudDSHModelBudgetPreparationServiceStub) PrepareTaskModelBudget(_ context.Context, request app.TaskModelBudgetPrepareRequest) (app.TaskModelBudgetPlan, error) {
+	stub.request = request
+	return stub.plan, nil
+}
+
+func (*cloudDSHModelBudgetPreparationServiceStub) SupportsTaskModelBudgetAdmission(context.Context, task.Task) (bool, error) {
+	return true, nil
+}
+
 func TestCloudDSHModelBudgetAdmissionIsOptIn(t *testing.T) {
 	start := map[string]any{"type": "start"}
 	configureCloudDSHModelBudgetAdmission(start, nil, false, 2048)
@@ -98,6 +112,24 @@ func TestCloudDSHModelBudgetPrepareRequestIsStrictAndAuthorized(t *testing.T) {
 		t.Fatalf("valid budget request rejected: digest=%q err=%v", got, err)
 	}
 
+	compaction := frame
+	compaction.Config = json.RawMessage(`{"provider":"morde","model":"m1234567","purpose":"compaction"}`)
+	if got, err := validateCloudDSHModelBudgetPrepareRequest(compaction, "m1234567", nil); err != nil || got != digest {
+		t.Fatalf("valid compaction budget request rejected: digest=%q err=%v", got, err)
+	}
+	for _, config := range []string{
+		`{"provider":"morde","model":"m1234567","purpose":null}`,
+		`{"provider":"morde","model":"m1234567","purpose":7}`,
+		`{"provider":"morde","model":"m1234567","purpose":"unknown"}`,
+		`{"provider":"morde","model":"m1234567","purpose":""}`,
+	} {
+		badPurpose := frame
+		badPurpose.Config = json.RawMessage(config)
+		if _, err := validateCloudDSHModelBudgetPrepareRequest(badPurpose, "m1234567", nil); err == nil {
+			t.Fatalf("invalid model budget purpose was accepted: %s", config)
+		}
+	}
+
 	bad := frame
 	bad.RequestDigest = strings.Repeat("0", 64)
 	if _, err := validateCloudDSHModelBudgetPrepareRequest(bad, "m1234567", nil); err == nil {
@@ -118,6 +150,31 @@ func TestCloudDSHModelBudgetPrepareRequestIsStrictAndAuthorized(t *testing.T) {
 	bad.RequestDigest, _ = cloudDSHModelBudgetRequestDigest(bad.Request)
 	if _, err := validateCloudDSHModelBudgetPrepareRequest(bad, "m1234567", nil); err == nil {
 		t.Fatal("unauthorized draft tool was accepted")
+	}
+}
+
+func TestCloudDSHModelBudgetPlannerAdapterForwardsCompactionPurpose(t *testing.T) {
+	service := &cloudDSHModelBudgetPreparationServiceStub{plan: app.TaskModelBudgetPlan{PlanID: "plan_1", MaxTokens: 512}}
+	planner, err := NewCloudDSHModelBudgetPlanner(service)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := planner.PrepareModelBudget(context.Background(), CloudDSHModelBudgetPlanRequest{
+		Config:  json.RawMessage(`{"provider":"morde","model":"m1234567","purpose":"compaction"}`),
+		Request: json.RawMessage(`{"provider":"morde","model":"m1234567","messages":[],"tools":[]}`),
+	})
+	if err != nil || plan.PlanID != "plan_1" || plan.MaxTokens != 512 {
+		t.Fatalf("compaction adapter plan=%+v err=%v", plan, err)
+	}
+	if service.request.Purpose != "compaction" {
+		t.Fatalf("preparation service purpose = %q, want compaction", service.request.Purpose)
+	}
+
+	_, err = planner.PrepareModelBudget(context.Background(), CloudDSHModelBudgetPlanRequest{
+		Config: json.RawMessage(`{"provider":"morde","model":"m1234567","purpose":"unknown"}`),
+	})
+	if err == nil {
+		t.Fatal("planner adapter accepted an unknown budget purpose")
 	}
 }
 

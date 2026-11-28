@@ -271,6 +271,9 @@ func validateCloudDSHModelBudgetPrepareRequest(frame cloudDSHFrame, modelID stri
 	if _, exists := config["max_tokens"]; exists {
 		return "", errors.New("dsh model budget config still contains an output cap")
 	}
+	if _, err := cloudDSHModelBudgetPreparePurpose(frame.Config); err != nil {
+		return "", err
+	}
 	var requestFields map[string]json.RawMessage
 	if json.Unmarshal(frame.Request, &requestFields) != nil || requestFields == nil || len(requestFields) != 4 {
 		return "", errors.New("dsh model budget draft request shape is invalid")

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -69,7 +70,9 @@ func TestCloudDSHModelBudgetPlannerBootstrapIsOptIn(t *testing.T) {
 	if err != nil || planner == nil {
 		t.Fatalf("enabled planner = %v, err=%v", planner, err)
 	}
-	plan, err := planner.PrepareModelBudget(context.Background(), worker.CloudDSHModelBudgetPlanRequest{})
+	plan, err := planner.PrepareModelBudget(context.Background(), worker.CloudDSHModelBudgetPlanRequest{
+		Config: json.RawMessage(`{"provider":"morde","model":"p1234567"}`),
+	})
 	if err != nil || plan.PlanID != "plan_test_123" || plan.MaxTokens != 4096 || service.calls != 1 {
 		t.Fatalf("planner result=%+v calls=%d err=%v", plan, service.calls, err)
 	}
