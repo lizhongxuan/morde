@@ -2825,6 +2825,11 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				"agent_id": rootIdentity.AgentID, "session_id": rootIdentity.SessionID, "generation": rootIdentity.Generation,
 				"authorization_version": rootIdentity.AuthorizationVersion, "task_revision": cloudDSHTaskRevision(value), "model": value.ModelID,
 				"tools": cloudDSHToolPayload(rootDefinitions)}
+			if cloudDSHWebResearchProfileActive(value) {
+				// This value comes from the persisted, server-owned Task context;
+				// never infer a profile from the tool definitions sent to DSH.
+				start["agent_tool_profile"] = string(task.AgentToolProfileWebResearch)
+			}
 			configureCloudDSHModelBudgetAdmission(start, e.options.ModelBudgetPlanner, modelBudgetAdmission, maxTokens)
 			if traceparent := cloudDSHTraceparent(trace.ContextWithSpan(ctx, rootState.traceSpan)); traceparent != "" {
 				start["version"] = 2
@@ -3786,6 +3791,15 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 					return errors.New("dsh tool call admission returned an unsupported result")
 				}
 			}
+			webResearchPolicyDenial := ""
+			if cloudDSHWebResearchProfileActive(value) {
+				webResearchPolicyDenial = cloudDSHWebResearchToolDenial(state.history, frame.CallID, frame.Name, arguments, recoveryCall)
+				if webResearchPolicyDenial != "" {
+					// Return a normal failed tool result to DSH so it can synthesize
+					// from evidence already collected. The Broker is not invoked.
+					result = app.AgentToolResult{Status: app.AgentToolFailed, Output: webResearchPolicyDenial}
+				}
+			}
 			cancelRequested, err := e.cloudDSHJobCancelRequested(ctx, fence, state)
 			if err != nil {
 				return errors.New("dsh background job authorization changed")
@@ -3814,7 +3828,7 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 					return errCloudDSHPersonalMemoryChanged
 				}
 			}
-			if !recoveredPersonalResult {
+			if !recoveredPersonalResult && webResearchPolicyDenial == "" {
 				if frame.Name == cloudDSHResultEvidenceToolName {
 					result = app.AgentToolResult{Status: app.AgentToolSucceeded, Output: "Evidence map received as an untrusted claim. It is retained only if references resolve and the final answer exactly matches the text in the assistant message that submitted it."}
 				} else if cloudDSHJobTool(frame.Name) {
@@ -3954,15 +3968,23 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				return cloudDSHToolExecutionFailureFor(frame, "result_output_invalid", nil)
 			}
 			if result.Status == app.AgentToolFailed && !result.TerminalForAttempt {
-				e.options.Logger.Warn("DSH tool returned a definitive failure",
-					zap.String("task_id", state.identity.TaskID),
-					zap.String("failure_stage", "tool_execution"),
-					zap.String("failure_reason", "tool_returned_failed"),
-					zap.String("tool_name", cloudDSHSafeDiagnosticToolName(frame.Name)),
-					zap.String("tool_call_id", safeCloudDSHDiagnosticCallID(frame.CallID)),
-					zap.String("tool_status", string(result.Status)),
-					zap.String("tool_dispatch_status", "result_received"),
-				)
+				if webResearchPolicyDenial != "" {
+					e.options.Logger.Info("DSH web research call was stopped by its bounded policy",
+						zap.String("task_id", state.identity.TaskID),
+						zap.String("failure_stage", "web_research_policy"),
+						zap.String("failure_reason", "attempt_or_duplicate_limit"),
+					)
+				} else {
+					e.options.Logger.Warn("DSH tool returned a definitive failure",
+						zap.String("task_id", state.identity.TaskID),
+						zap.String("failure_stage", "tool_execution"),
+						zap.String("failure_reason", "tool_returned_failed"),
+						zap.String("tool_name", cloudDSHSafeDiagnosticToolName(frame.Name)),
+						zap.String("tool_call_id", safeCloudDSHDiagnosticCallID(frame.CallID)),
+						zap.String("tool_status", string(result.Status)),
+						zap.String("tool_dispatch_status", "result_received"),
+					)
+				}
 			}
 			if result.TerminalForAttempt {
 				retryAfterSeconds, retryAfterKnown := app.MCPConnectorTerminalRetryAfterSeconds(result.Output)

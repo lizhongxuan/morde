@@ -270,6 +270,93 @@ func TestPostgresTaskTerminalDeliveryRecoveryDiagnosisReachesModelFacts(t *testi
 	}
 }
 
+func TestPostgresTaskTerminalDeliveryBudgetDiagnosisCountsOnlyCurrentRevisionSuccessfulWebCalls(t *testing.T) {
+	f := newAgentLifecycleFixture(t)
+	ctx := context.Background()
+	if _, _, err := f.service.Start(ctx, f.request); err != nil {
+		t.Fatalf("start root Agent session for tool evidence: %v", err)
+	}
+	if _, err := f.store.pool.Exec(ctx, `UPDATE tasks SET model_id='p1234567' WHERE id=$1`, f.request.Fence.TaskID); err != nil {
+		t.Fatalf("set Task model identity for budget diagnosis: %v", err)
+	}
+	var currentRevision int64
+	if err := f.store.pool.QueryRow(ctx, `SELECT current_revision FROM tasks WHERE id=$1`, f.request.Fence.TaskID).Scan(&currentRevision); err != nil {
+		t.Fatal(err)
+	}
+	var nextSequence int64
+	if err := f.store.pool.QueryRow(ctx, `SELECT COALESCE(max(sequence),0)+1 FROM task_steps WHERE task_id=$1`,
+		f.request.Fence.TaskID).Scan(&nextSequence); err != nil {
+		t.Fatal(err)
+	}
+	evidence := []struct {
+		toolName string
+		status   string
+		revision int64
+		key      string
+		summary  string
+	}{
+		{toolName: "morde_web_search", status: "succeeded", revision: currentRevision, key: "search-success-1",
+			summary: "private query: current news; URL: https://private.example/news; result: private result 1"},
+		{toolName: "morde_web_search", status: "succeeded", revision: currentRevision, key: "search-success-2",
+			summary: "private query: private search 2; URL: https://private.example/second; result: private result 2"},
+		{toolName: "morde_web_read", status: "succeeded", revision: currentRevision, key: "read-success-1",
+			summary: "private query: private read; URL: https://private.example/read; result: private page output"},
+		{toolName: "morde_web_search", status: "failed", revision: currentRevision, key: "search-failed",
+			summary: "failed search must not count"},
+		{toolName: "morde_web_read", status: "running", revision: currentRevision, key: "read-unconfirmed",
+			summary: "unconfirmed read must not count"},
+		{toolName: "morde_private_tool", status: "succeeded", revision: currentRevision, key: "non-allowlisted-tool",
+			summary: "non-allowlisted success must not count"},
+		{toolName: "morde_web_search", status: "succeeded", revision: currentRevision + 1, key: "other-revision-search",
+			summary: "other revision search must not count"},
+		{toolName: "morde_web_read", status: "succeeded", revision: currentRevision + 1, key: "other-revision-read",
+			summary: "other revision read must not count"},
+	}
+	for index, item := range evidence {
+		stepID := mustID(t, domain.NewStepID)
+		requestDigest := sha256.Sum256([]byte(item.key))
+		if _, err := f.store.pool.Exec(ctx, `INSERT INTO task_steps
+(id,task_id,sequence,kind,status,title,summary,agent_session_id,task_revision,tool_call_key,tool_name,request_digest,phase,detail_state)
+VALUES ($1,$2,$3,'tool',$4,'Web tool call',$5,$6,$7,$8,$9,$10,'execute','available')`,
+			stepID, f.request.Fence.TaskID, nextSequence+int64(index), item.status, item.summary,
+			f.request.Fence.AgentSessionID, item.revision, item.key, item.toolName, requestDigest[:]); err != nil {
+			t.Fatalf("insert %s tool evidence: %v", item.key, err)
+		}
+	}
+	event := []byte(`{"reason":"dsh_recovery_unresolved","detail":{"phase":"recovery","failure_stage":"model_call_reservation","failure_category":"task_budget_exhausted","failure_reason":"task_budget_reservation_exceeded","query":"private event query","url":"https://private.example/event","result":"private event result","tool_call_id":"private-event-call"}}`)
+	sequence := commitTaskTerminalDeliveryWaiting(t, f, "dsh_recovery_unresolved", event)
+	claims, err := f.store.ClaimTaskTerminalDeliverySources(ctx, "terminal-budget-facts-reader", 30*time.Second, 1)
+	if err != nil || len(claims) != 1 || claims[0].SourceEventSequence != sequence {
+		t.Fatalf("claim budget diagnosis source: claims=%+v err=%v", claims, err)
+	}
+	claim := claims[0]
+	facts, found, err := f.store.ReadTaskTerminalDeliverySourceFacts(ctx, claim)
+	if err != nil || !found || !app.ValidTaskTerminalDeliverySourceFacts(claim, facts) {
+		t.Fatalf("read verified budget diagnosis facts: found=%t facts=%+v err=%v", found, facts, err)
+	}
+	if facts.ReadOnlyToolExecution.SuccessfulWebSearchCalls != 2 || facts.ReadOnlyToolExecution.SuccessfulWebReadCalls != 1 {
+		t.Fatalf("read-only call counts included failed, unconfirmed, non-allowlisted, or stale revision evidence: %+v",
+			facts.ReadOnlyToolExecution)
+	}
+	if !strings.Contains(facts.RecoveryDiagnosis, "此前有2 次网页搜索和 1 次网页读取调用记录为成功") ||
+		!strings.Contains(facts.RecoveryDiagnosis, "后续模型请求在派发前被任务预算检查拦截") ||
+		!strings.Contains(facts.RecoveryDiagnosis, "不能证明网页信息已核实或答复已完成") {
+		t.Fatalf("budget diagnosis does not distinguish earlier calls from unverified synthesis: %q", facts.RecoveryDiagnosis)
+	}
+	request, err := app.BuildTaskTerminalDeliveryDSHModelRequest(facts.ModelID, facts)
+	if err != nil {
+		t.Fatalf("build safe budget explanation request: %v", err)
+	}
+	for _, privateValue := range []string{"morde_web_search", "morde_web_read", "morde_private_tool", "private query", "private search 2",
+		"https://private.example/news", "https://private.example/second", "https://private.example/read", "private page output",
+		"private event query", "https://private.example/event", "private event result", "private-event-call",
+		claim.TaskID, claim.OwnerID, claim.ConversationID, "source_sha256"} {
+		if bytes.Contains(request, []byte(privateValue)) {
+			t.Fatalf("model input leaked tool detail or identity %q: %s", privateValue, request)
+		}
+	}
+}
+
 func TestPostgresTaskTerminalDeliveryStillInvalidatesAfterInstallationRevocation(t *testing.T) {
 	f := newAgentLifecycleFixture(t)
 	ctx := context.Background()

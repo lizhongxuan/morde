@@ -91,6 +91,9 @@
 - [x] 路由模型兼容返回内置 search/read tool 意图时，统一转成普通 DSH Task 并请求受理标记；不再把 Broker 原始输出直接发布成助手答复。正常 Task 由 DSH Agent 执行工具和综合结果，失败走 DSH 安全事实终态回告。应用解析与 PostgreSQL 路由用例通过；实际 PC 工具派发与最终合成回复仍待验收。
 - [ ] 对普通短答完成新的 DSH 延迟验收并记录 receipt、claim、分类和首条持久 assistant 消息时间。已有一个低于 1 秒的完整短答样本及 receipt/分类指标，但没有 first-delta 持久流；有界增量写入和断线续读协议仍未实现，不能宣称实时流式回复已完成。
 - [ ] 在实际 `morde-pc` 验证普通问答真实模型回复、一个只读工具请求和一个明确后台任务的进度/最终结果；检查现有 DSH 工具、MCP、子 Agent 和授权边界，不增加第二套 Agent Runtime。
+- [x] 已增加持久化的 `web_research` Task profile：只由服务端验证并从 Task context 传到 DSH start；DSH 指引和 Runtime checkpoint 历史 guard 限制重复检索，Worker 再按 checkpoint history 做派发前上限/去重校验。工具拒绝作为反馈交回 DSH 总结，不调用第二套 Agent Runtime。
+- [x] 终态 DSH 解释事实增加本 revision 内已成功的网页搜索/读取次数；不包含查询、URL、原始输出或调用 ID，并明确“调用成功”不等于内容已核实或答复已完成。
+- [ ] 以上实现还需在部署后的真实 PC/Provider 请求验收；模型 delta 持久化和断线续读协议未实现。
 
 ### 2026-11-28 本轮验证
 
@@ -98,6 +101,15 @@
 - 未完成：本地 PostgreSQL 终态回告集成测试当前环境未提供可确认的测试数据库，定向命令没有运行完整数据库路径；需用隔离 PostgreSQL 重跑。
 - 未完成：线上当前为 `release@ee618bed`，Worker 的终态错误持续发生在 `read_source_facts`。旧日志没有 `failure_code`；新字段尚未部署，不能猜测或宣称已修好该根因。
 - 未完成：本轮尚未实机启动并操作 `morde-pc`，也未生成新对话或测试请求；真实 AI 答案、端到端延迟和工具接管尚未验收。
+
+### 2026-11-28 续验（重复检索根因与有界 DSH 方案）
+
+- 设计已写入 [Morde 实时对话与 Agent 接管设计方案](Morde_实时对话与Agent接管_设计方案.md)：继续由 DSH 理解、检索和总结；参考 OpenClaw 的持久受理、run-scoped 进度/真实文本 delta、失败与成功分离及重连快照，不复用 OpenClaw Runtime。先立即展示真实受理状态，再缩短路由/Task/模型/工具/回告串行等待；Taskless delta 和续读协议仍单独未实现。
+- 真实 PC 基线复现：用 `make pc` 构建并启动本地 Electron `morde-pc`，连接当时线上 `/opt/morde-src@b47f009c`（health/readiness 均 HTTP 200）。新旁聊的真实短答“1+1等于2。”从发送到首次观察约 0.8 秒；另一个新只读新闻请求约 0.7 秒显示持久 receipt“已收到，正在等待处理”，随后进入“结果待核对”。任务详情显示 5 次网页搜索和 2 次网页读取为已完成，另有 1 次 `web_url_read` 工具执行已确认失败；另一个恢复步骤为状态待确认。没有再次提交该请求。这个证据确认旧 Runtime 的建议性提醒没有阻止 DSH 重复检索，且用户看到的通用状态卡没有说明实际做过哪些工作。
+- 代码处理：服务端只对经验证的首 revision 公共网页检索 Task 持久化 `web_research` profile，并把其枚举传入 DSH start。DSH 使用现有 repeat-tool-reminder、profile 指引和 pre-execute 历史 guard；Worker 从同一持久 checkpoint 再限制最多 2 次搜索、3 个 URL、每 URL 2 个窗口、总计 6 次读取及精确重复，拒绝不派发 Broker 并反馈给 DSH。终态说明只把白名单失败事实与成功调用计数交给 DSH，不泄漏查询或网页数据；硬预算保持 50,000，不降估算或重放未知动作。
+- 本地通过：`make pc`；`cd server && go test ./internal/app -run '^TestTaskTerminalDelivery' -count=1`；Worker `go test ./internal/worker -run 'WebResearch|CloudDSHTaskProfile|CloudDSHAccountTaskStart|SearchThenReadCompletesThroughWorkerWithSourceDate' -count=1`；Runtime `node --check src/engine.mjs && node --check src/account-runtime.mjs && node --test test/web-research-guard.test.mjs test/account-runtime.test.mjs`（11/11）。新增合成 DSH E2E 验证搜索/读取后遇到重复搜索时，Runtime 持久 guard 拒绝第二次 Broker 派发，模型收到拒绝后仍能用已读证据完成答复。
+- 真实 Provider 搜索结果**未通过**上述本地合成 E2E 覆盖。当前测试 PC 复现的是旧服务器代码，不能代表待发布修复；代码尚待提交/推送/部署，需部署后在另一个全新 PC 旁聊验证工具调用数、来源综合、终态失败气泡和各阶段耗时。自动恢复仍关闭；完整 Worker 包、未知用量/副作用反例、灰度 cohort 与低基数基线以及真实 PC 部署后验收尚未完成，T07/T08 继续进行中。
+- 全量 Worker 包运行 453.9 秒后暴露两项既有测试断言与当前路由/终态提示词不一致；未发现运行逻辑回归。将两项断言同步到当前合同后，新增重复检索拒绝 E2E、coordinator 路由合同与终态解释合同三项定向 Worker 用例均通过，`internal/app` 终态投递用例通过。完整 Worker 包需在合并后的 release 树重跑。
 
 ## 实施与验证记录（2026-11-27）
 

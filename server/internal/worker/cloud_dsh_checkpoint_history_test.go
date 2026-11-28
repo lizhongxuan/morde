@@ -750,6 +750,62 @@ func TestCloudDSHCheckpointHistoryRejectsRecoveredScreenshotWithoutImageBytes(t 
 	}
 }
 
+func TestCloudDSHCheckpointHistoryPersistsWebResearchGuardDenialWithoutReplaying(t *testing.T) {
+	const callID = "search_guard_1"
+	const toolName = cloudDSHWebResearchSearchToolName
+	const arguments = `{"query":"today news"}`
+	event := cloudDSHCheckpointEvent{Sequence: 4, Type: "tool/result", SurfaceOp: "append", SourceEventSeqs: []int64{3}, Data: map[string]any{
+		"turn": 1, "step": 1, "message": map[string]any{"toolCallId": callID, "isError": true,
+			"source": map[string]any{"kind": "tool", "callId": callID}, "content": []any{
+				map[string]any{"type": "text", "text": "Error: web_research guard: duplicate search"}}},
+		"error": map[string]any{"name": cloudDSHWebResearchGuardErrorName, "code": cloudDSHWebResearchGuardErrorCode},
+	}}
+	history := newCloudDSHCheckpointHistory("session_1")
+	if err := history.append(cloudDSHCheckpointPayload("session_1", 0,
+		checkpointTurnStart(0, "turn/start", map[string]any{"turn": 1}),
+		checkpointTurnStart(1, "step/start", map[string]any{"turn": 1, "step": 1}),
+		checkpointAssistantTextAndTool(2, "search", callID, toolName, arguments),
+		checkpointNamedToolCall(3, callID, toolName, arguments), event), 0, 4); err != nil {
+		t.Fatalf("web research guard denial was not persisted: %v", err)
+	}
+	call := history.calls[callID]
+	if call == nil || !call.resultSeen || !call.resultGuardDenied || call.resultUnknown || !call.reconciled || !history.allCallsReconciled() {
+		t.Fatalf("guard denial was not treated as a settled no-dispatch result: %+v", call)
+	}
+	if err := history.validateRecoveryToolCall(callID, toolName, []byte(arguments)); err == nil {
+		t.Fatal("settled guard denial must not be eligible for Worker replay")
+	}
+
+	for name, mutate := range map[string]func(cloudDSHCheckpointEvent) cloudDSHCheckpointEvent{
+		"wrong marker": func(value cloudDSHCheckpointEvent) cloudDSHCheckpointEvent {
+			value.Data.(map[string]any)["error"] = map[string]any{"name": "WebResearchGuardError", "code": "OTHER"}
+			return value
+		},
+		"extra marker field": func(value cloudDSHCheckpointEvent) cloudDSHCheckpointEvent {
+			value.Data.(map[string]any)["error"] = map[string]any{"name": cloudDSHWebResearchGuardErrorName,
+				"code": cloudDSHWebResearchGuardErrorCode, "query": "private"}
+			return value
+		},
+		"missing safe prefix": func(value cloudDSHCheckpointEvent) cloudDSHCheckpointEvent {
+			message := value.Data.(map[string]any)["message"].(map[string]any)
+			message["content"] = []any{map[string]any{"type": "text", "text": "private detail"}}
+			return value
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			mutated := mutate(event)
+			bad := newCloudDSHCheckpointHistory("session_1")
+			if err := bad.append(cloudDSHCheckpointPayload("session_1", 0,
+				checkpointTurnStart(0, "turn/start", map[string]any{"turn": 1}),
+				checkpointTurnStart(1, "step/start", map[string]any{"turn": 1, "step": 1}),
+				checkpointAssistantTextAndTool(2, "search", callID, toolName, arguments),
+				checkpointNamedToolCall(3, callID, toolName, arguments), mutated), 0, 4); err == nil {
+				t.Fatal("invalid guard-denial checkpoint was accepted")
+			}
+		})
+	}
+}
+
 func checkpointAssistantCall(seq int64, callID string) cloudDSHCheckpointEvent {
 	return cloudDSHCheckpointEvent{Sequence: seq, Type: "assistant/message", Data: map[string]any{
 		"turn": 1, "step": 1,

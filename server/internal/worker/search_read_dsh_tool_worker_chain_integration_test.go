@@ -10,6 +10,10 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
+
 	"morde/server/internal/app"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/task"
@@ -154,6 +158,189 @@ func TestDSHSearchThenReadCompletesThroughWorkerWithSourceDate(t *testing.T) {
 			got.step.Status != task.StepSucceeded || got.step.Title != expected.name || got.step.Summary != expected.output {
 			t.Fatalf("search/read call %d = %#v; want exact Task-bound operation and ordered work-chain record %#v", index, got, expected)
 		}
+	}
+}
+
+func TestDSHWebResearchDuplicateCallDenialReturnsToAgentWithoutSecondDispatch(t *testing.T) {
+	executor, _, _, checkpoints, models, value := cloudDSHFixture(t)
+	value.InitiatorID = value.OwnerID
+	expiresAt := time.Now().Add(time.Hour)
+	value.Authorization = task.Authorization{Kind: string(identity.KindSession), TokenID: "t1234567",
+		Scopes: []string{string(identity.ScopeTaskRead), string(identity.ScopeTaskSubmit)}, Version: 1, ExpiresAt: &expiresAt}
+	value.ConversationContext = &task.ConversationContext{
+		OwnerID: value.OwnerID, InitiatorID: value.InitiatorID, ConversationID: value.ConversationID,
+		Scope: "personal", ThroughSequence: 0, Digest: bytes.Repeat([]byte{3}, 32),
+		AgentToolProfile: task.AgentToolProfileWebResearch,
+	}
+	searchTool := app.AgentToolDefinition{ModelTool: app.ModelTool{Name: cloudDSHWebResearchSearchToolName,
+		Description: "Search public web pages.", Parameters: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}`)}}
+	readTool := app.AgentToolDefinition{ModelTool: app.ModelTool{Name: cloudDSHWebResearchReadToolName,
+		Description: "Read one public web page.", Parameters: json.RawMessage(`{"type":"object","properties":{"url":{"type":"string"}},"required":["url"],"additionalProperties":false}`)}}
+	broker := &boundedSearchReadWorkerBrokerStub{definitions: []app.AgentToolDefinition{searchTool, readTool}}
+	completion := &desktopChainCompleterStub{done: make(chan struct{}, 1)}
+	executor.options.Tools = broker
+	executor.options.Children = &cloudDSHProfileNoChildStore{}
+	executor.options.Completion = completion
+	model := &boundedSearchReadWorkerModel{taskID: value.ID}
+	models.complete = model.Complete
+
+	workerID := "morde-web-research-bound-worker"
+	logCore, observedLogs := observer.New(zapcore.DebugLevel)
+	value.Lease.Owner = workerID
+	claimed := false
+	leaseStore := &taskLeaseStoreStub{
+		claim: func(_ context.Context, gotWorkerID string, _ time.Duration) (task.Task, bool, error) {
+			if gotWorkerID != workerID {
+				return task.Task{}, false, errors.New("unexpected Worker identity")
+			}
+			if claimed {
+				return task.Task{}, false, nil
+			}
+			claimed = true
+			return value, true, nil
+		},
+		renew: func(_ context.Context, taskID, gotWorkerID string, version int64, lease time.Duration) (task.Task, error) {
+			if taskID != value.ID || gotWorkerID != workerID || version != value.Lease.Version {
+				return task.Task{}, errors.New("unexpected Task lease renewal")
+			}
+			expiresAt := time.Now().Add(lease)
+			value.Lease.ExpiresAt = &expiresAt
+			return value, nil
+		},
+	}
+	backgroundWorker, err := NewTaskWorker(TaskWorkerOptions{
+		Store: leaseStore, Executor: executor, WorkerID: workerID, LeaseDuration: time.Minute,
+		PollInterval: time.Millisecond, MaxConcurrentTasks: 1, Logger: zap.New(logCore),
+	})
+	if err != nil {
+		t.Fatalf("create local TaskWorker: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	workerDone := make(chan error, 1)
+	go func() { workerDone <- backgroundWorker.Run(ctx) }()
+	select {
+	case <-completion.done:
+	case <-ctx.Done():
+		cancel()
+		select {
+		case <-workerDone:
+		case <-time.After(5 * time.Second):
+		}
+		lastCheckpoint := "none"
+		if len(checkpoints.commands) > 0 {
+			lastCheckpoint = string(checkpoints.commands[len(checkpoints.commands)-1].Payload)
+			if len(lastCheckpoint) > 5000 {
+				lastCheckpoint = lastCheckpoint[len(lastCheckpoint)-5000:]
+			}
+		}
+		var logSummaries []string
+		for _, entry := range observedLogs.All() {
+			logSummaries = append(logSummaries, fmt.Sprintf("%s %#v", entry.Message, entry.Context))
+		}
+		t.Fatalf("bounded web research did not complete through DSH: %v; model rounds=%d broker calls=%d last_checkpoint_tail=%s logs=%s",
+			ctx.Err(), model.calls, len(broker.calls), lastCheckpoint, strings.Join(logSummaries, " | "))
+	}
+	cancel()
+	select {
+	case err := <-workerDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("TaskWorker stopped with %v; want context cancellation", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("TaskWorker did not stop after the bounded Task completed")
+	}
+		if completion.completion.Result != searchReadFinalAnswer {
+		t.Fatalf("bounded research completion = %q; want DSH to synthesize after the denial", completion.completion.Result)
+	}
+		if model.calls != 4 || !model.denialSeen {
+			t.Fatalf("model rounds=%d denial_seen=%t; want DSH to receive its persisted guard denial and answer in the next turn", model.calls, model.denialSeen)
+	}
+	if len(broker.calls) != 2 || broker.calls[0].Name != cloudDSHWebResearchSearchToolName ||
+		broker.calls[1].Name != cloudDSHWebResearchReadToolName {
+		t.Fatalf("Broker dispatches = %#v; duplicate search must not dispatch", broker.calls)
+	}
+}
+
+type boundedSearchReadWorkerBrokerStub struct {
+	definitions []app.AgentToolDefinition
+	calls       []app.ModelToolCall
+}
+
+func (b *boundedSearchReadWorkerBrokerStub) Definitions(context.Context, task.Task) ([]app.AgentToolDefinition, error) {
+	return append([]app.AgentToolDefinition(nil), b.definitions...), nil
+}
+
+func (b *boundedSearchReadWorkerBrokerStub) Execute(_ context.Context, _ task.Task, call app.ModelToolCall) (app.AgentToolResult, error) {
+	b.calls = append(b.calls, call)
+	switch call.Name {
+	case cloudDSHWebResearchSearchToolName:
+		return app.AgentToolResult{Status: app.AgentToolSucceeded, Output: searchReadSearchResult}, nil
+	case cloudDSHWebResearchReadToolName:
+		return app.AgentToolResult{Status: app.AgentToolSucceeded, Output: searchReadPageResult}, nil
+	default:
+		return app.AgentToolResult{}, fmt.Errorf("unexpected web research tool %q", call.Name)
+	}
+}
+
+type boundedSearchReadWorkerModel struct {
+	taskID     string
+	calls      int
+	denialSeen bool
+}
+
+func (m *boundedSearchReadWorkerModel) Complete(_ context.Context, call app.ModelCall) (app.ModelResponse, error) {
+	if call.Task == nil || call.Task.TaskID != m.taskID {
+		return app.ModelResponse{}, fmt.Errorf("synthetic model received unexpected Task fence: %#v", call.Task)
+	}
+	m.calls++
+	var request struct {
+		Messages []struct {
+			Role       string `json:"role"`
+			ToolCallID string `json:"toolCallId"`
+			Content    []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(call.RawRequest, &request); err != nil {
+		return app.ModelResponse{}, fmt.Errorf("decode bounded research model request: %w", err)
+	}
+	usage := app.ModelUsage{Known: true, InputTokens: 8, OutputTokens: 3}
+	switch m.calls {
+	case 1:
+		return app.ModelResponse{ToolCalls: []app.ModelToolCall{{CallID: "web_research_search_1", Name: cloudDSHWebResearchSearchToolName,
+			Arguments: `{"query":"synthetic AI research news from this week"}`}}, StopReason: "tool_calls", Usage: usage}, nil
+	case 2:
+		if !hasSearchReadToolResult(request.Messages, "web_research_search_1", searchReadSearchResult) {
+			return app.ModelResponse{}, errors.New("search result was not returned to DSH")
+		}
+		return app.ModelResponse{ToolCalls: []app.ModelToolCall{{CallID: "web_research_read_1", Name: cloudDSHWebResearchReadToolName,
+			Arguments: `{"url":"https://news.example.test/ai-research"}`}}, StopReason: "tool_calls", Usage: usage}, nil
+	case 3:
+		if !hasSearchReadToolResult(request.Messages, "web_research_read_1", searchReadPageResult) {
+			return app.ModelResponse{}, errors.New("page result was not returned to DSH")
+		}
+		return app.ModelResponse{ToolCalls: []app.ModelToolCall{{CallID: "web_research_search_2", Name: cloudDSHWebResearchSearchToolName,
+			Arguments: `{"query":"  SYNTHETIC AI RESEARCH NEWS FROM THIS WEEK  "}`}}, StopReason: "tool_calls", Usage: usage}, nil
+	case 4:
+		for _, message := range request.Messages {
+			if message.Role != "tool" || message.ToolCallID != "web_research_search_2" {
+				continue
+			}
+			for _, block := range message.Content {
+				if strings.Contains(strings.ToLower(block.Text), "web_research guard:") ||
+					strings.Contains(strings.ToLower(block.Text), "bounded web research allowance") {
+					m.denialSeen = true
+				}
+			}
+		}
+		if !m.denialSeen {
+			return app.ModelResponse{}, errors.New("Worker denial feedback was not returned to DSH")
+		}
+		return app.ModelResponse{Text: searchReadFinalAnswer, StopReason: "stop", Usage: usage}, nil
+	default:
+		return app.ModelResponse{}, fmt.Errorf("unexpected bounded research model round %d", m.calls)
 	}
 }
 

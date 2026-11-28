@@ -1289,6 +1289,104 @@ func TestAccountAgentRuntimeTaskPipeTagsSequenceAndDropsLateToolResult(t *testin
 	}
 }
 
+func TestCloudDSHAccountTaskStartProfileAllowlist(t *testing.T) {
+	base := map[string]any{"type": "start", "version": 1, "task_id": "q1234567", "owner_id": "u1234567",
+		"agent_id": "agent_123", "session_id": "session_123", "generation": 1, "authorization_version": 1,
+		"task_revision": 0, "model": "test-model", "tools": []any{}, "prompt": "request"}
+	tests := []struct {
+		name   string
+		mutate func(map[string]any)
+		want   bool
+	}{
+		{name: "ordinary task omits profile", want: true},
+		{name: "persisted web research profile", mutate: func(frame map[string]any) { frame["agent_tool_profile"] = "web_research" }, want: true},
+		{name: "empty profile is not serialized", mutate: func(frame map[string]any) { frame["agent_tool_profile"] = "" }},
+		{name: "forged profile", mutate: func(frame map[string]any) { frame["agent_tool_profile"] = "all_tools" }},
+		{name: "wrong profile type", mutate: func(frame map[string]any) { frame["agent_tool_profile"] = map[string]any{"name": "web_research"} }},
+		{name: "unexpected field", mutate: func(frame map[string]any) { frame["client_profile"] = "web_research" }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			frame := make(map[string]any, len(base)+1)
+			for key, value := range base {
+				frame[key] = value
+			}
+			if tt.mutate != nil {
+				tt.mutate(frame)
+			}
+			if got := validCloudDSHAccountTaskStartFrame(frame); got != tt.want {
+				t.Fatalf("validCloudDSHAccountTaskStartFrame() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCloudDSHAccountTaskPipeForwardsValidatedWebResearchProfile(t *testing.T) {
+	reader, writer := io.Pipe()
+	t.Cleanup(func() {
+		_ = reader.Close()
+		_ = writer.Close()
+	})
+	fence := app.AgentInstanceFence{TaskID: "q1234567", OwnerID: "u1234567", AgentInstanceID: "agent_123",
+		AgentGeneration: 1, AgentSessionID: "session_123", AuthorizationVersion: 2}
+	task := &cloudDSHAccountTask{ctx: context.Background(), fence: fence, sequence: 9, started: make(chan error, 1)}
+	task.started <- nil
+	session := &cloudDSHAccountRuntimeSession{runtime: app.AccountAgentRuntime{Fence: app.AccountAgentRuntimeFence{
+		ServiceInstanceID: "server_123", RuntimeID: "runtime_123", RuntimeGeneration: 4}}, input: &cloudDSHRuntimeInput{target: writer}}
+	pipes := &cloudDSHAccountTaskPipes{session: session, task: task, ctx: context.Background()}
+	start := map[string]any{"type": "start", "version": 1, "task_id": fence.TaskID, "owner_id": fence.OwnerID,
+		"agent_id": fence.AgentInstanceID, "session_id": fence.AgentSessionID, "generation": fence.AgentGeneration,
+		"authorization_version": fence.AuthorizationVersion, "task_revision": 0, "model": "test-model",
+		"tools": []any{}, "prompt": "request", "agent_tool_profile": "web_research"}
+	raw, err := json.Marshal(start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forwardedFrame := make(chan []byte, 1)
+	go func() {
+		line, _ := bufio.NewReader(reader).ReadBytes('\n')
+		forwardedFrame <- line
+	}()
+	if _, err := pipes.Write(append(raw, '\n')); err != nil {
+		t.Fatalf("write validated Task start: %v", err)
+	}
+	line := <-forwardedFrame
+	var forwarded map[string]any
+	if err := json.Unmarshal(line, &forwarded); err != nil {
+		t.Fatalf("decode forwarded Task start %q: %v", line, err)
+	}
+	if forwarded["type"] != "task_start" || forwarded["agent_tool_profile"] != "web_research" ||
+		forwarded["runtime_sequence"] != float64(9) {
+		t.Fatalf("forwarded Task start lost profile or runtime fence: %+v", forwarded)
+	}
+}
+
+func TestCloudDSHAccountTaskPipeRejectsForgedProfile(t *testing.T) {
+	reader, writer := io.Pipe()
+	t.Cleanup(func() {
+		_ = reader.Close()
+		_ = writer.Close()
+	})
+	fence := app.AgentInstanceFence{TaskID: "q1234567", OwnerID: "u1234567", AgentInstanceID: "agent_123",
+		AgentGeneration: 1, AgentSessionID: "session_123", AuthorizationVersion: 2}
+	task := &cloudDSHAccountTask{ctx: context.Background(), fence: fence, sequence: 9, started: make(chan error, 1)}
+	task.started <- nil
+	session := &cloudDSHAccountRuntimeSession{runtime: app.AccountAgentRuntime{Fence: app.AccountAgentRuntimeFence{
+		ServiceInstanceID: "server_123", RuntimeID: "runtime_123", RuntimeGeneration: 4}}, input: &cloudDSHRuntimeInput{target: writer}}
+	pipes := &cloudDSHAccountTaskPipes{session: session, task: task, ctx: context.Background()}
+	start := map[string]any{"type": "start", "version": 1, "task_id": fence.TaskID, "owner_id": fence.OwnerID,
+		"agent_id": fence.AgentInstanceID, "session_id": fence.AgentSessionID, "generation": fence.AgentGeneration,
+		"authorization_version": fence.AuthorizationVersion, "task_revision": 0, "model": "test-model",
+		"tools": []any{}, "prompt": "request", "agent_tool_profile": "all_tools"}
+	raw, err := json.Marshal(start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pipes.Write(append(raw, '\n')); err == nil || !strings.Contains(err.Error(), "start frame is invalid") {
+		t.Fatalf("forged profile error = %v, want invalid start frame", err)
+	}
+}
+
 func TestAccountAgentRuntimeUnarmedTaskStopDoesNotStopSibling(t *testing.T) {
 	control := &accountRuntimeControlStub{}
 	supervisor := &accountRuntimeSupervisorStub{recoverErr: errors.New("Runtime is still running")}

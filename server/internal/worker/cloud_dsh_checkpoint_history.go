@@ -21,6 +21,8 @@ const (
 	cloudDSHUnknownToolResultText         = "The tool outcome is unknown. The operation may already have happened. Do not repeat it; verify external state or ask the user before trying again."
 	cloudDSHUnknownToolResultErrorName    = "ToolOutcomeUnknownError"
 	cloudDSHUnknownToolResultErrorCode    = "TOOL_OUTCOME_UNKNOWN"
+	cloudDSHWebResearchGuardErrorName     = "WebResearchGuardError"
+	cloudDSHWebResearchGuardErrorCode     = "WEB_RESEARCH_GUARD"
 )
 
 type cloudDSHCheckpointHistory struct {
@@ -110,6 +112,7 @@ type cloudDSHToolCall struct {
 	surfaceResultData json.RawMessage
 	resultSeen        bool
 	resultUnknown     bool
+	resultGuardDenied bool
 	reconciled        bool
 	outputRecorded    bool
 }
@@ -923,7 +926,15 @@ func (h *cloudDSHCheckpointHistory) appendToolResult(sequence int64, data json.R
 	}
 	unknownOutcome := event.Message.IsError && cloudDSHToolResultErrorMatches(event.Error,
 		cloudDSHUnknownToolResultErrorName, cloudDSHUnknownToolResultErrorCode)
-	if event.Message.IsError != unknownOutcome || !unknownOutcome && len(event.Error) != 0 && string(event.Error) != "null" {
+	guardDeniedOutcome := event.Message.IsError && cloudDSHToolResultErrorMatches(event.Error,
+		cloudDSHWebResearchGuardErrorName, cloudDSHWebResearchGuardErrorCode)
+	if guardDeniedOutcome {
+		guardedCall := h.calls[event.Message.ToolCallID]
+		guardDeniedOutcome = guardedCall != nil &&
+			(guardedCall.name == cloudDSHWebResearchSearchToolName || guardedCall.name == cloudDSHWebResearchReadToolName)
+	}
+	if event.Message.IsError != (unknownOutcome || guardDeniedOutcome) ||
+		!unknownOutcome && !guardDeniedOutcome && len(event.Error) != 0 && string(event.Error) != "null" {
 		return errors.New("dsh tool result checkpoint has an unsupported error")
 	}
 	call := h.calls[event.Message.ToolCallID]
@@ -938,6 +949,10 @@ func (h *cloudDSHCheckpointHistory) appendToolResult(sequence int64, data json.R
 	if unknownOutcome && (call.status != "" || len(imageRefs) != 0 || output != cloudDSHUnknownToolResultText) {
 		return errors.New("dsh unknown tool result is invalid")
 	}
+	if guardDeniedOutcome && (call.status != "" || len(imageRefs) != 0 ||
+		!strings.HasPrefix(output, "Error: web_research guard: ")) {
+		return errors.New("dsh web research guard denial is invalid")
+	}
 	if call.status != "" && !sameCloudDSHImageRefs(call.runtimeImages, imageRefs) {
 		return errors.New("dsh tool result image differs from the reconciled Host result")
 	}
@@ -946,6 +961,10 @@ func (h *cloudDSHCheckpointHistory) appendToolResult(sequence int64, data json.R
 	}
 	call.resultText, call.resultImages, call.resultSeen, call.resultSeq = output, imageRefs, true, sequence
 	call.resultUnknown = unknownOutcome
+	call.resultGuardDenied = guardDeniedOutcome
+	if guardDeniedOutcome {
+		call.reconciled = true
+	}
 	call.surfaceResultSeq = sequence
 	call.surfaceResultData = append(json.RawMessage(nil), data...)
 	if call.status != "" {

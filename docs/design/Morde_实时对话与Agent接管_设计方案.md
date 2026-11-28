@@ -34,6 +34,18 @@
 - 搜索和网页读取统一创建普通 DSH Task。Task Agent 通过现有授权的只读工具检查来源并组织答案；未知操作结果仍遵守不重放规则，失败事实走现有 DSH 终态解释链路并回到原对话。
 - 首次 receipt 与处理中状态继续由持久消息/Task 状态展示。纯文字直接回复保留单次 DSH 路由；搜索要经过 Agent 工具和结果总结，响应可能更久，后续以端到端样本拆解 receipt、route claim、分类、工具派发与首条持久助手回复耗时。此调整没有实现 token 增量流。
 
+### 2026-11-28 用户反馈：重复失败气泡、慢响应与任务未完成
+
+用户实际看到对同一类请求反复出现相同的“模型服务未返回可确认的答复”，无法知道 DSH 是否实际搜索或失败在哪一步。处理按以下路径实施：
+
+1. **DSH 负责完成请求。** 路由只把经服务端验证的公开网页检索意图转成普通 DSH Task，并持久记录受限 `web_research` profile。DSH Task 仍负责搜索、阅读和基于证据撰写答复；不把原始 Broker 输出或预制新闻文案当成答案。Profile 仅收窄当前 Task 已获授权的工具，不能扩大授权。
+2. **让 DSH 少走重复步骤。** DSH 收到检索专用指引，复用同一会话已有结果，限制为最多 2 次搜索、3 个来源、每个来源最多 2 个阅读窗口、总计 6 次阅读。Runtime 依据持久 DSH 事件在派发前阻止成功/未决请求的重复；Worker 从 checkpoint history 再做一次权威校验。拒绝会作为工具反馈交回 DSH，供其用已有结果总结并如实指出证据缺口。它分别覆盖 DSH 正常循环与 Runtime/Worker 恢复边界，不用提示词代替强制限制。
+3. **失败气泡必须有事实。** 终态解释请求只接收允许的失败分类、真实步骤状态及成功网页调用计数，不接收查询、URL、原始输出或供应商错误。DSH 据此区分“工具调用成功”“来源已读”“模型答复完成”；调用成功不能被描述成内容已核实。只有 DSH 无法交付时，显示明确的状态/原因未明兜底，不冒充 AI 已排查。
+4. **先给可见回执，再缩短真实回答时间。** receipt 和处理中状态持续作为持久状态立即显示；路线、Task、模型、工具、终态投递分别计时，定位慢在分类、队列、Provider 还是检索轮次。Profile 收窄工具定义和不必要上下文，减少检索任务首轮输入；保留 50,000 token 硬上限和现有预留策略。持久 assistant delta、重连游标和 PC 续读需要独立的消息版本/权限围栏协议，本轮未实现前不称为 token 实时流。
+5. **参考 OpenClaw 的边界。** 借鉴 `/project/openclaw/src/gateway/server-methods/chat-send-input-dispatch.ts` 的受理/执行分层、`packages/gateway-protocol/src/schema/logs-chat.ts` 的 run-scoped typed status/delta/final/error、`src/gateway/server-chat-live-text.ts` 的真实文本增量投影，以及持久事件快照重连。仍只用当前固定版本的 DSH loop、provider 和 tools/MCP；不接入 OpenClaw Runtime，也不因重复失败放松鉴权、预算、checkpoint 或未知结果不重放规则。
+
+本轮验收目标是验证服务端持久 profile 到 DSH start、真实工具调用和拒绝反馈、模型综合及原会话回告的完整链路，并在实际 `morde-pc` 记录快答与搜索阶段耗时。合成模型 E2E 只能验证控制流和不重复派发；未由真实 Provider 与实际 PC 验收的项继续标为未完成。
+
 ## 实施顺序与验收
 
 ### P0：错误解释和即时可见状态

@@ -41,7 +41,7 @@ const TASK_PROCESS_ADMIT_KEYS = ['type', 'server_instance_id', 'runtime_id', 'ru
 const ACCOUNT_START_KEYS = [
   'type', 'version', 'traceparent', ...TASK_FENCE_FIELDS, 'server_instance_id', 'runtime_id', 'runtime_generation',
   'runtime_sequence', 'task_revision', 'conversation_id', 'model', 'tools', 'prompt', 'initial_message', 'initial_context', 'revision_messages', 'resume', 'checkpoint_through_seq', 'checkpoint_sha256', 'max_tokens', 'context_window_tokens', 'background_jobs', 'step_retry', 'model_budget_admission',
-  'model_recovery',
+  'model_recovery', 'agent_tool_profile',
 ]
 const COORDINATOR_START_KEYS = [
   'type', 'version', ...COORDINATOR_FENCE_FIELDS, 'server_instance_id', 'runtime_id', 'runtime_generation',
@@ -330,7 +330,8 @@ function coordinatorStartContentDigest(frame) {
 
 function validAccountStart(frame, runtime) {
   const start = { ...frame, type: 'start' }
-  return frame.type === 'task_start' && Object.keys(frame).every(key => ACCOUNT_START_KEYS.includes(key)) && validStart(start) &&
+  const validAgentToolProfile = !Object.hasOwn(frame, 'agent_tool_profile') || frame.agent_tool_profile === 'web_research'
+  return frame.type === 'task_start' && Object.keys(frame).every(key => ACCOUNT_START_KEYS.includes(key)) && validAgentToolProfile && validStart(start) &&
     Number.isSafeInteger(frame.runtime_sequence) && frame.runtime_sequence > 0 &&
     frame.owner_id === runtime.owner_id && frame.server_instance_id === runtime.server_instance_id &&
     frame.runtime_id === runtime.runtime_id && frame.runtime_generation === runtime.runtime_generation

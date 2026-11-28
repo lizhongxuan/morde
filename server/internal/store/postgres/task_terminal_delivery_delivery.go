@@ -442,14 +442,17 @@ func readTaskTerminalDeliveryFactsInTx(ctx context.Context, tx pgx.Tx,
 	var objective, result, status, waitingReason, modelID string
 	var eventPayload []byte
 	err := tx.QueryRow(ctx, `SELECT task.objective,task.result,task.status,task.waiting_reason,task.model_id,event.payload,
-       step_counts.total,step_counts.succeeded,step_counts.failed,step_counts.cancelled,step_counts.unconfirmed
+	       step_counts.total,step_counts.succeeded,step_counts.failed,step_counts.cancelled,step_counts.unconfirmed,
+	       step_counts.successful_web_search_calls,step_counts.successful_web_read_calls
 FROM tasks task JOIN task_events event ON event.task_id=task.id AND event.sequence=$3
 JOIN LATERAL (
   SELECT count(*) AS total,
          count(*) FILTER (WHERE step.status='succeeded') AS succeeded,
          count(*) FILTER (WHERE step.status='failed') AS failed,
          count(*) FILTER (WHERE step.status='cancelled') AS cancelled,
-         count(*) FILTER (WHERE step.status IN ('queued','running','waiting_user','unknown')) AS unconfirmed
+	         count(*) FILTER (WHERE step.status IN ('queued','running','waiting_user','unknown')) AS unconfirmed,
+	         count(*) FILTER (WHERE step.kind='tool' AND step.status='succeeded' AND step.tool_name='morde_web_search') AS successful_web_search_calls,
+	         count(*) FILTER (WHERE step.kind='tool' AND step.status='succeeded' AND step.tool_name='morde_web_read') AS successful_web_read_calls
   FROM task_steps step WHERE step.task_id=task.id
     AND (step.task_revision=task.current_revision OR (task.current_revision=0 AND step.task_revision IS NULL))
 ) step_counts ON TRUE
@@ -460,7 +463,8 @@ FOR SHARE OF task,event`, claim.TaskID, claim.OwnerID, claim.SourceEventSequence
 		claim.InitiatorID, claim.TaskRevision, claim.AuthorizationVersion, claim.SourceEventType, claim.SourceSHA256).
 		Scan(&objective, &result, &status, &waitingReason, &modelID, &eventPayload,
 			&facts.StepCounts.Total, &facts.StepCounts.Succeeded, &facts.StepCounts.Failed,
-			&facts.StepCounts.Cancelled, &facts.StepCounts.Unconfirmed)
+			&facts.StepCounts.Cancelled, &facts.StepCounts.Unconfirmed,
+			&facts.ReadOnlyToolExecution.SuccessfulWebSearchCalls, &facts.ReadOnlyToolExecution.SuccessfulWebReadCalls)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return app.TaskTerminalDeliverySourceFacts{}, domain.NewError(domain.CodeConflict, "Task terminal delivery source changed")
 	}
@@ -478,7 +482,7 @@ FOR SHARE OF task,event`, claim.TaskID, claim.OwnerID, claim.SourceEventSequence
 	case TaskTerminalDeliverySourceCancellation:
 	case TaskTerminalDeliverySourceWaiting:
 		facts.WaitingReason = safeTaskTerminalWaitingReason(waitingReason)
-		facts.RecoveryDiagnosis = app.TaskTerminalDeliveryRecoveryDiagnosisFromEvent(eventPayload)
+		facts.RecoveryDiagnosis = app.TaskTerminalDeliveryRecoveryDiagnosisFromEvent(eventPayload, facts.ReadOnlyToolExecution)
 	case TaskTerminalDeliverySourceValidation:
 		validation, err := readTaskTerminalDeliveryValidationFactsInTx(ctx, tx, claim, result)
 		if err != nil {

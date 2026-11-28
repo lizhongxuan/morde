@@ -241,7 +241,7 @@ func TestBuildTaskTerminalDeliveryModelRequestVerifiesDigestAndOmitsInternalIden
 		app.TaskTerminalDeliverySafeNextStep(app.TaskTerminalDeliverySourceFailure),
 		app.TaskTerminalDeliveryFailureExplanation("provider_unavailable"), `\"failure_explanation\"`,
 		"never expose message IDs, source hashes, checkpoint markers, internal tool names, or internal status/error codes",
-		"Do not list step counts or treat operational progress steps as evidence of task results",
+		"Do not list generic step counts or treat operational progress steps as evidence of task results",
 		"do not suggest repeating a potentially side-effecting action"} {
 		if !bytes.Contains(raw, []byte(fact)) {
 			t.Fatalf("model request omitted progress or safe-delivery rule %q: %s", fact, raw)
