@@ -1,6 +1,6 @@
 # Morde 模型生成预算自适应实施任务 TODO
 
-**状态（2026-11-28）：预算候选 `663d9250` 已由 `0c906232` 纳入 `release`；本地 `release` 上新增 B08 长回复请求类型缺陷修复，并通过定向回归及一次真实 DeepSeek Gateway 长回复调用（发送上限及 provider 报告输出均为 4,096 token，返回 `length` 部分结果）。截图所示 7 个 Codex worktree 已核对并删除，分支引用保留；其他任务的 detached worktree 与未提交任务中断/输出捕获改动仍保留。此前 P0 smoke 8 pass/0 fail/2 预期例外、DSH runtime 302/302、Worker→PostgreSQL→fake HTTP 整链、PostgreSQL 容量恢复及 DSH 来源/校验和检查通过。测试 Portal/SSH 当前不可达；尚未部署、进行 PC 真实长回复验收、刷新/重连与取消恢复验证，故 B01–B09 生产/PC 门禁仍未完成，B10 尚未开始。**
+**状态（2026-11-28）：预算候选 `663d9250` 已由 `0c906232` 纳入本地 `release`；B08 长回复请求类型缺陷已修复，并通过定向回归及一次真实 DeepSeek Gateway 长回复调用（4,096 token cap，provider 报告输出 4,096 token，返回 `length` 部分结果）。截图所示 7 个 Codex worktree 已核对并删除，分支引用保留；其他任务的 detached worktree 与未提交改动仍保留。此前 P0 smoke 8 pass/0 fail/2 预期例外、DSH runtime 302/302、Worker→PostgreSQL→fake HTTP 整链、PostgreSQL 容量恢复及 DSH 来源/校验和检查通过。测试 Portal 当前可达，但远端尚不满足完整 v4 离线备份及安全升级前置条件；本地 `release` 为 `bdb34b0d`，较 `origin/release@ee618bed` ahead 7。尚未部署，PC 真实长回复、刷新/重连、取消恢复与生产账单门禁未验收；B01–B09 生产/PC 门禁仍未完成，B10 尚未开始。**
 评审依据：《Morde_个人Agent_模型预算与可靠交付实施方案.md》、固定提交的 Morde 源码，以及锁定版本 DSH 的本地包契约和离线实跑。保留原 B01–B10 编号；已实现 DSH opt-in IPC/Worker 协议探针、Task compaction prepare、假 HTTP 集成测试、模型输出能力元数据、阶段策略快照及 PostgreSQL 预算准备账本。Portal 可单独加载显式路由阶段策略，但不会因此启用 Task admission 或 shadow sampling；默认配置没有任何阶段预算值。第25–27节记录旧候选 smoke、00270 迁移失败与本地 schema 修复；第28节记录当前候选本地验证、冲突核查及测试机不可达状态。
 
 **方案复核决策（2026-11-27）：** 采纳方案的 P0–P4 门禁、等待/暂停语义、周期止损与试点质量验收；保留“未知能力不猜、短答不多一次模型往返、历史 Task/Schedule 合同不迁移、未知派发结果继续占用”的边界。B03 影子原型不再作为开始 B04 账本工作的硬依赖；预算策略与 `O_send` 计算仍须在 B04/P1 试点启用前通过影子核验。方案中的 `4,000` 仅是反例数值，拟议 API 字段不代表现有接口；均不写成默认额度或既有合同。
@@ -426,3 +426,11 @@ P0 协议子门禁通过后可开始 P1 的 B02、B04；B03 影子计算可与 B
 - **真实 provider：** 在 `/private/tmp` 干净 release 源码副本（应用上述两处修复）运行 opt-in `TestDeepSeekFlashLongFormUsesAdaptiveStagePlanAndProviderUsage`，由 Morde `ModelGateway` 请求 DeepSeek `deepseek-flash`。用 4,096-token `long_form` 目标发出单次请求，provider 报告 input **216**、output **4,096** tokens，输出达到 cap 并以 `length` 标记部分结果，正文 **6,047 bytes**；用时 **21.48 秒**。这验证了单次 Gateway/provider 请求可使用并实际消耗高于 2,048 的输出额度。探针使用内存 route-store stub，不证明 PostgreSQL 持久化/账单结算、PC 展示、刷新/重连或生产部署；这次 provider 调用不构成全面质量或延迟基线。
 - **PC 当前源码尝试：** 执行 `make pc` 后，确认本地 Electron 主进程 PID `54123` 和 `morde-pc` 窗口已启动，辅助功能树显示助手输入区与“短答”模式。没有从该客户端发送新消息：测试 Portal/SSH 不可达，当前服务无法完成会话续期；因此没有声称 PC 实际生成、展示长回复或完成刷新/重连验收。桌面 CUA 状态读取两次超时，使用 macOS System Events 只读确认当前窗口和控件。
 - **密钥与远端边界：** DeepSeek key 仅作为该次 opt-in 测试的进程环境变量使用，未保存至文件或仓库。测试 Portal HTTPS/TLS 与 SSH banner 探测仍超时；本次没有登录、上传、迁移、数据库修改、部署或重启服务。B08 PC/生产验收和 B09 试点门禁保持未完成，B10 未开始。
+
+## 33. 测试机连通恢复、PC 状态及安全发布门复核（2026-11-28）
+
+- **本地 release 与 worktree：** 当前分支为 `release@bdb34b0d`，预算候选 `663d9250` 是其祖先；`origin/release` 仍在 `ee618bed`，本地 ahead 7，本轮没有 push。截图中的 7 个 worktree 已不存在，相关分支引用保留。另有 11 个与截图无关的 detached worktree，未触碰。工作区现有 Server Worker、Assistant 页面与设计文档的未提交改动均属于其他任务，本轮未暂存或覆盖。
+- **测试机连通性：** 重新探测 `https://portal.120.25.178.93.sslip.io/healthz` 返回 HTTP 200（TLS 0.132 秒、总计 0.151 秒），HTTP 80 返回 308。之前的只读 SSH 清点确认 Portal、Docker、PostgreSQL 与 Sandbox 服务在运行，候选 staging 仍是旧提交；线上 Portal YAML 没有 `long_form` 阶段策略配置，先前 remote dry-run 停在 `CH_TEST_DATABASE_URL` 未设置。旧备份目录里没有满足当前要求的 v4 bundle。上述只读结果不证明预算候选已部署。
+- **v4 备份前置条件：** `/etc/cloudhost/cloudhost.env` 缺少 `CH_POSTGRES_WAL_ARCHIVE_DIR` 与 `CH_WORKSPACE_SYNC_CURRENT_FILES_DIR`；当前 Workspace 存储位于 loop 挂载 `/srv/morde-acceptance`，无法证明它是部署 README 要求的独立、固定容量且非 thin-provisioned 数据文件系统。现有约 74 MB 旧备份不包含完整 WAL/Workspace/Site/named-volume v4 归档，不能作为本次升级回滚包。故本轮只读复核，没有停服务、修改 env/数据库、上传 bundle、迁移、替换二进制或重启 Portal。
+- **实际 PC 检查：** `make pc` 退出码 0；Electron 窗口在内置 CUA 中显示当前源码 `/assistant` 页面、会话与长回复开关。页面里可见的模型失败状态是已有会话记录；本轮没有发送新消息或改写对话。当前没有把候选部署至测试机，因此真实长回复、超过 2,048 输出 token、刷新/重连、取消与账本结算仍未从 PC 验收。
+- **状态：** B08 本地代码及 Gateway/provider 单次 4,096 输出证据保持通过；生产与 PC 验收不勾选。B09 继续未完成；先补齐并验证符合 README 的存储/配置与完整 v4 离线备份，再运行与当前 release 对应的远端 smoke/dry-run 和升级流程。B01–B09 生产/客户端门禁尚未全部通过，B10 未开始。
