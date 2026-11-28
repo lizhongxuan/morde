@@ -30,20 +30,18 @@ flowchart TD
 
   P --> I --> R
   R -->|reply / status / clarify / stop；或已记录的路由失败| Q
-  R -->|new / join / update / steer / tool| A
+  R -->|new / join / update / steer| A
   A -->|Task 已通过准入| C
-  A -->|仅限公开、单次、只读查询| B
   C <-->|DSH 工具请求、结果、审批恢复或未知状态对账| B
-  B -->|单次查询结果| Q
   C -->|按任务要求验证| V
   V -->|PASS / FAIL / pending| Q
   C -->|结果、部分完成、失败、取消或等待| Q
   Q -->|呈现在原会话| P
 ```
 
-**图例：**“代码接入”表示源代码落点存在，“待验”表示真实 PC/DSH 交互链路尚无完整证据，“待补”表示关键验证证据本身缺失。箭头表示可能的数据流，不代表每条消息都经过全部节点。步骤号对应下方 11 步表。分类、DSH 和必要的终态说明调用共用 Model Gateway；该网关不是另一个 Agent Runtime。PC 文件夹同步是独立的用户手动单向路径，授权 Workspace 的读取仍经 Broker；细节见[步骤 04](实施任务TODO/04-工具执行与工作项.md)。路由策略要求新闻和需要引用来源的请求走 Task Agent 搜索、读取并核对来源；实际搜索服务可用性与模型执行仍待验。单次 `tool` 路径只返回受限只读工具结果，不负责生成完整新闻综述。
+**图例：**“代码接入”表示源代码落点存在，“待验”表示真实 PC/DSH 交互链路尚无完整证据，“待补”表示关键验证证据本身缺失。箭头表示可能的数据流，不代表每条消息都经过全部节点。步骤号对应下方 11 步表。分类、DSH 和必要的终态说明调用共用 Model Gateway；该网关不是另一个 Agent Runtime。PC 文件夹同步是独立的用户手动单向路径，授权 Workspace 的读取仍经 Broker；细节见[步骤 04](实施任务TODO/04-工具执行与工作项.md)。所有公开网页搜索和页面读取都由 DSH Task Agent 在授权工具范围内执行、核验并综合回答；路由层不直接返回原始网页工具结果。实际搜索服务可用性与模型执行仍待验。
 
-**路由动作**包括 `reply`、`status`、`new`、`join`、`update`、`steer`、`stop`、`stop_all`、`clarify` 和受限 `tool`。分类服务失败或返回无效结果时先保留原消息并持久记录；只有确认可安全重试时才重新处理。
+**路由动作**包括 `reply`、`status`、`new`、`join`、`update`、`steer`、`stop`、`stop_all` 和 `clarify`。公开网页搜索/页面读取会转交 DSH Task Agent；旧式 `tool` 输出只有在上下文完整且参数有效时才会被提升为 Task，否则要求澄清。分类服务失败或返回无效结果时先保留原消息并持久记录；只有确认可安全重试时才重新处理。
 
 **模型预算状态（2026-11-28）：** B02 能力元数据与当前源码 PC 本地构建已通过；本轮 PC 的测试门户会话无法续期，代理隧道后的上游探测超时，真实目录读写仍未验。锁定 DSH 已接入 opt-in 的逐次预算请求钩子与 Worker/Runtime 计划协议；预算账本、单次 plan 和基于精确并发限额的容量等待由服务端 PostgreSQL 路径实现。等待事务持久化 Task/Agent/call/checkpoint fence 并清除 lease；reconciler 核对旧 Agent stop receipt 后重新检查额度并唤醒或安全暂停。恢复 attempt 持久化独立的 DSH frame ID 与 ledger call ID。migration 00270 按 `BudgetCallID` 保存首次容量等待时间和 deadline：单次调用最多等待 5 分钟，同一调用 requeue 后不会重置；成功 prepare 与 inactive Task 清理会删除 marker。migration 00272 为有效 FIFO waiter 保留一个后续账户并发槽，普通新请求不能插队占用；waiter 成功 prepare 后清除 claim，过期等待不占槽。动态 PG 用例证明策略与项目费率改变后会丢弃旧计划、按当前值重算，容量唤醒后也会按当前费率重新定价。migration 00273 与现有管理员未知用量页面支持自适应 Task overage 核对：管理员提交供应商证据和确认用量后，账户/项目账本按实际用量结算并保留审计；这不增加预算，也不恢复丢失回复，当前仅完成本地代码验证。另有 B05 的 40,000 signed-cap 本地链路，验证 DSH final frame、PG reservation 与 fake provider HTTP 一致；旧路径 cap 保持；Portal planner bootstrap 与 exact-route 资格门控已接入，但部署配置为 false；共享 endpoint resolver 会按当前 exact route/version 清除过期的输出/上下文目录值。B06 本地已增加有界长正文传输：fake SSE 512 KiB、PostgreSQL durable delta 超过旧 32 KiB、2 MiB 累计上限与超限拒绝均有定向验证；助手正文持久化上限为 2 MiB、delta 不超过 32 KiB、DSH frame 不超过 4 MiB，Task 模型总时限 10 分钟且正文空闲时限 60 秒。这些是假 provider/本地 PG 证据，不代表真实 provider 或 PC 已验；测试 PC 会话无法续期，实际刷新重连交付仍待验，B05/B06 不勾选。Worker plan binding、ModelGateway reservation、响应密封/回放均验证 prepare ledger ID 与最终 DSH frame ID；本地 DSH runtime → PostgreSQL → ModelGateway → fake HTTP 整链通过，确认一个 3,072 cap、8/6 usage 入账，settled replay 后 provider 仍仅被调用一次；timeout、503、派发后 cancel 均阻止同键二次派发。另有真实锁定 DSH + Worker 子进程在 DB 派发提交后、fake HTTP 前被 SIGKILL 的用例：恢复标记 ledger 为 `unknown`，相同调用 replay 被拒绝且 HTTP 仍为 0。它不代表运行中的 Portal 二进制或真实 provider 已验。Portal bootstrap 已接入但部署配置为 false，发送上限未改变。完整状态与验证命令见[模型预算自适应实施 TODO](../design/Morde-模型生成预算自适应实施任务todo清单文档.md)。
 
@@ -64,7 +62,7 @@ B03 另实现默认关闭的 Task-only 影子路径：用只读 repeatable-read 
 
 | 层 | 当前实现 | 与 Muse 体验的主要差距 |
 |---|---|---|
-| **L1 路由** | Agent 输出结构化动作；代码校验消息身份、任务引用、控制范围、授权、修订和幂等。支持直接回复、状态、任务新建/关联/修改/停止、澄清及受限只读工具。 | 真实 PC + 模型下的复杂意图、追问和新闻请求仍需验证；分类失败虽会保留消息并可安全重试，用户端失败体验仍要实测。 |
+| **L1 路由** | Agent 输出结构化动作；代码校验消息身份、任务引用、控制范围、授权、修订和幂等。支持直接回复、状态、任务新建/关联/修改/停止和澄清；公开网页搜索与读取由 DSH Task Agent 完成。 | 真实 PC + 模型下的复杂意图、追问和新闻请求仍需验证；分类失败虽会保留消息并可安全重试，用户端失败体验仍要实测。 |
 | **L2 合并** | 仅对显式 `joinable` 的先前请求开放加入；同一执行范围、控制范围、授权及其他关键输入需匹配。可将同一工作的补充消息纳入 Task。 | 主题相似不能作为合并依据；需要继续验收并发消息、不同授权/项目和独立请求不会误合并。 |
 | **L3 Task** | Task 保存目标、brief/计划、步骤、依赖、修订、工具调用和结果；复杂任务按需使用计划，不要求普通问答创建 Task。 | 部分计划与验证门禁仍在收口；计划完整不代表执行完成，缺少真实结果时不能提前报成功。 |
 | **L4 协调** | Task Worker 驱动 DSH 会话；DSH 子会话树支持按需委派、依赖和结果回传。DSH 是唯一 Agent Runtime。 | 代码有子会话和恢复路径，但真实 PC + DSH 的并行执行、阻塞恢复及主 Agent 汇总尚未完整验收。独立的“每目标 watch-loop”不视为已实现。 |
@@ -87,7 +85,7 @@ B03 另实现默认关闭的 Task-only 影子路径：用只读 repeatable-read 
 
 ## 与 Muse 体验对齐时不能越过的边界
 
-- 普通问答直接在对话中回复；简单查询仅在受限工具范围内直返；复杂工作才创建或关联 Task。
+- 普通问答直接在对话中回复；公开网页搜索和页面读取由 DSH Task Agent 执行并综合来源；其他复杂工作按范围创建或关联 Task。
 - 只有明确可加入且范围、授权一致时才合并；合并运行不算任务失败。独立目标不能因主题相似而合并。
 - 工具调用先经过 Morde Broker 的身份、权限、范围、审批、预算和操作记录检查。批准后再次校验当前授权与版本。
 - 用户审批在对话 MCP App 和审核列表中呈现同一请求；任务动态是只读进度与工作项。

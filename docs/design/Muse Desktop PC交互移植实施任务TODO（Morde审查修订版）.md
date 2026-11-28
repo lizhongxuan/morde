@@ -15,7 +15,7 @@
 ## PR A · 先交付两个纯交互收益
 
 - [ ] **待 PC 实测 · M01 折叠工具活动。** `Assistant.tsx`：保留 MAIN / SUBAGENT 和现有 `TaskStepDetails`，二级分组按 Task、Agent、修订、相邻原序号；保守拆开身份缺失、修订不同或原日志有断点的项。同一失败步骤仍有详情入口，等候/失败/待核对不被默认折叠遮住。**验收：**12 条同组成功步骤折叠时只见 1 项，展开是原 12 个 ID；0 个提前详情请求；失败最多一次展开可达；覆盖序号断点、修订变化、主/子 Agent、重复事件与断线重连（基线 E1）。2026-11-28 定向测试复跑 2/2、Portal 类型检查通过；仍未用 `make pc` 实测。
-- [ ] **PC 局部实测，Finder 拖放仍未进入草稿 · M08 附件拖放。** `Assistant.tsx`、`assistant-drafts.ts`：仅拦截输入区文件拖放并阻止导航；复用 `addComposerFiles` 的 staging、16 项上限和既有校验。预览对象 URL 生命周期跟随草稿；保留原文件选择、移除、错误恢复。**验收：**用合成文件对同一组执行「点击选文件」与「拖入」得到相同接受/拒绝结果；慢准备期间切会话仍进原草稿。拖入、移除和开草稿不触发附件发送或 Office POST；显式点既有 Office 预览才走受提示的服务端解析（E2）。联测用替身，不上传个人文件。2026-11-28 定向测试复跑 3/3、Portal 类型检查通过。当前源码重新打包的 `io.morde.client` 隔离 profile 实测：文件选择器将合成文件加入“待发送附件”，移除后草稿清空；Finder 拖动同一文件到输入区后草稿无变化。未发送消息或打开 Office 预览；拖放及与选择器等价验收仍未完成。
+- [ ] **代码与自动化验证完成，PC 实测待授权 · M08 附件拖放。** `Assistant.tsx`、`assistant-drafts.ts`：仅拦截输入区文件拖放并阻止导航；复用 `addComposerFiles` 的 staging、16 项上限和既有校验。Finder 在部分拖放路径上会提供 `DataTransferItem(kind=file)`，但 `DataTransfer.files` 为空；现回退到 `getAsFile()` 后仍走同一 staging。预览对象 URL 生命周期跟随草稿；保留原文件选择、移除和错误恢复。**验收：**用合成文件对同一组执行「点击选文件」与「拖入」得到相同接受/拒绝结果；慢准备期间切会话仍进原草稿。拖入、移除和开草稿不触发附件发送或 Office POST；显式点既有 Office 预览才走受提示的服务端解析（E2）。联测用替身，不上传个人文件。2026-11-28 `npm test -- src/routes/Assistant.test.tsx` 332/332、Portal 类型检查通过；覆盖 items-only Finder drop、16 项上限和不触发隐式发送/Office 请求。用当前源码生成的独立 `io.morde.client` 包已到登录页，登录会自动授权本机，等待用户确认后才能继续凭据登录和 PC 拖放实测；此前的 Finder 手测发生在此修复前，不能代表当前候选包。M08 保持未勾选。
 
 ## PR B · 追问沿用 Morde；语音先修正确性
 
@@ -60,3 +60,10 @@
 - 2026-11-28 本轮续做：从 `release@1d65dba8` 开始，本地提交 `5def8c0b` 修复 Project Task 输出捕获的 Workspace resource 版本校验并加入撤权集成回归；此前 TODO 记录提交 `0a508dff` 也在本地 `release`。本段新验收记录随本次文档更新提交到 `release`。PG16 三项定向输出捕获测试、`go test ./internal/app ./internal/api -count=1`、`gofmt` 和 `git diff --check` 均通过。未推送或部署。M03、M04、M12 仍未完成：服务器输出分页路由尚未部署，且其余要求的 PC 入口、任务场景和权限矩阵没有完整联验。随后以 `npm run dist:dir` 从当前源码生成本地 `morde-pc` 包（`io.morde.client`，未发布），并以独立 `MORDE_TEST_USER_DATA` 启动；CUA 确认窗口来自该包，使用指定测试服务账号登录成功。合成附件经选择器可进入草稿并可移除；Finder 拖入无状态变化；没有发送消息、重试服务端既有待核对任务或接受麦克风权限。测试后关闭客户端并清理本轮创建的 `/tmp` profile 与合成文件；默认 Electron profile 未操作。
 
 - 2026-11-28 M06/路由预算续验：本地 `release@8c46fee0`，使用仅绑定回环地址的 PostgreSQL 16 临时容器。`go test -json ./internal/worker -count=1` 全量通过；包含摘要跨主/side chat 重启、Task 模型调用进程崩溃恢复及最小 4K 路由边界。`go test ./internal/app ./internal/api -count=1` 通过；三项摘要/模型崩溃/DSH 路由定向用例 3/3 通过，最小窗口控制证据、长消息预览及 SOUL 预留边界定向用例通过。Go 格式检查与 `git diff --check` 通过。没有连接或修改测试服务器，也没有使用提供的模型密钥；未部署或推送。M12 仍因实际 PC 与部署/实机验收未完成而保持未勾选。提交后工作区另有未提交的 `cloud_dsh_model_budget_postgres_http_e2e_integration_test.go` 改动引用未定义 `routeWorker`（第 404 行），后续定向复跑在编译阶段被阻断；该文件未纳入本次提交。
+
+### 2026-11-28 当前候选续验
+
+- 本轮开始时本地 `release@d7262566` 与 `origin/release` 一致；M08 代码和测试已提交为 `2cbff474`，其余路由代码和记录仍在 `release` 工作区。macOS arm64 源码包由 `npm run dist:dir` 生成，应用 ID 为 `io.morde.client`，Electron `44.7.0`。应用已从独立 profile 打开并显示登录页；由于登录会将本机加入账号授权设备，尚未提交登录凭据或操作账号数据。测试服务器未部署、未写入，未使用提供的 DeepSeek key。
+- M08 拖放修复后，`web/portal` 的 `npm test -- src/routes/Assistant.test.tsx` 332/332；`npm run typecheck` 通过。当前候选包的实际 Finder 等价拖放验收尚未执行，等待账号授权确认；不要把修复前的 Finder 手测写成当前候选的实测结果。
+- 路由回归：`go test ./internal/worker -run '^TestTrimConversationRouteCandidates(PreservesActiveTaskControlEvidence|DeduplicatesActiveTaskControlEvidence|PreservesTaskWithActiveControlEvidence)$' -count=3` 通过；`go test ./internal/app -run '^TestConversationRouteWebLookupUsesTaskAgentAndSynthesis$' -count=1` 通过。另一次 PG16 `TestCloudDSHModelBudgetPostgresHTTPUsesTaskHermesCompactionSummaryStage` 仍未通过：追问路由停在 `waiting_user`，早先快照还曾报告 `message_too_long`；这是未解决的 M06/路由 E2E，不记录为通过，也不放宽来源、授权或 checkpoint fence。总流程文档已同步公开搜索/网页读取由 DSH Task Agent 执行并综合，路由层不再直返网页工具输出。
+- M01、M07、M09a、M02–M04、M09b、M11 与 M12 的未验项按前文保留；PC 登录、PC/iOS 联合回归、部署 API、真实麦克风电平和签名通知仍无本轮证据。统一 UI 规范文件缺失仍待核对。本 TODO 和 M12 保持未勾选。

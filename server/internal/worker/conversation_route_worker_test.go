@@ -611,6 +611,38 @@ func TestTrimConversationRouteCandidatesPreservesActiveTaskControlEvidence(t *te
 	}
 }
 
+func TestTrimConversationRouteCandidatesDeduplicatesActiveTaskControlEvidence(t *testing.T) {
+	value := app.ConversationRouteContext{
+		ActorID: "u1234567", Content: "补充一项结果", CurrentRequestModelID: "p1234567", TimeZone: "Asia/Shanghai",
+		ReferenceTaskID: "q1234567", PreviousMessageID: "m7654321",
+		Candidates: []app.ConversationRouteCandidate{{TaskID: "q1234567", InitiatorID: "u1234567",
+			Status: task.StatusRunning, Revision: 3}},
+	}
+	for sequence := int64(1); sequence <= 16; sequence++ {
+		value.RequestCandidates = append(value.RequestCandidates, app.ConversationRouteRequestCandidate{
+			MessageID: fmt.Sprintf("m%07d", sequence), Sequence: sequence, TaskID: "q1234567", TaskStatus: task.StatusRunning,
+			SameControlScope: true, SameAuthorization: true,
+			RequestInput: app.ConversationRoutingInput{ModelID: "p1234567", TimeZone: "Asia/Shanghai"},
+		})
+	}
+	value.RequestCandidates = append(value.RequestCandidates, app.ConversationRouteRequestCandidate{
+		MessageID: "m7654321", Sequence: 17, Content: "unrelated previous request", RoutingStatus: conversation.RoutingRouted,
+	})
+
+	for trimConversationRouteCandidates(&value) {
+	}
+	if !value.CandidateSetIncomplete || !value.RequestCandidateSetIncomplete || len(value.RequestCandidates) != 2 {
+		t.Fatalf("repeated active Task evidence was not bounded while marking omissions: candidates=%d incomplete=%t/%t value=%+v",
+			len(value.RequestCandidates), value.CandidateSetIncomplete, value.RequestCandidateSetIncomplete, value)
+	}
+	if value.RequestCandidates[0].MessageID != "m0000016" || value.RequestCandidates[1].MessageID != value.PreviousMessageID {
+		t.Fatalf("trimming did not retain the newest control proof and explicit previous request: %+v", value.RequestCandidates)
+	}
+	if !app.ValidConversationRouteSteerTarget("q1234567", value) {
+		t.Fatalf("bounded control evidence no longer authorizes a safe steer: %+v", value)
+	}
+}
+
 func TestTrimConversationRouteCandidatesPreservesTaskWithActiveControlEvidence(t *testing.T) {
 	value := app.ConversationRouteContext{
 		ActorID: "u1234567", CurrentRequestModelID: "p1234567", TimeZone: "Asia/Shanghai",

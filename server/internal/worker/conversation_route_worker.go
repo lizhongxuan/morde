@@ -668,6 +668,20 @@ func conversationRouteRequestSupportsActiveTaskControl(candidate app.Conversatio
 	return false
 }
 
+func conversationRouteRequestHasNewerActiveTaskControlEvidence(candidate app.ConversationRouteRequestCandidate,
+	value *app.ConversationRouteContext) bool {
+	if !conversationRouteRequestSupportsActiveTaskControl(candidate, value) {
+		return false
+	}
+	for _, newer := range value.RequestCandidates {
+		if newer.TaskID == candidate.TaskID && newer.Sequence > candidate.Sequence &&
+			conversationRouteRequestSupportsActiveTaskControl(newer, value) {
+			return true
+		}
+	}
+	return false
+}
+
 func conversationRouteTaskHasActiveControlEvidence(candidate app.ConversationRouteCandidate,
 	value *app.ConversationRouteContext) bool {
 	if candidate.TaskID == "" || candidate.InitiatorID != value.ActorID || candidate.Status != task.StatusRunning {
@@ -685,7 +699,9 @@ func conversationRouteTaskHasActiveControlEvidence(candidate app.ConversationRou
 func trimConversationRouteCandidates(value *app.ConversationRouteContext) bool {
 	for index := len(value.RequestCandidates) - 1; index >= 0; index-- {
 		candidate := value.RequestCandidates[index]
-		if candidate.MessageID == value.PreviousMessageID || conversationRouteRequestSupportsActiveTaskControl(candidate, value) {
+		if candidate.MessageID == value.PreviousMessageID ||
+			(conversationRouteRequestSupportsActiveTaskControl(candidate, value) &&
+				!conversationRouteRequestHasNewerActiveTaskControlEvidence(candidate, value)) {
 			continue
 		}
 		value.RequestCandidates = append(value.RequestCandidates[:index], value.RequestCandidates[index+1:]...)
