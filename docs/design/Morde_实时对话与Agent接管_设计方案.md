@@ -21,12 +21,12 @@
 
 ## OpenClaw 可复用模式
 
-- `project/openclaw/src/agents/embedded-agent-subscribe.handlers.messages.update.ts` 先展示真实模型 text delta，再结束该条响应。
-- `project/openclaw/src/sessions/session-run-error.ts` 把失败报告与正常模型回复分开，并按 run ID 幂等追加，避免模型无回复时静默。
-- `project/openclaw/src/agents/embedded-agent-subscribe.handlers.tools.progress.ts` 只展示明确标记为公开的类型化进度；内部工具细节留在诊断面板。
-- `project/openclaw/src/channels/message/ingress-drain.ts` 用持久 ingress 状态和可恢复 lease，保证接收、处理、重试和失败都有可观察生命周期。
+- `project/openclaw/src/gateway/server-methods/chat-send-input-dispatch.ts` 在用户消息持久受理后才返回带 `runId`、`status=started` 和 transcript sequence 的 receipt；`chat-send-admission.ts` 管理幂等与并发受理。Morde 采用相同区分：受理回执立即可见，但不把它冒充模型回答。
+- `project/openclaw/packages/gateway-protocol/src/schema/logs-chat.ts` 定义带 `runId/sessionKey/seq` 的状态、真实文本 delta、final、aborted 和 error 事件；`src/gateway/server-chat.ts` 记录 receipt 到首个助手事件的耗时，并在工具开始前冲刷模型已生成的实际文本增量。Morde 的直接回复应增加带 conversation/message/revision fence 的持久增量和续读协议，不能从 Task 状态文案推断模型内容。
+- `project/openclaw/src/agents/embedded-agent-runner/run.ts`、`run-orchestrator.ts` 和 `run-loop.ts` 将模型驱动执行与产品消息生命周期分层。Morde 只借鉴分层，继续让 DSH 作为唯一 Runtime；现有 Broker、审批、账本和 checkpoint 保留授权边界。
+- `project/openclaw/src/sessions/session-run-error.ts` 将安全失败与成功答复分开，按 run identity 去重；`chat-inflight-snapshot.ts` 和 `packages/gateway-client/src/chat-stream-projection.ts` 让客户端按 run 重建进行中的真实内容，并在事件基线缺失时请求续接。Morde 的终态失败事实应一次性、安全地交给 DSH 解释，再以来源和消息身份去重写入原会话；重连恢复应读取同一 run/message 的持久快照与事件游标，不能重派未知结果的操作。
 
-这些只作为消息流、去重和公开状态的设计参考；不复用其 Agent loop、provider 或 tool runtime。
+这些只作为回执、流事件、恢复和错误隔离的设计参考；不复用 OpenClaw Agent loop、provider 或 tool runtime，也不接入第二套运行时。
 
 ### 2026-11-28 实施决策：搜索交给 DSH Task Agent
 

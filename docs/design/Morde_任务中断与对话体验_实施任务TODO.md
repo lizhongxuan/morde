@@ -191,6 +191,7 @@
 ### 2026-11-28 续验（PC 重复失败说明与 Task 预算拒绝）
 
 - 设计方向：继续使用唯一的 DSH Agent Runtime。普通问答仍走 DSH 对话；搜索/网页读取由 DSH Task Agent 实际调用已授权工具、核实来源并生成答复；失败回告由 DSH 根据安全事实组织自然语言。PC 收到终态后有界补读原会话消息，避免 Worker 晚于 Task 状态事件写入的 AI 回告一直不可见。
+- OpenClaw 只读审查完成：参考其 admission receipt、run-scoped typed status/delta/final/error、真实文本流、错误与成功答复隔离、幂等失败报告及重连快照；不复用 OpenClaw 的 Agent loop、provider 或工具 Runtime。Morde 还需为 Taskless 直接答复设计自己的持久消息版本与续读游标。
 - 实际 PC 证据：上一条新旁聊短答由真实模型针对问题生成，用户提交后观察到的可见延迟低于 1 秒。重复的失败气泡关联两条分别提交的同文请求，不是同一助手消息被复制。另一次新的只读搜索创建了 DSH Task，但任务进入 `waiting_user`，未产生 Task 模型调用账本或预算预案，Task 用量为 0、上限为 50,000；相关模型账本只包含成功的终态说明调用（输入 386、输出 116），该助手消息已写回原会话。旧 PC 会话未及时补读该消息。
 - 根因定位：`task_budget_exhausted` 唯一对应 PostgreSQL Task 模型调用预留检查，在 provider 派发前拒绝 `request.ReservedTokens > Task 剩余额度`。请求预留由输入估算与输出上限组成；旧账本没有记录被拒绝请求的输入/输出拆分，因此尚不能确定哪部分超限，也不能据此调高 50,000 上限或降低估算系数。
 - 本地修复：只对白名单 `task_budget_exhausted` 保留阶段 `model_call_reservation` 与原因码 `task_budget_reservation_exceeded`，交给终态 DSH 解释模型；不把失败伪装成搜索结果。增加仅含整数的预算 envelope 诊断日志（Task 上限、已用、在途预留、输入估算、输出上限、总预留）；PC 在未见关联助手消息时最多退避刷新 8 次，消息到达后立即停止。审批或澄清待处理时不轮询。未关闭 fence、账本或硬预算限制。
