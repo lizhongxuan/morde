@@ -51,8 +51,17 @@ func TestConversationRouteSearchIntentUsesDSHTaskAgent(t *testing.T) {
 	value := ConversationRouteContext{ActorID: "u1234567", Content: "搜索 DeepSeek 官方网站并核实链接。"}
 	output := `{"action":"tool","tool_name":"morde_web_search","tool_arguments":{"query":"DeepSeek 官方网站"}}`
 	decision := ParseConversationRouteDecisionForContext(output, value)
-	if decision.InvalidOutput || decision.Action != ConversationRouteNew || !decision.Acknowledge || decision.ToolName != "" || decision.ToolArguments != "" {
+	if decision.InvalidOutput || decision.Action != ConversationRouteNew || !decision.Acknowledge || decision.ToolName != "" || decision.ToolArguments != "" ||
+		decision.AgentToolProfile != task.AgentToolProfileWebResearch {
 		t.Fatalf("valid search intent was not assigned to the DSH Task Agent: %+v", decision)
+	}
+	if !ValidConversationRouteAgentToolProfile(decision, value) {
+		t.Fatal("validated search route did not retain its bounded DSH tool profile")
+	}
+	forged := decision
+	forged.ModelOutput = `{"action":"new","task_id":"","acknowledge":true}`
+	if ValidConversationRouteAgentToolProfile(forged, value) {
+		t.Fatal("a web research profile not backed by a route search/read intent was accepted")
 	}
 	quotedArguments := `{"action":"tool","tool_name":"morde_web_search","tool_arguments":"{\"query\":\"DeepSeek 官方网站\"}"}`
 	decision = ParseConversationRouteDecisionForContext(quotedArguments, value)

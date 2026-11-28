@@ -105,6 +105,7 @@ type taskConversationContextManifest struct {
 	MessageCount         int                              `json:"message_count"`
 	MessageIDs           []string                         `json:"message_ids"`
 	DigestSHA256         string                           `json:"digest_sha256"`
+	AgentToolProfile     task.AgentToolProfile            `json:"agent_tool_profile,omitempty"`
 	Summary              *task.ConversationContextSummary `json:"summary,omitempty"`
 	CurrentMessageSource *task.ConversationMessageSource  `json:"current_message_source,omitempty"`
 }
@@ -234,7 +235,8 @@ func readTaskConversationContextWithProjectLock(ctx context.Context, tx pgx.Tx, 
 		(manifest.ProjectID == value.ProjectID && manifest.InitiatorID == value.InitiatorID)
 	if manifest.OwnerID != value.OwnerID ||
 		manifest.ConversationID != value.ConversationID || manifest.Scope != expectedScope || !manifestMatchesIdentity ||
-		manifest.ThroughSequence < 0 || manifest.MessageCount < 0 || manifest.MessageCount > task.MaxConversationContextMessages {
+		manifest.ThroughSequence < 0 || manifest.MessageCount < 0 || manifest.MessageCount > task.MaxConversationContextMessages ||
+		!manifest.AgentToolProfile.Valid() {
 		return nil, taskContextSnapshotError("Task conversation context metadata is invalid")
 	}
 	if manifest.ProjectID != "" && (manifest.ProjectID != value.ProjectID || manifest.InitiatorID != value.InitiatorID) {
@@ -302,6 +304,7 @@ func readTaskConversationContextWithProjectLock(ctx context.Context, tx pgx.Tx, 
 	}
 	contextValue := buildTaskConversationContext(value.OwnerID, value.ProjectID, value.InitiatorID, value.ConversationID,
 		manifest.ThroughSequence, messages, summary)
+	contextValue.AgentToolProfile = manifest.AgentToolProfile
 	if manifest.MessageCount != len(contextValue.Messages) || !bytes.Equal(expectedDigest, contextValue.Digest) {
 		return nil, taskContextSnapshotError("Task conversation history no longer matches its fixed boundary")
 	}

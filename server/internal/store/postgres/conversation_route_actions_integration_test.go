@@ -171,6 +171,33 @@ func (f routeActionsTestFixture) receive(t *testing.T, clientID, content string,
 	return f.receiveInConversation(t, f.conversation.ID, clientID, content, input)
 }
 
+func TestConversationRoutePersistsValidatedWebResearchToolProfile(t *testing.T) {
+	f := newRouteActionsTestFixture(t)
+	ctx := context.Background()
+	claim := f.receive(t, "route-web-research-profile-001", "搜索今天一条科技新闻并核实来源。", app.ConversationRoutingInput{})
+	snapshot, err := f.store.LoadConversationRouteSnapshot(ctx, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawDecision := `{"action":"tool","tool_name":"morde_web_search","tool_arguments":{"query":"今天科技新闻","category":"news","time_range":"day"}}`
+	decision := app.ParseConversationRouteDecisionForContext(rawDecision, snapshot.Context)
+	if decision.Action != app.ConversationRouteNew || decision.AgentToolProfile != task.AgentToolProfileWebResearch {
+		t.Fatalf("search route decision = %+v", decision)
+	}
+	if err := f.store.ApplyConversationRoute(ctx, claim, snapshot, decision); err != nil {
+		t.Fatal(err)
+	}
+	claimed, found, err := f.store.ClaimNextTask(ctx, "web-research-profile-worker", time.Minute)
+	if err != nil || !found || claimed.ConversationContext == nil ||
+		claimed.ConversationContext.AgentToolProfile != task.AgentToolProfileWebResearch {
+		t.Fatalf("claimed search Task profile = %+v found=%t err=%v", claimed.ConversationContext, found, err)
+	}
+	if claimed.Authorization.Kind != f.authorization.Kind || claimed.Authorization.TokenID != f.authorization.TokenID ||
+		claimed.Authorization.Version != f.authorization.Version {
+		t.Fatalf("claimed Task authorization changed: got %+v, want %+v", claimed.Authorization, f.authorization)
+	}
+}
+
 func (f routeActionsTestFixture) receiveInConversation(t *testing.T, conversationID, clientID, content string,
 	input app.ConversationRoutingInput) app.ConversationRouteClaim {
 	t.Helper()

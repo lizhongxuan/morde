@@ -2120,15 +2120,30 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 		}
 	}()
 	baseDefinitions := []app.AgentToolDefinition{}
+	childrenAllowed := toolsAllowed && e.options.Children != nil
 	if toolsAllowed && e.options.Tools != nil {
 		definitions, err := e.options.Tools.Definitions(ctx, value)
 		if err != nil || !validCloudDSHToolDefinitions(definitions) {
 			return errors.New("dsh tool definitions are unavailable")
 		}
-		definitions, err = cloudDSHEnableTaskAttachmentQueue(value, definitions, e.options.Children != nil)
+		var profileAllowsChildren bool
+		definitions, profileAllowsChildren, err = cloudDSHTaskProfileToolDefinitions(value, definitions)
+		if err != nil || !validCloudDSHToolDefinitions(definitions) {
+			return errors.New("dsh Task tool profile is unavailable")
+		}
+		childrenAllowed = childrenAllowed && profileAllowsChildren
+		definitions, err = cloudDSHEnableTaskAttachmentQueue(value, definitions, childrenAllowed)
 		if err != nil || !validCloudDSHToolDefinitions(definitions) {
 			return errors.New("dsh attachment tool definition is unavailable")
 		}
+		// Attachment readers can be appended from the Task authorization snapshot;
+		// reapply the first-turn profile after that augmentation so it remains a
+		// strict allowlist of the Broker definitions selected above.
+		definitions, profileAllowsChildren, err = cloudDSHTaskProfileToolDefinitions(value, definitions)
+		if err != nil || !validCloudDSHToolDefinitions(definitions) {
+			return errors.New("dsh Task tool profile is unavailable")
+		}
+		childrenAllowed = childrenAllowed && profileAllowsChildren
 		baseDefinitions = definitions
 	}
 	rootDefinitions := append([]app.AgentToolDefinition(nil), baseDefinitions...)
@@ -2138,7 +2153,7 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 		}
 	}
 	canDelegate := false
-	if toolsAllowed && e.options.Children != nil {
+	if childrenAllowed {
 		rootDefinitions = append(rootDefinitions, cloudDSHJobTools()...)
 		hasDelegableTools := false
 		for _, definition := range baseDefinitions {
@@ -2163,14 +2178,14 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 	if resume {
 		rootThrough, rootDigest = value.CheckpointThroughSequence, value.CheckpointDigest
 		pinnedDefinitions, found, err := e.cloudDSHRestorePinnedToolSelection(ctx, fence, rootIdentity.SessionID,
-			rootThrough, rootDigest, rootDefinitions, toolsAllowed && e.options.Children != nil, toolsAllowed && e.options.Tools != nil)
+			rootThrough, rootDigest, rootDefinitions, childrenAllowed, toolsAllowed && e.options.Tools != nil)
 		if err != nil {
 			return err
 		}
 		if found {
 			rootDefinitions = pinnedDefinitions
 			baseDefinitions = cloudDSHFilterToolDefinitionsBySelection(baseDefinitions, pinnedDefinitions)
-			canDelegate = toolsAllowed && e.options.Children != nil && cloudDSHToolAllowed(rootDefinitions, cloudDSHDelegateToolName)
+			canDelegate = childrenAllowed && cloudDSHToolAllowed(rootDefinitions, cloudDSHDelegateToolName)
 		}
 	}
 	if value.StepRetry != nil {
@@ -2209,6 +2224,11 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 		protectsMemory = protectsMemory &&
 			(value.Authorization.Kind != string(identity.KindScheduleTask) || value.ConversationContext != nil && value.ConversationContext.Scope == "personal")
 	}
+	if cloudDSHTaskProfileSkipsInitialPersonalContext(value) {
+		// This first turn neither receives personal context nor exposes personal
+		// data mutation tools, so the context-bound memory proof is not applicable.
+		protectsMemory = false
+	}
 	personalCredential := value.ProjectID == "" && (value.Authorization.Kind == string(identity.KindSession) || value.Authorization.Kind == string(identity.KindClient))
 	if resume && personalCredential && !protectsMemory {
 		// A saved checkpoint may contain personal data even when its original
@@ -2222,7 +2242,7 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 	memoryProof := ""
 	backgroundJobs := make([]map[string]any, 0)
 	var childSessions []app.AgentChildSession
-	if e.options.Children != nil {
+	if childrenAllowed {
 		children, err := e.options.Children.List(ctx, fence, rootIdentity.SessionID)
 		if err != nil {
 			return errors.New("dsh child sessions are unavailable")
@@ -2878,7 +2898,7 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				revisionBatch = revisionBatch[:prefixCount]
 				start["revision_messages"] = revisionBatch
 			}
-			if toolsAllowed && e.options.Children != nil {
+			if childrenAllowed {
 				if value.StepRetry != nil && len(backgroundJobs) != 0 {
 					return errors.New("dsh step retry cannot include background jobs")
 				}
@@ -2976,7 +2996,8 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 					}
 					contextText = strings.TrimSuffix(prompt, suffix)
 				}
-				if provider, ok := e.options.Tools.(cloudDSHInitialContextProvider); ok {
+				if provider, ok := e.options.Tools.(cloudDSHInitialContextProvider); ok &&
+					!cloudDSHTaskProfileSkipsInitialPersonalContext(value) {
 					personalContext, err := provider.InitialContext(ctx, value)
 					if err != nil {
 						if protectsMemory && domain.CodeOf(err) == domain.CodeInvalidState {
@@ -3470,7 +3491,7 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				(!state.resume && state.lastModel < 0) {
 				return errors.New("dsh did not produce a completed candidate")
 			}
-			if e.options.Children != nil {
+			if childrenAllowed {
 				children, err := e.options.Children.List(ctx, fence, rootIdentity.SessionID)
 				if err != nil {
 					return errors.New("dsh background job settlement is unavailable")
@@ -3766,7 +3787,7 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				if frame.Name == cloudDSHResultEvidenceToolName {
 					result = app.AgentToolResult{Status: app.AgentToolSucceeded, Output: "Evidence map received as an untrusted claim. It is retained only if references resolve and the final answer exactly matches the text in the assistant message that submitted it."}
 				} else if cloudDSHJobTool(frame.Name) {
-					if (state.identity.SessionID != rootIdentity.SessionID && !state.canDelegate) || e.options.Children == nil {
+					if !childrenAllowed || (state.identity.SessionID != rootIdentity.SessionID && !state.canDelegate) || e.options.Children == nil {
 						return errors.New("dsh job tool is unavailable to this session")
 					}
 					if recoveryCall {

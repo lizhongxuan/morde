@@ -243,6 +243,7 @@ type ConversationRouteDecision struct {
 	ExpectedRevision         int64
 	ExplicitNew              bool
 	DependencyTaskIDs        []string
+	AgentToolProfile         task.AgentToolProfile `json:"AgentToolProfile,omitempty"`
 	Question                 string
 	Reply                    string
 	LongReply                bool `json:"long_reply,omitempty"`
@@ -268,6 +269,23 @@ func ValidConversationRouteFileDeliveryIntent(action ConversationRouteAction, in
 		return false
 	}
 	return intent.Valid()
+}
+
+// ValidConversationRouteAgentToolProfile requires a web-research profile to be
+// derived from a validated route-model search/read intent. The persisted field
+// cannot be forged independently of that decision.
+func ValidConversationRouteAgentToolProfile(value ConversationRouteDecision, context ConversationRouteContext) bool {
+	if !value.AgentToolProfile.Valid() {
+		return false
+	}
+	if value.AgentToolProfile == "" {
+		return true
+	}
+	if value.Action != ConversationRouteNew || !value.Acknowledge || !ConversationRouteDirectToolContextEligible(context) {
+		return false
+	}
+	verified := ParseConversationRouteDecisionForContext(value.ModelOutput, context)
+	return !verified.InvalidOutput && verified.Action == ConversationRouteNew && verified.AgentToolProfile == value.AgentToolProfile
 }
 
 const MaxConversationRouteModelOutputBytes = 16384
@@ -1124,7 +1142,8 @@ func parseConversationRouteDecision(text, content string, candidates []Conversat
 			len(answer.DependencyTaskIDs) == 0 && len(answer.AggregateMessageIDs) == 0 {
 			if ConversationRouteDirectToolRequiresTask(answer.ToolName, answer.ToolArguments) {
 				if directToolContextEligible {
-					return ConversationRouteDecision{Action: ConversationRouteNew, Acknowledge: true, ModelOutput: text}
+					return ConversationRouteDecision{Action: ConversationRouteNew, Acknowledge: true,
+						AgentToolProfile: task.AgentToolProfileWebResearch, ModelOutput: text}
 				}
 				return fallback
 			}

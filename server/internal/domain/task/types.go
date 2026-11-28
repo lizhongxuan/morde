@@ -226,9 +226,21 @@ type ConversationContext struct {
 	Scope                string
 	ThroughSequence      int64
 	Digest               []byte
+	AgentToolProfile     AgentToolProfile `json:"-"`
 	Summary              *ConversationContextSummary
 	CurrentMessageSource *ConversationMessageSource `json:"-"`
 	Messages             []ConversationContextMessage
+}
+
+// AgentToolProfile is a server-validated, least-privilege hint for the first
+// DSH Task turn. It narrows the tools exposed to the model; it never grants
+// authority beyond the Task's current Broker authorization.
+type AgentToolProfile string
+
+const AgentToolProfileWebResearch AgentToolProfile = "web_research"
+
+func (profile AgentToolProfile) Valid() bool {
+	return profile == "" || profile == AgentToolProfileWebResearch
 }
 
 // ConversationMessageSource is the immutable page-hash manifest for a Task's
