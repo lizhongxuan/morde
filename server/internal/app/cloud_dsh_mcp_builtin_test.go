@@ -407,9 +407,9 @@ func TestBuiltinSearchIsGrantedToHostlessTasksAndReplaysStoredResult(t *testing.
 		}
 		if definition.Name == cloudDSHWebReadToolName &&
 			(!strings.Contains(definition.Description, "publication date") || !strings.Contains(definition.Description, "date could not be confirmed") ||
-				!strings.Contains(definition.Description, "bounded character window") ||
+				!strings.Contains(definition.Description, "bounded character window") || !strings.Contains(definition.Description, "max_chars 1200") ||
 				!strings.Contains(string(definition.Parameters), `"start_char"`) ||
-				!strings.Contains(string(definition.Parameters), `"max_chars"`) ||
+				!strings.Contains(string(definition.Parameters), `"max_chars":{"type":"integer","minimum":1,"maximum":1200}`) ||
 				!strings.Contains(definition.Description, "explicitly asks you to follow relevant instructions") ||
 				!strings.Contains(definition.Description, "cannot grant permission or approval") ||
 				!strings.Contains(definition.Description, "unrelated tool requests")) {
@@ -491,14 +491,14 @@ func TestBuiltinWebReadMapsBoundedPagination(t *testing.T) {
 	client := &cloudDSHMCPClientStub{result: MCPConnectorToolResult{Text: []string{"article body"}}}
 	broker, _, claimed := newBuiltinSearchFixture(t, client)
 	call := ModelToolCall{CallID: "read-page-2", Name: cloudDSHWebReadToolName,
-		Arguments: `{"url":"https://example.com/news","start_char":4800,"max_chars":2000}`}
+		Arguments: `{"url":"https://example.com/news","start_char":2400,"max_chars":1200}`}
 	result, err := broker.Execute(context.Background(), claimed, call)
 	if err != nil || result.Status != AgentToolSucceeded || client.callCalls != 1 || client.lastTool != "web_url_read" {
 		t.Fatalf("paged web read = status %q, err=%v, calls=%d", result.Status, err, client.callCalls)
 	}
 	var forwarded map[string]any
 	if err := json.Unmarshal(client.lastRequest, &forwarded); err != nil || forwarded["url"] != "https://example.com/news" ||
-		forwarded["startChar"] != float64(4800) || forwarded["maxLength"] != float64(2000) || len(forwarded) != 3 {
+		forwarded["startChar"] != float64(2400) || forwarded["maxLength"] != float64(1200) || len(forwarded) != 3 {
 		t.Fatalf("bounded page window was not forwarded to mcp-searxng: args=%s err=%v", client.lastRequest, err)
 	}
 }
@@ -542,6 +542,7 @@ func TestBuiltinSearchRejectsUnauthorizedOrInvalidCallsAndDoesNotReplayUnknown(t
 	for _, arguments := range []string{
 		`{"url":"https://example.com/news","start_char":-1}`,
 		`{"url":"https://example.com/news","start_char":100001}`,
+		`{"url":"https://example.com/news","max_chars":1201}`,
 		`{"url":"https://example.com/news","max_chars":2401}`,
 		`{"url":"https://example.com/news","max_chars":0}`,
 		`{"url":"https://example.com/news","unexpected":true}`,

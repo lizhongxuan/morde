@@ -12,7 +12,23 @@ var errCloudDSHWebResearchToolUnavailable = errors.New("required web research to
 const (
 	cloudDSHWebResearchSearchToolName = "morde_web_search"
 	cloudDSHWebResearchReadToolName   = "morde_web_read"
+	cloudDSHDefaultOutputTokenCap     = int64(2048)
+	cloudDSHWebResearchOutputTokenCap = int64(1024)
 )
+
+// cloudDSHTaskLegacyModelOutputTokens keeps the existing DSH cap for ordinary
+// Tasks while giving the initial public-research profile enough room for a
+// concise evidence-based answer without reserving an unnecessary 2048 tokens.
+func cloudDSHTaskLegacyModelOutputTokens(value task.Task) int64 {
+	cap := value.Budget.ModelTokens
+	if cap > cloudDSHDefaultOutputTokenCap {
+		cap = cloudDSHDefaultOutputTokenCap
+	}
+	if cap > cloudDSHWebResearchOutputTokenCap && cloudDSHWebResearchProfileActive(value) {
+		cap = cloudDSHWebResearchOutputTokenCap
+	}
+	return cap
+}
 
 // cloudDSHTaskProfileToolDefinitions applies the Task's least-privilege tool
 // profile only to its first revision. The returned child policy must be used

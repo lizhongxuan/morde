@@ -10,6 +10,29 @@ import (
 	"morde/server/internal/domain/task"
 )
 
+func TestCloudDSHTaskLegacyModelOutputTokens(t *testing.T) {
+	revision := int64(1)
+	for _, test := range []struct {
+		name  string
+		value task.Task
+		want  int64
+	}{
+		{name: "ordinary task retains legacy cap", value: task.Task{Budget: task.Budget{ModelTokens: 50_000}}, want: cloudDSHDefaultOutputTokenCap},
+		{name: "initial web research uses concise cap", value: task.Task{Budget: task.Budget{ModelTokens: 50_000}, ConversationContext: &task.ConversationContext{
+			AgentToolProfile: task.AgentToolProfileWebResearch}}, want: cloudDSHWebResearchOutputTokenCap},
+		{name: "small task budget remains authoritative", value: task.Task{Budget: task.Budget{ModelTokens: 512}, ConversationContext: &task.ConversationContext{
+			AgentToolProfile: task.AgentToolProfileWebResearch}}, want: 512},
+		{name: "later revision returns to legacy cap", value: task.Task{CurrentRevision: &revision, Budget: task.Budget{ModelTokens: 50_000}, ConversationContext: &task.ConversationContext{
+			AgentToolProfile: task.AgentToolProfileWebResearch}}, want: cloudDSHDefaultOutputTokenCap},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := cloudDSHTaskLegacyModelOutputTokens(test.value); got != test.want {
+				t.Fatalf("legacy output cap = %d, want %d", got, test.want)
+			}
+		})
+	}
+}
+
 func TestCloudDSHTaskProfileToolDefinitionsFiltersWebResearchTools(t *testing.T) {
 	definitions := []app.AgentToolDefinition{
 		profileTestTool("file_read"),

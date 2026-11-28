@@ -14,10 +14,11 @@ import (
 )
 
 const (
-	cloudDSHWebResearchMaxSearchCalls       = 2
-	cloudDSHWebResearchMaxReadCalls         = 6
-	cloudDSHWebResearchMaxReadURLs          = 3
-	cloudDSHWebResearchMaxReadWindowsPerURL = 2
+	cloudDSHWebResearchMaxSearchCalls        = 2
+	cloudDSHWebResearchMaxSuccessfulSearches = 1
+	cloudDSHWebResearchMaxReadCalls          = 4
+	cloudDSHWebResearchMaxReadURLs           = 2
+	cloudDSHWebResearchMaxReadWindowsPerURL  = 2
 )
 
 const cloudDSHWebResearchBudgetFeedback = "The bounded web research allowance is exhausted or this exact request was already attempted. Stop repeating search/read calls, synthesize the available evidence, and state any gaps in the user's language."
@@ -67,7 +68,7 @@ func cloudDSHWebResearchToolDenial(history *cloudDSHCheckpointHistory, currentCa
 		return cloudDSHWebResearchBudgetFeedback
 	}
 
-	searchCalls, readCalls := 0, 0
+	searchCalls, successfulSearches, readCalls := 0, 0, 0
 	readURLs := make(map[string]struct{})
 	readWindowsByURL := make(map[string]int)
 	for callID, call := range history.calls {
@@ -77,6 +78,9 @@ func cloudDSHWebResearchToolDenial(history *cloudDSHCheckpointHistory, currentCa
 		switch call.name {
 		case cloudDSHWebResearchSearchToolName:
 			searchCalls++
+			if call.resultSeen && !call.resultUnknown && call.status == app.AgentToolSucceeded {
+				successfulSearches++
+			}
 			prior, _, valid := cloudDSHWebResearchCallSignature(call.name, call.arguments)
 			if !valid || toolName == cloudDSHWebResearchSearchToolName && prior == currentSignature &&
 				cloudDSHWebResearchPriorBlocksDuplicate(call) {
@@ -97,7 +101,8 @@ func cloudDSHWebResearchToolDenial(history *cloudDSHCheckpointHistory, currentCa
 		}
 	}
 
-	if toolName == cloudDSHWebResearchSearchToolName && searchCalls >= cloudDSHWebResearchMaxSearchCalls {
+	if toolName == cloudDSHWebResearchSearchToolName && (searchCalls >= cloudDSHWebResearchMaxSearchCalls ||
+		successfulSearches >= cloudDSHWebResearchMaxSuccessfulSearches) {
 		return cloudDSHWebResearchBudgetFeedback
 	}
 	if toolName == cloudDSHWebResearchReadToolName &&
